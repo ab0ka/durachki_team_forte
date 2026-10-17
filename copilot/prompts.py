@@ -260,13 +260,75 @@ def result_times(result: dict[str, Any]) -> list[float]:
         except (TypeError, ValueError):
             pass
     meta = result.get("meta") or {}
-    for key in ("duration", "duration_s", "video_duration"):
+    for key in ("duration", "duration_s", "duration_sec", "video_duration"):
         try:
             if meta.get(key) is not None:
                 times.append(float(meta[key]))
         except (TypeError, ValueError, AttributeError):
             pass
+    for h in review_hints(result):  # спорные места тоже факты результата
+        for key in ("timecode_sec", "t_start", "t_end"):
+            t = to_float(h.get(key))
+            if t is not None:
+                times.append(t)
     return times
+
+
+SOURCE_RU = {"rules": "правила по сигналам сцены", "temporal": "временная модель", "vlm": "проверка VLM",
+             "fusion": "слияние источников", "pose": "поза/жесты", "scene": "состояние сцены"}
+VLM_RU = {"supports": "VLM подтвердила по кадрам", "contradicts": "VLM по кадрам не подтвердила",
+          "uncertain": "VLM не уверена", "type_mismatch": "VLM видит на кадрах другой тип",
+          "not_checked": "VLM не проверяла", "error": "проверка VLM не выполнена (ошибка)"}
+
+
+def explain_for(result: dict[str, Any], v: dict[str, Any]) -> dict[str, Any]:
+    """«Почему отмечено» для нарушения: наблюдаемые факты, какие детекторы сработали, проверка VLM.
+
+    Берётся из meta.ui.evidence_overlays (A12, по violation_index) и meta.violation_extra (A01).
+    Только то, что прислал пайплайн; ничего не достраивается.
+    """
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    idx = int(v.get("_n", 0)) - 1
+    found: dict[str, Any] = {}
+    overlays = ((meta.get("ui") or {}).get("evidence_overlays") or []) if isinstance(meta.get("ui"), dict) else []
+    for o in overlays:
+        if isinstance(o, dict) and o.get("violation_index") == idx:
+            found.update(o)
+    extra = meta.get("violation_extra")
+    if isinstance(extra, list) and 0 <= idx < len(extra) and isinstance(extra[idx], dict):
+        for k in ("facts", "sources", "vlm"):
+            found.setdefault(k, extra[idx].get(k))
+    facts = [str(f) for f in (found.get("facts") or []) if str(f).strip()][:6]
+    sources = found.get("sources")
+    src_list: list[tuple[str, Optional[float]]] = []
+    if isinstance(sources, dict):
+        src_list = [(str(k), to_float(val)) for k, val in sources.items()]
+    elif isinstance(sources, list):
+        src_list = [(str(k), None) for k in sources]
+    vlm = found.get("vlm")
+    vlm_state = (vlm.get("agreement") or vlm.get("status")) if isinstance(vlm, dict) else vlm
+    return {"facts": facts, "sources": src_list, "vlm": str(vlm_state) if vlm_state else None}
+
+
+def explain_lines(ex: dict[str, Any]) -> list[str]:
+    out = []
+    if ex["facts"]:
+        out.append("Наблюдаемые факты (от детекторов): " + "; ".join(ex["facts"]))
+    if ex["sources"]:
+        out.append("Кто отметил: " + ", ".join(
+            SOURCE_RU.get(k, k) + (f" ({sc:.2f})" if sc is not None else "") for k, sc in ex["sources"]))
+    if ex["vlm"]:
+        out.append("Проверка VLM: " + VLM_RU.get(ex["vlm"], ex["vlm"]))
+    return out
+
+
+def review_hints(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Спорные места: кандидаты, не вошедшие в вердикт (meta.ui.review_hints A12 или candidates A01)."""
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    hints = ((meta.get("ui") or {}).get("review_hints") or []) if isinstance(meta.get("ui"), dict) else []
+    if not hints:
+        hints = result.get("candidates") or []
+    return [h for h in hints if isinstance(h, dict)][:10]
 
 
 @dataclass
@@ -363,6 +425,8 @@ def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optio
             frames = [fmt_tc(f.get("timestamp_sec")) for f in v.get("evidence_frames") or []]
             if frames:
                 lines.append(f"    Кадры-доказательства: {', '.join(frames)}")
+            for ln in explain_lines(explain_for(result, v)):
+                lines.append(f"    {ln}")
             own = [r.marker for r in refs if r.relation == "catalog" and n in r.events]
             if own:
                 lines.append(f"    Нормы каталога для этого типа: {', '.join(own)}")
@@ -373,6 +437,12 @@ def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optio
                 lines.append(f"    Пояснение каталога (не текст нормы): {note}")
     else:
         lines.append("Возможные нарушения: нет")
+    hints = review_hints(result)
+    if hints:
+        lines.append("Спорные места (кандидаты ниже порога, в вердикт НЕ вошли):")
+        for h in hints:
+            reasons = ", ".join(str(x) for x in h.get("reasons_ru") or []) or "ниже порога"
+            lines.append(f"  - {h.get('type') or h.get('type_id') or '—'}, {fmt_tc(h.get('timecode_sec'))}: {reasons}")
     lines.append("По видео НЕ устанавливается: " + "; ".join(unobservable_items(result, corpus)))
     lines.append("")
     if refs:

@@ -9,7 +9,8 @@ from typing import Any, Optional
 
 from .config import default_config
 from .corpus import Corpus, load_corpus
-from .prompts import completeness, completeness_text, fmt_tc, normalize_result, unobservable_items, verdict_text
+from .prompts import (completeness, completeness_text, explain_for, explain_lines, fmt_tc, normalize_result,
+                      review_hints, unobservable_items, verdict_text)
 
 
 def _md(s: Any) -> str:
@@ -94,6 +95,10 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
             if v.get("confidence") not in (None, ""):
                 lines.append(f"- **Уверенность алгоритма:** {float(v['confidence']):.2f} (не вероятность нарушения)")
             lines.append(f"- **Что видно:** {_md(v.get('description')) or 'нет описания'}")
+            why = explain_lines(explain_for(res, v))
+            if why:
+                lines.append("- **Почему отмечено (данные системы):**")
+                lines.extend(f"  - {_md(x)}" for x in why)
             frames = [fmt_tc(f.get("timestamp_sec")) for f in v.get("evidence_frames") or []]
             lines.append(f"- **Кадры-доказательства:** {', '.join(frames) if frames else 'нет'}")
             rules, dropped = _verified_rules(v, corpus)
@@ -121,6 +126,14 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
             if dropped:
                 lines.append(f"- _Отброшено ссылок, не найденных в каталоге норм: {dropped}_")
             lines.append("")
+
+    hints = review_hints(res)
+    if hints:
+        lines += ["## Спорные места (не вошли в вердикт)", ""]
+        for h in hints:
+            reasons = ", ".join(_md(x) for x in h.get("reasons_ru") or []) or "ниже порога"
+            lines.append(f"- {_md(h.get('type') or h.get('type_id') or 'кандидат')} — {fmt_tc(h.get('timecode_sec'))}: {reasons}")
+        lines.append("")
 
     lines += ["## Что проверить вручную", ""]
     for v in viols:

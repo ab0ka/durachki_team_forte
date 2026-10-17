@@ -12,7 +12,8 @@ from typing import Any, Optional, Sequence
 
 from .corpus import Corpus
 from .prompts import (NormRef, REFUSAL_NO_DATA, REFUSAL_SCOPE, REFUSAL_SOURCES, REFUSAL_VIDEO, completeness,
-                      completeness_text, fmt_tc, to_float, unobservable_items, verdict_text)
+                      completeness_text, explain_for, explain_lines, fmt_tc, review_hints, to_float,
+                      unobservable_items, verdict_text)
 
 # порядок важен: первое совпадение побеждает
 _INTENT_PATTERNS: list[tuple[str, str]] = [
@@ -26,6 +27,7 @@ _INTENT_PATTERNS: list[tuple[str, str]] = [
     ("fine", r"штраф|наказан|санкци|ответственност|уволь|выговор"),
     ("evidence", r"кадр|доказательств|скриншот|фото|изображени"),
     ("checklist", r"что\s+(мне\s+)?(проверить|делать|сделать)|как\s+проверить|рекомендац|следующ\w+\s+шаг|на\s+что\s+обратить"),
+    ("hints", r"спорн|сомнительн|кандидат|ниже\s+порога|не\s+вошл|отсеян|отброшен"),
     ("confidence", r"уверен|вероятност|точност|насколько\s+(надёжн|надежн|точн)|ошиб(ка|ся|лась)|ложн"),
     ("when", r"когда|в\s+какой\s+момент|на\s+какой\s+секунд|таймкод|в\s+какое\s+время|время\s+нарушени"),
     ("why", r"почему|на\s+каком\s+основании|за\s+что|объясни|поясни|что\s+не\s+так|в\s+ч[её]м\s+(нарушение|проблема)|чем\s+нарушен"),
@@ -112,7 +114,8 @@ def _norm_phrase(r: NormRef) -> str:
     return f"{r.marker}" + (f" ({', '.join(tags)})" if tags else "")
 
 
-def _viol_line(v: dict[str, Any], refs: Sequence[NormRef], corpus: Optional[Corpus]) -> str:
+def _viol_line(v: dict[str, Any], refs: Sequence[NormRef], corpus: Optional[Corpus],
+               result: Optional[dict[str, Any]] = None) -> str:
     tid = v.get("type_id") or ""
     name = v.get("type") or (corpus.type_name(tid) if corpus and tid else "") or "возможное нарушение"
     own = _catalog_refs(v, refs)
@@ -122,6 +125,9 @@ def _viol_line(v: dict[str, Any], refs: Sequence[NormRef], corpus: Optional[Corp
     line = f"- [V{v.get('_n')}] {name}{conf_s}"
     if desc:
         line += f". Что видно: {desc}"
+    if result is not None:  # «почему отмечено» — только то, что прислал пайплайн
+        for ex in explain_lines(explain_for(result, v)):
+            line += f". {ex}"
     if own:
         line += ". Норма: " + ", ".join(_norm_phrase(r) for r in own)
     elif corpus is not None and tid:
@@ -207,6 +213,15 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
             parts.append(f"- [V{v.get('_n')}]: " + (f"кадры {', '.join(frames)}." if frames else "кадров-доказательств нет."))
         return "Кадры-доказательства:\n" + "\n".join(parts)
 
+    if intent == "hints":
+        hints = review_hints(result)
+        if not hints:
+            return ("Сведений о спорных местах (кандидатах ниже порога) в результате нет. "
+                    "Это не означает, что сомнительных моментов не было.")
+        parts = [f"- {h.get('type') or h.get('type_id') or 'кандидат'}, {fmt_tc(h.get('timecode_sec'))}: "
+                 + (", ".join(str(x) for x in h.get("reasons_ru") or []) or "ниже порога") for h in hints]
+        return ("Спорные места (в вердикт не вошли, решение за проверяющим):\n" + "\n".join(parts))
+
     if intent == "confidence":
         parts = [f"- [V{v.get('_n')}]: уверенность {float(v.get('confidence') or 0):.2f}." for v in targets]
         return ("Уверенность модели по нарушениям:\n" + "\n".join(parts) +
@@ -225,7 +240,7 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
     # why / summary / general
     head = (f"Вердикт: {verdict_text(result)}; возможных нарушений: {len(viols)}."
             if intent in {"summary", "general"} else "Основания (только наблюдаемые факты):")
-    lines = [head] + [_viol_line(v, refs, corpus) for v in targets]
+    lines = [head] + [_viol_line(v, refs, corpus, result if intent == "why" else None) for v in targets]
     if corpus is None and not any(_catalog_refs(t, refs) for t in targets):
         lines.append("Норма для этого случая в источниках не найдена.")
     lines.append("Это признаки возможного нарушения, решение принимает проверяющий.")
