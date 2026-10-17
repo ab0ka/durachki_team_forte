@@ -24,8 +24,12 @@ OFF_CONFIG = PKG_DIR / "ablation" / "temporal_off.yaml"
 
 
 def ablate_cmd(a: argparse.Namespace) -> list[str]:
+    # SENTINEL_TEMPORAL_OOF=1 — обеим рукам (при выключенной стадии ни на что не влияет), чтобы руки различались
+    # только stages.temporal. eval.ablate всё равно покажет 2 ключа (путь SENTINEL_PIPELINE_CONFIG и sha конфига) —
+    # это одно логическое изменение: оверлей temporal_off.yaml.
     cmd = [sys.executable, "-m", "eval.ablate", "--name", a.name,
-           "--baseline-config", str(OFF_CONFIG), "--candidate-env", "SENTINEL_TEMPORAL_OOF=1",
+           "--baseline-config", str(OFF_CONFIG),
+           "--baseline-env", "SENTINEL_TEMPORAL_OOF=1", "--candidate-env", "SENTINEL_TEMPORAL_OOF=1",
            "--videos", a.videos, "--labels", a.labels, "--manifest", a.manifest, "--out", a.out]
     if a.splits:
         cmd += ["--splits", a.splits]

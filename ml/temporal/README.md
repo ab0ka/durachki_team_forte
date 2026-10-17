@@ -9,6 +9,79 @@
 > в разведочной оценке, поэтому любые метрики на них — **разведочные**, не независимый тест.
 > В прод режим попадает только после измеренной пользы.
 
+## Передача L2 после аудита `2055fc4`
+
+**Код, обученные веса и измеренная польза — три разные вещи:**
+- **Код** обучения/инференса/замера есть и проверен на синтетике (тесты ниже).
+- **Обученных весов temporal нет:** агент не обучал ни на реальных, ни на каких-либо данных команды.
+- **Полезность temporal на реальных видео не измерена.** Ответ даст только сравнение off/on у L2.
+
+**Temporal — генератор риска и кандидатов, а не самостоятельное доказательство нарушения.**
+- События `score()` несут `extra.role="risk_support"`, `standalone_evidence=False`.
+- В fusion A12 по умолчанию `temporal_mode: off` и гейт `temporal_only`.
+
+**Без обученного checkpoint `score()` бросает `TemporalUnavailable`, а не отдаёт тихо `([], [])`.**
+- Видимые сигналы в пайплайне: `meta.stages.temporal = {status: "error", error: "TemporalUnavailable: …
+  пустой результат не означает «нарушений нет»"}`, `meta.coverage.by_stage.temporal = 0.0` и строка
+  в `meta.warnings`. Проверено на реальном пайплайне A03 (inline-исполнитель, синтетический ролик).
+- Ядро анализа при этом считается полным: temporal необязателен.
+- Так же обрабатываются причины `backend_mismatch`, `checkpoint_mismatch`, `too_short`, `oof_unavailable`
+  и внутренняя ошибка.
+- Старое поведение включается только явно: `infer.on_unavailable: empty`.
+
+**Инвалидация кэшей:**
+- **Кэш стадии в пайплайне.** Пакет экспортирует `model_info()`, который `backend.pipeline.stages.module_identity`
+  уже читает. Подписи файлов checkpoint и хэш эффективного конфига (включая `SENTINEL_TEMPORAL_CONFIG`)
+  входят в ключ кэша стадии temporal. Раньше переобучение ключ не меняло.
+- **Checkpoint в памяти процесса** перечитывается при изменении любого его файла, а не только `selected.json`.
+- **Кэш признаков** (`cache/features`): ключ = md5 содержимого (имя файла не входит) + модель + **ревизия
+  снапшота SigLIP2 в HF-кэше** + настройки focus/зон + **`max_frames`** + fps/виды + `FEATURE_VERSION`.
+  Первый `extract` после обновления пересоберёт кэш признаков.
+- **Checkpoint хранит подпись признаков:** обученный на других признаках не используется молча
+  (`checkpoint_mismatch`).
+
+**Группы дубликатов:**
+- md5-дубликаты сворачиваются в одну группу.
+- Внешние и внутренние (калибровочные) фолды не разрывают группу — тест `test_no_duplicate_group_leak_*`.
+- Cross-fit берёт фолды из `data/splits.csv` (`eval.split`). Противоречивый split, где члены группы
+  оказались в разных фолдах, даёт ошибку.
+
+**Сравнение temporal off/on в полном пайплайне — одна команда:**
+```bash
+python -m ml.temporal.offon --splits data/splits.csv --videos data/raw --labels data/labels.csv \
+       --manifest data/manifest.csv --out runs/ablate/A10-temporal-offon
+```
+Шаги:
+1. `ml.temporal.extract` — если кэша признаков нет.
+2. `ml.temporal.oof` — cross-fit по фолдам `splits.csv`. Модель **и порог (внутренний grouped CV)** —
+   только на группах других фолдов; holdout-группы `eval.split` (fold = −1) в обучение фолдов не входят.
+3. `eval.ablate` (A16): baseline = пайплайн с `stages.temporal: false`
+   (`ml/temporal/ablation/temporal_off.yaml`), candidate = тот же пайплайн. Обеим рукам ставится
+   `SENTINEL_TEMPORAL_OOF=1`: каждое видео оценивает модель фолда, не видевшая его группу.
+
+FN, FP, hit@k (локализация), латентность, VRAM, группировку md5-дубликатов и вердикт
+PASS/FAIL/INCONCLUSIVE считает `eval`. Особенности:
+- `eval.ablate` покажет `changed_params = [SENTINEL_PIPELINE_CONFIG, pipeline_config]` — это одно
+  логическое изменение (оверлей конфига).
+- Первая рука может включать холодный старт моделей; латентность сравнивайте с учётом этого.
+- Это cross-fitting на 42 уже исследованных роликах: оценка **разведочная**, не независимый holdout.
+
+Проверено только на синтетике в mock-режиме: связка `extract → oof → eval.ablate` отработала, temporal в руке
+candidate — `ok` на всех видео. Цифры синтетики о пользе ничего не говорят.
+
+**Коммиты для интеграции.** В `claude/integration-cloud` (`2055fc4`) мои коммиты есть до `09a28a4`. Нужны все
+последующие — по порядку, без нового рефакторинга (точный HEAD — в сообщении передачи и `git log`):
+- `7e5b971` — README фазы 2;
+- `d3a2a00` — `change_onset` в CV, блок воспроизводимости в meta checkpoint;
+- `eaa38af` — smoke-тест E2 в bench;
+- `bca11f1` — кэш change-признаков на объекте признаков;
+- `0d026a2` — README, стоимость E2;
+- `c8c1483` — честный статус no_checkpoint, инвалидация кэшей;
+- `55f3539` — cross-fit OOF и команда off/on.
+
+Пробный мердж в `2055fc4` проходит без конфликтов: правки A03 (`_contract_fallback.py` удалён,
+импорты на `contracts`) совместимы, а импорт в `infer.py` приведён к тексту интеграции.
+
 ## Фаза 2: что изменено
 
 ### 1. Корректность baseline
@@ -106,7 +179,7 @@ python -m ml.temporal.bench --experiments E0,E1,E2 --folds 5 --repeats 3 --inner
 - **Как решать:** переключать дефолты (`propose.mode`, `infer.pooling`, `infer.timecode_policy`,
   `model.input_groups`) и обучать прод-чекпоинт (`python -m ml.temporal.train --kind baseline|temporal`)
   только при измеренной пользе. Обязательные условия: без роста FN и без предупреждения сторожа
-  длительности. Пока checkpoint нет, `score()` отдаёт `([], [])`.
+  длительности. Пока checkpoint нет, `score()` бросает `TemporalUnavailable` (честный статус стадии).
 - **Стоимость** (замер на CPU контейнера, 4 потока, синтетика реального размера: 40 групп, 3 версии,
   D=768): E0 — 51 с, E1 — 55 с, E2 — 635 с на один повтор 5×(3+1) (20 обучений TCN по 40 эпох,
   часть времени ядра делились с тестами). При 3 повторах: E0/E1 — примерно 2.5–3 мин каждая,
@@ -117,9 +190,11 @@ python -m ml.temporal.bench --experiments E0,E1,E2 --folds 5 --repeats 3 --inner
 ## Публичные функции
 ```python
 from ml.temporal import score, propose, warmup, status
-risk, events = score(clip, zones=None, budget_s=None)   # контракт; без checkpoint -> ([], [])
+risk, events = score(clip, zones=None, budget_s=None)   # контракт; без checkpoint -> TemporalUnavailable
 cands = propose(clip, zones=None, budget_s=None)        # 3–8 Event-кандидатов для VLM/правил
-warmup(); status()                                      # status(): ok | no_checkpoint | backend_mismatch | too_short | error
+warmup(); status()                                      # status(): ok | no_checkpoint | backend_mismatch |
+                                                        # checkpoint_mismatch | too_short | oof_unavailable | error
+model_info()                                            # идентичность для кэша пайплайна (checkpoint, конфиг)
 from ml.temporal.infer import propose_status            # диагностика propose()
 ```
 - **Пустой ответ при неполном анализе — это «не проанализировано», а не «нарушений нет».**
@@ -140,11 +215,19 @@ from ml.temporal.infer import propose_status            # диагностика
 | `infer.timecode_policy` | `peak` | выбрать по замеру |
 | `labels.time_conflict_policy` | `both` | решает человек |
 | `train.use_pseudo_types` | `false` | псевдометки VLM — только явно |
+| `infer.on_unavailable` | `raise` | честный статус «не проанализировано»; `empty` — старое поведение |
 
 ## Что реально проверено (контейнер без GPU)
-- `pytest ml/temporal/tests`: **50 passed** на Python 3.13 (numpy 2.5, torch 2.14 CPU, transformers 5.20.1).
-- **50 passed на Python 3.11.15 со стеком из lock L1:** torch 2.11.0, transformers 5.20.1, numpy 2.4.6,
+- `pytest ml/temporal/tests`: **59 passed** на Python 3.13 (numpy 2.5, torch 2.14 CPU, transformers 5.20.1).
+- **59 passed на Python 3.11.15 со стеком из lock L1:** torch 2.11.0, transformers 5.20.1, numpy 2.4.6,
   opencv-python-headless 4.14.0.94, pyyaml 6.0.3, Pillow 13.0.0, torchvision 0.26.0 (CPU).
+- То же (59 passed на 3.13 и 3.11) — в пробном мердже ветки в `claude/integration-cloud` (`2055fc4`):
+  с каноническим `contracts` и glue-conftest A03.
+- Реальный пайплайн A03 (inline, синтетический ролик, mock-режим включён явно): без checkpoint стадия
+  temporal — `error` с честной причиной. После обучения меняется `module_identity` (ключ кэша стадии).
+- `python -m ml.temporal.offon` на 7 синтетических роликах (включая md5-дубликат) в mock-режиме:
+  `extract → oof → eval.ablate` отработал, temporal в руке candidate — `ok` на всех видео. Метрики
+  синтетики о пользе ничего не говорят.
 - Сквозной mock-сценарий: синтетические видео (X/Х, md5-дубликат с конфликтом) → `extract` →
   `bench` (E0, E1) → `check_split` → `cv` → `train` → `predict`/`score`/`propose`.
 - Путь SigLIP-бэкенда проверен только на крошечной случайной модели. Настоящие веса не запускались.
@@ -159,7 +242,10 @@ from ml.temporal.infer import propose_status            # диагностика
 ## Для интегратора
 - **A03 (pipeline):**
   - `propose(clip, zones=...)` — кандидаты в `ml.vlm.verify` и правила. Включать после замера L2.
-  - `score(clip, zones=...)` — как раньше.
+  - `score(clip, zones=...)` — без обученного checkpoint бросает `TemporalUnavailable`. Пайплайн записывает
+    стадию как `error` с причиной; это не «видео чистое». Пока весов нет, можно выключить стадию
+    `stages.temporal: false` (статус `disabled`).
+  - `model_info()` уже подхватывается `module_identity` — отдельной интеграции не требует.
   - `warmup()` — из `pipeline.warmup()`.
   - `status()["coverage"]` → `meta.coverage`.
 - **A12 (fusion):**
@@ -189,7 +275,7 @@ from ml.temporal.infer import propose_status            # диагностика
 - null-статистика блочная (τ = 4 с, k = 4 окна по 0.5 с), скор видео — максимум тех же блоков. Так
   статистика согласована с null; глобальный top-k давал остаточную корреляцию с длиной.
 - Без checkpoint `propose()` возвращает кандидатов только из кривой изменений. Это детерминированный
-  выбор моментов для проверки, а не скор нарушения. `score()` без checkpoint по-прежнему пуст.
+  выбор моментов для проверки, а не скор нарушения. `score()` без checkpoint бросает `TemporalUnavailable`.
 - Прод-порог калибрует `train` внутренним CV; отчёт CV для этого больше не нужен (`deploy_threshold`
   удалён).
 - Зоны считаются по оригинальному ролику; у аугментированных копий зонные виды неизвестны.
