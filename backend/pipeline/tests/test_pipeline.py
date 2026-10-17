@@ -199,3 +199,21 @@ def test_run_with_context_outputs(fake_ml, synth_video, tmp_path):
     names = {Path(f).name for f in files}
     assert {"dets.jsonl", "tracks.json", "zones.json", "states.jsonl", "events_rules.json", "risk.json",
             "events_all.json", "stages.json"} <= names
+
+
+def test_cold_flag_queue_wait_and_vlm_usage(fake_ml, synth_video):
+    def verify(clip, events, budget_s):
+        out = []
+        for e in events:
+            out.append(Event(e.type_id, e.t_start, e.t_end, e.t_peak, e.confidence, "vlm", [], {}, [],
+                             {"vlm": {"status": "checked", "budget": {"calls": 1, "output_tokens": 37}}}))
+        return out
+
+    fake_ml({"ml.vlm.verify": verify})
+    r1 = run(synth_video, "job-cold-1", None, 60, overrides={"cache": {"mode": "off"}})
+    r2 = run(synth_video, "job-cold-2", None, 60, overrides={"cache": {"mode": "off"}})
+    assert r1.meta["stages"]["detect"].get("cold") is True          # первый вызов — с загрузкой модели
+    assert not r2.meta["stages"]["detect"].get("cold")              # модель уже тёплая
+    assert r1.meta["queue_wait_s"] >= 0
+    assert r1.meta["vlm"]["vlm_verify"]["budget"]["output_tokens"] == 37
+    assert r1.meta["vlm"]["vlm_verify"]["statuses"] == {"checked": 1}

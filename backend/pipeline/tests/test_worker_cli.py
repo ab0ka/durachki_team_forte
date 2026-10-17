@@ -20,7 +20,8 @@ def test_process_worker_e2e_mock(synth_video, monkeypatch):
     res = run(synth_video, "job-proc", None, 120, overrides={"mock": True})
     assert res.status == "done", res.meta.get("error")
     assert res.meta["executor"]["mode"] == "process" and res.meta["executor"]["pid"]
-    assert res.meta["stages"]["detect"]["origin"] == "builtin-mock"
+    # без модуля ml.detect в ветке — встроенный фейк; в интеграции — mock-бэкенд самого модуля
+    assert res.meta["stages"]["detect"]["origin"] in ("builtin-mock", "module")
 
 
 def test_process_worker_killed_on_timeout_and_restarted(synth_video, monkeypatch, fake_ml_files):
@@ -71,8 +72,10 @@ def test_cli_run_and_dump(synth_video, tmp_path):
     assert "Декодирование" in p.stderr
 
 
-def test_cli_run_failed_exit_code(synth_video, tmp_path):
-    p = _cli("run", synth_video, "--out", str(tmp_path / "o.json"), "--no-vlm")  # без mock и без модулей ml
+def test_cli_run_failed_exit_code(tmp_path):
+    bad = tmp_path / "broken.mp4"
+    bad.write_bytes(b"not a video at all")                    # не декодируется ни ml.ingest, ни OpenCV
+    p = _cli("run", str(bad), "--out", str(tmp_path / "o.json"), "--no-vlm", "--mock")
     assert p.returncode == 2
     assert json.loads((tmp_path / "o.json").read_text(encoding="utf-8"))["status"] == "failed"
 
@@ -99,3 +102,41 @@ def test_cli_profile(synth_video):
     p = _cli("profile", synth_video, "--mock", "--inline", "--json")
     rep = json.loads(p.stdout)
     assert rep["status"] == "done" and any(r["stage"] == "detect" for r in rep["stages"])
+
+
+def test_deadline_respected_when_worker_keeps_dying(synth_video, monkeypatch, fake_ml_files):
+    """Регрессия пробной интеграции A01: 6-с ролик, deadline 40 с, ответ через 110 с.
+    Служебные RPC (identity/device/prepare_vram) и перезапуски воркера тоже обязаны укладываться в дедлайн."""
+    base = fake_ml_files()
+    for name in ("track", "scene", "rules", "temporal", "vlm"):   # медленный импорт каждого модуля в воркере
+        p = base / "ml" / name / "__init__.py"
+        p.write_text("import time\ntime.sleep(2.0)\n" + p.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("SENTINEL_EXECUTOR", "process")
+    monkeypatch.setenv("SENTINEL_FAKE_SLEEP", "60")               # detect зависает → воркер убивается
+    deadline = 8.0
+    t0 = time.perf_counter()
+    res = run(synth_video, "job-deadline", None, deadline,
+              overrides={"executor": {"extra_sys_path": [str(base)]}, "timeouts": {"min_s": 2.0}})
+    elapsed = time.perf_counter() - t0
+    assert elapsed < deadline + 4.0, f"run() занял {elapsed:.1f} с при дедлайне {deadline} с"
+    assert res.status == "failed" and res.verdict is None
+    assert res.meta["stages"]["detect"]["status"] == "timeout"
+
+
+def test_process_worker_refine_windows(synth_video, monkeypatch):
+    monkeypatch.setenv("SENTINEL_EXECUTOR", "process")
+    res = run(synth_video, "job-proc-refine", None, 120, overrides={"mock": True, "refine": {"enabled": True}})
+    assert res.status == "done", res.meta.get("error")
+    st = res.meta["stages"]["refine"]["status"]
+    assert st in ("ok", "skipped"), res.meta["stages"]["refine"]
+    if st == "ok":
+        assert res.meta["refine"]["processed"] >= 1
+
+
+def test_cli_profile_repeat_cold_warm(synth_video):
+    p = _cli("profile", synth_video, "--mock", "--inline", "--json", "--repeat", "2")
+    assert p.returncode == 0, p.stderr
+    reps = json.loads(p.stdout)
+    assert [r["run"] for r in reps] == [1, 2]
+    det = [next(s for s in r["stages"] if s["stage"] == "detect") for r in reps]
+    assert det[0]["cold"] is True and det[1]["cold"] is False

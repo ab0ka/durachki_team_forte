@@ -33,13 +33,58 @@ _MB = 1024 ** 2
 
 
 class ClipRef:
-    """Маркер аргумента: «подставь клип текущей задачи» (сам клип не пересылается между процессами)."""
+    """Маркер аргумента: «подставь клип текущей задачи» (сам клип не пересылается между процессами).
+    ``window=(t0, t1, fps, max_frames)`` — окно клипа с плотной выборкой (режим coarse→fine)."""
+
+    def __init__(self, window: Optional[tuple] = None) -> None:
+        self.window = tuple(window) if window else None
 
     def __repr__(self) -> str:  # pragma: no cover
-        return "<clip>"
+        return f"<clip window={self.window}>" if self.window else "<clip>"
 
 
 CLIP = ClipRef()
+
+
+def window_times(t0: float, t1: float, fps: float, max_frames: int, duration: Optional[float] = None) -> list[float]:
+    """Плотные таймстемпы окна [t0, t1]: шаг 1/fps, не больше max_frames (иначе шаг растягивается)."""
+    t0 = max(0.0, float(t0))
+    if duration:
+        t1 = min(float(t1), float(duration))
+    if t1 <= t0:
+        return [round(t0, 4)]
+    step = 1.0 / max(0.1, float(fps))
+    n = int((t1 - t0) / step) + 1
+    if max_frames and n > max_frames:
+        step = (t1 - t0) / max(1, max_frames - 1)
+        n = max_frames
+    return [round(t0 + k * step, 4) for k in range(n)]
+
+
+class WindowClip:
+    """VideoClip-окно поверх клипа задачи: times — плотные таймстемпы окна, frame(i) — точный кадр
+    по PTS (frame_at исходного клипа). Модули стадий не знают, что работают с окном."""
+
+    def __init__(self, base: Any, times: list[float]) -> None:
+        self._base = base
+        self.times = list(times)
+        self._frames: dict[int, Any] = {}
+        for attr in ("path", "duration", "fps", "width", "height"):
+            setattr(self, attr, getattr(base, attr, None))
+
+    def __len__(self) -> int:
+        return len(self.times)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def frame(self, i: int) -> Any:
+        if i not in self._frames:
+            self._frames[i] = self._base.frame_at(self.times[i])
+        return self._frames[i]
+
+    def frame_at(self, t: float) -> Any:
+        return self._base.frame_at(t)
 
 
 @dataclass
@@ -52,6 +97,7 @@ class CallResult:
     identity: dict = field(default_factory=dict)
     vram_peak_mb: Optional[float] = None
     trace: str = ""
+    cold: bool = False               # первый вызов функции в этом процессе-воркере (≈ загрузка модели)
 
     @property
     def ok(self) -> bool:
@@ -70,6 +116,8 @@ class Runtime:
         self.frame_cache_mb = frame_cache_mb
         self.clip: Any = None
         self.clip_key: Optional[tuple] = None
+        self._windows: dict[tuple, WindowClip] = {}
+        self._called: set[tuple[str, str]] = set()
 
     # ---------------------------------------------------------------- клип
     def load_clip(self, path: str, sample_fps: float) -> dict:
@@ -85,6 +133,7 @@ class Runtime:
             return self._clip_info(self.clip, getattr(self, "_clip_source", "ml.ingest"),
                                    list(getattr(self, "_clip_warnings", [])))
         self.clip = None
+        self._windows = {}
         gc.collect()
         warnings: list[str] = []
         source = "ml.ingest"
@@ -123,7 +172,21 @@ class Runtime:
     def drop_clip(self) -> None:
         self.clip = None
         self.clip_key = None
+        self._windows = {}
         gc.collect()
+
+    def _resolve_clip(self, ref: ClipRef) -> Any:
+        if ref.window is None or self.clip is None:
+            return self.clip
+        win = self._windows.get(ref.window)
+        if win is None:
+            t0, t1, fps, max_frames = ref.window
+            win = WindowClip(self.clip, window_times(t0, t1, fps, int(max_frames),
+                                                     getattr(self.clip, "duration", None)))
+            if len(self._windows) >= 8:  # окна одной задачи; старые — вон
+                self._windows.pop(next(iter(self._windows)))
+            self._windows[ref.window] = win
+        return win
 
     # ---------------------------------------------------------------- вызовы модулей
     def identity(self, module: str, func: str) -> dict:
@@ -147,10 +210,12 @@ class Runtime:
             return CallResult("error", error=f"импорт {module}: {type(exc).__name__}: {exc}",
                               seconds=time.perf_counter() - t0, trace=traceback.format_exc(limit=8))
         ident = module_identity(mod, origin)
-        real_args = tuple(self.clip if isinstance(a, ClipRef) else a for a in args)
-        real_kwargs = {k: (self.clip if isinstance(v, ClipRef) else v) for k, v in (kwargs or {}).items()}
+        real_args = tuple(self._resolve_clip(a) if isinstance(a, ClipRef) else a for a in args)
+        real_kwargs = {k: (self._resolve_clip(v) if isinstance(v, ClipRef) else v) for k, v in (kwargs or {}).items()}
         if any(isinstance(a, ClipRef) for a in args) and self.clip is None:
             return CallResult("error", error="клип не загружен", origin=origin, identity=ident)
+        cold = (module, func) not in self._called
+        self._called.add((module, func))
         torch = _torch_cuda()
         if torch is not None:
             with contextlib.suppress(Exception):
@@ -159,14 +224,14 @@ class Runtime:
             value = fn(*real_args, **real_kwargs)
         except Exception as exc:  # noqa: BLE001
             return CallResult("error", error=f"{type(exc).__name__}: {exc}", seconds=time.perf_counter() - t0,
-                              origin=origin, identity=ident, trace=traceback.format_exc(limit=8))
+                              origin=origin, identity=ident, trace=traceback.format_exc(limit=8), cold=cold)
         peak = None
         torch = _torch_cuda()
         if torch is not None:
             with contextlib.suppress(Exception):
                 peak = round(torch.cuda.max_memory_allocated() / _MB, 1)
         return CallResult("ok", value=value, seconds=time.perf_counter() - t0, origin=origin,
-                          identity=ident, vram_peak_mb=peak)
+                          identity=ident, vram_peak_mb=peak, cold=cold)
 
     # ---------------------------------------------------------------- память
     def vram(self) -> dict:

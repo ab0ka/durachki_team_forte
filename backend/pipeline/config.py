@@ -10,7 +10,7 @@ PIPELINE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PIPELINE_DIR.parent.parent
 DEFAULT_CONFIG_PATH = PIPELINE_DIR / "config.yaml"
 
-STAGE_ORDER = ["ingest", "detect", "track", "pose", "scene", "rules", "temporal",
+STAGE_ORDER = ["ingest", "detect", "track", "pose", "scene", "rules", "temporal", "refine",
                "vlm_verify", "vlm_discover", "fusion"]
 ALWAYS_ON = ("ingest", "fusion")
 
