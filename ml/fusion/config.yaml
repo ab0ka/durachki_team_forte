@@ -49,7 +49,8 @@ risk:                     # риск-кривая temporal
 report_gate:
   require_fact: true            # ≥1 конкретный наблюдаемый факт от rules/VLM (не «модель заметила аномалию»)
   fact_sources: [rules, vlm]    # чьи факты считаются наблюдаемыми
-  require_norm: true            # тип есть в каталоге и у него ≥1 норма
+  require_norm: false           # L2: пока у большинства типов нет подтверждённого пункта, нарушение всё равно
+                                # выдаётся (с пометкой «норма не установлена»); FAQ 31 допускает ссылку без пункта
   norm_missing_if_no_catalog: report   # каталог norms недоступен целиком: report (с warning) | hint
   temporal_only_types: false    # событие ТОЛЬКО от temporal (без фактов) — нарушение? (false → подсказка)
 
