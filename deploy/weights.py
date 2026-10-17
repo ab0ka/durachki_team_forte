@@ -4,6 +4,8 @@
   python deploy/weights.py plan                 # что и сколько будет скачано (нужна сеть к HF)
   python deploy/weights.py prepare [--only a,b] # скачать ТОЧНЫЕ ревизии → weights/, записать
                                                 # deploy/weights.lock.json (ревизии, sha256, лицензии)
+  python deploy/weights.py adopt [--hash]       # БЕЗ сети: уже скачанный кэш HF (weights/hf/hub) → lock:
+                                                # commit из refs, полнота шардов, .incomplete, лицензия из карточки
   python deploy/weights.py verify [--fast]      # без сети: каждый файл из lock на месте, размер+sha256
   python deploy/weights.py licenses             # deploy/LICENSES.md из lock (или models.json)
 
@@ -79,6 +81,9 @@ def classify_source(src: str) -> tuple[str, str, str, str]:
     s = (src or "").strip()
     if not s or s.lower() in {"none", "builtin", "bundled", "pip"} or s.startswith(("pip:", "bundled:")):
         return "bundled", "", "", ""
+    if s.startswith("local:"):
+        path = s[6:].strip().split()
+        return "local", "", path[0] if path else "", ""
     if s.startswith("hf://"):
         s = s[5:]
     if s.startswith(("http://", "https://")):
@@ -95,7 +100,7 @@ def classify_source(src: str) -> tuple[str, str, str, str]:
         return "url", "", Path(u.path).name or "download.bin", ""
     if HF_ID_RE.match(s):
         return "hf", s, "", ""
-    return "bundled", "", "", ""
+    return "unknown", "", "", ""  # свободный текст вместо id/URL — проверить нельзя
 
 
 def load_specs(root: Path, errors: Optional[list[str]] = None) -> list[ModelSpec]:
@@ -377,6 +382,130 @@ def write_manifest(weights: Path, lock: dict[str, Any], entries: list[dict[str, 
     return path
 
 
+# ----------------------------------------------------------------------------- adopt (без сети)
+WEIGHT_EXT = (".safetensors", ".bin", ".pt", ".pth", ".onnx", ".gguf", ".ckpt")
+
+
+def card_license(readme: Path) -> str:
+    """license из YAML front matter README.md снапшота (карточка модели)."""
+    try:
+        text = readme.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = re.match(r"^---\s*\n(.*?)\n---", text, re.S)
+    if not m:
+        return ""
+    lm = re.search(r"^license:\s*(.+?)\s*$", m.group(1), re.M)
+    return lm.group(1).strip().strip("'\"") if lm else ""
+
+
+def inspect_snapshot(hub_cache: Path, repo_id: str, ref: str = "main", hash_files: bool = False) -> dict[str, Any]:
+    """Полнота конкретного снапшота в кэше huggingface_hub — только файловая система."""
+    rdir = repo_cache_dir(hub_cache, repo_id)
+    out: dict[str, Any] = {"repo_id": repo_id, "problems": [], "warnings": [], "files": [], "commit": ""}
+    if not rdir.is_dir():
+        out["problems"].append(f"нет в кэше ({rdir})")
+        return out
+    refp = rdir / "refs" / ref
+    snaps = sorted(d.name for d in (rdir / "snapshots").glob("*") if d.is_dir()) if (rdir / "snapshots").is_dir() else []
+    if refp.is_file():
+        out["commit"] = refp.read_text(encoding="utf-8").strip()
+    elif len(snaps) == 1:
+        out["commit"] = snaps[0]
+        out["warnings"].append(f"нет refs/{ref}; единственный снапшот {snaps[0][:12]}")
+    else:
+        out["problems"].append(f"нет refs/{ref}, снапшотов: {len(snaps)}")
+        return out
+    snap = rdir / "snapshots" / out["commit"]
+    if not snap.is_dir():
+        out["problems"].append(f"refs/{ref} → {out['commit'][:12]}, но снапшота нет")
+        return out
+    incomplete = sorted(b.name for b in (rdir / "blobs").glob("*.incomplete")) if (rdir / "blobs").is_dir() else []
+    if incomplete:
+        out["warnings"].append(f"{len(incomplete)} недокачанных blob (.incomplete)")
+    out["incomplete_blobs"] = len(incomplete)
+    names = []
+    for f in sorted(snap.rglob("*")):
+        if f.is_dir():
+            continue
+        rel = f.relative_to(snap).as_posix()
+        names.append(rel)
+        target = f.resolve() if f.is_symlink() else f
+        if not target.is_file():
+            out["problems"].append(f"{rel}: битая ссылка на blob")
+            continue
+        blob = target.name if f.is_symlink() else ""
+        entry: dict[str, Any] = {"path": rel, "size": target.stat().st_size, "sha256": None, "blob_id": None}
+        if re.fullmatch(r"[0-9a-f]{64}", blob):
+            entry["sha256"] = blob                       # LFS: имя blob = sha256 содержимого
+        elif re.fullmatch(r"[0-9a-f]{40}", blob):
+            entry["blob_id"] = blob                      # не-LFS: git blob sha1
+        if hash_files:
+            got = sha256_file(target)
+            if entry["sha256"] and got != entry["sha256"]:
+                out["problems"].append(f"{rel}: sha256 содержимого не равен имени blob")
+            entry["sha256"] = got
+        if entry["size"] == 0 and rel.endswith(WEIGHT_EXT):
+            out["problems"].append(f"{rel}: пустой файл весов")
+        out["files"].append(entry)
+    for idx in [n for n in names if n.endswith(".index.json")]:
+        try:
+            wmap = json.loads((snap / idx).read_text(encoding="utf-8")).get("weight_map", {})
+        except (OSError, ValueError) as exc:
+            out["problems"].append(f"{idx}: не читается ({exc})")
+            continue
+        missing = sorted(set(wmap.values()) - set(names))
+        if missing:
+            out["problems"].append(f"{idx}: нет шардов {missing}")
+    if not any(n.endswith(WEIGHT_EXT) for n in names):
+        out["problems"].append("в снапшоте нет файлов весов")
+    out["license_card"] = card_license(snap / "README.md")
+    return out
+
+
+def adopt(models: list[dict[str, Any]], weights: Path, lock_path: Path = LOCK_PATH, hash_files: bool = False,
+          exclude: Iterable[str] = (), declared: Optional[dict[str, str]] = None, log=print) -> tuple[int, dict]:
+    """Уже скачанные веса → lock (точный commit, файлы, лицензия карточки). Сеть не нужна."""
+    declared = declared or {}
+    lock = load_lock(lock_path)
+    hub = hub_cache_dir(weights)
+    entries, code = [], 0
+    for m in models:
+        repo = m["repo"]
+        if any(fnmatch.fnmatch(repo, pat) for pat in exclude):
+            log(f"[adopt] SKIP {repo}: исключён шаблоном {list(exclude)}")
+            continue
+        info = inspect_snapshot(hub, repo, m.get("ref", "main"), hash_files)
+        decl = declared.get(repo) or info.get("license_card", "")
+        ok, why = license_verdict(decl, info.get("license_card", ""), policy.banned_reasons(repo))
+        e = {"name": repo, "module": m.get("module", ""), "source": repo, "kind": "hf", "repo_id": repo,
+             "revision": info["commit"], "requested_revision": m.get("ref", "main"),
+             "license_declared": decl, "license_hub": info.get("license_card", ""),
+             "license_ok": ok, "license_note": why + " (лицензия из README.md локального снапшота)",
+             "purpose": m.get("purpose", ""), "optional": bool(m.get("optional")), "adopted": True,
+             "files": [{"path": f["path"], "size": f["size"], "sha256": f["sha256"], "blob_id": f["blob_id"]}
+                       for f in info["files"]],
+             "status": "ok" if not info["problems"] else "error: " + "; ".join(info["problems"])}
+        if info["problems"] and not e["optional"]:
+            code = 1
+        flag = "OK  " if not info["problems"] and ok else "FAIL"
+        log(f"[adopt] {flag} {repo}@{info['commit'][:12]} файлов {len(info['files'])} "
+            f"{sum(f['size'] for f in info['files']) / 2**30:.2f} GB license={e['license_hub'] or '—'} "
+            + "; ".join(info["problems"] + info["warnings"]))
+        entries.append(e)
+    keep = {(e["name"], e["source"]) for e in entries}
+    others = [x for x in lock.get("models", []) if (x.get("name"), x.get("source")) not in keep]
+    lock = {"version": 1, "generated_at": _now(), "tool": "deploy/weights.py adopt",
+            "models": sorted(others + entries, key=lambda x: (x.get("module", ""), x["name"]))}
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        write_manifest(weights, lock, entries)
+    except OSError:
+        pass
+    return code, lock
+
+
 # ----------------------------------------------------------------------------- verify (без сети)
 def file_location(weights: Path, model: dict[str, Any], rel: str) -> Path:
     if model.get("kind") in ("hf", "hf_file"):
@@ -388,7 +517,7 @@ def verify(weights: Path, lock: dict[str, Any], fast: bool = False, only: Option
            log=print) -> tuple[int, list[dict[str, Any]]]:
     os.environ["HF_HUB_OFFLINE"] = "1"
     results, code = [], 0
-    models = [m for m in lock.get("models", []) if not only or m["name"] in only]
+    models = [m for m in lock.get("models", []) if not only or m["name"] in only or m.get("repo_id") in only]
     if not models:
         log("[verify] lock пуст — нечего проверять (сначала: weights.py prepare)")
     for m in models:
@@ -407,6 +536,8 @@ def verify(weights: Path, lock: dict[str, Any], fast: bool = False, only: Option
                 problems.append(f"{f['path']}: размер {size} != {f['size']}")
             elif not fast and f.get("sha256") and sha256_file(p) != f["sha256"]:
                 problems.append(f"{f['path']}: sha256 не совпал")
+            elif not fast and not f.get("sha256") and f.get("blob_id") and git_blob_sha1(p) != f["blob_id"]:
+                problems.append(f"{f['path']}: git blob не совпал")
         ok = not problems
         if not ok and not m.get("optional"):
             code = 1
@@ -468,6 +599,19 @@ def license_rows(specs: list[ModelSpec], lock: dict[str, Any]) -> list[dict[str,
     return rows
 
 
+def _config_models() -> Optional[tuple[list[dict], list[dict], list[str]]]:
+    try:
+        try:
+            from deploy import deploy_config as dc
+        except ImportError:
+            import deploy_config as dc  # type: ignore
+        cfg = dc.load()
+    except (ImportError, OSError):
+        return None
+    req, opt = dc.required_models(cfg)
+    return req, opt, list((cfg.get("models") or {}).get("exclude_patterns") or [])
+
+
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
 
@@ -475,7 +619,7 @@ def _now() -> str:
 # ----------------------------------------------------------------------------- CLI
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("plan", "prepare", "verify", "licenses", "list"))
+    ap.add_argument("cmd", choices=("plan", "prepare", "adopt", "verify", "licenses", "list"))
     ap.add_argument("--root", type=Path, default=REPO_ROOT)
     ap.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
     ap.add_argument("--lock", type=Path, default=None, help="по умолчанию <root>/deploy/weights.lock.json")
@@ -484,6 +628,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--fast", action="store_true", help="verify: только наличие и размер, без sha256")
     ap.add_argument("--allow-license-flags", action="store_true", help="prepare: качать и с красным флагом")
     ap.add_argument("--out", type=Path, default=None, help="licenses: путь LICENSES.md")
+    ap.add_argument("--hash", action="store_true", help="adopt: полный sha256 каждого файла (долго)")
+    ap.add_argument("--models-from", choices=("config", "models-json"), default="config",
+                    help="verify/adopt: обязательный список из deploy.yaml (по умолчанию) или из models.json")
     args = ap.parse_args(argv)
 
     root = args.root.resolve()
@@ -507,9 +654,37 @@ def main(argv: Optional[list[str]] = None) -> int:
         red = sum(1 for r in rows if not r.get("license_ok"))
         print(f"[weights] {out}: моделей {len(rows)}, красных флагов {red}")
         return 1 if red or errors else 0
+    cfg_models = _config_models() if args.models_from == "config" else None
+    if args.cmd == "adopt":
+        if cfg_models is None:
+            print("[adopt] нужен deploy/config/deploy.yaml (models.required/optional)", file=sys.stderr)
+            return 2
+        req, opt, exclude = cfg_models
+        declared = {s.repo_id: s.license for s in specs if s.repo_id}
+        todo = [dict(m) for m in req] + [dict(m, optional=True) for m in opt]
+        if only:
+            todo = [m for m in todo if m["repo"] in only]
+        code, _ = adopt(todo, args.weights, lock_path, hash_files=args.hash, exclude=exclude, declared=declared)
+        return code
+    if args.cmd == "verify" and cfg_models is not None:
+        req, opt, exclude = cfg_models
+        lock = load_lock(lock_path)
+        have = {m.get("repo_id") or m.get("name") for m in lock.get("models", [])}
+        missing = [m["repo"] for m in req if m["repo"] not in have]
+        for name in missing:
+            print(f"[verify] FAIL {name}: обязательной модели нет в weights.lock.json (weights.py adopt|prepare)",
+                  file=sys.stderr)
+        wanted = {m["repo"] for m in req + opt} | (only or set())
+        sub = {**lock, "models": [m for m in lock.get("models", []) if (m.get("repo_id") or m["name"]) in wanted
+                                  and not any(fnmatch.fnmatch(m.get("repo_id") or m["name"], p) for p in exclude)]}
+        for m in sub["models"]:
+            m["optional"] = (m.get("repo_id") or m["name"]) not in {x["repo"] for x in req}
+        code, _ = verify(args.weights, sub, fast=args.fast, only=only or None)
+        return 1 if missing else code
     if args.cmd == "verify":
         lock = load_lock(lock_path)
-        missing = [s.name for s in specs if s.kind != "bundled" and not s.optional and not _locked(lock, s)]
+        missing = [s.name for s in specs if s.kind not in ("bundled", "unknown") and not s.optional
+                   and not _locked(lock, s)]
         for name in missing:
             print(f"[verify] FAIL {name}: нет в weights.lock.json — запустите weights.py prepare", file=sys.stderr)
         code, _ = verify(args.weights, lock, fast=args.fast, only=only or None)

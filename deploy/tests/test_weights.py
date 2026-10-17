@@ -190,6 +190,90 @@ def test_cli_licenses_and_verify_empty(tmp_path, capsys):
     assert w.main(["licenses", "--root", str(root)]) == 1  # не подтверждено хабом → красный
     assert "weights.py prepare" in (root / "deploy" / "LICENSES.md").read_text(encoding="utf-8")
     # модель объявлена, но не подготовлена → verify не зелёный
-    assert w.main(["verify", "--root", str(root), "--weights", str(tmp_path / "w")]) == 1
+    mj = ["--models-from", "models-json"]
+    assert w.main(["verify", "--root", str(root), "--weights", str(tmp_path / "w")] + mj) == 1
     (root / "ml/detect/models.json").write_text("[]", encoding="utf-8")
-    assert w.main(["verify", "--root", str(root), "--weights", str(tmp_path / "w")]) == 0
+    assert w.main(["verify", "--root", str(root), "--weights", str(tmp_path / "w")] + mj) == 0
+    # по умолчанию обязательный список — из deploy.yaml: пустой lock → FAIL
+    assert w.main(["verify", "--root", str(root), "--weights", str(tmp_path / "w")]) == 1
+
+
+def _fake_cache_repo(hub: Path, repo: str, files: dict[str, bytes], commit: str = COMMIT, lfs=(".safetensors",),
+                     readme_license: str | None = "apache-2.0", symlinks: bool = True) -> Path:
+    """Раскладка huggingface_hub: blobs/<sha256|sha1>, snapshots/<commit>/<file> → ../../blobs/..., refs/main."""
+    rdir = w.repo_cache_dir(hub, repo)
+    snap = rdir / "snapshots" / commit
+    (rdir / "blobs").mkdir(parents=True, exist_ok=True)
+    (rdir / "refs").mkdir(parents=True, exist_ok=True)
+    (rdir / "refs" / "main").write_text(commit)
+    if readme_license is not None:
+        files = {**files, "README.md": f"---\nlicense: {readme_license}\ntags: [x]\n---\n# card\n".encode()}
+    for rel, data in files.items():
+        if rel.endswith(lfs):
+            blob = hashlib.sha256(data).hexdigest()
+        else:
+            blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        (rdir / "blobs" / blob).write_bytes(data)
+        dst = snap / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if symlinks:
+            dst.symlink_to(Path("../../blobs") / blob if "/" not in rel else Path("../../../blobs") / blob)
+        else:
+            dst.write_bytes(data)
+    return rdir
+
+
+def test_adopt_existing_cache_and_verify(tmp_path):
+    weights = tmp_path / "weights"
+    hub = weights / "hf" / "hub"
+    shard_idx = json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                           "b": "model-00002-of-00002.safetensors"}}).encode()
+    _fake_cache_repo(hub, "Qwen/Qwen3-VL-4B-Instruct", {
+        "config.json": b"{}", "model.safetensors.index.json": shard_idx,
+        "model-00001-of-00002.safetensors": b"\x01" * 64, "model-00002-of-00002.safetensors": b"\x02" * 64})
+    _fake_cache_repo(hub, "PekingU/rtdetr_v2_r18vd", {"config.json": b"{}", "model.safetensors": b"\x03" * 32},
+                     symlinks=False)  # Windows без symlink: файлы прямо в снапшоте
+    lock_path = tmp_path / "lock.json"
+    models = [{"repo": "Qwen/Qwen3-VL-4B-Instruct", "module": "ml/vlm"},
+              {"repo": "PekingU/rtdetr_v2_r18vd", "module": "ml/detect"},
+              {"repo": "Qwen/Qwen3-VL-4B-Instruct-GGUF", "module": "ml/vlm"}]
+    code, lock = w.adopt(models, weights, lock_path, exclude=["*GGUF*"], log=lambda *_: None)
+    assert code == 0
+    by = {m["name"]: m for m in lock["models"]}
+    assert set(by) == {"Qwen/Qwen3-VL-4B-Instruct", "PekingU/rtdetr_v2_r18vd"}   # GGUF исключён
+    q = by["Qwen/Qwen3-VL-4B-Instruct"]
+    assert q["revision"] == COMMIT and q["license_ok"] and q["license_hub"] == "apache-2.0"
+    assert all(len(f["sha256"]) == 64 for f in q["files"] if f["path"].endswith(".safetensors"))
+    assert w.verify(weights, lock, log=lambda *_: None)[0] == 0
+    # порча шарда: размер тот же, sha256 — нет
+    snap = w.snapshot_dir(hub, "Qwen/Qwen3-VL-4B-Instruct", COMMIT)
+    (snap / "model-00002-of-00002.safetensors").resolve().write_bytes(b"\x09" * 64)
+    code, res = w.verify(weights, lock, log=lambda *_: None)
+    assert code == 1 and any("sha256" in p for r in res for p in r["problems"])
+
+
+def test_adopt_detects_missing_shard_incomplete_and_bad_license(tmp_path):
+    weights = tmp_path / "weights"
+    hub = weights / "hf" / "hub"
+    idx = json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
+                                     "b": "model-00002-of-00002.safetensors"}}).encode()
+    rdir = _fake_cache_repo(hub, "Qwen/Qwen3-VL-4B-Instruct", {
+        "config.json": b"{}", "model.safetensors.index.json": idx,
+        "model-00001-of-00002.safetensors": b"\x01" * 8})
+    (rdir / "blobs" / ("f" * 64 + ".incomplete")).write_bytes(b"part")
+    _fake_cache_repo(hub, "MCG-NJU/videomae-base", {"model.safetensors": b"x"}, readme_license="cc-by-nc-4.0")
+    code, lock = w.adopt([{"repo": "Qwen/Qwen3-VL-4B-Instruct"}, {"repo": "MCG-NJU/videomae-base"}],
+                         weights, tmp_path / "l.json", log=lambda *_: None)
+    assert code == 1
+    by = {m["name"]: m for m in lock["models"]}
+    assert "нет шардов" in by["Qwen/Qwen3-VL-4B-Instruct"]["status"]
+    assert not by["MCG-NJU/videomae-base"]["license_ok"]
+    info = w.inspect_snapshot(hub, "Qwen/Qwen3-VL-4B-Instruct")
+    assert info["incomplete_blobs"] == 1
+    assert w.inspect_snapshot(hub, "nobody/absent")["problems"]
+
+
+def test_classify_local_and_free_text():
+    assert w.classify_source("local: weights/scene/scene_signals.json — python -m ml.scene")[:3] == (
+        "local", "", "weights/scene/scene_signals.json")
+    assert w.classify_source("Qwen/Qwen3-4B-Instruct-2507 (GGUF Q4_K_M: конвертация)")[0] == "unknown"

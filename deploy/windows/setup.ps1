@@ -1,63 +1,60 @@
-# Kassa Sentinel - one-time setup on the Windows 11 laptop (owner: A17). ASCII-only on purpose
-# (Windows PowerShell 5.1 reads BOM-less files as ANSI).
-#   powershell -ExecutionPolicy Bypass -File deploy\windows\setup.ps1            # GPU (cu124)
-#   powershell -ExecutionPolicy Bypass -File deploy\windows\setup.ps1 -Cpu       # CPU fallback
-# Steps: uv -> Python 3.11 venv -> merge requirements (conflicts stop here) -> lock via real resolver
-# (uv pip compile, target windows-cu124) -> exact install from lock (hashes) -> GPU probe -> .env ->
-# weights prepare (SEPARATE online step) + verify -> optional frontend build.
-# Does NOT change firewall or global power settings.
+# Kassa Sentinel - setup on the Windows laptop (owner: A17). ASCII-only.
+# The working venv and the L1 lock (tools\dataprep\requirements-l1.lock.txt) are the source of truth:
+# NO blind upgrades. Existing .venv is never re-synced; missing runtime packages are added only with
+# -InstallMissing and only under "-c <L1 lock>" (pinned versions cannot change).
+#   powershell -ExecutionPolicy Bypass -File deploy\windows\setup.ps1                 # check only
+#   powershell -ExecutionPolicy Bypass -File deploy\windows\setup.ps1 -InstallMissing # + fastapi/uvicorn/...
+#   powershell -ExecutionPolicy Bypass -File deploy\windows\setup.ps1 -Fresh          # new machine: venv from L1 lock
+# GPU probe allocates VRAM: run setup only while the service is stopped.
 param(
-    [switch]$Cpu,
-    [switch]$Relock,          # rebuild deploy\locks\<target>.lock.txt even if it exists
-    [switch]$SkipWeights,
+    [switch]$Fresh,
+    [switch]$InstallMissing,
+    [switch]$HashWeights,        # full sha256 of every weight file during adopt (slow, once)
     [switch]$SkipFrontend,
     [string]$PythonVersion = "3.11"
 )
 $ErrorActionPreference = "Stop"
-$Repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+. "$PSScriptRoot\_env.ps1"
 Set-Location $Repo
 function Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Fail($msg) { Write-Host "XX  $msg" -ForegroundColor Red; exit 1 }
+$Lock = "tools\dataprep\requirements-l1.lock.txt"
+if (-not (Test-Path $Lock)) { Fail "L1 lock not found: $Lock (merge branch data/labels)" }
 
-Step "uv"
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    powershell -ExecutionPolicy ByPass -NoProfile -Command "irm https://astral.sh/uv/install.ps1 | iex"
-    $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
-    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { Fail "uv not found after install" }
-}
-uv --version
-
-Step "Python $PythonVersion venv (.venv)"
-uv python install $PythonVersion
-if (-not (Test-Path ".venv\Scripts\python.exe")) { uv venv .venv --python $PythonVersion }
-$Py = Join-Path $Repo ".venv\Scripts\python.exe"
-uv pip install --python $Py "packaging>=23"   # bootstrap for merge_requirements; sync reconciles later
-
-$Target = if ($Cpu) { "windows-cpu" } else { "windows-cu124" }
-$Backend = if ($Cpu) { "cpu" } else { "cu124" }
-$ReqProfile = if ($Cpu) { "cpu" } else { "gpu" }
-$Lock = "deploy\locks\$Target.lock.txt"
-
-Step "merge requirements of all modules (no version guessing)"
-& $Py deploy\merge_requirements.py --profile $ReqProfile
-if ($LASTEXITCODE -ne 0) { Fail "requirements conflicts/banned packages (see report). Resolve with module owners / A01." }
-
-if ($Relock -or -not (Test-Path $Lock)) {
-    Step "lock via resolver: uv pip compile -> $Lock"
-    & $Py deploy\merge_requirements.py --profile $ReqProfile --lock $Target
-    if ($LASTEXITCODE -ne 0) { Fail "resolver failed - this is a real conflict, do not pin by hand" }
-    Write-Host "Commit $Lock so every machine installs the same versions."
+if (-not (Test-Path $Py)) {
+    if (-not $Fresh) { Fail "No .venv. Use the L1 venv, or run with -Fresh on a new machine." }
+    Step "new venv from the L1 lock (exact versions, torch from the cu128 index)"
+    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { Fail "uv not found: https://docs.astral.sh/uv/" }
+    uv python install $PythonVersion
+    uv venv .venv --python $PythonVersion
+    uv pip install --python $Py -r $Lock --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match
+    if ($LASTEXITCODE -ne 0) { Fail "install from L1 lock failed" }
 }
 
-Step "exact install from lock (hashes required)"
-uv pip sync $Lock --python $Py --torch-backend $Backend --require-hashes
-if ($LASTEXITCODE -ne 0) { Fail "uv pip sync failed" }
+Step "envcheck: venv vs L1 lock + module requirements (no installs)"
+& $Py deploy\envcheck.py
+if ($LASTEXITCODE -ne 0) {
+    $missing = (& $Py deploy\envcheck.py --json | Out-String | ConvertFrom-Json).missing_runtime
+    if ($InstallMissing -and $missing) {
+        Step "install ONLY missing runtime packages under -c L1 lock: $($missing -join ', ')"
+        uv pip install --python $Py @missing -c $Lock
+        & $Py deploy\envcheck.py
+        if ($LASTEXITCODE -ne 0) { Fail "still blocking after install - see envcheck output (do not upgrade pinned packages)" }
+    } else { Fail "environment does not match the L1 lock (see BLOCK lines). Missing runtime only? re-run with -InstallMissing" }
+}
 
-Step "GPU probe on THIS machine"
-$probeArgs = @("deploy\gpu_probe.py")
-if ($Cpu) { $probeArgs += "--allow-cpu" }
-& $Py @probeArgs
-if ($LASTEXITCODE -ne 0) { Fail "GPU probe failed (logs\gpu_probe.json). Check NVIDIA driver (nvidia-smi) and the torch build." }
+Step "GPU probe on THIS machine (service must be stopped)"
+& $Py deploy\gpu_probe.py --expect-cuda 12.8 --min-vram-gib 7.5
+if ($LASTEXITCODE -ne 0) { Fail "GPU probe failed (runs\deploy\gpu_probe.json)" }
+
+Step "weights: adopt the existing offline cache (weights\hf\hub) -> deploy\weights.lock.json, then verify"
+$adoptArgs = @("deploy\weights.py", "adopt")
+if ($HashWeights) { $adoptArgs += "--hash" }
+& $Py @adoptArgs
+if ($LASTEXITCODE -ne 0) { Fail "required weights missing/incomplete (see [adopt] FAIL lines)" }
+& $Py deploy\weights.py verify --fast
+if ($LASTEXITCODE -ne 0) { Fail "weights verify failed" }
+& $Py deploy\weights.py licenses | Out-Null
 
 Step "deploy\.env (secrets stay local, never in git)"
 if (-not (Test-Path "deploy\.env")) {
@@ -66,30 +63,12 @@ if (-not (Test-Path "deploy\.env")) {
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $key = ([Convert]::ToBase64String($bytes)) -replace '[+/=]', ''
     (Get-Content "deploy\.env") -replace '^SENTINEL_API_KEYS=.*$', "SENTINEL_API_KEYS=$key" | Set-Content "deploy\.env" -Encoding ASCII
-    Write-Host "Generated API key -> deploy\.env (SENTINEL_API_KEYS). Give it to the jury out of band."
+    Write-Host "Generated API key -> deploy\.env (not printed). Hand it to the jury out of band."
 }
-
-if (-not $SkipWeights) {
-    Step "weights: prepare (online, separate step) + verify (offline)"
-    $env:HF_HUB_OFFLINE = "0"
-    & $Py deploy\weights.py prepare
-    if ($LASTEXITCODE -ne 0) { Fail "weights prepare failed (license red flag / disk / network) - see above" }
-    $env:HF_HUB_OFFLINE = "1"
-    & $Py deploy\weights.py verify
-    if ($LASTEXITCODE -ne 0) { Fail "weights verify failed" }
-}
-
-if (-not $SkipFrontend -and (Test-Path "frontend\package.json")) {
+if (-not $SkipFrontend -and (Test-Path "frontend\package.json") -and -not (Test-Path "frontend\dist\index.html")) {
     if (Get-Command npm -ErrorAction SilentlyContinue) {
-        Step "frontend build (A15)"
-        Push-Location frontend
-        if (Test-Path "package-lock.json") { npm ci } else { npm install }
-        npm run build
-        Pop-Location
-    } else { Write-Host "npm not found - UI not built (winget install OpenJS.NodeJS.LTS)" -ForegroundColor Yellow }
+        Step "frontend build (A15)"; Push-Location frontend; if (Test-Path "package-lock.json") { npm ci } else { npm install }; npm run build; Pop-Location
+    } else { Write-Host "npm not found - UI not built" -ForegroundColor Yellow }
 }
-
-if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
-    Write-Host "cloudflared not found: winget install --id Cloudflare.cloudflared" -ForegroundColor Yellow
-}
-Step "done. Next: deploy\windows\offline_smoke.ps1, then deploy\windows\start.ps1"
+if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) { Write-Host "cloudflared not found: winget install --id Cloudflare.cloudflared" -ForegroundColor Yellow }
+Step "done. Next: deploy\windows\offline_smoke.ps1 -Firewall (as admin), then deploy\windows\run_all.ps1"

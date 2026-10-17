@@ -76,7 +76,8 @@ def test_netguard_off_by_default():
 
 
 FAKE_PIPELINE = '''
-import os, urllib.request
+import os, subprocess, sys, urllib.request
+CHILD = "import urllib.request\\ntry:\\n    urllib.request.urlopen('https://huggingface.co', timeout=2)\\nexcept Exception:\\n    pass\\n"
 def warmup():
     pass
 def run(video_path, job_id, progress, deadline_s=240):
@@ -86,7 +87,12 @@ def run(video_path, job_id, progress, deadline_s=240):
             urllib.request.urlopen("https://huggingface.co/api/models", timeout=2)
         except Exception:
             pass  # «graceful fallback» — smoke всё равно должен упасть
-    return {"job_id": job_id, "status": "done", "verdict": "no_violation", "violations": [], "meta": {}}
+    if os.environ.get("FAKE_WORKER_PHONE_HOME"):  # как spawn-воркер A03: отдельный процесс
+        subprocess.run([sys.executable, "-c", CHILD])
+    meta = {"complete": os.environ.get("FAKE_INCOMPLETE") != "1", "mock": os.environ.get("FAKE_MOCK") == "1",
+            "executor": {"mode": "process", "pid": 1},
+            "stages": {"detect": {"status": "ok", "origin": "hf", "vram_peak_mb": 900}}}
+    return {"job_id": job_id, "status": "done", "verdict": "no_violation", "violations": [], "meta": meta}
 '''
 
 
@@ -160,3 +166,50 @@ def test_scripts_portable():
     for p in (ROOT / "deploy").rglob("*.sh"):
         data = p.read_bytes()
         assert data.startswith(b"#!") and b"\r\n" not in data, p
+
+
+def test_ps1_parse_with_pwsh(tmp_path):
+    """Синтаксис .ps1 парсером PowerShell (если pwsh есть: PATH или SENTINEL_TEST_PWSH)."""
+    pwsh = os.environ.get("SENTINEL_TEST_PWSH") or shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("pwsh не установлен")
+    files = [str(p) for p in sorted((ROOT / "deploy").rglob("*.ps1"))]
+    checker = tmp_path / "parse.ps1"
+    checker.write_text("$bad=0; foreach($f in $args){$t=$null;$e=$null;"
+                       "[void][System.Management.Automation.Language.Parser]::ParseFile($f,[ref]$t,[ref]$e);"
+                       "foreach($x in $e){$bad++; Write-Output ($f+':'+$x.Extent.StartLineNumber+': '+$x.Message)}}"
+                       "; exit $bad\n", encoding="ascii")
+    r = subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-File", str(checker), *files], capture_output=True,
+                       text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_offline_smoke_counts_attempts_from_spawned_worker(tmp_path, fake_backend):
+    r, rep = _smoke(tmp_path, *fake_backend, {"FAKE_WORKER_PHONE_HOME": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert rep["network_attempts"] >= 1 and rep["network_attempts_sample"][0]["action"] == "BLOCKED"
+
+
+def test_offline_smoke_rejects_mock_meta_and_incomplete_no_violation(tmp_path, fake_backend):
+    r, rep = _smoke(tmp_path, *fake_backend, {"FAKE_MOCK": "1"})
+    assert r.returncode == 1 and any("mock" in p for p in rep["problems"])
+    r, rep = _smoke(tmp_path, *fake_backend, {"FAKE_INCOMPLETE": "1"})
+    assert r.returncode == 1 and any("неполн" in p for p in rep["problems"])
+
+
+def test_offline_smoke_pitch_log_and_evidence(tmp_path, fake_backend):
+    r, rep = _smoke(tmp_path, *fake_backend)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert rep["result"]["stages"]["detect"]["vram_peak_mb"] == 900
+    logs = list((tmp_path / "logs").glob("offline_proof_*.md"))
+    assert len(logs) == 1
+    text = logs[0].read_text(encoding="utf-8")
+    assert "попыток выхода: **0**" in text and "**OK**" in text
+
+
+def test_egress_selftest_parsing(monkeypatch):
+    from deploy import offline_worker_smoke as oss
+    monkeypatch.setattr(oss, "EGRESS_PROBE", "import json; print(json.dumps({'tcp': 'blocked: X', 'dns': 'blocked: Y'}))")
+    assert oss.egress_selftest()["all_blocked"] is True
+    monkeypatch.setattr(oss, "EGRESS_PROBE", "import json; print(json.dumps({'tcp': 'OPEN'}))")
+    assert oss.egress_selftest()["all_blocked"] is False
