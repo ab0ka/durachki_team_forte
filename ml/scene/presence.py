@@ -70,6 +70,7 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
     cashier_absent_known = np.ones(n)
     track_info: dict[int, dict[str, Any]] = {}
     backfill_s = float(pc.get("appear_backfill_s", 1.5))
+    naive = bool(cfg.get("ablation", {}).get("naive"))  # АБЛЯЦИЯ: пропавший трек = ушёл
     # проход 1: вход/выход каждого трека (выход подтверждён у края кадра / в двери / вне рабочего места)
     geo: dict[int, dict[str, Any]] = {}
     for tid, obs in tracks.items():
@@ -78,7 +79,7 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
         m = {i: member(obs[i].bbox, workplace, ay, of) for i in idx} if workplace else {i: 0.5 for i in idx}
         geo[tid] = {
             "idx": idx, "first": first, "last": last, "m": m,
-            "exit_end": workplace is not None and (m[last] < 0.3 or _near_exit(obs[last].bbox, door, border, ay, of)),
+            "exit_end": workplace is not None and (naive or m[last] < 0.3 or _near_exit(obs[last].bbox, door, border, ay, of)),
             "enter_start": workplace is not None and (m[first] < 0.3 or _near_exit(obs[first].bbox, door, border, ay, of)),
         }
     exit_times = sorted(float(tl.times[g["last"]]) for g in geo.values() if g["exit_end"])
@@ -121,6 +122,8 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
                         cashier_gone[i] = 0.0
                     continue
                 gone = m[prev] < 0.3 and m[nxt] < 0.3
+            if naive:
+                gone = True
             if not gone:
                 ws_unknown[i] = 1.0
                 if cashierish:

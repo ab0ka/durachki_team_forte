@@ -240,6 +240,7 @@ def scene_states_with_trace(
                 green_pf[i] = green_frac_frame(fr, green_region, bc)
     if not have.any():
         trace["warnings"].append("frames unavailable: ROI/colour cues disabled, detections only")
+    shifts_list = [shifts_have.get(i, (0.0, 0.0)) for i in range(n)]
     quality = q_clip if q_clip is not None else _fill_nearest(q_own, have, 1.0 if not have.any() else 0.5)
     trace["info"]["quality_source"] = "clip.quality" if q_clip is not None else ("frames" if have.any() else "default")
     det_ran = np.full(n, bool(dets))
@@ -262,7 +263,17 @@ def scene_states_with_trace(
         roi_box = roi_of[name]
         det_lo, det_c = det_evidence(tl, roi_box, open_lbl, closed_lbl, ocfg, quality)
         if roi_box is not None and stores.get(name):
-            res = analyze_roi(stores[name], [i for i in idxs if have[i]], n, times, roi_box, person_boxes, quality, det_lo, det_c, rc, ocfg, use_shape_prior=(name == "safe_open"))
+            nm = None
+            backend = str((ocfg.get("namer") or {}).get("backend", "none"))
+            if backend != "none":
+                from .namer import get_namer
+
+                nm = get_namer(cfg.get("namer", {}), backend)
+                if nm is None:
+                    trace["warnings"].append(f"{name}: namer '{backend}' unavailable — naming by detections/shape only")
+            res = analyze_roi(stores[name], [i for i in idxs if have[i]], n, times, roi_box, person_boxes, quality, det_lo, det_c, rc, ocfg,
+                              use_shape_prior=(name == "safe_open"), naive_reference=bool(cfg.get("ablation", {}).get("naive")),
+                              frame_fn=frames if nm is not None else None, shifts=shifts_list, namer=nm, obj=_zone)
             p, c, v = res.p_open, res.conf, res.visibility
             prov = list(dict.fromkeys(res.provenance))
             trace["info"][name] = {"p_a_open": res.p_a_open, "label_conf": res.label_conf, "two_states": res.has_two_states, **{k: v2 for k, v2 in res.info.items() if k not in ("ref_idx", "features")}}
@@ -356,8 +367,14 @@ def scene_states_with_trace(
             out_c[name] = sig.c
             continue
         spec = _smooth_spec(name, cfg)
+        if cfg.get("ablation", {}).get("smoothing"):
+            spec = dict(cfg["ablation"]["smoothing"])  # только для абляции (ml.scene.ablation)
         out_p[name] = smooth(sig.p, times, spec, conf=None if name in weighted else sig.c)
         out_c[name] = hold_conf(sig.c, times, tau) if spec.get("method") == "hmm" else sig.c
+        if cfg.get("ablation", {}).get("naive"):
+            # АБЛЯЦИЯ «наивный режим»: неизвестное считается наблюдённым (как будто «не увидели» = «нет»)
+            out_p[name] = smooth(np.where(sig.c > 0, sig.p, 0.0), times, spec)
+            out_c[name] = np.ones(n)
 
     # --- составной: оставленные без присмотра наличные (трёхзначная логика) ---
     _unattended(out_p, out_c, pres_extra, raw, times, cfg, trace)
