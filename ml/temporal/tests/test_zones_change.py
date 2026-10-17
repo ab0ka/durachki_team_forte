@@ -14,7 +14,7 @@ from .conftest import make_bank, make_samples, write_video
 
 def test_zone_views_known_and_unknown(tmp_path):
     pytest.importorskip("cv2")
-    from ml.temporal._contract_fallback import Zone
+    from contracts.sentinel_contracts import Zone
     from ml.temporal._video import SimpleClip
 
     cfg = load_config()

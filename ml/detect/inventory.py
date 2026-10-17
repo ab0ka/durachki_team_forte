@@ -28,7 +28,7 @@ import numpy as np
 try:
     from contracts.sentinel_contracts import BBox  # noqa
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import BBox  # noqa
+    from contracts.sentinel_contracts import BBox  # noqa
 
 from .boxes import RawDets, iou_matrix
 from .config import label_threshold, load_config

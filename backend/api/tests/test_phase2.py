@@ -260,7 +260,7 @@ def test_response_size_limit(client_factory):
     frames = [_noise_jpeg_b64(i) for i in range(4)]
 
     def run(video_path, job_id, progress, deadline_s=240):
-        from backend.api._contract_fallback import EvidenceFrame, Violation
+        from contracts.sentinel_contracts import EvidenceFrame, Violation
         r = make_result(job_id)
         r.violations = [Violation(type="V", timecode_sec=float(i), description="d",
                                   evidence_frames=[EvidenceFrame(float(i), f) for f in frames])
@@ -367,7 +367,7 @@ def test_container_duration_preferred(tmp_path, mov_bytes):
 # ------------------------------------------------------------------ строгий профиль жюри
 def test_strict_jury_profile_embeds_norm(client_factory):
     def run(video_path, job_id, progress, deadline_s=240):
-        from backend.api._contract_fallback import RuleRef
+        from contracts.sentinel_contracts import RuleRef
         r = make_result(job_id)
         r.violations[0].rules = [RuleRef(document="Правила X", clause="п. 5",
                                          url="https://adilet.zan.kz/rus/docs/TEST", quote="q")]
