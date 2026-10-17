@@ -47,7 +47,16 @@
    - Где: `backend/pipeline/worker.py`, spawn. `track()` меняет копию детекций в воркере, а scene получает исходный список A03.
    - Следствие: `ml/scene/timeline.py:133-137` — `det_score` пуст, score по умолчанию 0,8.
    - Ожидается: A08 сопоставляет детекции с треком по паре (`t`, `bbox`) — `Track.boxes` содержит те же боксы детекций (5 знаков) в те же `t`. Либо A03 передаёт `track_id` сам.
-3. **`coverage` трекера не попадает в `meta.coverage`.**
+3. **A09 в запасном пути считает разрыв трека отсутствием.**
+   - Где: `ml/rules/signals.py: derive_from_tracks` (строки ~300–345). Путь работает, только если сигнала нет в состояниях A08 (`ml/rules/engine.py:812-824`).
+   - Что происходит: между боксами трека кассира и между его фрагментами `cashier_present = 0`.
+   - Вход: трек кассира с пропуском в глубине кадра (`gaps()` → `lost_in_view`).
+   - Ожидается: `NaN` или unknown на этом отрезке, а не 0. Классификация пропусков — `ml.track.events.gaps` / `presence_state`.
+4. **A09 ждёт треки с метками `safe_open` и `door_open`, а `ml.track` объединяет состояния одного предмета в трек `safe` / `door`.**
+   - Где: `ml/rules/signals.py: derive_from_tracks`, `label_to_signal`.
+   - Следствие: в запасном пути `safe_open` и `door_open` из треков не появляются никогда. Состояние открыт/закрыт есть только в `Detection.label`, и A08 берёт его оттуда.
+   - Ожидается: запасной путь A09 не выводит открытость из треков, а оставляет сигнал отсутствующим (unknown).
+5. **`coverage` трекера не попадает в `meta.coverage`.**
    - Где: `backend/pipeline/orchestrator.py:314` вызывает `track()`, а не `track_full()`.
    - Ожидается: при необходимости A03 вызывает `ml.track.track_full` и передаёт `info["coverage"]["visibility_loss"]` как `unknown_spans` в `contracts/extensions.py: compute_coverage`.
 
