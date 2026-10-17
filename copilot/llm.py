@@ -3,6 +3,8 @@
 * ``mock`` (SENTINEL_MOCK=1) / ``extractive`` (только явно в конфиге) — без модели: детерминированный
   ответ из фактов результата и норм. НЕ подставляется автоматически вместо LLM: если модели нет,
   ассистент честно сообщает «недоступен» (HTTP 501).
+* ``vlm_service`` — общая Qwen3-VL-4B через ``ml.vlm.service.chat`` (A11), низкий приоритет (по умолчанию).
+* ``retrieval`` — негенеративный режим, когда модели нет или GPU занят анализом (не mock, честно помечен).
 * ``llama_cpp`` — llama-cpp-python (MIT) в процессе, GGUF Q4_K_M, загрузка по требованию,
   частичный offload на GPU по свободной VRAM, выгрузка по простою (VRAM нужна VLM).
 * ``llama_server`` — локальный llama.cpp server (OpenAI-совместимый /v1/chat/completions),
@@ -364,12 +366,209 @@ def find_model(cfg: dict[str, Any]) -> Optional[Path]:
     return None
 
 
-def make_llm(cfg: Optional[dict[str, Any]] = None, warnings: Optional[list[str]] = None) -> Optional[Any]:
-    """Выбор бэкенда. auto: llama_server (если задан и жив) -> llama_cpp (если есть GGUF и библиотека).
+class RetrievalBackend(ExtractiveBackend):
+    """Негенеративный режим: модели нет/GPU занят — ответ из фактов задачи и найденных норм (не mock)."""
 
-    Если локальной модели нет — возвращает None (честное «недоступно», без подмены ответа и без
-    облачных API). ``mock`` — только при SENTINEL_MOCK=1 (auto) или явно; ``extractive`` — только явно.
-    Модель здесь НЕ загружается (загрузка — при первом вопросе или warmup()).
+    name = "retrieval"
+
+
+def _text_of(res: Any) -> tuple[str, bool, str]:
+    """(text, timed_out, error) из str / GenResult-подобного объекта / dict."""
+    if res is None:
+        return "", False, "empty"
+    if isinstance(res, str):
+        return res, False, ""
+    if isinstance(res, dict):
+        return (str(res.get("text") or res.get("content") or ""), bool(res.get("timed_out")),
+                str(res.get("error") or ""))
+    return str(getattr(res, "text", "") or ""), bool(getattr(res, "timed_out", False)), str(getattr(res, "error", "") or "")
+
+
+def _flatten(messages: Sequence[Message]) -> tuple[str, str]:
+    """messages -> (system, prompt) для API вида generate(system, prompt)."""
+    system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
+    turns = [f"{'Проверяющий' if m['role'] == 'user' else 'Ассистент'}: {m['content']}"
+             for m in messages if m.get("role") in {"user", "assistant"}]
+    return system, "\n\n".join(turns)
+
+
+class VLMServiceBackend:
+    """Общая модель Qwen3-VL-4B через ``ml.vlm.service.chat`` (A11) — отдельная LLM на 8 ГБ не влезает.
+
+    Вызов с низким приоритетом (``priority="low"``, если сервис его принимает): анализ видео важнее.
+    Подпись ``chat`` определяется по параметрам: ``messages=[...]`` или ``system=``/``prompt=``;
+    ответ — str, объект с ``.text`` (GenResult) или dict. Занятость -> LLMBusy (сервис отвечает
+    в негенеративном режиме), таймаут -> LLMTimeout.
+    """
+
+    name = "vlm_service"
+    is_generative = True
+
+    def __init__(self, chat_fn: Any, cfg: Optional[dict[str, Any]] = None, module: Any = None) -> None:
+        self.cfg = (cfg or default_config())
+        self.vcfg = self.cfg.get("vlm_service", {}) or {}
+        self._chat = chat_fn
+        self._module = module
+        try:
+            import inspect
+
+            self._params = set(inspect.signature(chat_fn).parameters)
+            self._varkw = any(p.kind == p.VAR_KEYWORD for p in inspect.signature(chat_fn).parameters.values())
+        except (TypeError, ValueError):
+            self._params, self._varkw = set(), True
+
+    @classmethod
+    def resolve(cls, cfg: dict[str, Any], warnings: list[str]) -> Optional["VLMServiceBackend"]:
+        vcfg = cfg.get("vlm_service", {}) or {}
+        mod_name = str(vcfg.get("module", "ml.vlm.service"))
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as exc:  # нет модуля / сломан импорт — генеративный режим недоступен
+            warnings.append(f"{mod_name} недоступен ({type(exc).__name__})")
+            return None
+        fn = getattr(mod, str(vcfg.get("function", "chat")), None)
+        if not callable(fn):
+            warnings.append(f"{mod_name}.{vcfg.get('function', 'chat')} не найден")
+            return None
+        avail = getattr(mod, "available", None)
+        if callable(avail):
+            try:
+                ok = avail()
+                ok, why = (ok if isinstance(ok, tuple) else (bool(ok), ""))
+                if not ok:
+                    warnings.append(f"VLM-сервис недоступен: {why or 'нет модели'}")
+                    return None
+            except Exception as exc:
+                warnings.append(f"VLM-сервис: ошибка проверки ({type(exc).__name__})")
+                return None
+        return cls(fn, cfg, mod)
+
+    def _accepts(self, name: str) -> bool:
+        return self._varkw or name in self._params
+
+    def stream_chat(self, messages: Sequence[Message], max_tokens: int = 512, temperature: float = 0.2,
+                    deadline: Optional[float] = None, **kw: Any) -> Iterator[str]:
+        remaining = (deadline - time.monotonic()) if deadline is not None else float(self.cfg.get("llm", {}).get("timeout_s", 45))
+        if remaining <= 0:
+            raise LLMTimeout("no time left for VLM chat")
+        kwargs: dict[str, Any] = {}
+        if self._accepts("messages"):
+            kwargs["messages"] = list(messages)
+        else:
+            system, prompt = _flatten(messages)
+            kwargs["system"], kwargs["prompt"] = system, prompt
+            if self._accepts("images"):
+                kwargs["images"] = []
+        alts = {"max_new_tokens": "max_tokens", "timeout_s": "timeout"}
+        for name, value in (("max_new_tokens", int(max_tokens)), ("timeout_s", remaining),
+                            ("temperature", float(temperature)),
+                            ("priority", str(self.vcfg.get("priority", "low"))),
+                            ("wait_s", min(remaining, float(self.vcfg.get("wait_s", 10))))):
+            if self._accepts(name):
+                kwargs[name] = value
+            elif name in alts and self._accepts(alts[name]):
+                kwargs[alts[name]] = value
+        try:
+            res = self._chat(**kwargs)
+        except TimeoutError as exc:
+            raise LLMTimeout(str(exc)) from exc
+        except Exception as exc:
+            if type(exc).__name__ in {"Busy", "GPUBusy", "QueueFull", "BackendBusy"}:
+                raise LLMBusy(str(exc)) from exc
+            raise
+        if hasattr(res, "__iter__") and not isinstance(res, (str, dict, bytes)) and not hasattr(res, "text"):
+            for piece in res:  # потоковый chat
+                text, _, _ = _text_of(piece)
+                if text:
+                    yield text
+                if deadline is not None and time.monotonic() > deadline:
+                    raise LLMTimeout("VLM chat exceeded budget")
+            return
+        text, timed_out, error = _text_of(res)
+        if timed_out and not text:
+            raise LLMTimeout(error or "VLM chat timed out")
+        if error and not text:
+            if "busy" in error.lower():
+                raise LLMBusy(error)
+            raise RuntimeError(f"VLM chat error: {error}")
+        yield text
+
+    def release(self) -> None:
+        return None  # моделью владеет A11/A03
+
+    def info(self) -> dict[str, Any]:
+        return {"backend": self.name, "module": getattr(self._module, "__name__", "")}
+
+
+class VLMRuntimeAdapter(VLMServiceBackend):
+    """ВРЕМЕННЫЙ адаптер к внутренностям A11 (``ml.vlm.runtime``), пока нет ``ml.vlm.service.chat``.
+
+    Выключен по умолчанию (``vlm_service.runtime_adapter: false``). Модель сам не загружает: если VLM
+    не «тёплая» (не загружена пайплайном), генеративный режим недоступен. GPU-замок A11 берётся с
+    таймаутом ``wait_s``: не дождались — LLMBusy (приоритет у анализа видео).
+    """
+
+    name = "vlm_runtime"
+
+    @classmethod
+    def resolve(cls, cfg: dict[str, Any], warnings: list[str]) -> Optional["VLMRuntimeAdapter"]:
+        try:
+            runtime = importlib.import_module("ml.vlm.runtime")
+            vlm_config = importlib.import_module("ml.vlm.config")
+            be, reason = runtime.get_backend(vlm_config.load_config())
+        except Exception as exc:
+            warnings.append(f"ml.vlm.runtime недоступен ({type(exc).__name__})")
+            return None
+        if be is None:
+            warnings.append(f"VLM не настроена: {reason}")
+            return None
+        if not getattr(be, "loaded", False) and not (cfg.get("vlm_service", {}) or {}).get("allow_cold_load", False):
+            warnings.append("VLM не загружена пайплайном — копилот её сам не грузит")
+            return None
+        adapter = cls(lambda **kw: None, cfg, runtime)
+        adapter._backend = be
+        return adapter
+
+    def stream_chat(self, messages: Sequence[Message], max_tokens: int = 512, temperature: float = 0.2,
+                    deadline: Optional[float] = None, **kw: Any) -> Iterator[str]:
+        remaining = (deadline - time.monotonic()) if deadline is not None else 30.0
+        system, prompt = _flatten(messages)
+        lock = self._module.gpu_guard()
+        wait = min(max(0.0, remaining), float(self.vcfg.get("wait_s", 10)))
+
+        def _gen() -> Any:
+            if not getattr(self._backend, "loaded", False):
+                raise LLMBusy("VLM выгружена")
+            return self._backend.generate([], system, prompt, max_new_tokens=int(max_tokens),
+                                          timeout_s=max(1.0, (deadline - time.monotonic()) if deadline else 30.0),
+                                          temperature=float(temperature))
+
+        if hasattr(lock, "acquire") and hasattr(lock, "release"):
+            if not lock.acquire(timeout=wait):
+                raise LLMBusy("GPU занят анализом видео")
+            try:
+                res = _gen()
+            finally:
+                lock.release()
+        else:  # замок без acquire(timeout) — только как context manager (ждём без таймаута)
+            with lock:
+                res = _gen()
+        text, timed_out, error = _text_of(res)
+        if timed_out and not text:
+            raise LLMTimeout(error or "VLM generate timed out")
+        if error and not text:
+            raise RuntimeError(f"VLM generate error: {error}")
+        yield text
+
+
+def make_llm(cfg: Optional[dict[str, Any]] = None, warnings: Optional[list[str]] = None) -> Optional[Any]:
+    """Выбор генеративного бэкенда. Модель здесь НЕ загружается.
+
+    auto: ``ml.vlm.service.chat`` (общая Qwen3-VL-4B) -> [временный адаптер ml.vlm.runtime, если включён]
+    -> локальный llama.cpp server (если явно задан ``server_url``). Отдельная llama.cpp-модель в процессе
+    (``llama_cpp``) — только явно: на 8 ГБ рядом с VLM она не помещается.
+    Нет модели -> None: сервис отвечает в негенеративном режиме (retrieval) или 501 — по конфигу.
+    ``mock`` — только при SENTINEL_MOCK=1 (auto) или явно; ``extractive`` — только явно.
     """
     cfg = cfg or default_config()
     lcfg = cfg.get("llm", {})
@@ -381,6 +580,14 @@ def make_llm(cfg: Optional[dict[str, Any]] = None, warnings: Optional[list[str]]
         mock = ExtractiveBackend()
         mock.name = "mock"
         return mock
+    if backend in {"auto", "vlm_service"}:
+        be = VLMServiceBackend.resolve(cfg, warn)
+        if be is not None:
+            return be
+        if (cfg.get("vlm_service", {}) or {}).get("runtime_adapter", False):
+            ad = VLMRuntimeAdapter.resolve(cfg, warn)
+            if ad is not None:
+                return ad
     if backend in {"auto", "llama_server"} and lcfg.get("server_url"):
         try:
             srv = LlamaServerBackend(str(lcfg["server_url"]), cfg)
@@ -389,7 +596,7 @@ def make_llm(cfg: Optional[dict[str, Any]] = None, warnings: Optional[list[str]]
             warn.append("llama.cpp server не отвечает")
         except ValueError as exc:
             warn.append(str(exc))
-    if backend in {"auto", "llama_cpp"}:
+    if backend == "llama_cpp":
         path = find_model(cfg)
         if path is None:
             warn.append("GGUF-модель не найдена (llm.model_candidates)")
@@ -397,6 +604,6 @@ def make_llm(cfg: Optional[dict[str, Any]] = None, warnings: Optional[list[str]]
             warn.append("llama-cpp-python не установлен")
         else:
             return LlamaCppBackend(path, cfg)
-    if backend not in {"auto", "llama_cpp", "llama_server"}:
+    if backend not in {"auto", "llama_cpp", "llama_server", "vlm_service"}:
         warn.append(f"неизвестный llm.backend: {backend!r}")
     return None

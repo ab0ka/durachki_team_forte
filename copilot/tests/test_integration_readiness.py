@@ -83,15 +83,16 @@ def test_main_api_starts_without_copilot_weights(monkeypatch, tmp_path, job_viol
             assert r.status_code == 501 and r.json()["detail"]["answer"] == ""
             assert client.get("/api/v1/jobs/job-test-1/report").status_code == 200  # отчёт без LLM
 
-            monkeypatch.setenv("COPILOT_ENABLED", "1")  # включили, но весов нет
+            monkeypatch.setenv("COPILOT_ENABLED", "1")  # включили, но модели (ml.vlm.service) нет
             service_mod.set_service(None)
             st = client.get("/api/v1/copilot/status").json()
-            assert st["enabled"] is True and st["available"] is False and st["reason"] == "unavailable"
+            assert st["enabled"] is True and st["available"] is True and st["generative"] is False
+            assert st["mode"] == "retrieval" and st["reason"] == "generative_unavailable"
             r = client.post("/api/v1/jobs/job-test-1/ask", json={"question": "Почему?"})
-            assert r.status_code == 501
-            body = r.json()["detail"]
-            assert body["error"] == "unavailable" and body["answer"] == "" and body["citations"] == []
-            assert "недоступен" in body["message"]
+            assert r.status_code == 200
+            body = r.json()
+            assert body["mode"] == "retrieval" and body["generative"] is False and body["backend"] != "mock"
+            assert body["answer"].startswith("(Генеративный режим недоступен")
     finally:
         service_mod.set_service(None)
         router_mod.set_job_provider(None)
@@ -111,15 +112,15 @@ r = copilot.answer({"job_id": "1", "status": "done", "verdict": "violation", "vi
     {"type": "t", "type_id": "V05", "timecode_sec": 3.0, "description": "d", "evidence_frames": []}]}, "Почему?")
 heavy = [m for m in ("torch", "transformers", "llama_cpp", "sentence_transformers", "huggingface_hub") if m in sys.modules]
 print(json.dumps({"available": st["available"], "reason": st["reason"], "error": r["error"],
-                  "answer": r["answer"], "heavy": heavy, "warmup": copilot.warmup()}))
+                  "answer": r["answer"], "heavy": heavy}))
 """
     env = {"PATH": "/usr/bin:/bin", "COPILOT_ENABLED": "1", "COPILOT_MODEL_PATH": str(tmp_path / "none.gguf"),
-           "COPILOT_CACHE_DIR": str(tmp_path / "cache"), "HF_HUB_OFFLINE": "1"}
+           "COPILOT_CACHE_DIR": str(tmp_path / "cache"), "HF_HUB_OFFLINE": "1", "COPILOT_EMBED_BACKEND": "hashing"}
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60, env=env)
     assert out.returncode == 0, out.stderr
     res = json.loads(out.stdout.strip().splitlines()[-1])
-    assert res == {"available": False, "reason": "unavailable", "error": "unavailable", "answer": "",
-                   "heavy": [], "warmup": False}
+    assert res["available"] is True and res["reason"] == "generative_unavailable" and res["error"] is None
+    assert res["answer"].startswith("(Генеративный режим недоступен") and res["heavy"] == []
 
 
 # ----------------------------------------------------------------------------- сбои copilot не ломают API
