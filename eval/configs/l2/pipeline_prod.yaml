@@ -10,3 +10,8 @@ gpu:
     vlm_discover: 3.0
 warmup:
   vlm: true
+timeouts:
+  min_s: 150.0          # холодный старт CUDA и длинные видео: детектор не должен падать по таймауту стадии
+  hard_factor: 6.0
+executor:
+  load_clip_timeout_s: 120

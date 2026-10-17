@@ -8,8 +8,8 @@
 
 | Что | Значение |
 |---|---|
-| Веб-интерфейс | `https://<адрес>/` — вход по API-ключу |
-| API для жюри | `POST https://<адрес>/api/v1/analyze`, `GET https://<адрес>/api/v1/jobs/{job_id}` |
+| Веб-интерфейс | https://bachelor-msgstr-expenses-pixel.trycloudflare.com/ — вход по API-ключу |
+| API для жюри | `POST https://bachelor-msgstr-expenses-pixel.trycloudflare.com/api/v1/analyze`, `GET https://bachelor-msgstr-expenses-pixel.trycloudflare.com/api/v1/jobs/{job_id}` |
 | Ключ | передаётся отдельно; заголовок `X-API-Key`; без верного ключа — 401 |
 
 Публичный адрес — Cloudflare Tunnel к серверу команды (ноутбук с RTX 4060). Пример запроса — ровно как в ТЗ:
