@@ -14,7 +14,7 @@ from typing import Any, Optional
 _HOMOGLYPHS = str.maketrans({
     "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C",
     "Т": "T", "У": "Y", "Х": "X", "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y",
-    "х": "x", "к": "k", "м": "m", "т": "t", "в": "b", "н": "h",
+    "х": "x",
 })
 
 VIDEO_EXTS = (".mov", ".mp4", ".avi", ".mkv", ".m4v", ".webm")

@@ -70,9 +70,14 @@ class TimeBudget:
         return base * factor
 
     def reserve_after(self, stage: str) -> float:
-        """Сколько времени нужно оставить после стадии (на финальное слияние)."""
+        """Сколько времени оставить после стадии на финальное слияние. Обязательным стадиям — минимум
+        (без них результат всё равно неполный), дополнительным — полный резерв."""
         if stage == "fusion":
             return 0.0
+        from .stages import is_required
+
+        if is_required(stage, self.cfg):
+            return float(cfg_get(self.cfg, "reserve_s.fusion_min", 3))
         return float(cfg_get(self.cfg, "reserve_s.fusion", 12))
 
     def timeout(self, stage: str) -> float:
