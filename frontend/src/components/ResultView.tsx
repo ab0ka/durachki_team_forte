@@ -126,6 +126,12 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
         </div>
       </section>
 
+      {job.status === "failed" && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-400/30 dark:bg-amber-400/10 dark:text-amber-200" role="alert">
+          <b>Анализ не завершён{job.error ? `: ${job.error}` : ""}.</b> Ниже — только то, что система успела найти до сбоя; остальная часть записи не проверена.
+        </div>
+      )}
+
       {warnings.length > 0 && (
         <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-400/20 dark:bg-amber-400/10 dark:text-amber-200">
           <b>Предупреждения сервера:</b> {warnings.join(" · ")}
@@ -150,7 +156,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             <section className="space-y-4">
               <h2 className="flex items-center gap-2 text-lg font-bold">
                 <ListChecks className="h-5 w-5 text-brand-600 dark:text-brand-300" />
-                Эпизоды с признаками возможных нарушений
+                {job.status === "failed" ? "Найдено до сбоя анализа" : "Эпизоды с признаками возможных нарушений"}
               </h2>
               {job.violations.map((v, i) => (
                 <ViolationCard

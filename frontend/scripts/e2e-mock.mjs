@@ -12,6 +12,8 @@ const shots = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../scr
 mkdirSync(shots, { recursive: true });
 
 const KEY = "ks_test_key_e2e";
+const CSRF = "csrf_synthetic_token_123";
+let csrfRejected = 0;
 const svg = (label) =>
   Buffer.from(
     `<svg xmlns="http://www.w3.org/2000/svg" width="232" height="424"><rect width="232" height="424" fill="#cfd8de"/><text x="20" y="200" font-size="20">${label}</text></svg>`,
@@ -76,22 +78,43 @@ try {
     const p = u.pathname;
     if (p.endsWith("/ui/v1/session")) {
       if (req.method() === "POST") {
-        const ok = req.headers()["x-api-key"] === KEY;
+        let body = {};
+        try {
+          body = JSON.parse(req.postData() || "{}");
+        } catch {}
+        const ok = body.api_key === KEY || body.password === KEY; // как в A02: {api_key} или {password}
         loggedIn = ok;
         return route.fulfill({
           status: ok ? 200 : 401,
           contentType: "application/json",
           headers: ok ? { "set-cookie": "ks_ui=1; HttpOnly; Path=/; SameSite=Strict" } : {},
-          body: JSON.stringify(ok ? { authenticated: true, features: { copilot: true } } : { detail: "bad key" }),
+          body: JSON.stringify(ok ? { authenticated: true, expires_at: 0, csrf_token: CSRF } : { detail: "invalid credentials" }),
         });
       }
-      return route.fulfill({ status: loggedIn ? 200 : 401, contentType: "application/json", body: JSON.stringify(loggedIn ? { authenticated: true } : { detail: "no session" }) });
+      return route.fulfill({
+        status: loggedIn ? 200 : 401,
+        contentType: "application/json",
+        body: JSON.stringify(loggedIn ? { authenticated: true, csrf_token: CSRF } : { authenticated: false, password_login: false }),
+      });
     }
     if (!loggedIn) return route.fulfill({ status: 401, body: "{}" });
+    // A02: мутирующие запросы /ui/v1/* требуют X-CSRF-Token
+    if (req.method() === "POST" && req.headers()["x-csrf-token"] !== CSRF) {
+      csrfRejected++;
+      return route.fulfill({ status: 403, contentType: "application/json", body: '{"detail":"missing or invalid X-CSRF-Token"}' });
+    }
+    if (p.endsWith("/ui/v1/jobs")) {
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ jobs: [{ job_id: "old-1", status: "done", stage: "done", filename: "synthetic_old.mov", created_at: 1792000000, finished_at: 1792000030 }] }) });
+    }
     if (p.endsWith("/ui/v1/analyze")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job_id: "e2e-1" }) });
     if (p.endsWith("/ui/v1/jobs/e2e-1")) {
       polls++;
-      const body = polls < 3 ? { job_id: "e2e-1", status: "processing", verdict: null, violations: [], progress: polls * 0.3, stage: polls === 1 ? "detect" : "vlm" } : doneJob("e2e-1");
+      const body =
+        polls === 1
+          ? { job_id: "e2e-1", status: "processing", stage: "queued", progress: 0, queue_position: 2, elapsed_s: 0.4 }
+          : polls < 4
+            ? { job_id: "e2e-1", status: "processing", stage: polls === 2 ? "detect" : "vlm", progress: polls * 0.3, queue_position: 0, elapsed_s: polls * 1.5 }
+            : doneJob("e2e-1");
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
     }
     if (p.endsWith("/ask")) return route.fulfill({ status: 501, contentType: "application/json", body: JSON.stringify({ detail: "copilot disabled" }) });
@@ -122,6 +145,7 @@ try {
   await step("загрузка → обработка (реальный progress) → результат", async () => {
     await page.locator('input[type="file"]').setInputFiles({ name: "synthetic.mov", mimeType: "video/quicktime", buffer: Buffer.alloc(2048, 1) });
     await page.getByRole("button", { name: "Начать проверку" }).click();
+    await page.getByText("позиция в очереди: 2", { exact: false }).waitFor({ timeout: 8000 });
     await page.getByText("Идёт анализ записи").waitFor({ timeout: 8000 });
     await page.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 15000 });
     assert.ok(polls >= 3, `опросов: ${polls}`);
@@ -147,11 +171,19 @@ try {
   await step("ключ ни разу не попал в URL запросов", async () => {
     assert.equal(sawKeyInUrl, false);
   });
+  await step("POST-запросы шли с X-CSRF-Token (ни одного 403)", async () => {
+    assert.equal(csrfRejected, 0, `отклонено CSRF: ${csrfRejected}`);
+  });
+  await step("серверная история (GET /ui/v1/jobs) видна на главной", async () => {
+    await page.goto(`${url}#/`);
+    await page.getByText("synthetic_old.mov").waitFor({ timeout: 5000 });
+  });
   await ctx.close();
 
   // ---------- сценарий 2: failed и неполный анализ не зелёные ----------
   for (const [name, body, expectText] of [
     ["failed", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "синтетическая ошибка" }, "Анализ не завершён"],
+    ["failed-partial", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "timeout", partial: { ...doneJob("f1"), verdict: "no_violation", violations: [] , timeline: [[0, 0.1], [5, 0.2]] } }, "Анализ не завершён"],
     ["partial", { job_id: "f1", status: "done", verdict: "no_violation", violations: [], meta: { partial: true } }, "Анализ неполный"],
     ["clean", { job_id: "f1", status: "done", verdict: "no_violation", violations: [], meta: {} }, "Нарушение не обнаружено"],
   ]) {

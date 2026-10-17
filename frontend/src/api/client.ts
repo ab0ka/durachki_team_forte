@@ -8,6 +8,8 @@ import type { AskResponse, JobResult, SessionInfo } from "./types";
 export const ENDPOINTS = {
   session: "/ui/v1/session",
   uiAnalyze: "/ui/v1/analyze",
+  uiJobs: "/ui/v1/jobs",
+  apiJobs: "/api/v1/jobs",
   uiJob: (id: string) => `/ui/v1/jobs/${encodeURIComponent(id)}`,
   uiAsk: (id: string) => `/ui/v1/jobs/${encodeURIComponent(id)}/ask`,
   apiAnalyze: "/api/v1/analyze",
@@ -110,6 +112,7 @@ export interface Backend {
   logout(): Promise<void>;
   upload(file: File, onProgress: (fraction: number) => void): UploadHandle;
   getJob(id: string): Promise<{ job: JobResult; raw: unknown }>;
+  listJobs?(limit?: number): Promise<HistoryItem[]>;
   ask(id: string, question: string, history: { role: "user" | "assistant"; text: string }[]): Promise<AskResponse>;
   /** URL исходного видео для <video>. fallback — загрузка blob с X-API-Key, если cookie-маршрут не играет. */
   videoSource(id: string): { url: string; fallback?: () => Promise<string> } | null;
@@ -119,6 +122,7 @@ function sessionFromJson(info: Record<string, unknown>, authenticated: boolean):
   const f = info.features;
   const features: SessionInfo["features"] = typeof f === "object" && f !== null ? { ...(f as SessionInfo["features"]) } : {};
   if (typeof info.copilot === "boolean") features.copilot = info.copilot;
+  if (typeof info.password_login === "boolean") features.password_login = info.password_login;
   const auth = typeof info.authenticated === "boolean" ? info.authenticated : authenticated;
   return {
     token: null,
@@ -144,6 +148,8 @@ export class HttpBackend implements Backend {
   kind = "http" as const;
   /** Необязательный токен из тела ответа сессии (если A02 его отдаёт) — только в памяти. */
   private token: string | null = null;
+  /** CSRF-токен из GET/POST /ui/v1/session (A02) — заголовок X-CSRF-Token для POST в /ui/v1/*. */
+  private csrf: string | null = null;
   private features: SessionInfo["features"] = {};
   private uiAvailable = true;
 
@@ -154,6 +160,7 @@ export class HttpBackend implements Backend {
   private headers(path: string, extra?: Record<string, string>): Record<string, string> {
     const h: Record<string, string> = { Accept: "application/json", ...extra };
     if (this.token && path.startsWith("/ui/")) h["X-UI-Token"] = this.token;
+    if (this.csrf && path.startsWith("/ui/")) h["X-CSRF-Token"] = this.csrf;
     if (path.startsWith("/api/") && settings.apiKey) h["X-API-Key"] = settings.apiKey;
     return h;
   }
@@ -165,14 +172,19 @@ export class HttpBackend implements Backend {
         headers: this.headers(ENDPOINTS.session),
       });
       if (res.ok) {
-        const s = sessionFromJson(await readJson(res), true);
-        this.features = s.features;
+        const info = await readJson(res);
+        this.csrf = typeof info.csrf_token === "string" ? info.csrf_token : this.csrf;
+        const s = sessionFromJson(info, true);
+        this.features = { ...this.features, ...s.features };
         this.uiAvailable = true;
-        return s;
+        return { ...s, features: this.features };
       }
       if (res.status === 401 || res.status === 403) {
         this.uiAvailable = true;
-        return { token: null, reachable: true, authenticated: !!settings.apiKey, features: {} };
+        this.csrf = null;
+        const s = sessionFromJson(await readJson(res), false);
+        // Сессии нет; работать можно только с API-ключом в памяти вкладки (/api/v1/*).
+        return { ...s, authenticated: !!settings.apiKey };
       }
       // 404/405 — UI-маршруты выключены (ui_enabled: false): работаем только через API-ключ.
       this.uiAvailable = false;
@@ -190,8 +202,9 @@ export class HttpBackend implements Backend {
       res = await fetch(this.url(ENDPOINTS.session), {
         method: "POST",
         credentials: "same-origin",
-        headers: { Accept: "application/json", "Content-Type": "application/json", "X-API-Key": k },
-        body: JSON.stringify({ key: k }),
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        // A02: вход по API-ключу ИЛИ паролю UI — одно поле формы, сервер проверяет оба варианта.
+        body: JSON.stringify({ api_key: k, password: k }),
       });
     } catch {
       throw new ApiError(0, messageForStatus(0));
@@ -203,10 +216,12 @@ export class HttpBackend implements Backend {
       return { token: null, reachable: true, authenticated: true, features: {} };
     }
     if (!res.ok) {
-      if (res.status === 401 || res.status === 403) throw new ApiError(res.status, "Неверный ключ доступа.");
+      if (res.status === 401) throw new ApiError(res.status, "Неверный ключ доступа.");
+      if (res.status === 403) throw new ApiError(res.status, "Сервер отклонил вход (запрос не с того же адреса).");
       throw new ApiError(res.status, messageForStatus(res.status, await errorText(res)));
     }
     const info = await readJson(res);
+    this.csrf = typeof info.csrf_token === "string" ? info.csrf_token : null;
     const t = info.token ?? info.ui_token;
     this.token = typeof t === "string" ? t : null;
     const s = sessionFromJson(info, true);
@@ -217,6 +232,7 @@ export class HttpBackend implements Backend {
 
   async logout(): Promise<void> {
     this.token = null;
+    this.csrf = null;
     settings.apiKey = "";
     try {
       await fetch(this.url(ENDPOINTS.session), { method: "DELETE", credentials: "same-origin" });
@@ -234,7 +250,11 @@ export class HttpBackend implements Backend {
         headers: this.headers(p, (init.headers as Record<string, string>) ?? {}),
       });
     if (this.uiAvailable || !settings.apiKey) {
-      const res = await doFetch(uiPath);
+      let res = await doFetch(uiPath);
+      if (res.status === 403 && init.method && init.method !== "GET") {
+        await this.init(); // CSRF-токен мог устареть (перезапуск сервера) — обновляем и повторяем
+        res = await doFetch(uiPath);
+      }
       const tryApi = (res.status === 404 || res.status === 405 || res.status === 401) && !!settings.apiKey;
       if (!tryApi) return res;
     }
@@ -264,6 +284,11 @@ export class HttpBackend implements Backend {
       let r: { status: number; body: string };
       if (this.uiAvailable || !settings.apiKey) {
         r = await send(ENDPOINTS.uiAnalyze);
+        if (r.status === 403 && !aborted) {
+          await this.init();
+          onProgress(0);
+          r = await send(ENDPOINTS.uiAnalyze);
+        }
         if ((r.status === 404 || r.status === 405 || r.status === 401) && settings.apiKey && !aborted) {
           onProgress(0);
           r = await send(ENDPOINTS.apiAnalyze);
@@ -299,6 +324,30 @@ export class HttpBackend implements Backend {
         (xhr as XMLHttpRequest | null)?.abort();
       },
     };
+  }
+
+  /** GET /ui/v1/jobs — последние задачи на сервере (A02). Ошибки → пустой список. */
+  async listJobs(limit = 20): Promise<HistoryItem[]> {
+    try {
+      const res = await this.fetchWithFallback(`${ENDPOINTS.uiJobs}?limit=${limit}`, `${ENDPOINTS.apiJobs}?limit=${limit}`);
+      if (!res.ok) return [];
+      const j = (await res.json()) as { jobs?: unknown };
+      if (!Array.isArray(j.jobs)) return [];
+      const out: HistoryItem[] = [];
+      for (const x of j.jobs as Record<string, unknown>[]) {
+        if (!x || (typeof x.job_id !== "string" && typeof x.job_id !== "number")) continue;
+        const created = typeof x.created_at === "number" ? new Date(x.created_at < 1e12 ? x.created_at * 1000 : x.created_at) : new Date(String(x.created_at ?? ""));
+        out.push({
+          job_id: String(x.job_id),
+          file_name: typeof x.filename === "string" && x.filename ? x.filename : "видео",
+          created_at: Number.isNaN(created.getTime()) ? new Date().toISOString() : created.toISOString(),
+          status: typeof x.status === "string" ? x.status : undefined,
+        });
+      }
+      return out;
+    } catch {
+      return [];
+    }
   }
 
   async getJob(id: string): Promise<{ job: JobResult; raw: unknown }> {

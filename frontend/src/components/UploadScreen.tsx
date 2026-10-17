@@ -33,6 +33,23 @@ export default function UploadScreen() {
 
   useEffect(() => () => handleRef.current?.abort(), []);
 
+  // История: локальная (этот браузер) + серверная (GET /ui/v1/jobs, A02) — с именами файлов.
+  useEffect(() => {
+    if (!authenticated || !backend.listJobs) return;
+    let alive = true;
+    void backend.listJobs(20).then((server) => {
+      if (!alive || server.length === 0) return;
+      const local = loadHistory();
+      const byId = new Map(local.map((h) => [h.job_id, h]));
+      for (const sv of server) byId.set(sv.job_id, { ...sv, ...(byId.get(sv.job_id) ?? {}) });
+      const merged = [...byId.values()].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+      setHistory(merged.slice(0, 20));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [authenticated, backend]);
+
   const pick = useCallback((f: File | undefined | null) => {
     if (!f) return;
     const err = validateVideoFile(f);
@@ -235,7 +252,13 @@ export default function UploadScreen() {
                     <span
                       className={cx(
                         "h-2.5 w-2.5 shrink-0 rounded-full",
-                        h.verdict === "violation" ? "bg-rose-500" : h.verdict === "no_violation" ? "bg-emerald-500" : "bg-slate-300 dark:bg-slate-600",
+                        h.verdict === "violation"
+                          ? "bg-rose-500"
+                          : h.verdict === "no_violation"
+                            ? "bg-emerald-500"
+                            : h.status === "failed"
+                              ? "bg-amber-500"
+                              : "bg-slate-300 dark:bg-slate-600",
                       )}
                     />
                     <span className="min-w-0 flex-1">
@@ -244,7 +267,7 @@ export default function UploadScreen() {
                         {formatDateTime(h.created_at)}
                         {h.verdict === "violation" && ` · нарушений: ${h.n_violations ?? "?"}`}
                         {h.verdict === "no_violation" && " · без нарушений"}
-                        {!h.verdict && " · в обработке"}
+                        {!h.verdict && (h.status === "failed" ? " · анализ не завершён" : h.status === "done" ? " · готово" : " · в обработке")}
                       </span>
                     </span>
                     <ChevronRight className="h-4 w-4 text-slate-400" />

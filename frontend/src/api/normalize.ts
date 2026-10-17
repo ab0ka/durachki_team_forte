@@ -150,8 +150,21 @@ export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
   if (status === "done" && verdict === null) verdict = violations.length > 0 ? "violation" : "no_violation";
   const meta: JobMeta = isObj(raw.meta) ? (raw.meta as JobMeta) : {};
   const error = str(raw.error ?? raw.detail ?? meta.error ?? "") || undefined;
+  let partialResult: JobResult | undefined;
+  if (status === "failed" && isObj(raw.partial)) {
+    try {
+      partialResult = normalizeJob({ ...raw.partial, status: "done" }, fallbackJobId);
+    } catch {
+      partialResult = undefined;
+    }
+  }
+  const qp = optNum(raw.queue_position);
+  const el = optNum(raw.elapsed_s);
   return {
     job_id: str(raw.job_id ?? raw.id, fallbackJobId),
+    queuePosition: qp,
+    elapsedSec: el,
+    partialResult,
     status,
     verdict,
     violations,

@@ -34,7 +34,14 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
 
   const idx = job.status === "queued" ? 0 : stepIndex(job.stage, hasProgress ? p : undefined);
   const known = !!job.stage || hasProgress || job.status === "queued";
-  const elapsed = (now - watchStart.current) / 1000;
+  // «Прошло» — по серверу (elapsed_s, A02) + время с последнего ответа; иначе — с открытия страницы.
+  const lastServer = useRef<{ at: number; el: number } | null>(null);
+  if (typeof job.elapsedSec === "number" && (lastServer.current === null || lastServer.current.el !== job.elapsedSec))
+    lastServer.current = { at: Date.now(), el: job.elapsedSec };
+  const elapsed = lastServer.current
+    ? lastServer.current.el + (now - lastServer.current.at) / 1000
+    : (now - watchStart.current) / 1000;
+  const queued = job.status === "queued" || (job.stage ?? "").toLowerCase().startsWith("queue");
 
   return (
     <div className="mx-auto max-w-3xl animate-fade-in">
@@ -51,7 +58,7 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
             </div>
             <div className="min-w-0">
               <div className="text-xs font-semibold uppercase tracking-[.12em] text-white/60">
-                {job.status === "queued" ? "Задача в очереди" : "Идёт анализ записи"}
+                {queued ? "Задача в очереди" : "Идёт анализ записи"}
               </div>
               <h1 className="truncate text-2xl font-extrabold">{fileName ?? "Видеозапись"}</h1>
               <div className="mt-1 font-mono text-xs text-white/50">задача {job.job_id}</div>
@@ -63,7 +70,11 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
           <div className="mb-6 space-y-2">
             <div className="flex items-baseline justify-between gap-3 text-sm">
               <span className="font-semibold">
-                {job.stage ? `Стадия: ${stageLabel(job.stage)}` : job.status === "queued" ? "Ожидание свободного обработчика" : "Обработка на сервере"}
+                {queued
+                  ? `Ожидание свободного обработчика${job.queuePosition ? ` · позиция в очереди: ${job.queuePosition}` : ""}`
+                  : job.stage
+                    ? `Стадия: ${stageLabel(job.stage)}`
+                    : "Обработка на сервере"}
               </span>
               <span className="text-slate-500 tnum">
                 {hasProgress ? `${Math.round(p * 100)} %` : "прогресс не передаётся"}

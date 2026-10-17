@@ -61,6 +61,12 @@ export interface JobResult {
   progress?: number;
   stage?: string;
   error?: string;
+  /** A02: позиция в очереди (processing/queued). */
+  queuePosition?: number;
+  /** A02: секунд с постановки задачи (реальный источник для «прошло»). */
+  elapsedSec?: number;
+  /** A02 (только /ui/v1): у failed — частичный результат, если пайплайн успел что-то найти. */
+  partialResult?: JobResult;
 }
 
 export interface AskResponse {

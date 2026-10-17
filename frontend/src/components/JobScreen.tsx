@@ -76,6 +76,11 @@ export default function JobScreen({ jobId }: { jobId: string }) {
       </div>
     );
   }
+  if (job.status === "failed" && job.partialResult && (job.partialResult.violations.length > 0 || job.partialResult.timeline.length > 0)) {
+    // A02 отдаёт для UI частичный результат упавшего анализа: показываем найденное, баннер — «Анализ не завершён».
+    const shown: JobResult = { ...job.partialResult, job_id: job.job_id, status: "failed", error: job.error };
+    return <ResultView job={shown} raw={raw} fileName={fileName.current} />;
+  }
   if (job.status === "failed") {
     return (
       <StateCard

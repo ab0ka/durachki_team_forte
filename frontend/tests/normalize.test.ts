@@ -175,3 +175,24 @@ describe("imageSrc: пути и base64", () => {
     expect(imageSrc("blob:abc")).toBe("blob:abc");
   });
 });
+
+describe("поля A02", () => {
+  it("processing: queue_position и elapsed_s", () => {
+    const j = normalizeJob({ job_id: "q", status: "processing", stage: "queued", progress: 0, queue_position: 3, elapsed_s: 4.2 });
+    expect(j.queuePosition).toBe(3);
+    expect(j.elapsedSec).toBeCloseTo(4.2);
+  });
+  it("failed + partial → partialResult, но статус остаётся failed", () => {
+    const j = normalizeJob({
+      job_id: "f",
+      status: "failed",
+      verdict: null,
+      violations: [],
+      error: "timeout",
+      partial: { job_id: "f", verdict: "violation", violations: [{ type: "A", timecode_sec: 3, description: "", evidence_frames: [] }] },
+    });
+    expect(j.status).toBe("failed");
+    expect(j.verdict).toBeNull();
+    expect(j.partialResult?.violations).toHaveLength(1);
+  });
+});
