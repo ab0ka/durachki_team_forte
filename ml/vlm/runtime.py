@@ -1,0 +1,192 @@
+"""Жизненный цикл бэкенда (ленивая загрузка, тёплая модель, unload), общий GPU-lock и вызов с JSON-ретраем.
+
+Один GPU-владелец: все обращения к GPU (load + generate) идут под lock, который A03 может заменить своим
+(ml.vlm.set_gpu_lock) — тогда VLM не работает параллельно с детектором/энкодерами.
+"""
+from __future__ import annotations
+
+import contextlib
+import logging
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Callable, ContextManager, Optional
+
+from .backends import BackendUnavailable, VLMBackend, resolve_backend
+from .budget import Budget, visual_tokens
+from .parsing import extract_json
+
+log = logging.getLogger(__name__)
+
+_state_lock = threading.Lock()
+_backend: Optional[VLMBackend] = None
+_backend_key: Optional[tuple[Any, ...]] = None
+_backend_reason = ""
+_injected: Optional[VLMBackend] = None
+_gpu_lock: Any = threading.RLock()
+
+
+def set_gpu_lock(lock: Optional[Any]) -> None:
+    """A03 передаёт общий lock/семафор GPU (любой context manager). None — вернуть внутренний."""
+    global _gpu_lock
+    _gpu_lock = lock if lock is not None else threading.RLock()
+
+
+def gpu_guard() -> ContextManager[Any]:
+    lk = _gpu_lock
+    return lk if hasattr(lk, "__enter__") else contextlib.nullcontext()
+
+
+def set_backend(backend: Optional[VLMBackend]) -> None:
+    """Явная подстановка бэкенда (тесты, интеграция). None — снова из конфига."""
+    global _injected
+    _injected = backend
+
+
+def _key(cfg: dict[str, Any]) -> tuple[Any, ...]:
+    preset = (cfg.get("presets") or {}).get(cfg.get("preset", ""), {})
+    return (cfg.get("backend"), cfg.get("preset"), repr(preset), repr(cfg.get("llamacpp_server")),
+            repr((cfg.get("mock") or {})))
+
+
+def get_backend(cfg: dict[str, Any]) -> tuple[Optional[VLMBackend], str]:
+    global _backend, _backend_key, _backend_reason
+    if _injected is not None:
+        return _injected, ""
+    k = _key(cfg)
+    with _state_lock:
+        if _backend_key != k:
+            if _backend is not None:
+                with contextlib.suppress(Exception):
+                    _backend.unload()
+            _backend, _backend_reason = resolve_backend(cfg)
+            _backend_key = k
+            if _backend is None:
+                log.warning("VLM stage disabled: %s", _backend_reason)
+        return _backend, _backend_reason
+
+
+def ensure_loaded(be: VLMBackend) -> tuple[bool, str]:
+    if be.loaded:
+        return True, ""
+    try:
+        with gpu_guard():
+            be.load()
+        return True, ""
+    except BackendUnavailable as e:
+        return False, str(e)
+    except Exception as e:  # noqa: BLE001 — OOM, битые веса и т.п.: стадия пропускается
+        log.warning("VLM load failed: %s", type(e).__name__)
+        return False, f"{type(e).__name__}: {str(e)[:200]}"
+
+
+def unload_backend() -> None:
+    global _backend, _backend_key
+    with _state_lock:
+        if _backend is not None:
+            with contextlib.suppress(Exception):
+                _backend.unload()
+        _backend, _backend_key = None, None
+
+
+def backend_status() -> dict[str, Any]:
+    be = _injected or _backend
+    info = be.info() if be is not None else {"backend": None}
+    info["reason"] = _backend_reason if be is None else ""
+    return info
+
+
+# --------------------------------------------------------------------------- вызов с ретраем
+
+
+@dataclass
+class CallOutcome:
+    ok: bool = False
+    status: str = "not_called"   # ok | parse_failed | timeout | error | skipped_budget
+    data: dict[str, Any] = field(default_factory=dict)
+    attempts: int = 0
+    latency_s: float = 0.0
+    repaired: bool = False
+    error: str = ""
+    raw: list[str] = field(default_factory=list)  # только для локального дампа (CLI), не для логов
+
+
+def fit_images(images: list[Any], max_frames: int, max_vis_tokens: int, px_per_token: int,
+               keep_index: Optional[int] = None) -> list[Any]:
+    """Урезает число кадров (сохраняя keep_index) и при необходимости уменьшает их, чтобы влезть в лимит токенов."""
+    from .frames import resize_max_side
+
+    imgs = list(images)
+    if max_frames > 0 and len(imgs) > max_frames:
+        keep = keep_index if keep_index is not None and 0 <= keep_index < len(imgs) else len(imgs) // 2
+        step = (len(imgs) - 1) / max(1, max_frames - 1)
+        idx = sorted({int(round(i * step)) for i in range(max_frames)})
+        if keep not in idx:
+            idx[min(range(len(idx)), key=lambda j: abs(idx[j] - keep))] = keep
+            idx = sorted(set(idx))
+        imgs = [imgs[i] for i in idx]
+    for _ in range(4):
+        tot = sum(visual_tokens(im.size, px_per_token) for im in imgs)
+        if max_vis_tokens <= 0 or tot <= max_vis_tokens:
+            break
+        k = (max_vis_tokens / float(tot)) ** 0.5 * 0.97
+        imgs = [resize_max_side(im, max(2 * px_per_token, int(max(im.size) * k))) for im in imgs]
+    return imgs
+
+
+def call_json(be: VLMBackend, images: list[Any], system: str, prompt: str, budget: Budget,
+              normalize: Callable[[dict[str, Any]], tuple[Optional[dict[str, Any]], str]],
+              max_new_tokens: int, schema: Optional[dict[str, Any]] = None, retry_suffix: str = "",
+              temperature: float = 0.0,
+              fallback: Optional[Callable[[str], Optional[dict[str, Any]]]] = None) -> CallOutcome:
+    """Вызов VLM -> JSON -> нормализация. 1 ретрай (в пределах бюджета) только при невалидном JSON."""
+    out = CallOutcome()
+    lim = budget.limits
+    vis = sum(visual_tokens(getattr(im, "size", (448, 448)), budget.px_per_token) for im in images)
+    for attempt in range(1 + max(0, lim.max_retries_per_item)):
+        retry = attempt > 0
+        if not budget.can_call(len(images), vis, retry=retry):
+            if not retry:
+                out.status = "skipped_budget"
+            break
+        mnt = budget.output_tokens_for_call(max_new_tokens)
+        if mnt < 24:
+            budget.stop_reason = budget.stop_reason or "max_output_tokens_total"
+            out.status = out.status if retry else "skipped_budget"
+            break
+        p = prompt if not retry else f"{prompt}\n\n{retry_suffix}".strip()
+        try:
+            with gpu_guard():
+                res = be.generate(images, system, p, max_new_tokens=mnt, timeout_s=budget.call_timeout(),
+                                  json_schema=schema, temperature=temperature)
+        except Exception as e:  # noqa: BLE001 — сбой бэкенда не роняет пайплайн
+            budget.record(0.0, vis, 0, 0, retry)
+            out.attempts += 1
+            out.status, out.error = "error", f"{type(e).__name__}"
+            log.warning("VLM generate failed: %s", type(e).__name__)
+            break
+        out.attempts += 1
+        out.latency_s += res.latency_s
+        budget.record(res.latency_s, vis, res.completion_tokens, mnt, retry)
+        out.raw.append(res.text)
+        if res.timed_out and not res.text.strip():
+            out.status, out.error = "timeout", res.error or "timeout"
+            break  # таймаут не ретраим — дорого
+        if res.error and not res.text.strip():
+            out.status, out.error = "error", res.error
+            break
+        pr = extract_json(res.text)
+        if pr.ok:
+            data, err = normalize(pr.data)
+            if data is not None:
+                out.ok, out.status, out.data, out.repaired = True, "ok", data, pr.repaired
+                return out
+            out.error = err
+        else:
+            out.error = pr.error
+            if fallback is not None:
+                fb = fallback(res.text)
+                if fb is not None:
+                    out.ok, out.status, out.data, out.repaired = True, "ok", fb, True
+                    return out
+        out.status = "parse_failed"
+    return out

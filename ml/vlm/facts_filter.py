@@ -30,6 +30,12 @@ _RULES: list[tuple[str, str]] = [
     ("intent", r"\bпыта(ет|ют|лся|лась)ся\s+(скрыть|украсть|спрятать|вынести|обмануть)|\bхочет\b|\bсобира(ет|ют)ся\b"),
     ("intent", r"\bкраж\w*|\bворует\b|\bукрал\w*|\bпохити\w*|\bхищени\w*|\bмошенни\w*|\bсговор\w*|\bпреступ\w*|\bвинов\w*"),
     ("intent", r"\b(intent\w*|on purpose|deliberately|in order to|trying to (steal|hide)|theft|steal\w*|fraud\w*|collusion|guilty|crime)\b"),
+    # нормы / пункты / полномочия людей — VLM их не знает и не придумывает (нормы — только norms/catalog.yaml)
+    ("norm_or_authority", r"\bпункт\w*|\bп\.\s*\d|\bстать(я|и|ей|ю)\s+\d|\bзакон\w*|\bпостановлени\w*|\bнорм(а|ы|ой|е|у|ам|ами|ах|атив\w*)\b|\bправил(а|ам|ами|ах)?\b|\bинструкци\w*|\bрегламент\w*|\bнбрк\b"),
+    ("norm_or_authority", r"\bуполномоч\w*|\bполномочи\w*|\bдопуск\w*|\bимеет\s+прав\w*|\bимеют\s+прав\w*|\bразрешени\w*|\bзапрещ\w*|\bне\s+положено\b"),
+    ("norm_or_authority", r"\b(regulation|clause|article \d+|law|authori[sz]ed|unauthori[sz]ed|permission|not allowed|prohibited)\b"),
+    # квалификация вместо наблюдения
+    ("conclusion", r"\bнаруша\w*|\bнарушени\w*|\bviolat\w*"),
     # эмоции / внутреннее состояние — не наблюдаемо
     ("mental_state", r"\bнервнича\w*|\bволну(ет|ют)ся\b|\bбоит\w*|\bзл(ой|ится)\b|\bнедовол\w*|\bспешит\b"),
     ("mental_state", r"\b(nervous|anxious|angry|afraid|wants to|intends)\b"),
@@ -40,7 +46,17 @@ _RULES: list[tuple[str, str]] = [
 
 _HEDGES = r"\bвероятно\b|\bскорее всего\b|\bпо-видимому\b|\bвидимо\b|\bнаверное\b|\bпредположительно\b|\bкажется\b|\b(probably|likely|presumably|apparently|seems to)\b"
 
+# «Якоря» наблюдаемости: факт должен называть видимую роль/объект/часть тела (иначе это не наблюдение).
+_ANCHORS = (r"кассир|человек|люд(и|ей|ьми)|посетител|клиент|инкассатор|сотрудник|рук(а|и|у|ой|ами|ах)?\b|ладон|пальц|"
+            r"телефон|смартфон|мобильн|наличн|купюр|банкнот|деньг|денег|пачк|сейф|дверц|двер|сумк|мешок|пакет|"
+            r"стол|стул|кресл|окн|стекл|перегородк|касс|ноутбук|компьютер|монитор|клавиатур|сч[её]тчик|машинк|"
+            r"чашк|кружк|стакан|бутылк|напит|ед(а|у|ы|ой)\b|пищ|бутерброд|документ|бумаг|ключ|рабоч|зон|помещени|проход|"
+            r"голов|плеч|спин|лиц(о|а|ом)\b|"
+            r"cashier|person|people|visitor|client|collector|hand|phone|cash|banknote|money|safe|door|bag|desk|"
+            r"table|chair|window|laptop|counter|cup|bottle|food|drink|document|key")
+
 _COMPILED = [(cat, re.compile(rx, re.I | re.U)) for cat, rx in _RULES]
+_ANCHOR_RE = re.compile(_ANCHORS, re.I | re.U)
 _HEDGE_RE = re.compile(_HEDGES, re.I | re.U)
 _LATIN_ONLY_RE = re.compile(r"^[^А-Яа-яЁё]*$")
 
@@ -51,13 +67,15 @@ class FilterResult:
     dropped: list[tuple[str, str]] = field(default_factory=list)  # (факт, категория)
 
 
-def check_fact(fact: str, drop_hedges: bool = True) -> str:
-    """'' — факт допустим; иначе категория нарушения."""
+def check_fact(fact: str, drop_hedges: bool = True, require_anchor: bool = True) -> str:
+    """'' — факт допустим; иначе категория нарушения. Это грубая страховка, НЕ гарантия от галлюцинаций."""
     for cat, rx in _COMPILED:
         if rx.search(fact):
             return cat
     if drop_hedges and _HEDGE_RE.search(fact):
         return "hedge"
+    if require_anchor and not _ANCHOR_RE.search(fact):
+        return "no_anchor"
     return ""
 
 
@@ -74,7 +92,7 @@ def _clean(fact: str, max_len: int) -> str:
 
 
 def filter_facts(facts: list[str], max_len: int = 220, max_items: int = 4, drop_hedges: bool = True,
-                 require_cyrillic: bool = True) -> FilterResult:
+                 require_cyrillic: bool = True, require_anchor: bool = True) -> FilterResult:
     """Чистит, дедуплицирует и отбрасывает недопустимые факты.
 
     require_cyrillic: факты для жюри — по-русски; английский ответ модели отбрасываем
@@ -90,7 +108,7 @@ def filter_facts(facts: list[str], max_len: int = 220, max_items: int = 4, drop_
         if key in seen:
             continue
         seen.add(key)
-        cat = check_fact(f, drop_hedges=drop_hedges)
+        cat = check_fact(f, drop_hedges=drop_hedges, require_anchor=require_anchor)
         if not cat and require_cyrillic and _LATIN_ONLY_RE.match(f):
             cat = "not_russian"
         if cat:

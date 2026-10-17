@@ -15,7 +15,7 @@ Violation type reference (in Russian):
 Rules:
 - Mark an item ONLY when there is a concrete visible fact (an object in a hand, an open safe door, a person at the cashier's desk, etc.).
 - Normal cashier work, serving a client across the desk/window, counting money on the desk in view of the camera is NOT a violation.
-- Never claim what cannot be seen: amounts, authenticity, identity, intentions, contents of bags or the safe.
+- Never claim what cannot be seen: amounts, authenticity, identity, intentions, authority (clearance), contents of bags or the safe. Do not cite regulations or clauses.
 - If in doubt, do not mark. An empty list is the normal answer for most fragments.
 - Key "other" is only for a concrete visible action that breaks cash-handling discipline and fits no other item; describe it in observed_facts.
 - observed_facts: IN RUSSIAN, 1–2 short sentences about visible facts.

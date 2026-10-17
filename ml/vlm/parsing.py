@@ -7,41 +7,54 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-VERIFY_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "visible": {"type": "boolean"},
-        "type_id": {"type": "string", "pattern": "^V[0-9]{2}$"},
-        "observed_facts": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "best_frame": {"type": "integer", "minimum": 1},
-        "uncertain_because": {"type": "string"},
-    },
-    "required": ["visible", "type_id", "observed_facts", "confidence", "uncertain_because"],
-}
+def verify_schema(type_ids: Optional[list[str]] = None, n_frames: int = 6) -> dict[str, Any]:
+    """JSON-схема ответа verify (для llama.cpp превращается в грамматику: enum и диапазоны соблюдаются)."""
+    n = max(1, int(n_frames))
+    tid: dict[str, Any] = {"type": "string", "enum": list(type_ids)} if type_ids else {"type": "string", "pattern": "^V[0-9]{2}$"}
+    return {
+        "type": "object",
+        "properties": {
+            "visible": {"type": "boolean"},
+            "type_id": tid,
+            "observed_facts": {"type": "array", "items": {"type": "string", "maxLength": 200}, "maxItems": 3},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "best_frame": {"type": "integer", "minimum": 1, "maximum": n},
+            "visible_frames": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": n}, "maxItems": n},
+            "uncertain_because": {"type": "string", "maxLength": 200},
+        },
+        "required": ["visible", "type_id", "observed_facts", "confidence", "best_frame", "visible_frames",
+                     "uncertain_because"],
+        "additionalProperties": False,
+    }
 
 
-def discover_schema(items: list[str]) -> dict[str, Any]:
+VERIFY_SCHEMA: dict[str, Any] = verify_schema()
+
+
+def discover_schema(items: list[str], n_frames: int = 4) -> dict[str, Any]:
+    n = max(1, int(n_frames))
     return {
         "type": "object",
         "properties": {
             "findings": {
                 "type": "array",
-                "maxItems": 4,
+                "maxItems": 3,
                 "items": {
                     "type": "object",
                     "properties": {
                         "item": {"type": "string", "enum": list(items)},
-                        "observed_facts": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+                        "observed_facts": {"type": "array", "items": {"type": "string", "maxLength": 200}, "maxItems": 2},
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        "frame": {"type": "integer", "minimum": 1},
+                        "frame": {"type": "integer", "minimum": 1, "maximum": n},
                     },
-                    "required": ["item", "observed_facts", "confidence"],
+                    "required": ["item", "observed_facts", "confidence", "frame"],
+                    "additionalProperties": False,
                 },
             },
-            "uncertain_because": {"type": "string"},
+            "uncertain_because": {"type": "string", "maxLength": 200},
         },
-        "required": ["findings"],
+        "required": ["findings", "uncertain_because"],
+        "additionalProperties": False,
     }
 
 
@@ -206,11 +219,13 @@ def coerce_conf(v: Any) -> Optional[float]:
             x /= 100.0
     else:
         return None
-    if x > 1.0 and x <= 100.0:
-        x /= 100.0
-    if x != x:  # NaN
+    if x != x or x in (float("inf"), float("-inf")):  # NaN/inf
         return None
-    return max(0.0, min(1.0, x))
+    if 1.0 < x <= 100.0:  # проценты
+        x /= 100.0
+    if x < 0.0 or x > 1.0:
+        return None  # вне диапазона — считаем, что уверенности нет (флаг confidence_invalid)
+    return x
 
 
 def coerce_type_id(v: Any, allowed: Optional[set[str]] = None) -> Optional[str]:
@@ -221,7 +236,7 @@ def coerce_type_id(v: Any, allowed: Optional[set[str]] = None) -> Optional[str]:
         return None
     tid = f"V{int(m.group(1)):02d}"
     if allowed is not None and tid not in allowed:
-        return "V99" if "V99" in allowed else None
+        return None  # вне enum каталога — флаг type_id_invalid
     return tid
 
 
@@ -256,26 +271,65 @@ def coerce_int(v: Any) -> Optional[int]:
     return None
 
 
-def normalize_verify(data: dict[str, Any], allowed_types: Optional[set[str]] = None) -> tuple[Optional[dict[str, Any]], str]:
-    """Приводит ответ verify к схеме. (None, причина) — если нет обязательного 'visible'."""
+def coerce_int_list(v: Any) -> list[int]:
+    if v is None:
+        return []
+    if isinstance(v, (int, float, str)) and not isinstance(v, bool):
+        v = [v] if not isinstance(v, str) else re.findall(r"\d+", v)
+    out: list[int] = []
+    if isinstance(v, (list, tuple)):
+        for x in v:
+            i = coerce_int(x)
+            if i is not None and i not in out:
+                out.append(i)
+    return out
+
+
+def normalize_verify(data: dict[str, Any], allowed_types: Optional[set[str]] = None,
+                     n_frames: Optional[int] = None) -> tuple[Optional[dict[str, Any]], str]:
+    """Приводит ответ verify к схеме и валидирует enum/числа/номера кадров.
+
+    (None, причина) — если нет обязательного 'visible'. Невалидные поля -> None + флаг в 'flags'.
+    """
     d = {str(k).strip().lower(): v for k, v in data.items()}
     visible = coerce_bool(d.get("visible", d.get("is_visible", d.get("violation"))))
     if visible is None:
         return None, "missing_visible"
-    conf = coerce_conf(d.get("confidence", d.get("conf")))
+    flags: list[str] = []
+    raw_conf = d.get("confidence", d.get("conf"))
+    conf = coerce_conf(raw_conf)
+    if conf is None:
+        flags.append("confidence_missing" if raw_conf is None else "confidence_invalid")
+    raw_tid = d.get("type_id", d.get("type"))
+    tid = coerce_type_id(raw_tid, allowed_types)
+    if tid is None and raw_tid not in (None, ""):
+        flags.append("type_id_invalid")
+    best = coerce_int(d.get("best_frame", d.get("frame")))
+    vis_frames = coerce_int_list(d.get("visible_frames"))
+    if n_frames is not None:
+        if best is not None and not 1 <= best <= n_frames:
+            flags.append("best_frame_out_of_range")
+            best = None
+        bad = [i for i in vis_frames if not 1 <= i <= n_frames]
+        if bad:
+            flags.append("visible_frames_out_of_range")
+            vis_frames = [i for i in vis_frames if 1 <= i <= n_frames]
     out = {
         "visible": visible,
-        "type_id": coerce_type_id(d.get("type_id", d.get("type")), allowed_types),
+        "type_id": tid,
         "observed_facts": coerce_str_list(d.get("observed_facts", d.get("facts"))),
         "confidence": 0.5 if conf is None else conf,
         "confidence_missing": conf is None,
-        "best_frame": coerce_int(d.get("best_frame", d.get("frame"))),
+        "best_frame": best,
+        "visible_frames": sorted(vis_frames),
         "uncertain_because": str(d.get("uncertain_because") or "").strip()[:300],
+        "flags": flags,
     }
     return out, ""
 
 
-def normalize_discover(data: dict[str, Any], items: list[str]) -> tuple[Optional[dict[str, Any]], str]:
+def normalize_discover(data: dict[str, Any], items: list[str],
+                       n_frames: Optional[int] = None) -> tuple[Optional[dict[str, Any]], str]:
     d = {str(k).strip().lower(): v for k, v in data.items()}
     raw = d.get("findings")
     if raw is None:
@@ -289,23 +343,35 @@ def normalize_discover(data: dict[str, Any], items: list[str]) -> tuple[Optional
     if not isinstance(raw, list):
         return None, "findings_not_list"
     findings = []
+    flags: list[str] = []
     for f in raw:
         if not isinstance(f, dict):
+            flags.append("finding_not_object")
             continue
         fd = {str(k).strip().lower(): v for k, v in f.items()}
         item = str(fd.get("item") or fd.get("name") or "").strip().lower()
         if item not in items:
+            flags.append("item_not_in_enum")
             continue
         if coerce_bool(fd.get("present", fd.get("visible", True))) is False:
             continue
-        conf = coerce_conf(fd.get("confidence"))
+        raw_conf = fd.get("confidence")
+        conf = coerce_conf(raw_conf)
+        if conf is None and raw_conf is not None:
+            flags.append("confidence_invalid")
+        frame = coerce_int(fd.get("frame", fd.get("best_frame")))
+        if frame is not None and n_frames is not None and not 1 <= frame <= n_frames:
+            flags.append("frame_out_of_range")
+            frame = None
         findings.append({
             "item": item,
             "observed_facts": coerce_str_list(fd.get("observed_facts", fd.get("fact", fd.get("facts")))),
             "confidence": 0.5 if conf is None else conf,
-            "frame": coerce_int(fd.get("frame", fd.get("best_frame"))),
+            "confidence_missing": conf is None,
+            "frame": frame,
         })
-    return {"findings": findings, "uncertain_because": str(d.get("uncertain_because") or "")[:300]}, ""
+    return {"findings": findings, "uncertain_because": str(d.get("uncertain_because") or "")[:300],
+            "flags": flags}, ""
 
 
 def regex_fallback_verify(text: str, allowed_types: Optional[set[str]] = None) -> Optional[dict[str, Any]]:
@@ -320,9 +386,11 @@ def regex_fallback_verify(text: str, allowed_types: Optional[set[str]] = None) -
     return {
         "visible": coerce_bool(mv.group(1)),
         "type_id": coerce_type_id(mt.group(1), allowed_types) if mt else None,
-        "observed_facts": [],
+        "observed_facts": [],  # из нераспарсенного текста факты не берём
         "confidence": 0.5 if conf is None else conf,
         "confidence_missing": conf is None,
         "best_frame": None,
-        "uncertain_because": "regex_fallback",
+        "visible_frames": [],
+        "uncertain_because": "",
+        "flags": ["regex_fallback"],
     }
