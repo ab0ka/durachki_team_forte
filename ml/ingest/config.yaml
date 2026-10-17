@@ -17,7 +17,7 @@ decode:
   warn_coverage: 0.98      # < 98% -> clip.meta["complete"] = False + warning
 
 storage:
-  mode: jpeg               # jpeg | raw | memmap — как хранить сэмплы в памяти
+  mode: jpeg               # jpeg (RAM, сверх max_ram_mb — temp-файл) | raw (без сжатия, тоже под max_ram_mb) | disk
   jpeg_quality: 92
   max_side: 1280           # сэмплы ужимаются по длинной стороне (0 = без ужатия); frame_at — всегда полный размер
   max_ram_mb: 512          # JPEG-байты сэмплов сверх лимита уходят во временный файл на диске
