@@ -231,3 +231,26 @@ def test_report_and_loaders_read_a03_tracks_zones(tmp_path):
     tracks, zones, info = load_track_cache(str(d))
     assert [t.track_id for t in tracks] == [t.track_id for t in res.tracks] and info == {}
     assert report_main(["--cache", str(d), "--out", str(tmp_path / "t.png")]) == 0
+
+
+def test_replay_real_reads_eval_labels_schema(tmp_path):
+    """Метки в схеме eval.labels (tools/dataprep/build_labels.py): t_sec / t_all / conflict — синтетические строки."""
+    import json
+
+    from ml.track.replay import load_labels, main as replay_main
+
+    root = _a03_cache(tmp_path)
+    (root / "labels.csv").write_text(
+        "video_id,file,label,t_sec,md5,group,t_all,conflict,raw\n"
+        "X-1,Х-1.mov,violation,16,0,X-1,16,0,synthetic\n"
+        "X-2,X-2.mov,no_violation,,0,X-2,,0,synthetic\n"
+        "X-9,X-9.mov,violation,57,0,X-9,57;68,1,synthetic\n", encoding="utf-8")
+    lab = load_labels(str(root / "labels.csv"))
+    assert lab["x-1"]["seconds"] == [16.0] and lab["x-9"]["seconds"] == [57.0, 68.0] and lab["x-9"]["conflict"]
+    out = root / "out"
+    assert replay_main(["--real", "--dets-glob", str(root / "cache" / "*" / "dets.jsonl"), "--videos-dir",
+                        str(root / "videos"), "--labels", str(root / "labels.csv"), "--variant", "no_lost_penalty",
+                        "--out", str(out)]) == 0
+    s = json.loads((out / "replay.json").read_text())["summary"]["baseline"]
+    assert s["videos"] == 2 and s["unlabeled_videos"] == 0 and s["violation_hit_within_2.0s"] == 1
+    assert s["label_conflicts"] == 0

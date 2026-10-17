@@ -67,6 +67,7 @@
 | Подмена ID при проходе посетителя перед сидящим кассиром | потерянный трек кассира забирал детекцию посетителя | `tracker.lost_cost_penalty: 0.1` — штраф потерянным трекам только при выборе пар (0 — как было) | `test_crossing_in_front_of_cashier_keeps_cashier_and_no_leave[0-4]` |
 | Конфиг не перечитывался в долгоживущем воркере; внешний `$SENTINEL_TRACK_CONFIG` не менял ключ кэша A03 | правка YAML не действовала, кэш стадии мог вернуть результат со старым конфигом | YAML кэшируется по (путь, `mtime`, размер); `ml.track.model_info()` отдаёт `config_sha` | `test_config_reload_and_model_info_follow_external_yaml` |
 | `replay --real`, `report` и `viz` не читали кэш стадий A03: `cache/<sha256>/dets.jsonl`, `tracks.json` + `zones.json`, `manifest.json` | команда замера L2 находила 0 роликов **молча**; метки не сопоставлялись, потому что папки названы по sha256 | читаются `dets.jsonl`, `tracks.json` + `zones.json`, `manifest.json["video"]`; `--videos-dir` сопоставляет sha256 с именем (считается локально); 0 файлов → явная ошибка | `test_replay_real_reads_a03_stage_cache_and_maps_sha_to_names`, `test_replay_real_without_files_fails_loudly`, `test_report_and_loaders_read_a03_tracks_zones` |
+| Метки в схеме `eval.labels` (`t_sec`, `t_all`, `conflict`) не читались | таймкод не попадал в метрику попадания | читаются `t_sec`, `t_all` (все таймкоды дубликатов), `video_id`, `conflict` | `test_replay_real_reads_eval_labels_schema` |
 
 Синтетический replay, 9 сценариев × 8 возмущений × 1 сид. Сравнение `baseline` с `no_lost_penalty` (прежнее поведение): подмены ID 1 против 6, фрагментация 31 против 39, ложные тревоги 8 против 10. Пропуски (3) и входы без изменений.
 
@@ -148,14 +149,14 @@ python -m ml.track.report --cache cache/<sha>                   # PNG-таймл
 
 ### Команда замера для L2 (одна; реальные детекции, локально)
 ```bash
-python -m ml.track.replay --real --dets-glob "cache/*/dets.jsonl" --videos-dir <папка с роликами> \
-    --labels <labels.csv> --variant smooth --tol 2.0 --out ml/track/_out/replay_real
+python -m ml.track.replay --real --dets-glob "cache/*/dets.jsonl" --videos-dir data \
+    --labels data/labels.csv --variant smooth --tol 2.0 --out ml/track/_out/replay_real
 ```
 - **Сравниваем**: `baseline` (текущие значения) против `smooth` (H-SMOOTH). Другие флаги — `--variant vis_bridge`, `appearance` или `naive_entries`, по одному за раз.
 - **Вход**:
   - кэш стадий A03 (`backend/pipeline/cache.py`): `$SENTINEL_CACHE_DIR` или `<repo>/cache`, внутри `<sha256>/dets.jsonl` и `manifest.json["video"]` (`width`, `height`, `duration`). Он появляется после прогона пайплайна с кэшем `read_write`. Подходят и дампы `detections.json` + `meta.json` (тогда `--dets-glob` указывает на них);
   - `--videos-dir` — локальная папка роликов: только для соответствия sha256 → имя; видео никуда не передаются;
-  - CSV меток с колонками `video|file`, `label|violation`, `second|t` (и необязательно `sha256`). Имена нормализуются: латинская X = кириллическая Х.
+  - метки `data/labels.csv` в схеме `eval.labels` (`tools/dataprep/build_labels.py`): `video_id`, `file`, `label`, `t_sec`, `t_all`, `conflict`, … Поддерживаются и простые CSV `video|file`, `label`, `second|t` (и необязательно `sha256`). Имена нормализуются: латинская X = кириллическая Х. Конфликтные дубликаты (`conflict=1`) считаются в `label_conflicts` — решает человек.
 - **Выход**: `replay.json` и `replay.md`.
 - **Метрики для решения**:
   - «чистые ролики с тревогой» — прокси ложных срабатываний;
@@ -219,7 +220,7 @@ person_signals(tracks, zones, times, *, extended=False) -> list[SceneState]
 ## Запуск
 ```bash
 pip install -r ml/track/requirements.txt -c <lock L1>   # версии не менять вслепую (opencv < 5)
-python -m pytest ml/track/tests -q                     # 87 тестов, без GPU/весов/данных (~25 с)
+python -m pytest ml/track/tests -q                     # 88 тестов, без GPU/весов/данных (~25 с)
 python -m pytest ml/track/tests -q -m perturbation     # только возмущения ракурса (perspective/mirror/rotation)
 python -m ml.track.viz video.mov --cache cache/<sha> [--out out.mp4] [--recompute] [--blur-heads]
 ```

@@ -197,20 +197,32 @@ def norm_name(name: str) -> str:
 
 
 def load_labels(path: Optional[str]) -> dict[str, dict]:
-    """Ключи — нормализованное имя ролика и (если есть колонка sha256) sha256 файла."""
+    """Ключи — нормализованные имя файла и video_id, а также sha256 (если есть такая колонка).
+
+    Понимает схему eval.labels (tools/dataprep/build_labels.py -> data/labels.csv):
+    video_id, file, label, t_sec, md5, group, t_all, conflict, raw. t_all — все таймкоды группы
+    дубликатов; conflict=1 — разные таймкоды или метки у дубликатов (решает человек).
+    """
     if not path:
         return {}
     out: dict[str, dict] = {}
+    num = re.compile(r"\d+(?:[.,]\d+)?")
     with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             low = {k.strip().lower(): (v or "").strip() for k, v in row.items() if k}
-            name = low.get("video") or low.get("file") or low.get("filename") or low.get("name") or ""
+            name = low.get("video") or low.get("file") or low.get("filename") or low.get("name") or low.get("video_id") or ""
             lab = (low.get("label") or low.get("violation") or low.get("verdict") or "").lower()
             viol = lab in ("1", "true", "yes", "violation", "нарушение", "да")
-            sec = re.findall(r"\d+(?:[.,]\d+)?", low.get("second") or low.get("t") or low.get("timecode") or "")
-            entry = out.setdefault(norm_name(name), {"violation": viol, "seconds": []})
-            if sec:
-                entry["seconds"].append(float(sec[0].replace(",", ".")))
+            raw_t = low.get("second") or low.get("t_sec") or low.get("t") or low.get("timecode") or ""
+            secs = [float(x.replace(",", ".")) for x in num.findall(raw_t)[:1]]
+            secs += [float(x.replace(",", ".")) for x in num.findall(low.get("t_all") or "")]
+            entry = out.setdefault(norm_name(name), {"violation": viol, "seconds": [], "conflict": False})
+            for s in secs:
+                if s not in entry["seconds"]:
+                    entry["seconds"].append(s)
+            entry["conflict"] = entry["conflict"] or low.get("conflict", "") in ("1", "true", "yes")
+            if low.get("video_id"):
+                out.setdefault(norm_name(low["video_id"]), entry)
             if low.get("sha256"):
                 out[low["sha256"].lower()] = entry
     return out
@@ -277,6 +289,7 @@ def run_real(variants: Sequence[str], dets_glob: str, labels: dict, tol: float, 
             alarm = sorted(t for k in ALARM_KINDS for t in pred.get(k, []))
             near = [min(abs(a - s) for a in alarm) for s in lab.get("seconds", []) if alarm]
             rows.append({"variant": variant, "video": vid, "cache_dir": d.name, "violation": lab.get("violation"),
+                         "label_conflict": bool(lab.get("conflict")),
                          "label_seconds": lab.get("seconds", []), "latency_ms": round(ms, 1),
                          "person_tracks": sum(1 for t in res.tracks if t.label == "person"),
                          "n_events": {k: len(pred.get(k, [])) for k in KINDS},
@@ -299,6 +312,7 @@ def run_real(variants: Sequence[str], dets_glob: str, labels: dict, tol: float, 
             "vram": "0 (stage is CPU-only)"}
     for variant in variants:
         summ[variant]["unlabeled_videos"] = sum(1 for r in rows if r["variant"] == variant and r["violation"] is None)
+        summ[variant]["label_conflicts"] = sum(1 for r in rows if r["variant"] == variant and r["label_conflict"])
     return {"mode": "real", "tol_s": tol, "rows": rows, "summary": summ,
             "note": "Все 42 строки уже использованы в разведке — это не независимый тест."}
 
