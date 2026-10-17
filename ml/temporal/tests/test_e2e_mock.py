@@ -87,7 +87,13 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
     # исходные метки обоих файлов сохранены, расхождение помечено (политика positive)
     assert x6["conflict"] and x6["label"] == 1
     assert {(s["name"], s["label"]) for s in x6["sources"]} == {("X-6", 0), ("X-9", 1)}
-    from ml.temporal import check_split
+    from ml.temporal import bench, check_split
+
+    bout = tmp_path / "bench.json"                        # та же команда, что запустит L2 (здесь — на mock)
+    assert bench.main(["--experiments", "E0,E1", "--folds", "3", "--repeats", "1", "--inner", "2",
+                       "--out", str(bout)]) == 0
+    brep = json.loads(bout.read_text(encoding="utf-8"))
+    assert set(brep["experiments"]) == {"E0", "E1"} and brep["n_groups"] == 8
 
     assert check_split.main(["--folds", "loo", "3", "--holdout", "0.25"]) == 0
     assert train.main(["--kind", "baseline", "--cv-report", str(out)]) == 0

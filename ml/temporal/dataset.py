@@ -217,8 +217,14 @@ def fit_spec(sets: Sequence[FeatureSet], bank: TextBank, cfg: dict) -> InputSpec
         spec.pca_comp = np.stack(comps).astype(np.float32)
         spec.pca_dim = k
     X = np.concatenate([_project(raw_blocks(fs, bank, spec), spec) for fs in sets], axis=0)
-    spec.mean = np.nan_to_num(np.nanmean(X, axis=0)).astype(np.float32)
-    std = np.nan_to_num(np.nanstd(X, axis=0), nan=1.0)
+    import warnings
+
+    with warnings.catch_warnings():  # полностью неизвестный столбец (напр. лаг длиннее роликов) -> среднее 0, std 1
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean = np.nanmean(X, axis=0)
+        std = np.nanstd(X, axis=0)
+    spec.mean = np.nan_to_num(mean).astype(np.float32)
+    std = np.nan_to_num(std, nan=1.0)
     spec.std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
     return spec
 

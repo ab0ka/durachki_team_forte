@@ -59,3 +59,13 @@ def test_bench_repeated_group_kfold_two_configs(cfg):
     assert {"peak", "onset"} <= set(s["timecode"]) and "recall@8" in s["candidates"]["hybrid"]
     assert rep["type_eval"] is None and "type_note" in rep
     assert "| E0 |" in bench._table(rep)
+
+
+def test_cv_invariant_to_row_order(cfg):
+    """Порядок строк/групп не влияет на результат: фолды строятся по отсортированным id групп."""
+    samples, bank = make_samples(n_pos=5, n_neg=5, T=60), make_bank()
+    a = cvmod.nested_cv(samples, bank, cfg, "baseline", outer=3, inner=2, seed=0)
+    b = cvmod.nested_cv(list(reversed(samples)), bank, cfg, "baseline", outer=3, inner=2, seed=0)
+    sa = {v["name"]: v["score"] for v in a["per_video"]}
+    sb = {v["name"]: v["score"] for v in b["per_video"]}
+    assert sa.keys() == sb.keys() and all(abs(sa[k] - sb[k]) < 1e-3 for k in sa)
