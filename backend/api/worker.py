@@ -26,8 +26,8 @@ from typing import Any, Callable, Optional
 
 from .config import Settings
 from .results import (adapt_stage_coverage, analysis_complete, coverage_problem, coverage_ratio,
-                      enforce_size, fill_missing_evidence, iter_frames, json_size, normalize,
-                      to_api_dict)
+                      enforce_evidence, enforce_size, fill_missing_evidence, iter_frames, json_size,
+                      normalize, to_api_dict)
 from .store import JobStore
 
 log = logging.getLogger("sentinel.api.worker")
@@ -53,6 +53,7 @@ class PipelineSpec:
     version: str = ""
     cancel: Optional[Callable[[str], Any]] = None      # A03: cancel(job_id) — остановить и освободить GPU
     release_gpu: Optional[Callable[[], Any]] = None    # A03: release_gpu() — при остановке сервиса
+    warmup_report: Optional[Callable[[], Any]] = None  # отчёт прогрева, если warmup() его не вернул
 
 
 def _accepts_kw(fn: Callable[..., Any], name: str) -> bool:
@@ -85,7 +86,51 @@ def resolve_pipeline(settings: Settings) -> PipelineSpec:
     return PipelineSpec(run=run, warmup=warm if callable(warm) else None, mode="real",
                         manages_gpu=manages, accepts_deadline_at=_accepts_kw(run, "deadline_at"),
                         version=version, cancel=cancel if callable(cancel) else None,
-                        release_gpu=release if callable(release) else None)
+                        release_gpu=release if callable(release) else None,
+                        warmup_report=None if fn else _report_reader(mod))
+
+
+def _report_reader(mod: Any) -> Callable[[], Any]:
+    """Отчёт прогрева пайплайна, если warmup() его не вернул: ``mod.warmup_report`` (функция или
+    dict) либо ``ModelRegistry.instance().warmup_report`` (так хранит отчёт A03 на 2055fc4)."""
+    def read() -> Any:
+        rep = getattr(mod, "warmup_report", None)
+        if callable(rep):
+            return rep()
+        if rep is not None:
+            return rep
+        try:
+            reg = getattr(mod, "ModelRegistry")
+            return getattr(reg.instance(), "warmup_report", None)
+        except Exception:
+            return None
+    return read
+
+
+def warmup_problem(report: Any) -> Optional[str]:
+    """None — прогрев согласованно успешен (или отчёта нет); иначе причина для /readyz 503.
+    Понимает: False; {"ok"/"ready": False}; {"status": failed|error}; {"error"|"errors"|
+    "hooks_error"|"synthetic_error": ...}; {"synthetic": {"status": != done}}."""
+    if report is False:
+        return "warmup() returned False"
+    if not isinstance(report, dict):
+        return None
+    for k in ("ok", "ready"):
+        if report.get(k) is False:
+            return f"warmup report: {k}=false" + (f" ({report.get('error')})" if report.get("error") else "")
+    if str(report.get("status", "")).lower() in ("failed", "error"):
+        return f"warmup report: status={report.get('status')}" + (
+            f" ({report.get('error')})" if report.get("error") else "")
+    for k in ("error", "hooks_error", "synthetic_error"):
+        if report.get(k):
+            return f"warmup {k}: {str(report[k])[:300]}"
+    errs = report.get("errors")
+    if isinstance(errs, (list, tuple, dict)) and errs:
+        return f"warmup errors: {str(errs)[:300]}"
+    syn = report.get("synthetic")
+    if isinstance(syn, dict) and syn.get("status") not in (None, "done"):
+        return f"warmup synthetic run: status={syn.get('status')}"
+    return None
 
 
 def mock_env_active() -> bool:
@@ -279,12 +324,18 @@ class JobManager:
             self.state = "warming"
             t0 = time.monotonic()
             try:
-                spec.warmup()
+                ret = spec.warmup()
+                report = ret if isinstance(ret, (dict, bool)) else (
+                    spec.warmup_report() if spec.warmup_report else None)
+                problem = warmup_problem(report)
+            except Exception as e:
+                problem = f"{type(e).__name__}: {e}"[:400]
+            if problem:  # прогрев не удался -> /readyz 503, а не «готов» с незагруженными моделями
+                self.state, self.state_detail = "warmup_failed", problem[:400]
+                log.error("pipeline warmup failed", extra={"error": self.state_detail})
+            else:
                 self.state = "ready"
                 log.info("pipeline warmed up", extra={"seconds": round(time.monotonic() - t0, 2)})
-            except Exception as e:
-                self.state, self.state_detail = "warmup_failed", f"{type(e).__name__}: {e}"[:400]
-                log.error("pipeline warmup failed", extra={"error": self.state_detail})
         else:
             self.state = "ready"
         self._warm.set()
@@ -531,7 +582,14 @@ class JobManager:
                     partial: bool = False) -> bool:
         row = self.store.get(job_id) or {}
         if self.s.evidence_fallback and row.get("video_path"):
-            warns += fill_missing_evidence(api, Path(row["video_path"]))
+            warns += fill_missing_evidence(api, Path(row["video_path"]),
+                                           tolerance_s=self.s.evidence_max_offset_s,
+                                           time_budget_s=self.s.evidence_budget_s)
+        ew, lost = enforce_evidence(api)  # нарушение без кадра -> candidates; ни одного -> failed
+        warns += ew
+        if lost:
+            self._fail(job_id, lost, "evidence_missing", details=api)
+            return False
         now = time.time()
         meta = api["meta"]
         mw = meta.get("warnings")

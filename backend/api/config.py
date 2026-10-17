@@ -46,6 +46,8 @@ class Settings:
     warmup: bool = True
     warmup_wait_s: float = 120.0
     evidence_fallback: bool = True
+    evidence_max_offset_s: float = 0.5
+    evidence_budget_s: float = 20.0
     video_validation: str = "required"
     copilot_timeout_s: float = 60.0
     min_coverage: float = 0.98

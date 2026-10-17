@@ -148,3 +148,82 @@ class Gate:
         self.started.set()
         self.release.wait(10)
         return make_result(job_id)
+
+
+# ------------------------------------------------------------------ синтетический VFR
+_MP4_CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"dinf", b"udta"}
+
+
+def _atom_chain(buf: bytes, path: list[bytes], start: int = 0, end: int | None = None,
+                chain: tuple = ()) -> tuple | None:
+    import struct
+    end = len(buf) if end is None else end
+    pos = start
+    while pos + 8 <= end:
+        size, typ = struct.unpack(">I4s", buf[pos:pos + 8])
+        hl = 8
+        if size == 1:
+            size, hl = struct.unpack(">Q", buf[pos + 8:pos + 16])[0], 16
+        elif size == 0:
+            size = end - pos
+        if typ == path[0]:
+            ch = chain + ((pos, size, hl),)
+            if len(path) == 1:
+                return ch
+            r = _atom_chain(buf, path[1:], pos + hl, pos + size, ch)
+            if r:
+                return r
+        pos += size
+    return None
+
+
+def write_vfr_mov(path: Path, fast: int = 30, slow: int = 30, slow_dt: float = 0.25,
+                  size: tuple[int, int] = (232, 424)) -> Path:
+    """Настоящий VFR-файл без внешних утилит: пишем CFR 30 fps через cv2 и переписываем stts
+    (длительности сэмплов) + длительности mdhd/mvhd/tkhd/elst. Кадр k залит яркостью (k*4)%255.
+    PTS: k/30 для k < fast, затем шаг slow_dt (1.0, 1.25, 1.5, ...)."""
+    import struct
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+    src = path.with_name(path.stem + "_cfr.mov")
+    w = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"), 30, size)
+    if not w.isOpened():
+        pytest.skip("cv2 VideoWriter cannot write mp4v/.mov here")
+    for k in range(fast + slow):
+        w.write(np.full((size[1], size[0], 3), (k * 4) % 255, np.uint8))
+    w.release()
+    b = bytearray(src.read_bytes())
+    if _atom_chain(b, [b"moov"])[0][0] < _atom_chain(b, [b"mdat"])[0][0]:
+        pytest.skip("moov before mdat: stco would need rewriting")
+    mdhd = _atom_chain(b, [b"moov", b"trak", b"mdia", b"mdhd"])[-1]
+    p = mdhd[0] + mdhd[2]
+    ts = struct.unpack(">I", b[p + 12:p + 16])[0]
+    deltas = [ts // 30] * fast + [int(ts * slow_dt)] * slow
+    chain = _atom_chain(b, [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stts"])
+    pos, old, _ = chain[-1]
+    runs: list[list[int]] = []
+    for d in deltas:
+        if runs and runs[-1][1] == d:
+            runs[-1][0] += 1
+        else:
+            runs.append([1, d])
+    body = struct.pack(">II", 0, len(runs)) + b"".join(struct.pack(">II", c, d) for c, d in runs)
+    new = struct.pack(">I4s", 8 + len(body), b"stts") + body
+    b[pos:pos + old] = new
+    for apos, asize, _ in chain[:-1]:
+        struct.pack_into(">I", b, apos, asize + len(new) - old)
+    total = sum(deltas)
+    mdhd = _atom_chain(b, [b"moov", b"trak", b"mdia", b"mdhd"])[-1]
+    struct.pack_into(">I", b, mdhd[0] + mdhd[2] + 16, total)
+    mvhd = _atom_chain(b, [b"moov", b"mvhd"])[-1]
+    q = mvhd[0] + mvhd[2]
+    mdur = int(round(total / ts * struct.unpack(">I", b[q + 12:q + 16])[0]))
+    struct.pack_into(">I", b, q + 16, mdur)
+    tkhd = _atom_chain(b, [b"moov", b"trak", b"tkhd"])[-1]
+    struct.pack_into(">I", b, tkhd[0] + tkhd[2] + 20, mdur)
+    elst = _atom_chain(b, [b"moov", b"trak", b"edts", b"elst"])
+    if elst:
+        struct.pack_into(">I", b, elst[-1][0] + elst[-1][2] + 8, mdur)
+    path.write_bytes(bytes(b))
+    src.unlink()
+    return path

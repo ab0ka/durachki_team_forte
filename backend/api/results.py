@@ -6,8 +6,10 @@ import binascii
 import dataclasses
 import json
 import math
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 VERDICTS = ("violation", "no_violation")
 
@@ -290,70 +292,237 @@ def missing_evidence(d: dict[str, Any]) -> list[int]:
     return [i for i, v in enumerate(d.get("violations") or []) if not v.get("evidence_frames")]
 
 
-def extract_jpeg(video_path: Path, t: float, max_side: int = 960, quality: int = 85,
-                 time_budget_s: float = 20.0) -> Optional[str]:
-    """Кадр в момент t как base64 JPEG. Время — только по PTS (CAP_PROP_POS_MSEC после grab):
-    fps у роликов переменный, поэтому «номер кадра = t * fps» не годится. None — не получилось."""
+# ------------------------------------------------------------------ кадр-доказательство по PTS
+EVIDENCE_ERRORS = ("no_decoder", "open_failed", "out_of_range", "bad_pts", "seek_failed",
+                   "budget_exhausted", "decode_failed", "too_far")
+
+
+@dataclass
+class FrameGrab:
+    """Итог поиска кадра для момента ``requested``: либо JPEG с ФАКТИЧЕСКИМ PTS кадра, либо явная
+    причина отказа (``error`` из EVIDENCE_ERRORS). Подписывать кадр запрошенным временем нельзя."""
+    requested: float
+    ok: bool = False
+    jpeg_b64: Optional[str] = None
+    pts: Optional[float] = None
+    error: Optional[str] = None
+    detail: str = ""
+
+    def fail(self, error: str, detail: str = "") -> "FrameGrab":
+        self.ok, self.jpeg_b64, self.pts, self.error, self.detail = False, None, None, error, detail
+        return self
+
+
+_CAP_PROP_POS_MSEC = 0  # cv2.CAP_PROP_POS_MSEC (константа OpenCV)
+
+
+def grab_frame_at(video_path: Path, t: float, *, tolerance_s: float = 0.5,
+                  time_budget_s: float = 10.0, max_side: int = 960, quality: int = 85,
+                  duration: Optional[float] = None, pre_roll_s: float = 2.0,
+                  capture_factory: Optional[Callable[[str], Any]] = None,
+                  clock: Callable[[], float] = time.monotonic) -> FrameGrab:
+    """Кадр, ближайший к t, только по PTS (CAP_PROP_POS_MSEC после grab; fps бывает переменным).
+
+    * |PTS кадра - t| <= tolerance_s, иначе ``too_far`` / ``out_of_range`` — кадр «с начала ролика»
+      вместо нужного не подставляется;
+    * t вне [0, длительность + tolerance] -> ``out_of_range`` без декодирования;
+    * PTS не число / отрицательный / идёт назад / не меняется -> ``bad_pts``;
+    * seek не удался или перескочил дальше t -> повторный проход с начала по PTS; не вышло ->
+      ``seek_failed``; бюджет времени кончился -> ``budget_exhausted``."""
+    g = FrameGrab(requested=float(t) if _num(t) is not None else float("nan"))
+    target = _num(t)
+    if target is None or target < 0:
+        return g.fail("out_of_range", f"timecode {t!r} is not a finite non-negative number")
+    tol = max(0.0, float(tolerance_s))
+    if duration is None:
+        duration = _num(_probe_duration(video_path))
+    if duration is not None and target > duration + tol:
+        return g.fail("out_of_range", f"timecode {target:.3f}s is beyond video duration {duration:.3f}s")
+    cv2 = None
+    if capture_factory is None:
+        try:
+            import cv2  # lazy
+        except ImportError:
+            return g.fail("no_decoder", "opencv is not installed")
+        capture_factory = cv2.VideoCapture
+    deadline = clock() + max(0.0, float(time_budget_s))
+
+    def open_cap() -> Any:
+        cap = capture_factory(str(video_path))
+        return cap if cap is not None and cap.isOpened() else None
+
+    cap = open_cap()
+    if cap is None:
+        return g.fail("open_failed", "decoder could not open the video")
     try:
-        import cv2  # lazy
-    except ImportError:
+        seek_note = ""
+        if target > pre_roll_s + 1.0:  # грубо подойти к t; дальше — только по PTS
+            sought = bool(cap.set(_CAP_PROP_POS_MSEC, (target - pre_roll_s) * 1000.0))
+            first = cap.get(_CAP_PROP_POS_MSEC) / 1000.0 if sought and cap.grab() else None
+            if not sought or first is None or _num(first) is None or first > target + tol:
+                seek_note = ("seek rejected by decoder" if not sought else
+                             "no frame after seek" if first is None or _num(first) is None else
+                             f"seek landed at {first:.3f}s, past {target:.3f}s")
+                cap.release()
+                cap = open_cap()  # проход с начала по PTS
+                if cap is None:
+                    return g.fail("seek_failed", f"{seek_note}; reopen for sequential read failed")
+            else:
+                res = _walk_pts(cap, target, tol, deadline, clock, start=(first, cap))
+                return _finish(g, res, target, tol, max_side, quality, seek_note)
+        res = _walk_pts(cap, target, tol, deadline, clock)
+        return _finish(g, res, target, tol, max_side, quality, seek_note)
+    except Exception as e:  # noqa: BLE001 — сбой декодера = нет доказательства, а не случайный кадр
+        return g.fail("decode_failed", f"{type(e).__name__}: {e}"[:200])
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def _probe_duration(video_path: Path) -> Optional[float]:
+    try:
+        from .uploads import probe_mp4
+        return probe_mp4(Path(video_path)).get("duration")
+    except Exception:
         return None
-    import time as _time
 
-    target = max(0.0, float(t))
 
-    def walk(cap: Any, deadline: float) -> Any:
-        frame, prev = None, None
-        while _time.monotonic() < deadline:
+def _walk_pts(cap: Any, target: float, tol: float, deadline: float, clock: Callable[[], float],
+              start: Optional[tuple[float, Any]] = None) -> dict[str, Any]:
+    """Идём по кадрам, читая PTS; декодируем только кадры в окне [t - tol, t + tol]."""
+    best: Optional[tuple[float, Any]] = None
+    last_pts: Optional[float] = None
+    zero_run = 0
+    pending = start is not None
+    while True:
+        if clock() > deadline:
+            return {"best": best, "last": last_pts, "error": "budget_exhausted"}
+        if pending:
+            pending = False
+            pts = start[0]  # type: ignore[index]
+        else:
             if not cap.grab():
                 break
-            pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            if pos + 1e-3 >= target:
-                ok, fr = cap.retrieve()
-                return fr if ok else prev
-            ok, prev = cap.retrieve() if pos >= target - 1.0 else (False, prev)
-        return frame if frame is not None else prev
+            pts = cap.get(_CAP_PROP_POS_MSEC) / 1000.0
+        if _num(pts) is None or pts < -1e-3:
+            return {"best": None, "last": last_pts, "error": "bad_pts",
+                    "detail": f"decoder reported PTS {pts!r}"}
+        if last_pts is not None:
+            if pts + 0.5 < last_pts:
+                return {"best": None, "last": last_pts, "error": "bad_pts",
+                        "detail": f"PTS went backwards: {last_pts:.3f}s -> {pts:.3f}s"}
+            zero_run = zero_run + 1 if pts == last_pts else 0
+            if zero_run >= 3:
+                return {"best": None, "last": last_pts, "error": "bad_pts",
+                        "detail": f"PTS stuck at {pts:.3f}s: no usable timestamps"}
+        last_pts = pts
+        if pts < target - tol:
+            continue
+        if pts > target + tol:
+            break
+        ok, frame = cap.retrieve()
+        if ok and frame is not None and getattr(frame, "size", 0):
+            if best is None or abs(pts - target) < abs(best[0] - target):
+                best = (pts, frame)
+        if pts >= target:
+            break  # следующие кадры только дальше от t
+    return {"best": best, "last": last_pts, "error": None}
 
-    deadline = _time.monotonic() + time_budget_s
-    frame = None
-    cap = cv2.VideoCapture(str(video_path))
-    try:
-        if not cap.isOpened():
-            return None
-        if target > 3.0:  # грубый переход ближе к t, дальше — по PTS
-            cap.set(cv2.CAP_PROP_POS_MSEC, (target - 2.0) * 1000.0)
-            if cap.grab() and cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 > target + 0.05:
-                cap.release()  # перескочили (VFR) — идём с начала
-                cap = cv2.VideoCapture(str(video_path))
-        frame = walk(cap, deadline)
-        if frame is None:
-            cap.release()
-            cap = cv2.VideoCapture(str(video_path))
-            ok, frame = cap.read()
-            if not ok:
-                return None
+
+def _finish(g: FrameGrab, res: dict[str, Any], target: float, tol: float, max_side: int,
+            quality: int, seek_note: str) -> FrameGrab:
+    best, last = res.get("best"), res.get("last")
+    note = f" ({seek_note})" if seek_note else ""
+    if best is not None and abs(best[0] - target) <= tol:
+        try:
+            import cv2  # lazy
+        except ImportError:
+            return g.fail("no_decoder", "opencv is not installed")
+        frame = best[1]
         h, w = frame.shape[:2]
         k = max_side / max(h, w)
         if k < 1:
             frame = cv2.resize(frame, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA)
         ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-        return base64.b64encode(buf.tobytes()).decode("ascii") if ok else None
-    except Exception:
-        return None
-    finally:
-        cap.release()
+        if not ok:
+            return g.fail("decode_failed", "JPEG encoding failed")
+        g.ok, g.pts, g.error = True, round(float(best[0]), 3), None
+        g.jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+        g.detail = seek_note
+        return g
+    err = res.get("error")
+    if err == "bad_pts":
+        return g.fail("bad_pts", str(res.get("detail") or "") + note)
+    if err == "budget_exhausted":
+        return g.fail("budget_exhausted", f"time budget ran out before PTS {target:.3f}s "
+                                          f"(last PTS {last if last is not None else 'none'}){note}")
+    if last is None:
+        return g.fail("seek_failed" if seek_note else "decode_failed",
+                      "no frame could be decoded" + note)
+    if last < target - tol:
+        return g.fail("out_of_range", f"video ends at PTS {last:.3f}s before {target:.3f}s{note}")
+    return g.fail("too_far", f"no frame within {tol:.2f}s of {target:.3f}s{note}")
 
 
-def fill_missing_evidence(d: dict[str, Any], video_path: Path) -> list[str]:
-    """ТЗ требует кадр к каждому нарушению: если fusion его не дал — берём кадр в timecode_sec."""
-    warns = []
+def extract_jpeg(video_path: Path, t: float, max_side: int = 960, quality: int = 85,
+                 time_budget_s: float = 20.0, tolerance_s: float = 0.5) -> Optional[str]:
+    """Кадр в момент t как base64 JPEG или None (нет кадра ближе tolerance_s). Подробности и
+    фактический PTS — grab_frame_at()."""
+    g = grab_frame_at(video_path, t, tolerance_s=tolerance_s, time_budget_s=time_budget_s,
+                      max_side=max_side, quality=quality)
+    return g.jpeg_b64 if g.ok else None
+
+
+def fill_missing_evidence(d: dict[str, Any], video_path: Path, *, tolerance_s: float = 0.5,
+                          time_budget_s: float = 20.0,
+                          grab: Optional[Callable[..., FrameGrab]] = None) -> list[str]:
+    """ТЗ требует кадр к каждому нарушению. Если fusion его не дал — ищем кадр по PTS у timecode_sec
+    и подписываем ФАКТИЧЕСКИМ PTS. Не нашли — evidence_error у нарушения, кадр не выдумываем.
+    time_budget_s — общий на все нарушения задачи."""
+    grab = grab or grab_frame_at
+    warns: list[str] = []
+    end = time.monotonic() + max(0.0, float(time_budget_s))
+    duration = _num(_probe_duration(video_path))
     for i in missing_evidence(d):
         v = d["violations"][i]
-        b64 = extract_jpeg(video_path, v["timecode_sec"])
-        if b64:
-            v["evidence_frames"] = [{"timestamp_sec": v["timecode_sec"], "image_base64": b64}]
-            warns.append(f"violation[{i}]: evidence frame extracted by API at timecode (no blur applied)")
+        left = end - time.monotonic()
+        if left <= 0:
+            g = FrameGrab(requested=v["timecode_sec"]).fail("budget_exhausted",
+                                                            "evidence time budget of the job is spent")
+        else:
+            g = grab(video_path, v["timecode_sec"], tolerance_s=tolerance_s, time_budget_s=left,
+                     duration=duration)
+        if g.ok:
+            v["evidence_frames"] = [{"timestamp_sec": g.pts, "image_base64": g.jpeg_b64}]
+            v.pop("evidence_error", None)
+            warns.append(f"violation[{i}]: evidence frame extracted by API at PTS {g.pts:.3f}s "
+                         f"(requested {v['timecode_sec']:.3f}s, no blur applied)")
+        else:
+            v["evidence_error"] = f"{g.error}: {g.detail}"[:300]
+            warns.append(f"violation[{i}]: no evidence frame ({g.error}: {g.detail})"[:300])
     return warns
+
+
+def enforce_evidence(d: dict[str, Any]) -> tuple[list[str], Optional[str]]:
+    """Нарушение без кадра-доказательства жюри не отдаём: уходит в candidates (только UI) с причиной.
+    Если при вердикте violation не осталось ни одного нарушения с кадром — задача failed (а НЕ
+    no_violation: потеря доказательства не означает отсутствие нарушения). (предупреждения, причина)."""
+    warns: list[str] = []
+    keep, lost = [], []
+    for v in d.get("violations") or []:
+        (keep if v.get("evidence_frames") else lost).append(v)
+    if not lost:
+        return warns, None
+    for v in lost:
+        v.setdefault("evidence_error", "no evidence frame")
+    d["violations"] = keep
+    d["candidates"] = list(d.get("candidates") or []) + lost
+    reasons = "; ".join(sorted({str(v["evidence_error"])[:120] for v in lost}))
+    warns.append(f"{len(lost)} violation(s) without evidence frame moved to candidates: {reasons}"[:400])
+    if d.get("verdict") == "violation" and not keep:
+        return warns, ("violation detected but no evidence frame could be provided "
+                       f"(not reported as no_violation): {reasons}")[:500]
+    return warns, None
 
 
 def iter_frames(d: dict[str, Any]) -> list[tuple[int, int, dict[str, Any]]]:
@@ -395,7 +564,8 @@ def schema_errors(d: dict[str, Any]) -> list[str]:
 
 
 # ------------------------------------------------------------------ представления и размер ответа
-UI_ONLY_KEYS = ("candidates", "verdict_state", "partial")
+UI_ONLY_KEYS = ("candidates", "verdict_state", "partial", "analysis_complete", "warnings",
+                "coverage_problem")  # остаются только в UI-ответе; у жюри — поля ТЗ + доп. поля нарушений
 
 
 def jury_description(v: dict[str, Any]) -> str:

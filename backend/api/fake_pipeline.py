@@ -56,7 +56,7 @@ def _catalog_rules(type_id: str) -> list[Any]:
 def make_fake_runner(seconds: float = 3.0) -> Callable[..., Any]:
     def run(video_path: str, job_id: str, progress: Callable[[str, float], None],
             deadline_s: float = 240) -> Any:
-        from .results import extract_jpeg
+        from .results import grab_frame_at
         from .uploads import probe_mp4
         try:
             from contracts.sentinel_contracts import (  # type: ignore
@@ -71,7 +71,11 @@ def make_fake_runner(seconds: float = 3.0) -> Callable[..., Any]:
             time.sleep(total / len(stages))
         duration = float(probe_mp4(Path(video_path)).get("duration") or 10.0)
         t = round(max(0.0, duration * 0.4), 2)
-        img = extract_jpeg(Path(video_path), t) or _placeholder(t)
+        g = grab_frame_at(Path(video_path), t)
+        if g.ok:  # фактический PTS кадра, а не запрошенное время
+            t, img = float(g.pts or t), g.jpeg_b64 or ""
+        else:
+            img = _placeholder(t)  # фейк: явно синтетическая картинка с надписью FAKE
         rules_raw, name = _catalog_rules("V01")
         rules = []
         for r in rules_raw:
