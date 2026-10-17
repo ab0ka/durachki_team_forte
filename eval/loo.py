@@ -328,6 +328,8 @@ def nested_cv(rows: list[dict], tuner: Optional[Tuner] = None, folds: int = 5, s
         if not test or not train:
             continue
         assert_no_leak(train, test)
+        if not any(it.positive for it in train) or all(it.positive for it in train):
+            raise ValueError(f"в outer-train фолда {i} нет обоих классов — порог не подобрать (мало групп?)")
         params = tuner.fit(train)                       # подбор только на outer-train
         fp = [(it.positive, tuner.predict(params, it)) for it in test]
         pairs += fp
@@ -353,7 +355,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     except TunerContractError as e:
         print(f"тюнер {args.tuner}: контракт не совпал — {e}", file=sys.stderr)
         return 2
-    res = {"logo": logo(rows, tuner), "nested_cv": nested_cv(rows, tuner, args.folds, args.seed)}
+    try:
+        res = {"logo": logo(rows, tuner), "nested_cv": nested_cv(rows, tuner, args.folds, args.seed)}
+    except (ValueError, TunerContractError) as e:   # явный отказ (данных/контракта), без подменного результата
+        print(f"LOGO/nested CV не выполнены: {e}", file=sys.stderr)
+        return 2
     write_json(args.out or Path(args.scores).with_name(f"loo_{args.tuner}.json"), res)
     print(EXPLORATORY)
     for k, v in res.items():

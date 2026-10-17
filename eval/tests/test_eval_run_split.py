@@ -73,6 +73,7 @@ def _fake_pipeline(calls: list) -> types.ModuleType:
 
     mod.run = run
     mod.warmup = lambda: None
+    mod.release_gpu = lambda: calls.append("release_gpu") or {}      # A03: остановить воркер после прогона
     return mod
 
 
@@ -98,6 +99,7 @@ def test_run_inproc_end_to_end(tmp_path: Path, monkeypatch, capsys, mock_mode):
                       "--label", "baseline-mock", "--env", "SENTINEL_FLAG_TEST=1"])
     assert rc == 0
     assert not any("47" in Path(c).name for c in calls)                # дубликат X-47 не гоняем
+    assert calls[-1] == "release_gpu"                                   # воркер пайплайна остановлен (иначе висим на выходе)
     preds = sorted(p.name for p in (out / "preds").glob("X-*.json"))
     assert len(preds) == 8
     m = json.loads((out / "metrics.json").read_text(encoding="utf-8"))

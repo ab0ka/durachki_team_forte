@@ -37,7 +37,8 @@ TYPES_NOTE = "Точность типа считается только по н�
 NORMS_NOTE = ("Проверяется полнота и формат ссылок (rule есть, из каталога, флаг verified). Наличие quote/URL "
               "≠ правильная трактовка нормы — корректность только по ручной экспертизе (data/norms_review.csv).")
 _TIMEOUT_RE = ("timeout", "time out", "timed out", "deadline", "таймаут", "тайм-аут", "превышен")
-_DEGRADED_RE = ("deadline", "timeout", "budget", "skipped", "skip ", "таймаут", "бюджет", "пропущ", "fallback")
+_DEGRADED_RE = ("deadline", "timeout", "budget", "таймаут", "бюджет", "дедлайн", "fallback")
+_DEGRADED_STAGE = ("timeout", "crashed", "cancelled")
 
 
 # ----------------------------------------------------------------------------- загрузка
@@ -233,6 +234,26 @@ def _is_mock(api: dict) -> bool:
     return meta.get("mock") is True or (isinstance(meta.get("provenance"), dict) and meta["provenance"].get("mock") is True)
 
 
+def _degraded(api: dict, texts: list[str]) -> bool:
+    """Деградация анализа: A03 meta.degraded, стадия timeout/crashed/cancelled, пропуск по дедлайну/бюджету,
+    fallback. «skipped — нет кандидатов» — штатный пропуск, не деградация."""
+    meta = api.get("meta") or {}
+    if meta.get("degraded") is True:
+        return True
+    stages = meta.get("stages") if isinstance(meta.get("stages"), dict) else {}
+    for st in stages.values():
+        if not isinstance(st, dict):
+            continue
+        err = str(st.get("error") or "").lower()
+        if st.get("status") in _DEGRADED_STAGE or st.get("origin") == "fallback":
+            return True
+        if st.get("status") == "skipped" and any(k in err for k in ("дедлайн", "deadline", "бюджет", "budget", "отмена")):
+            return True
+    if stages:   # структурированные статусы есть — свободный текст предупреждений не переинтерпретируем
+        return False
+    return any(k in t for t in texts for k in _DEGRADED_RE)
+
+
 def _texts(api: dict, info: dict) -> list[str]:
     meta = api.get("meta") or {}
     out = [str(info.get("error") or ""), str(api.get("error") or ""), str(meta.get("error") or "")]
@@ -301,7 +322,7 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
     if ve.status != "done":
         ve.timeout = bool(info.get("timeout")) or any(k in t for t in texts for k in _TIMEOUT_RE)
     else:
-        ve.degraded = any(k in t for t in texts for k in _DEGRADED_RE)
+        ve.degraded = _degraded(api, texts)
     ve.duration = _duration(api, info or {})
     rep = check_api_response(api, duration=ve.duration, max_frames=int(cfg.get("max_evidence_frames", 3)))
     ve.schema_errors, ve.schema_warnings = rep.errors, rep.warnings

@@ -183,3 +183,13 @@ def test_cli_fusion_contract_error_exit_code(tmp_path: Path, monkeypatch, capsys
     assert main(["--scores", str(p), "--tuner", "scalar"]) == 0
     out = json.loads((tmp_path / "loo_scalar.json").read_text(encoding="utf-8"))
     assert out["logo"]["status"] == "exploratory" and out["nested_cv"]["leakage_check"] == "ok"
+
+
+def test_too_few_groups_is_explicit_error(tmp_path: Path, capsys):
+    rows = _rows()[:2]                                   # 1 позитив + 1 негатив: после LOGO в train один класс
+    with pytest.raises(ValueError, match="обоих классов"):
+        logo(rows, ScalarThresholdTuner())
+    p = tmp_path / "s.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    assert main(["--scores", str(p)]) == 2 and "не выполнены" in capsys.readouterr().err
+    assert not (tmp_path / "loo_scalar.json").exists()   # никакого подменного результата

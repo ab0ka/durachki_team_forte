@@ -70,6 +70,15 @@ class InprocRunner:
             except Exception as e:  # noqa: BLE001
                 print(f"warmup: {e}", file=sys.stderr)
 
+    def close(self) -> None:
+        """Остановить воркер пайплайна (A03 release_gpu): иначе процесс eval ждёт его на выходе."""
+        rel = getattr(self.pipeline, "release_gpu", None)
+        if callable(rel):
+            try:
+                rel()
+            except Exception as e:  # noqa: BLE001 — метрики уже посчитаны; сообщаем, не маскируем
+                print(f"release_gpu: {e!r}", file=sys.stderr)
+
     def run_one(self, path: Path, video_id: str) -> tuple[dict, dict]:
         from .protocol import VramSampler, torch_peak_mb
 
@@ -105,6 +114,9 @@ class ApiRunner:
         self.url, self.key, self.cfg, self.raw = url.rstrip("/"), key, cfg, raw
         r = cfg.get("runner") or {}
         self.poll_s, self.timeout_s = float(r.get("api_poll_s", 2.0)), float(r.get("api_timeout_s", 600))
+
+    def close(self) -> None:
+        self.s.close()
 
     def run_one(self, path: Path, video_id: str) -> tuple[dict, dict]:
         info: dict[str, Any] = {"video_id": video_id, "file": str(path), "mode": "api"}
@@ -240,14 +252,17 @@ def run_folder(videos: list[tuple[str, Path]], out_dir: Path, cfg: dict, mode: s
         results = run_cli_batch(todo, out_dir, cfg, raw)
     else:
         runner = ApiRunner(api_url, api_key, cfg, raw) if mode == "api" else InprocRunner(cfg, raw)
-        for i, (vid, p) in enumerate(todo, 1):
-            api, info = runner.run_one(p, vid)
-            results[vid] = (api, info)
-            log(f"[{i}/{len(todo)}] {vid}: {api.get('status')} {api.get('verdict')} "
-                f"{info.get('latency_s')} с {('ОШИБКА ' + info['error']) if info.get('error') else ''}")
-            write_json(preds_dir / f"{vid}.json", api)
-            runinfo[vid] = info
-            write_json(runinfo_path, runinfo)
+        try:
+            for i, (vid, p) in enumerate(todo, 1):
+                api, info = runner.run_one(p, vid)
+                results[vid] = (api, info)
+                log(f"[{i}/{len(todo)}] {vid}: {api.get('status')} {api.get('verdict')} "
+                    f"{info.get('latency_s')} с {('ОШИБКА ' + info['error']) if info.get('error') else ''}")
+                write_json(preds_dir / f"{vid}.json", api)
+                runinfo[vid] = info
+                write_json(runinfo_path, runinfo)
+        finally:
+            runner.close()
     for vid, (api, info) in results.items():
         write_json(preds_dir / f"{vid}.json", api)
         runinfo[vid] = info

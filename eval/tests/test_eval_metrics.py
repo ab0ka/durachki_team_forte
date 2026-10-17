@@ -228,3 +228,23 @@ def test_l1_labels_format_and_policy_whatif(tmp_path: Path):
     assert tp["timecode_sec"]["median_abs_dt"] == 1.5 and tp["t_start"]["median_abs_dt"] == pytest.approx(0.2)
     assert tp["t_start"]["hit"]["0.5"] == 1.0 and tp["timecode_sec"]["hit"]["0.5"] == 0.0
     assert res["summary"]["conflict_groups"][0]["gt_alternatives"] == [57.0, 68.0]
+
+
+def test_degraded_uses_a03_structured_status(tmp_path: Path):
+    """«vlm_verify: skipped — нет кандидатов» — штатно; timeout/дедлайн/fallback/meta.degraded — деградация."""
+    rows = [LabelRow(f"X-{i}", "no_violation", []) for i in range(1, 6)]
+    p = tmp_path / "l.csv"
+    write_labels_csv(rows, p)
+    ok_skip = {"vlm_verify": {"status": "skipped", "error": "нет кандидатов"}, "detect": {"status": "ok"}}
+    preds = {
+        "X-1": make_pred("a", [], meta={"stages": ok_skip,
+                                        "warnings": ["дополнительная стадия vlm_verify: skipped — нет кандидатов"]}),
+        "X-2": make_pred("b", [], meta={"stages": {"detect": {"status": "timeout"}}}),
+        "X-3": make_pred("c", [], meta={"stages": {"vlm_discover": {"status": "skipped",
+                                                                    "error": "до дедлайна осталось 3.0 с"}}}),
+        "X-4": make_pred("d", [], meta={"degraded": True}),
+        "X-5": make_pred("e", [], meta={"stages": {"detect": {"status": "ok", "origin": "fallback"}}}),
+    }
+    res = evaluate(load_ground_truth(p), preds, {}, load_config())
+    deg = {e["video_id"]: e["degraded"] for e in res["per_video"]}
+    assert deg == {"X-1": False, "X-2": True, "X-3": True, "X-4": True, "X-5": True}
