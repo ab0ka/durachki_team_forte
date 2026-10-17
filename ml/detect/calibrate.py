@@ -183,7 +183,7 @@ def owl_producer(cfg: dict[str, Any], min_score: float = 0.05) -> Callable[[np.n
         boxes, probs = sc.score([img])[0]
         G = _group_scores(probs, sc.texts, queries)
         parts = []
-        for g, lab in GROUP_TO_LABEL.items():
+        for g in GROUP_TO_LABEL:
             m = G[g] >= min_score
             if m.any():
                 parts.append(RawDets(boxes[m], G[g][m].astype(np.float32), [g] * int(m.sum()), ["owl"] * int(m.sum())))
