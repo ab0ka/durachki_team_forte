@@ -34,6 +34,7 @@ class Settings:
     max_attempts: int = 3
     max_zombie_workers: int = 2
     zombie_release_gpu: bool = False
+    cancel_on_timeout: bool = True
     hung_gpu_s: float = 60.0
     restart_fresh_budget: bool = False
     pass_deadline_at: bool = True
@@ -45,11 +46,15 @@ class Settings:
     warmup: bool = True
     warmup_wait_s: float = 120.0
     evidence_fallback: bool = True
+    evidence_max_offset_s: float = 0.5
+    evidence_budget_s: float = 20.0
     video_validation: str = "required"
     copilot_timeout_s: float = 60.0
-    min_coverage: float = 0.95
+    min_coverage: float = 0.98
+    coverage_adapt_stages: bool = False
     partial_accept: bool = False
     jury_profile: str = "extended"
+    jury_embed_rule: bool = False
     max_response_mb: float = 3.0
     dedup: bool = True
 

@@ -63,6 +63,9 @@ def test_frames_endpoint(client_factory):
 
 
 def test_copilot_501_then_router(client_factory, monkeypatch):
+    # без copilot -> 501, даже если в дереве есть настоящий модуль A14 (интеграция)
+    monkeypatch.setitem(sys.modules, "copilot", None)
+    monkeypatch.setitem(sys.modules, "copilot.router", None)
     with client_factory(spec(ok_run)) as c:
         jid = _job(c)
         r = c.post(f"/api/v1/jobs/{jid}/ask", headers=H, json={"question": "почему?"})

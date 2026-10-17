@@ -23,6 +23,7 @@ max_queue: 12                   # backlog: активных (в очереди +
 max_attempts: 3                 # перезапусков после падения процесса
 max_zombie_workers: 2           # сколько «зависших» потоков терпим, подменяя их новыми
 zombie_release_gpu: false       # false: GPU остаётся за зависшим run() (один владелец GPU вместе с A03)
+cancel_on_timeout: true         # по таймауту вызвать backend.pipeline.cancel(job_id) (A03), если он есть
 hung_gpu_s: 60                  # зависший run() держит GPU дольше -> /readyz 503 (сигнал перезапуска)
 restart_fresh_budget: false     # false: после рестарта дедлайн по-прежнему от приёма файла
 pass_deadline_at: true          # передавать run(..., deadline_at=приём+budget_s), если run его принимает
@@ -34,16 +35,23 @@ fake_pipeline_s: 3.0
 allow_mock: false               # SENTINEL_MOCK=1 или meta.mock в результате -> readyz 503 / задача failed
 warmup: true
 warmup_wait_s: 120              # воркер ждёт прогрева не дольше
-evidence_fallback: true         # нет кадров у нарушения -> вырезать кадр из видео (cv2)
+evidence_fallback: true         # нет кадров у нарушения -> найти кадр по PTS у timecode_sec (cv2)
+evidence_max_offset_s: 0.5      # допуск |PTS кадра - timecode| ; дальше -> кадра нет (не «первый кадр»)
+evidence_budget_s: 20           # общий бюджет поиска кадров на задачу; кончился -> кадра нет
+                                # нарушение без кадра уходит в candidates (UI); ни одного с кадром -> failed
 video_validation: required      # required: файл должен открыться декодером (cv2/PyAV/ffprobe), иначе 415
                                 # best_effort: нет декодера -> только сигнатура; off: только сигнатура
 copilot_timeout_s: 60
 
 # --- честность и полнота результата ---
-min_coverage: 0.95              # meta.completeness/meta.coverage ниже -> анализ неполный
+min_coverage: 0.98              # meta.coverage.ratio ниже (или нет meta.coverage) -> no_violation не выдаётся
+                                # (как contracts: coverage.min_ratio_for_no_violation у A01)
+coverage_adapt_stages: false    # НОВЫЙ РЕЖИМ (выкл. до замера L2): покрытие A03 «по стадиям» -> ratio A01
+                                # = min по required_stages. Без него (и без исправления A03/A01) чистые видео = failed
 partial_accept: false           # НОВЫЙ РЕЖИМ (выкл. до замера L2): по таймауту отдать partial.json как done,
                                 # только если полнота >= min_coverage; иначе всегда failed с причиной
 jury_profile: extended          # extended: поля ТЗ + доп. (type_id, rules, meta…); strict: ровно поля ТЗ
+jury_embed_rule: false          # strict: дописывать норму rules[0] в description (у A01 по умолчанию false)
 max_response_mb: 3.0            # ответ GET /jobs/{id} не больше (кадры ужимаются)
 dedup: true                     # тот же файл (sha256) + та же версия пайплайна -> тот же job/результат
 

@@ -7,6 +7,7 @@ meta.completeness); иначе он — лишь подробности для U
 from __future__ import annotations
 
 import base64
+import dataclasses
 import importlib
 import inspect
 import json
@@ -24,8 +25,9 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .config import Settings
-from .results import (analysis_complete, coverage_ratio, enforce_size, fill_missing_evidence,
-                      iter_frames, json_size, normalize, to_api_dict)
+from .results import (adapt_stage_coverage, analysis_complete, coverage_problem, coverage_ratio,
+                      enforce_evidence, enforce_size, fill_missing_evidence, iter_frames, json_size,
+                      normalize, to_api_dict)
 from .store import JobStore
 
 log = logging.getLogger("sentinel.api.worker")
@@ -49,6 +51,9 @@ class PipelineSpec:
     manages_gpu: bool = False     # pipeline сам держит GPU-лок -> API не оборачивает run()
     accepts_deadline_at: bool = False
     version: str = ""
+    cancel: Optional[Callable[[str], Any]] = None      # A03: cancel(job_id) — остановить и освободить GPU
+    release_gpu: Optional[Callable[[], Any]] = None    # A03: release_gpu() — при остановке сервиса
+    warmup_report: Optional[Callable[[], Any]] = None  # отчёт прогрева, если warmup() его не вернул
 
 
 def _accepts_kw(fn: Callable[..., Any], name: str) -> bool:
@@ -76,9 +81,56 @@ def resolve_pipeline(settings: Settings) -> PipelineSpec:
     warm = getattr(mod, "warmup", None) if not fn else None
     manages = any(hasattr(mod, a) for a in ("GPU_LOCK", "GPU_SEMAPHORE", "gpu_lock"))
     version = str(getattr(mod, "PIPELINE_VERSION", None) or getattr(mod, "__version__", None) or "")
+    cancel = getattr(mod, "cancel", None) if not fn else None
+    release = getattr(mod, "release_gpu", None) if not fn else None
     return PipelineSpec(run=run, warmup=warm if callable(warm) else None, mode="real",
                         manages_gpu=manages, accepts_deadline_at=_accepts_kw(run, "deadline_at"),
-                        version=version)
+                        version=version, cancel=cancel if callable(cancel) else None,
+                        release_gpu=release if callable(release) else None,
+                        warmup_report=None if fn else _report_reader(mod))
+
+
+def _report_reader(mod: Any) -> Callable[[], Any]:
+    """Отчёт прогрева пайплайна, если warmup() его не вернул: ``mod.warmup_report`` (функция или
+    dict) либо ``ModelRegistry.instance().warmup_report`` (так хранит отчёт A03 на 2055fc4)."""
+    def read() -> Any:
+        rep = getattr(mod, "warmup_report", None)
+        if callable(rep):
+            return rep()
+        if rep is not None:
+            return rep
+        try:
+            reg = getattr(mod, "ModelRegistry")
+            return getattr(reg.instance(), "warmup_report", None)
+        except Exception:
+            return None
+    return read
+
+
+def warmup_problem(report: Any) -> Optional[str]:
+    """None — прогрев согласованно успешен (или отчёта нет); иначе причина для /readyz 503.
+    Понимает: False; {"ok"/"ready": False}; {"status": failed|error}; {"error"|"errors"|
+    "hooks_error"|"synthetic_error": ...}; {"synthetic": {"status": != done}}."""
+    if report is False:
+        return "warmup() returned False"
+    if not isinstance(report, dict):
+        return None
+    for k in ("ok", "ready"):
+        if report.get(k) is False:
+            return f"warmup report: {k}=false" + (f" ({report.get('error')})" if report.get("error") else "")
+    if str(report.get("status", "")).lower() in ("failed", "error"):
+        return f"warmup report: status={report.get('status')}" + (
+            f" ({report.get('error')})" if report.get("error") else "")
+    for k in ("error", "hooks_error", "synthetic_error"):
+        if report.get(k):
+            return f"warmup {k}: {str(report[k])[:300]}"
+    errs = report.get("errors")
+    if isinstance(errs, (list, tuple, dict)) and errs:
+        return f"warmup errors: {str(errs)[:300]}"
+    syn = report.get("synthetic")
+    if isinstance(syn, dict) and syn.get("status") not in (None, "done"):
+        return f"warmup synthetic run: status={syn.get('status')}"
+    return None
 
 
 def mock_env_active() -> bool:
@@ -219,6 +271,12 @@ class JobManager:
         self._stop.set()
         with self._cv:
             self._cv.notify_all()
+        spec = self.pipeline
+        if spec is not None and spec.release_gpu is not None:  # не оставлять процесс-воркер A03
+            t = threading.Thread(target=self._safe_call, args=(spec.release_gpu, "release_gpu"),
+                                 name="sentinel-release-gpu", daemon=True)
+            t.start()
+            t.join(5.0)
         end = time.monotonic() + timeout
         for t in list(self._threads):
             t.join(max(0.0, end - time.monotonic()))
@@ -266,12 +324,18 @@ class JobManager:
             self.state = "warming"
             t0 = time.monotonic()
             try:
-                spec.warmup()
+                ret = spec.warmup()
+                report = ret if isinstance(ret, (dict, bool)) else (
+                    spec.warmup_report() if spec.warmup_report else None)
+                problem = warmup_problem(report)
+            except Exception as e:
+                problem = f"{type(e).__name__}: {e}"[:400]
+            if problem:  # прогрев не удался -> /readyz 503, а не «готов» с незагруженными моделями
+                self.state, self.state_detail = "warmup_failed", problem[:400]
+                log.error("pipeline warmup failed", extra={"error": self.state_detail})
+            else:
                 self.state = "ready"
                 log.info("pipeline warmed up", extra={"seconds": round(time.monotonic() - t0, 2)})
-            except Exception as e:
-                self.state, self.state_detail = "warmup_failed", f"{type(e).__name__}: {e}"[:400]
-                log.error("pipeline warmup failed", extra={"error": self.state_detail})
         else:
             self.state = "ready"
         self._warm.set()
@@ -484,6 +548,16 @@ class JobManager:
     def _complete(self, job_id: str, result: Any, spec: PipelineSpec, *, t0: float,
                   started: float, deadline: float) -> None:
         warns: list[str] = []
+        if not (isinstance(result, dict) or dataclasses.is_dataclass(result)
+                or hasattr(result, "violations")):
+            self._fail(job_id, f"pipeline returned unusable result: {type(result).__name__}",
+                       "bad_result")
+            return
+        if self.s.coverage_adapt_stages:
+            rmeta = result.get("meta") if isinstance(result, dict) else getattr(result, "meta", None)
+            note = adapt_stage_coverage(rmeta)
+            if note:
+                warns.append(note)
         try:
             api, w = to_api_dict(result)
             warns += w
@@ -495,7 +569,7 @@ class JobManager:
             self._fail(job_id, "pipeline returned a MOCK result (meta.mock) — refused in production",
                        "mock_result", details=api)
             return
-        api, w = normalize(api, job_id, min_coverage=self.s.min_coverage)
+        api, w = normalize(api, job_id, min_coverage=self.s.min_coverage, allow_mock=self.s.allow_mock)
         warns += w
         if api["status"] == "failed":
             self._fail(job_id, str(api.get("error") or "analysis failed"), "pipeline_failed",
@@ -508,7 +582,14 @@ class JobManager:
                     partial: bool = False) -> bool:
         row = self.store.get(job_id) or {}
         if self.s.evidence_fallback and row.get("video_path"):
-            warns += fill_missing_evidence(api, Path(row["video_path"]))
+            warns += fill_missing_evidence(api, Path(row["video_path"]),
+                                           tolerance_s=self.s.evidence_max_offset_s,
+                                           time_budget_s=self.s.evidence_budget_s)
+        ew, lost = enforce_evidence(api)  # нарушение без кадра -> candidates; ни одного -> failed
+        warns += ew
+        if lost:
+            self._fail(job_id, lost, "evidence_missing", details=api)
+            return False
         now = time.time()
         meta = api["meta"]
         mw = meta.get("warnings")
@@ -525,7 +606,8 @@ class JobManager:
             "deadline_at_passed": bool(self.s.pass_deadline_at and spec.accepts_deadline_at),
             "filename": row.get("filename"), "video": row.get("video_meta") or {},
             "coverage": coverage_ratio(meta), "analysis_complete": analysis_complete(
-                meta, self.s.min_coverage), "partial": partial, "api_version": "2",
+                meta, self.s.min_coverage, not partial, self.s.allow_mock),
+            "partial": partial, "api_version": "2",
         }
         gm = gpu_memory()
         if gm:
@@ -580,13 +662,16 @@ class JobManager:
     def _try_partial(self, job_id: str, partial: dict[str, Any]) -> tuple[bool, str]:
         """partial.json -> done, только если включено и полнота достаточна. (принят?, причина)."""
         meta = partial.get("meta") if isinstance(partial.get("meta"), dict) else {}
+        if self.s.coverage_adapt_stages:
+            adapt_stage_coverage(meta)
         cov = coverage_ratio(meta)
-        complete = analysis_complete(meta, self.s.min_coverage, pipeline_flags=False)
+        problem = coverage_problem(meta, self.s.min_coverage, allow_mock=self.s.allow_mock,
+                                   pipeline_flags=False)
         why = (f"coverage={cov:.2f}" if cov is not None else "coverage not reported") + \
-              f", complete={complete}"
+              (f"; {problem}" if problem else "")
         if not self.s.partial_accept:
             return False, f"partial result not accepted (partial_accept=false; {why})"
-        if complete is not True:
+        if problem is not None:
             return False, f"partial result incomplete ({why}; need >= {self.s.min_coverage})"
         if not self.s.allow_mock and result_is_mock(meta):
             return False, "partial result is MOCK — refused"
@@ -596,7 +681,8 @@ class JobManager:
         for k in ("complete", "partial"):  # флаги «не доделано» у partial по определению
             cmeta.pop(k, None)
         cand["meta"] = cmeta
-        api, warns = normalize(cand, job_id, min_coverage=self.s.min_coverage)
+        api, warns = normalize(cand, job_id, min_coverage=self.s.min_coverage,
+                               allow_mock=self.s.allow_mock, pipeline_flags=False)
         if api["status"] != "done":
             return False, f"partial result rejected by outcome policy: {api.get('error')}"
         row = self.store.get(job_id) or {}
@@ -698,11 +784,23 @@ class JobManager:
             th = info.get("thread")
             if th is not None and th.is_alive():
                 self._zombies[th] = {"job_id": job_id, "since": now}
+        spec = self.pipeline
+        if self.s.cancel_on_timeout and spec is not None and spec.cancel is not None:
+            # A03 останавливает воркер и выгружает модели: run() вернётся, GPU освободится сам
+            self._spawn(lambda: self._safe_call(spec.cancel, "cancel", job_id), f"sentinel-cancel-{job_id[:8]}")
         if self.s.zombie_release_gpu:
             self.gpu.release(job_id)
         else:
             log.warning("pipeline.run still running after timeout; GPU stays with it (single owner)",
                         extra={"job_id": job_id})
+
+    @staticmethod
+    def _safe_call(fn: Callable[..., Any], what: str, *args: Any) -> None:
+        try:
+            r = fn(*args)
+            log.info(f"pipeline.{what} done", extra={"result": str(r)[:200]})
+        except Exception as e:
+            log.warning(f"pipeline.{what} failed", extra={"error": f"{type(e).__name__}: {e}"[:200]})
 
     # ------------------------------------------------------------ restart / cleanup
     def _recover(self) -> None:

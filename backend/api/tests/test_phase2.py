@@ -60,15 +60,16 @@ def test_processing_and_failed_have_required_fields(client_factory):
 @pytest.mark.parametrize("verdict,meta,violations,expect", [
     (None, {}, [], "failed"),                                         # no_violation не выдумываем
     ("violation", {}, [], "failed"),                                  # violation без нарушения
-    ("no_violation", {"coverage": 0.5}, [], "failed"),                # неполный анализ
-    ("no_violation", {"completeness": {"complete": False}}, [], "failed"),
-    ("no_violation", {"completeness": {"complete": True, "required_stages": ["detect"],
-                                       "stages": {"detect": "timeout"}}}, [], "failed"),
-    ("no_violation", {"coverage": {"analyzed_s": 99, "duration_s": 100}}, [], "done"),
-    ("no_violation", {}, [], "done"),                                  # нет сведений = совместимость
-    ("no_violation", {"complete": False}, [], "failed"),              # флаг A03
-    ("no_violation", {"required_stages": ["detect"],
-                      "stages": {"detect": {"status": "timeout"}}}, [], "failed"),  # стадии A03
+    ("no_violation", {}, [], "failed"),                               # нет meta.coverage -> не подтверждено
+    ("no_violation", {"coverage": 0.5}, [], "failed"),                # покрыта половина видео
+    ("no_violation", {"coverage": {"analyzed_sec": 99}}, [], "failed"),  # нет ratio
+    ("no_violation", {"coverage": {"ratio": 0.99, "complete": False}}, [], "failed"),
+    ("no_violation", {"coverage": 1.0, "complete": False}, [], "failed"),            # флаг A03
+    ("no_violation", {"coverage": 1.0, "required_stages": ["detect"],
+                      "stages": {"detect": {"status": "timeout"}}}, [], "failed"),   # стадии A03
+    ("no_violation", {"coverage": {"ratio": 1.0, "complete": True, "required": ["detect"],
+                                   "stages": {"detect": "ok"}}}, [], "done"),
+    ("no_violation", {"coverage": 0.99}, [], "done"),
     ("violation", {"complete": False}, None, "done"),                 # нарушение с кадром — отдаём
     (None, {}, None, "done"),                                          # есть нарушения -> violation
 ])
@@ -104,7 +105,7 @@ def test_violation_without_timecode_is_dropped(client_factory):
         return r
     with client_factory(spec(run)) as c:
         d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
-        assert d["status"] == "failed" and "timecode" in d["error"]
+        assert d["status"] == "failed" and "таймкод" in d["error"]
 
 
 # ------------------------------------------------------------------ partial.json и полнота
@@ -168,12 +169,13 @@ def test_mock_env_refused_in_production(client_factory, monkeypatch):
         assert wait_ready(c).status_code == 200
 
 
-def test_mock_result_refused(client_factory):
+def test_mock_result_refused(client_factory, monkeypatch):
     def run(video_path, job_id, progress, deadline_s=240):
         return result_with(job_id, meta={"mock": True})
     with client_factory(spec(run)) as c:
         d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
         assert d["status"] == "failed" and "MOCK" in d["error"]
+    monkeypatch.setenv("SENTINEL_MOCK", "1")  # явный mock-режим (так его понимает и A01)
     with client_factory(spec(run), allow_mock=True) as c:
         assert wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])["status"] == "done"
 
@@ -260,7 +262,7 @@ def test_response_size_limit(client_factory):
     frames = [_noise_jpeg_b64(i) for i in range(4)]
 
     def run(video_path, job_id, progress, deadline_s=240):
-        from contracts.sentinel_contracts import EvidenceFrame, Violation
+        from .conftest import EvidenceFrame, Violation
         r = make_result(job_id)
         r.violations = [Violation(type="V", timecode_sec=float(i), description="d",
                                   evidence_frames=[EvidenceFrame(float(i), f) for f in frames])
@@ -367,15 +369,55 @@ def test_container_duration_preferred(tmp_path, mov_bytes):
 # ------------------------------------------------------------------ строгий профиль жюри
 def test_strict_jury_profile_embeds_norm(client_factory):
     def run(video_path, job_id, progress, deadline_s=240):
-        from contracts.sentinel_contracts import RuleRef
+        from .conftest import RuleRef
         r = make_result(job_id)
         r.violations[0].rules = [RuleRef(document="Правила X", clause="п. 5",
                                          url="https://adilet.zan.kz/rus/docs/TEST", quote="q")]
         return r
-    with client_factory(spec(run), jury_profile="strict") as c:
+    with client_factory(spec(run), jury_profile="strict", jury_embed_rule=True) as c:
         d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
         assert set(d) == TZ_TOP
         v = d["violations"][0]
         assert set(v) == {"type", "timecode_sec", "description", "evidence_frames"}
         assert "Норма: Правила X, п. 5 — https://adilet.zan.kz/rus/docs/TEST" in v["description"]
         assert schema_errors(d) == []
+
+
+def test_strict_profile_without_embedding_keeps_description(client_factory):
+    with client_factory(spec(ok_run), jury_profile="strict") as c:
+        d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
+        assert d["violations"][0]["description"] == "Признаки возможного нарушения: тест."
+
+
+_A03_STAGES = {k: {"status": "ok"} for k in ("ingest", "detect", "track", "rules")}
+A03_STAGE_COVERAGE = {"coverage": {"ingest": 1.0, "detect": 1.0, "track": 1.0, "temporal": 0.0,
+                                   "vlm_verify": None, "rules": 1.0},
+                      "required_stages": ["ingest", "detect", "track", "rules"], "complete": True,
+                      "stages": _A03_STAGES}  # как в реальном meta A03
+
+
+def test_a03_stage_coverage_adapter_off_by_default(client_factory):
+    def run(video_path, job_id, progress, deadline_s=240):
+        return result_with(job_id, verdict="no_violation", violations=[],
+                           meta=json.loads(json.dumps(A03_STAGE_COVERAGE)))
+    with client_factory(spec(run)) as c:
+        d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
+        assert d["status"] == "failed" and "ratio" in d["error"]   # формат A03 != формат A01
+    with client_factory(spec(run), coverage_adapt_stages=True) as c:
+        d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
+        assert d["status"] == "done" and d["verdict"] == "no_violation"
+        assert d["meta"]["coverage"]["ratio"] == 1.0
+        assert d["meta"]["coverage"]["source"] == "api-adapter:A03-per-stage"
+
+
+def test_a03_stage_coverage_adapter_unknown_or_low(client_factory):
+    for cov, need in (({"ingest": 1.0, "detect": None, "track": 1.0, "rules": 1.0}, "ratio"),
+                      ({"ingest": 1.0, "detect": 0.6, "track": 1.0, "rules": 1.0}, "60%")):
+        meta = {"coverage": cov, "required_stages": ["ingest", "detect", "track", "rules"],
+                "stages": _A03_STAGES}
+
+        def run(video_path, job_id, progress, deadline_s=240, meta=meta):
+            return result_with(job_id, verdict="no_violation", violations=[], meta=json.loads(json.dumps(meta)))
+        with client_factory(spec(run), coverage_adapt_stages=True) as c:
+            d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
+            assert d["status"] == "failed" and need in d["error"], d["error"]

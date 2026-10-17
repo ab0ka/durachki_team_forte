@@ -15,7 +15,7 @@ python -m backend.api --host 127.0.0.1 --port 8000
 ## Одна команда: схема ТЗ + авторизация + жизненный цикл
 
 ```bash
-python -m pytest backend/api/tests -q                         # 76 тестов, без GPU и весов
+python -m pytest backend/api/tests -q                         # 103 теста, без GPU и весов
 SENTINEL_API_KEY=... python -m backend.api.tools.acceptance --url http://127.0.0.1:8000 --out runs/acceptance.json
 ```
 
@@ -46,6 +46,11 @@ SENTINEL_API_KEY=... python -m backend.api.tools.acceptance --url http://127.0.0
 | `acceptance` против **настоящего `backend.pipeline` из ветки A03** в mock-режиме (`SENTINEL_MOCK=1 SENTINEL_ALLOW_MOCK=1`, временная сборка, не коммитилась) | 27 PASS, 0 WARN, 0 FAIL |
 | `eval.jury_sim` из ветки A16 против этого API (`SENTINEL_DEDUP=0`) | 8/8 PASS: auth, 415, 404, sequential 5, bounded stress 5, 150 МБ мусора → 415 |
 | Ранний отказ (401/415) при загрузке через `requests`: быстрой 150 МБ и медленной chunked 30 МБ | Клиент получает код, а не обрыв соединения: uvicorn дочитывает тело |
+| `pytest backend/api/tests` **внутри дерева `origin/claude/integration-cloud`** (A01 `a3b2b55`, A03 с `coverage`/`cancel`, A14, A16…; мой fallback удалён, как у интегратора) | 82/82 |
+| `acceptance` против сервера из дерева интеграции (A03 mock, разрешён явно) | без адаптера: 26 PASS, 2 WARN — чистое видео `failed: «нет нарушения» не подтверждено: meta.coverage.ratio не задан` (см. «Для интегратора», п. 3); с `SENTINEL_COVERAGE_ADAPT_STAGES=1`: 27/27, чистое видео → `done/no_violation` |
+| **Аудит `2055fc4`:** `pytest backend/api/tests` внутри дерева `integration-cloud@2055fc4` (настоящие contracts A01, канонический `meta.coverage` A03, корневой glue `conftest`) | 103/103 |
+| `/readyz` с настоящим `backend.pipeline` A03 в боевом режиме (без mock, весов нет) | новый код: **503 `warmup_failed`** («warmup synthetic run: status=failed»); прежний `d821f24`: 200 `ready` — ошибка исправлена |
+| `acceptance` против дерева `2055fc4`, A03 в явно разрешённом mock-режиме (проверка связки, не реальный прогон) | 27/27; чистое видео → `done/no_violation`, `coverage.ratio=1.0` от A03 (адаптер не нужен) |
 
 ## Замер для L2 (реальные видео + GPU есть только у L2)
 
@@ -128,15 +133,18 @@ curl http://localhost:8000/api/v1/jobs/0f3c... -H "X-API-Key: $KEY"
 | Решение | По умолчанию | Почему |
 |---|---|---|
 | **Честный исход** (как `resolve_outcome` у A01) | вкл. | `done` бывает только по-честному: нет вердикта и нарушений → `failed` (`no_violation` не выдумываем); `violation` без нарушения с конечным таймкодом → `failed`; `no_violation` при неполном анализе → `failed`; при `no_violation` найденные кандидаты уходят в `candidates` (только UI); нарушение без таймкода отбрасывается (0.0 не подставляем) |
-| **Полнота** = `meta.completeness` (A01) + `meta.coverage` (число 0..1 или `{ratio \| analyzed_s/duration_s}`) + для итогового результата флаги A03 (`meta.complete`, статусы `required_stages`) | `min_coverage: 0.95` | unknown ≠ false: если сведений нет, совместимость (результат принимается); любой источник «неполный» → неполный |
+| **Полнота для `no_violation`** — зеркало `contracts.extensions.coverage_problem` (A01 `a3b2b55`): нужен `meta.coverage` (число или `{"ratio": …}`) ≥ `min_coverage`, `coverage.complete` ≠ false, обязательные стадии в статусе `ok`/`done`/`cached`, для итогового результата — `meta.complete` ≠ false | `min_coverage: 0.98` | unknown ≠ false: **нет `meta.coverage` → «нет нарушения» не подтверждено → `failed`**. На нарушения с кадрами не влияет. Сообщения — по-русски, как у A01 |
+| **Покрытие A03 «по стадиям» → `ratio` A01** | **выкл.** (`coverage_adapt_stages`) | Временный мост: `ratio` = минимум покрытия по `required_stages`; неизвестная обязательная стадия → `ratio` не ставится |
 | **partial.json → done** (watchdog или исключение) | **выкл.** (`partial_accept: false`) | Новый режим — до замера L2. Включённый: только при полноте ≥ `min_coverage` и прохождении политики исхода, с `meta.partial=true`. Иначе `failed` с причиной (покрытие, флаг), а `partial` — только в UI-ответе, без base64 |
 | **Fake/mock в проде** | запрещены | Fake — только явный `SENTINEL_FAKE_PIPELINE=1`. `SENTINEL_MOCK=1` без `SENTINEL_ALLOW_MOCK=1` → `/readyz` 503 `mock_not_allowed`, задачи `failed`. Результат с `meta.mock` / `provenance.mock` / origin `mock` → `failed` |
 | **Дедлайн 300 с от приёма, очередь включена** | вкл. | Отсчёт идёт с начала запроса загрузки. В `run()` передаётся `deadline_at=приём+budget_s`, если сигнатура его принимает (A03 принимает). После рестарта бюджет **не обнуляется**: опоздавшие → `failed: deadline passed`, остальные в очереди с остатком (`restart_fresh_budget: false`) |
-| **Один владелец GPU (вместе с A03)** | вкл. | `run()` идёт под семафором (1 слот). Зависший после таймаута `run()` **держит GPU** (`zombie_release_gpu: false`): следующие задачи честно получают `failed` по таймауту, а не запускаются параллельно. `/readyz` → 503 `gpu_hung` через `hung_gpu_s` — сигнал A17 перезапустить сервис. Если пайплайн экспортирует `GPU_LOCK`/`GPU_SEMAPHORE`, API `run()` не оборачивает |
+| **Один владелец GPU (вместе с A03)** | вкл. | `run()` идёт под семафором (1 слот). По таймауту API вызывает **`backend.pipeline.cancel(job_id)`** (A03 останавливает воркер и выгружает модели, `cancel_on_timeout: true`), при остановке сервиса — `release_gpu()`. Если `run()` всё же не вернулся, он **держит GPU** (`zombie_release_gpu: false`): следующие задачи честно получают `failed` по таймауту, а не идут параллельно; `/readyz` → 503 `gpu_hung` через `hung_gpu_s`. Если пайплайн экспортирует `GPU_LOCK`/`GPU_SEMAPHORE`, API `run()` не оборачивает |
 | **Падение воркера** | вкл. | Исключение вне `run()` или умерший поток → `failed: worker crashed`, поток пересоздаётся; `BaseException` из `run()` (в т.ч. `SystemExit` библиотеки) ловится; зависших задач нет — watchdog закрывает каждую с причиной |
 | **Идемпотентность по sha256** | вкл. (`dedup`) | Ключ = sha256 + версия пайплайна (`PIPELINE_VERSION`), чтобы новая версия не отдавала старый результат. `failed` не переиспользуется. Для замеров — `?force=1` или `SENTINEL_DEDUP=0` |
 | **Ответ ≤ 3 МБ** | `max_response_mb: 3` | По шагам: не больше 3 кадров на нарушение (ТЗ) → кадры кандидатов → прореживание `timeline` → крупные ключи `meta` → перекодирование кадров 640/480/360 px → 1 кадр → усечение списка. Каждый шаг пишется в `meta.warnings` |
-| **Время только по PTS** | вкл. | Длительность берётся из контейнера (`mvhd`), а не frames/fps (fps переменный). Запасной кадр-доказательство ищется проходом по PTS (`CAP_PROP_POS_MSEC` после `grab`), а не по номеру кадра |
+| **Время только по PTS** | вкл. | Длительность берётся из контейнера (`mvhd`), а не frames/fps (fps переменный) |
+| **Кадр-доказательство — только настоящий** (исправление по аудиту `2055fc4`) | вкл., не отключается | Если у нарушения нет кадра, `results.grab_frame_at()` ищет кадр, **ближайший по PTS**, в пределах `evidence_max_offset_s` (0.5 с) и подписывает его **фактическим PTS**. Явные ошибки: `out_of_range` (вне ролика, без декодирования), `bad_pts` (NaN, отрицательный, назад, «застрял»), `seek_failed` (seek отклонён или перескочил, и проход с начала невозможен), `budget_exhausted` (`evidence_budget_s` = 20 с на задачу), `too_far`. Раньше при сбое брался **первый кадр** с меткой запрошенного времени. Нарушение без кадра уходит в `candidates` (только UI) с `evidence_error`. Если с вердиктом `violation` не осталось ни одного нарушения с кадром → задача `failed: evidence_missing`: не `no_violation` и не `done` без кадра |
+| **Готовность = итог прогрева** | вкл. | `/readyz` 503 `warmup_failed`, если `warmup()` бросил исключение, вернул `False`, вернул отчёт с ошибкой (`ok`/`ready`=false, `status`=failed/error, `error`/`errors`/`hooks_error`/`synthetic_error`, `synthetic.status`≠done) или вернул `None`, а отчёт A03 (`backend.pipeline.warmup_report` / `ModelRegistry.instance().warmup_report`) показывает ошибку. Отчёта нет — совместимость: готов |
 | **Имя файла — не признак** | — | Пайплайн получает `data/jobs/<id>/video.<ext>`. Исходное имя (и нормализованное Х→X) попадает только в `meta.api` для сопоставления в eval |
 
 ## Веб-UI (согласовано с A15)
@@ -154,14 +162,17 @@ curl http://localhost:8000/api/v1/jobs/0f3c... -H "X-API-Key: $KEY"
 `backend/api/config.yaml`, любой ключ переопределяется `SENTINEL_<KEY>`. Новое в фазе 2:
 - `SENTINEL_ALLOW_MOCK` (0)
 - `SENTINEL_PARTIAL_ACCEPT` (0)
-- `SENTINEL_MIN_COVERAGE` (0.95)
-- `SENTINEL_JURY_PROFILE` (extended)
+- `SENTINEL_MIN_COVERAGE` (0.98)
+- `SENTINEL_COVERAGE_ADAPT_STAGES` (0)
+- `SENTINEL_CANCEL_ON_TIMEOUT` (1)
+- `SENTINEL_JURY_PROFILE` (extended), `SENTINEL_JURY_EMBED_RULE` (0)
 - `SENTINEL_MAX_RESPONSE_MB` (3)
 - `SENTINEL_DEDUP` (1)
 - `SENTINEL_ZOMBIE_RELEASE_GPU` (0)
 - `SENTINEL_HUNG_GPU_S` (60)
 - `SENTINEL_RESTART_FRESH_BUDGET` (0)
 - `SENTINEL_PASS_DEADLINE_AT` (1)
+- `SENTINEL_EVIDENCE_MAX_OFFSET_S` (0.5), `SENTINEL_EVIDENCE_BUDGET_S` (20)
 
 Из фазы 1:
 - `SENTINEL_API_KEYS` / `SENTINEL_API_KEY`
@@ -183,18 +194,26 @@ curl http://localhost:8000/api/v1/jobs/0f3c... -H "X-API-Key: $KEY"
 
 ## Тесты
 
-`python -m pytest backend/api/tests -q` — 76 тестов. Нужны только Python-пакеты из `requirements.txt` (с cv2 — включая тесты настоящего MOV); GPU, весов и данных не нужно.
+`python -m pytest backend/api/tests -q` — 103 теста (проходят и в этой ветке, и в дереве `integration-cloud@2055fc4` без fallback). Нужны только Python-пакеты из `requirements.txt` (с cv2 — включая тесты настоящего MOV); GPU, весов и данных не нужно.
 - `test_auth.py` — ключи, UI-сессия, CSRF, rate-limit, ключи не попадают в логи.
 - `test_jobs.py` — полный цикл, нет модели / warmup / исключение / таймаут, один владелец GPU, рестарт, backlog, честная доля дедлайна.
 - `test_uploads.py` — 415/400/413, стриминг, настоящий MOV, нет декодера.
 - `test_media.py` — Range, кадры, copilot (A14), SPA, CORS.
 - `test_phase2.py`:
-  - обязательные поля на всех статусах; политика исхода (11 случаев); кандидаты скрыты от жюри;
+  - обязательные поля на всех статусах; политика исхода (12 случаев, как у A01); кандидаты скрыты от жюри; адаптер покрытия A03;
   - partial (по умолчанию выкл. / по покрытию); mock в проде;
   - `deadline_at`; рестарт без обнуления бюджета;
   - идемпотентность; лимит 3 МБ (6 нарушений × 4 кадра шума → ≤ 1 МБ при валидных JPEG);
   - падение воркера; обрыв загрузки; обрезанный multipart и MOV;
   - кириллица `filename*`; кадр по PTS; длительность из контейнера; строгий профиль с нормой.
+- `test_evidence_readiness.py` (аудит `2055fc4`):
+  - валидный кадр с фактическим PTS;
+  - настоящий синтетический VFR (переписанный `stts`): кадр по PTS, а не по fps;
+  - недоступный таймкод (60 с в 2-секундном ролике) → `out_of_range`, без JPEG;
+  - неверный PTS, ошибочный seek, исчерпанный бюджет (заглушка декодера и фальшивые часы);
+  - через API: кадр подписан PTS; кадра нет → `failed: evidence_missing`, а не `no_violation`; смешанный случай;
+  - `/readyz` по итогу прогрева, включая отчёт в стиле A03;
+  - профили жюри (extended/strict) и UI различаются, обязательные поля ТЗ на месте.
 
 ## Модели
 
@@ -206,19 +225,27 @@ curl http://localhost:8000/api/v1/jobs/0f3c... -H "X-API-Key: $KEY"
 - Сессия UI stateless (HMAC): отзыв — только TTL или смена `SENTINEL_UI_SECRET`.
 
 ## Для интегратора
-1. **Ветка и PR.** Ветка начата до появления `main` (история отдельная), поэтому GitHub не даёт открыть PR в `main` ("no history in common"). По указанию «разные истории объединит интегратор» `main` в ветку я не вливал. Код — только `backend/api/**` и пустой `backend/__init__.py`.
-2. **Запуск** — один процесс (`--workers 1`, как в `deploy/` A17). В проде **не** ставить `SENTINEL_FAKE_PIPELINE`, `SENTINEL_MOCK`, `SENTINEL_ALLOW_MOCK`. Чтобы при зависшем GPU сервис перезапускался, healthcheck A17 должен смотреть `/readyz` (503 `gpu_hung`, `mock_not_allowed`, `unavailable`).
-3. **A03:**
+1. **Ветка.** Начата до появления `main` (история отдельная), поэтому GitHub не даёт открыть PR в `main` ("no history in common"). Интегратор вливает её напрямую в `claude/integration-cloud`: фаза 1 (`657424f`) уже там. Фаза 2 — коммиты после `657424f` в этой же ветке; `main` в неё я не вливал. Код — только `backend/api/**` и пустой `backend/__init__.py`.
+2. **Из `INTEGRATION_REPORT.md`** исправлены оба красных теста A02:
+   - `test_copilot_501_then_router` больше не зависит от наличия A14;
+   - мусорный результат пайплайна → `failed: pipeline returned unusable result` ещё до сериализатора.
+   Импорты в тестах идут сначала из `contracts`, поэтому удаление `_contract_fallback.py` в интеграции тесты не ломает.
+3. **Покрытие A01/A03 — СНЯТО на `2055fc4`.** A03 (`af48ab5`) пишет канонический `meta.coverage` (`compute_coverage`, есть `ratio`). Живая проверка связки: чистое видео → `done/no_violation`, `coverage.ratio=1.0`, источник — `backend.pipeline`. `SENTINEL_COVERAGE_ADAPT_STAGES` оставлен выключенным и больше не нужен.
+4. **Запуск** — один процесс (`--workers 1`, как в `deploy/` A17). В проде **не** ставить `SENTINEL_FAKE_PIPELINE`, `SENTINEL_MOCK`, `SENTINEL_ALLOW_MOCK`. Healthcheck A17 должен смотреть `/readyz`: 503 при `gpu_hung`, `mock_not_allowed`, `unavailable` → перезапуск.
+5. **A03:**
    - API вызывает `run(video_path, job_id, progress, deadline_s, deadline_at=приём+270)`;
-   - `partial.json` — в `data/jobs/<id>/` (тот же `SENTINEL_DATA_DIR`). По умолчанию он **не** становится `done`. Если включить `partial_accept`, то только при `meta.coverage`/`meta.completeness` ≥ 0.95. Флаги `complete`/`partial` у partial не учитываются — там они «ложь» по определению;
-   - просьба: заполнять `meta.completeness` (A01) или `meta.coverage` — иначе полнота «неизвестна»;
+   - по таймауту — `cancel(job_id)`, при остановке — `release_gpu()`;
+   - `partial.json` — в `data/jobs/<id>/`. По умолчанию он **не** становится `done`. Если включить `partial_accept`, то только при подтверждённом покрытии; флаги `complete`/`partial` у partial не учитываются;
    - `JobCancelled` (BaseException) из `progress()` не глотать.
-4. **A01:** обязательные поля на `processing`/`failed` теперь есть. `contracts.serialize.result_to_api` (UI-report) используется, если доступен. Строгий ответ жюри — `SENTINEL_JURY_PROFILE=strict`: по умолчанию extended, потому что eval A16 читает `type_id`/`rules`/`meta` из `/api/v1/jobs/{id}`. Нужно согласовать A01 и A16; переключение — одна переменная. После мерджа контрактов удалить `backend/api/_contract_fallback.py`.
-5. **A16:**
+6. **A01:**
+   - обязательные поля на `processing`/`failed` есть; `contracts.serialize.result_to_api` (UI-report) используется, когда доступен;
+   - строгий ответ жюри — `SENTINEL_JURY_PROFILE=strict` (норма в `description` — `SENTINEL_JURY_EMBED_RULE=1`). По умолчанию extended: eval A16 читает `type_id`/`rules`/`meta` из `/api/v1/jobs/{id}`. Нужно согласовать A01 и A16, переключение — одна переменная;
+   - `SENTINEL_MOCK=1` у A01 само по себе разрешает mock. У API mock включается только вдвоём с `SENTINEL_ALLOW_MOCK=1`: забытый в `.env` `SENTINEL_MOCK` не превращает прод в mock.
+7. **A16:**
    - в `eval/jury_sim.py::_judge` строка `(r.get("accept_to_done_s") or 1e9) > self.limit_s` считает задачу за 0.0 с (готовый результат по sha256) «> лимита» → ложный FAIL. Нужно `is None`;
-   - до исправления для замеров запускать API с `SENTINEL_DEDUP=0` или слать `?force=1`.
-6. **A15:**
+   - до исправления для замеров — `SENTINEL_DEDUP=0` или `?force=1`. С `SENTINEL_DEDUP=0` jury_sim проходит 8/8.
+8. **A15:**
    - у `failed` в UI-ответе есть `partial` (без кадров);
-   - у `no_violation` найденное лежит в `candidates` — показывать как «отклонённые кандидаты», а не как нарушения;
-   - кадры кандидатов брать из `frames`, если нужны.
-7. **A14:** без изменений — `make_router` монтируется под `/api/v1` (ключ) и `/ui/v1` (cookie + CSRF).
+   - у `no_violation` найденное лежит в `candidates` — показывать как «отклонённые кандидаты»;
+   - текст `error` — для человека, по-русски.
+9. **A14:** без изменений — `make_router` монтируется под `/api/v1` (ключ) и `/ui/v1` (cookie + CSRF).
