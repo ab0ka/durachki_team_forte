@@ -249,7 +249,8 @@ class Supervisor:
         self.ready_timeout = float(svc.get("ready_timeout_s", 900))
         self.trial_limit = float(svc.get("trial_job_limit_s", 300))
         tun = cfg.get("tunnel") or {}
-        self.tunnel_mode = "off" if args.no_tunnel else ("named" if args.named else str(tun.get("mode", "quick")))
+        self.tunnel_mode = "off" if args.no_tunnel else (
+            "named" if args.named else str(self.env.get("SENTINEL_TUNNEL_MODE") or tun.get("mode", "quick")))
         self.protocol = str(self.env.get("CLOUDFLARED_PROTOCOL") or tun.get("protocol") or "")
         self.netguard = str(self.env.get("SENTINEL_NETGUARD") or svc.get("netguard", "log"))
         self.app = str(args.app or svc.get("app", "backend.api.main:app"))

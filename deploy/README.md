@@ -1,55 +1,95 @@
 # deploy/ — развёртывание Kassa Sentinel (A17)
 
-**Основной путь — Windows-нативный** (прод: ноутбук RTX 4060 Laptop 8 GB, Windows 11).
-Docker (`Dockerfile.gpu`, `offline_smoke.sh`) — **опциональный**, для GPU-VM из Плана Б; здесь он **не собирался** (в среде агента нет docker daemon).
+**Основной путь — Windows-нативный, на рабочей venv L1** (Python 3.11, lock `tools/dataprep/requirements-l1.lock.txt`: torch 2.11.0+cu128, transformers 5.20.1, bitsandbytes 0.50.2, opencv < 5).
+- Веса — офлайн, уже лежат в `weights/hf/hub`.
+- Docker (`Dockerfile.gpu`, `offline_smoke.sh`, `PLAN_B.md`) — опциональный путь. Он **не собирался** и не синхронизирован с lock L1.
 
-## Шаги на ноутбуке
+## Команды для L2 (по порядку)
 ```powershell
-powershell -ExecutionPolicy Bypass -File deploy\windows\setup.ps1          # один раз, нужна сеть
-powershell -ExecutionPolicy Bypass -File deploy\windows\offline_smoke.ps1  # доказательство локальности
-powershell -ExecutionPolicy Bypass -File deploy\windows\start.ps1          # прод: API + туннель
-.venv\Scripts\python deploy\tunnel_probe.py real --url <PUBLIC_URL> --mb 30 # замер публичного URL
-.venv\Scripts\python deploy\sla_bench.py --url <URL> --videos <5 реальных .mov>  # замер SLA 300 с
+powershell -ExecutionPolicy Bypass -File deploy\windows\setup.ps1 [-InstallMissing]   # сверка venv с lock L1, adopt весов
+powershell -ExecutionPolicy Bypass -File deploy\windows\offline_smoke.ps1 -Firewall    # от администратора: доказательство локальности
+powershell -ExecutionPolicy Bypass -File deploy\windows\run_all.ps1                    # preflight → сервис → READY → URL
+.venv\Scripts\python deploy\tunnel_probe.py real --url <URL> --mb 30                   # замер публичного URL
+.venv\Scripts\python -m eval.jury_sim --url <URL> --key <ключ> --videos data\videos --n 6   # приёмка A16, замер SLA
+.venv\Scripts\python deploy\release.py mark-verified --note "A16 ok" --report <отчёт>  # зафиксировать проверенную версию
+deploy\windows\status.ps1   |   deploy\windows\stop.ps1
 ```
+Сбои — `RUNBOOK.md`, последний час — `CHECKLIST_SUBMISSION.md`, память GPU — `VRAM.md`.
 
-| Файл | Что делает |
+## Что делает каждый файл
+| Файл | Назначение |
 |---|---|
-| `merge_requirements.py` | Сводит `*/requirements.txt` + `platform.in` (torch 2.6.0/cu124). **Версии не выбирает**: несовместимые ограничения → exit 1 с источниками, запрещённые лицензии (ultralytics…) → exit 2. Lock — только настоящим resolver'ом: `--lock windows-cu124` → `uv pip compile` (платформа, Python 3.11, хэши) → `deploy/locks/*.lock.txt`. Решения по конфликтам — в `deploy/constraints.txt` (по согласованию с A01/владельцами). |
-| `weights.py` | `prepare` — **отдельный онлайн-шаг**: commit sha ревизии, список файлов, sha256 каждого файла (LFS sha256 / git blob id с хаба), лицензия **этой ревизии** из метаданных хаба → `deploy/weights.lock.json` (в git; весов там нет). `verify` — только файловая система, без сети. `licenses` → `LICENSES.md`. |
-| `netguard/` | Запрет исходящей сети **внутри Python-процесса** (аудит-хук PEP 578): connect/DNS к не-loopback и любые прокси → `PermissionError` + JSONL-лог. Firewall ОС не меняется. |
-| `offline_worker_smoke.py` | **Реальный worker** (`backend.pipeline.run`) на локальных весах, HF offline + netguard=block; отказ при `SENTINEL_MOCK=1`; FAIL при любой попытке выйти в сеть, даже «проглоченной» пайплайном. Проверяет worker, а не публичный HTTP. |
-| `healthcheck.py` | `live` — процесс отвечает; `ready` — **реальный пробный inference** через API (401 без ключа, загрузка, done, схема ТЗ, не заглушка). `start.ps1` открывает туннель только после `ready`. |
-| `tunnel_probe.py` | Замер публичного URL: лестница размеров тела, до какой паузы держится ответ, Range, Set-Cookie, загрузка MOV ~30 МБ, время до результата. Ничего не обещаем заранее. |
-| `sla_bench.py` | K видео одновременно, время до результата у каждого, max/медиана против 300 с. |
-| `gpu_probe.py` | На конкретной машине: nvidia-smi, torch CUDA build, VRAM, fp16-matmul, ORT providers. На другой машине — запускать первым. |
-| `stub_api.py` | Заглушка API (stdlib) для тестов и замера туннеля до интеграции; помечена `X-Sentinel-Stub`, `ready` её отвергает. |
-| `windows/*.ps1` | `setup`, `start` (супервизор с перезапуском, один worker, система не засыпает — дисплей может гаснуть), `offline_smoke`, `monitor` (CSV раз в 30 с). |
+| `config/deploy.yaml` | Все флаги и пороги: lock, обязательные/опциональные/исключённые модели, пороги диска и VRAM, сервис, туннель, netguard. |
+| `envcheck.py` | Сверяет установленную venv с lock L1 и требованиями модулей. **Ничего не ставит.** Блокирует расхождение критичных пакетов и отсутствие рантайм-пакетов (fastapi, uvicorn, python-multipart — их нет в lock L1). |
+| `merge_requirements.py` | Сводит `*/requirements.txt`, проверяет их против пинов lock L1 и сообщает только о нарушающих ограничениях; запрещённые лицензии. Lock — только resolver'ом (`uv pip compile -c <lock L1>`): пины L1 не двигаются. |
+| `weights.py adopt` | **Офлайн-инвентаризация уже скачанного кэша**: commit из `refs/main`, все файлы снапшота резолвятся, полнота шардов `*.index.json`, пустые файлы, `.incomplete`; sha256 LFS из имени blob (`--hash` — пересчитать); лицензия из `README.md` снапшота. Результат → `weights.lock.json`. `verify` проверяет обязательный список из `deploy.yaml`; GGUF исключён шаблоном. `prepare` — отдельный онлайн-шаг докачки. |
+| `preflight.py` | Блокирующие проверки до старта: Python, lock, CUDA-сборка (без создания CUDA-контекста), свободная VRAM, обязательные веса, конфиги модулей, диск, пути, наличие ключа (значение не печатается), порт, запрет `SENTINEL_MOCK`/`FAKE_PIPELINE`, ffmpeg/ffprobe/cloudflared. Нет обязательной модели → сервис не стартует. |
+| `supervisor.py` | Один экземпляр (OS-блокировка файла), один uvicorn-воркер. Рестарт — только после смерти своего дерева процессов и освобождения порта; чужие процессы не трогает (PID + время старта). Crash-loop → стоп с понятной ошибкой (GPU OOM распознаётся). READY = `/readyz` 200 (warmup A02) + **реальная пробная задача** → только потом cloudflared. Туннель переживает рестарт API (quick URL не меняется). Система не засыпает, дисплей гаснуть может. |
+| `windows/*.ps1` | Тонкие обёртки: `_env.ps1` (env из `deploy\.env`, офлайн), `setup`, `run_all`, `start` (прежние параметры), `status`, `stop`, `offline_smoke`, `firewall_python` (временное правило только на python.exe), `monitor`. |
+| `offline_worker_smoke.py` | **Реальный worker** (`backend.pipeline.run` → spawn-воркер A03) на локальных весах: HF offline, netguard=block в процессе и воркере. Попытки выхода в сеть считаются по общему логу. Падает на mock/fake, на `no_violation` при неполном анализе и на любой попытке выйти в сеть. `--egress-selftest`: python.exe без netguard должен не достучаться до интернета (под правилом фаервола). Лог для питча — `runs/deploy/offline_proof_*.md`. |
+| `healthcheck.py` | `live`; `ready` = `/readyz` + пробная задача + схема ТЗ, отвергает заглушку, `pipeline=fake`, `meta.mock`, `no_violation` при `complete=false`. |
+| `tunnel_probe.py`, `sla_bench.py` | Замеры публичного URL и SLA. Цифры — только из них или из A16 `jury_sim`. |
+| `release.py` | `mark-verified` (SHA, хэши конфигов и lock-файлов; `.env` — только хэш), `diff`, `rollback` (stash + switch --detach, без reset --hard). |
+| `netguard/` | Аудит-хук PEP 578: блокирует или логирует не-loopback connect/DNS и прокси; наследуется дочерними процессами через `PYTHONPATH`. |
+| `config/pipeline_vram_measured.yaml` | **Гипотеза, выключена**: оверлей VRAM-оценок A03 под измеренный пик 4.7 ГБ (см. `VRAM.md`). |
+| `stub_api.py` | Заглушка API — **только** для тестов deploy и замера туннеля до интеграции. Помечена; `ready` её отвергает. |
 
-## Как мы доказываем, что облака нет
-1. Рантайм офлайн: `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1`, веса заранее подготовлены `weights.py prepare` и сверены `verify` (sha256).
-2. `offline_worker_smoke` гоняет **настоящий** пайплайн с настоящими весами при запрете сети в процессе; отчёт `logs/offline_worker_smoke.json` (число попыток выхода в сеть, VRAM, время).
-3. Сильная гарантия (ядро): `deploy/offline_smoke.sh` — тот же тест в `docker run --network none` (План Б / Linux).
-4. Публичный API проверяется **отдельно** (`tunnel_probe.py`): контейнер или процесс без сети не может быть публичным API.
+## Решения фазы 2 (записаны по ходу)
+1. **Источник истины окружения — lock L1.**
+   - Свой пин torch 2.6.0/cu124 снят: он противоречил L1. Таргеты lock — `windows-cu128` / `linux-cu128`.
+   - `setup.ps1` не пересинхронизирует рабочую venv. Недостающее (fastapi, uvicorn…) ставится только с `-InstallMissing` под `-c lock`.
+2. **Обязательные модели** (блокируют readiness): `PekingU/rtdetr_v2_r18vd` (detect closed-set), `google/siglip2-base-patch16-224` (temporal), `Qwen/Qwen3-VL-4B-Instruct` (VLM).
+   - VLM понижается до опциональной только явным `SENTINEL_NO_VLM=1` / `SENTINEL_VLM_POLICY=off`.
+   - Опциональные: OWLv2 (open_vocab выключен в конфиге A05), D-FINE-medium (скачан, не используется), e5-small (копилот выключен).
+   - Исключены: `*GGUF*`.
+3. **netguard.** В проде — `log` (аудит, ничего не ломает). `block` — только в offline smoke: новый режим не включается в проде без замера.
+4. **Офлайн-доказательство.** Временное правило фаервола только на python.exe (лаунчер venv + базовый интерпретатор, который запускают лаунчер и multiprocessing spawn); снимается в `finally`.
+   - Глобально фаервол не меняется. cloudflared — отдельный процесс, публичный транспорт проверяется `tunnel_probe.py`.
+5. **Логи и отчёты** — в `runs/deploy/` (в `.gitignore`), а не в `logs/`: `logs/` не игнорируется корневым `.gitignore`.
+6. **Туннель после рестарта API не перезапускается**, чтобы quick URL у жюри не сменился.
 
-## Что реально проверено в этой сессии (Linux, без GPU, без данных)
-- `pytest deploy/tests` — 38 passed: merge/конфликты/lock-вызов (с фейковым uv), weights prepare/verify на фейковом хабе (пин коммита, sha256, порча файла, красная лицензия, URL-модели), netguard (блок, лог, allowlist, **прокси на loopback**), offline smoke с фейковым пайплайном (успех / проглоченная попытка выйти в сеть / отказ от mock), healthcheck/tunnel_probe/sla_bench против stub, ASCII в `.ps1`.
-- `uv pip compile` под `x86_64-pc-windows-msvc` и `x86_64-manylinux_2_28` (PyPI-часть) — работает; **lock с torch здесь не построен**: download.pytorch.org недоступен из среды агента → `setup.ps1` строит его на ноутбуке (закоммитьте `deploy/locks/windows-cu124.lock.txt`).
-- **НЕ проверено**: PowerShell-скрипты (нет pwsh), Docker-сборка (нет daemon), реальный GPU, реальные веса, Cloudflare Tunnel, SLA. Никаких измерений не приводим — их дают `gpu_probe`, `offline_smoke`, `tunnel_probe`, `sla_bench` на ноутбуке.
+## Найденные конфликты требований с lock L1 (решают владельцы, не deploy)
+`python deploy/merge_requirements.py --root <интеграционное дерево>` на ветке `claude/integration-cloud`:
 
-## Cloudflare Tunnel
-- Quick: `start.ps1` (без аккаунта, URL меняется при перезапуске, пишется в `logs/public_url.txt`).
-- Named (стабильный URL): Zero Trust → Networks → Tunnels → Create → токен в `deploy/.env` (`TUNNEL_TOKEN`), public hostname → `http://localhost:8000`; запуск `start.ps1 -Named`.
-- Если площадка режет UDP/QUIC: `CLOUDFLARED_PROTOCOL=http2`.
-- Лимиты тела запроса, таймауты ответа, Range и cookies — **измерить** `tunnel_probe.py tunnel` (против `stub_api.py` за тем же туннелем) и `tunnel_probe.py real`, результат приложить к сдаче.
+| Пакет | lock L1 | Требование модуля | Владелец |
+|---|---|---|---|
+| transformers | 5.20.1 | `>=4.57.1,<5` | `ml/vlm/requirements.txt` (A11) |
+| pillow | 13.0.0 | `>=10.0,<13` | `ml/fusion/requirements.txt` (A12) |
+| pyyaml | 6.0.3 | `==6.0.1` | `eval/requirements.txt` (A16) |
+
+Свой `huggingface_hub<2` (против 2.2.0 в L1) исправлен.
+
+## Что реально проверено (облако: Linux, без GPU, без данных)
+- `pytest deploy/tests` — **64 passed, 1 skipped** (skip — парсер PowerShell, если нет pwsh; с pwsh 7.4.6 — 65 passed). Покрыто:
+  - envcheck и merge против lock на синтетических фикстурах. Отдельно вручную прогнан `merge_requirements.py` по дереву ветки `claude/integration-cloud` с настоящим lock L1 — отсюда таблица конфликтов выше;
+  - adopt на раскладке кэша huggingface_hub (symlink и без symlink, недостающий шард, `.incomplete`, лицензия карточки, порча sha256);
+  - preflight на фейковых пробах (ключ не печатается);
+  - супервизор на реальных подпроцессах: полный цикл ready → туннель → URL → status → второй экземпляр отклонён → stop; crash-loop с OOM; чужой процесс на порту не тронут; путь без psutil;
+  - offline smoke: попытка выйти в сеть из дочернего процесса поймана; mock и неполный анализ отклонены;
+  - release (stash + detach на временном git-репо);
+  - healthcheck против `pipeline=fake`.
+- Все `.ps1` разбираются парсером PowerShell 7.4.6 (Linux); ASCII-only, чтобы Windows PowerShell 5.1 их не испортил.
+- **НЕ проверено**:
+  - на Windows `.ps1` не запускались;
+  - фаервол-правило, GPU, реальные веса и пайплайн не проверены;
+  - Cloudflare Tunnel, SLA и VRAM не проверены.
+  - Ни одной цифры скорости или памяти отсюда не приводим — их дают команды выше на ноутбуке L2.
 
 ## Для интегратора
-- Канонический контракт уже есть в ветке (`contracts/`), deploy его не импортирует — fallback-копия не нужна.
-- `backend.api.main:app` (A02): нужен `GET /healthz` (<500 = жив); `POST /api/v1/analyze` должен отвечать сразу после сохранения файла (очередь), иначе прокси с таймаутом ответа оборвёт запрос.
-- `backend.pipeline.run/warmup` (A03): вызывает `offline_worker_smoke.py`. Желательно класть в `result.meta["warnings"]` пропущенные из-за весов стадии — smoke их покажет.
-- Модули с весами: грузить по repo id из кэша HF (`HF_HUB_CACHE`) — `prepare` пишет `refs/<rev>`, `from_pretrained(repo)` работает офлайн. Для URL-моделей — путь из `weights/MANIFEST.json`. В `models.json` указывайте `revision` (коммит) и `files` (для GGUF/ONNX обязательно), для URL — `sha256`.
-- После мерджа всех веток: `python deploy/merge_requirements.py` → решить конфликты с владельцами → `setup.ps1 -Relock` → закоммитить lock; `python deploy/weights.py licenses` → `LICENSES.md`.
-- TODO (optional Docker): `docker-compose.yml`, установка в `Dockerfile.gpu` из `deploy/locks/linux-cu124.lock.txt` вместо `requirements.in`, `Dockerfile.cpu`, `PLAN_B.md` (GPU-VM: сначала `gpu_probe.py`).
+- **Структура.** Ветка добавляет только `deploy/`. Канонический контракт есть в `contracts/`; deploy его не импортирует, fallback-копии нет.
+- **A01.** Добавить `logs/` в корневой `.gitignore` (на всякий случай). deploy пишет в `runs/deploy/`.
+- **A02.** Запуск — `uvicorn backend.api.main:app --workers 1` из супервизора.
+  - `/readyz` используется как часть готовности; `pipeline=fake` блокирует.
+  - Ключ для пробной задачи — env или `data/api_keys.txt` (A02 генерирует его сам).
+- **A03.**
+  - `offline_worker_smoke` смотрит `meta.complete`, `meta.coverage` (если появится), `meta.mock`, `meta.stages.*.origin/vram_peak_mb`, `meta.vram_events`.
+  - Netguard передаётся spawn-воркеру через env и `PYTHONPATH`.
+  - Риск VRAM-оценок — `VRAM.md`.
+- **A11/A12/A16.** Конфликты с lock L1 — таблица выше.
+- **A14.** На время мероприятия `COPILOT_ENABLED=0`. Если включать — только CPU (`VRAM.md`).
+- **TODO (optional Docker):** установка в `Dockerfile.gpu` из lock L1 (cu128), compose, `Dockerfile.cpu`.
 
 ## Модели и лицензии
-deploy/ своих моделей не использует (`models.json` = `[]`). Сводная таблица — `LICENSES.md` (генерируется).
-Зависимости deploy: `requirements.txt` (huggingface_hub, packaging, PyYAML); остальные скрипты — stdlib.
+Своих моделей deploy не использует (`models.json` = `[]`). Лицензии весов решаются по конкретному снапшоту: `weights.py adopt` → `weights.lock.json` → `weights.py licenses` → `LICENSES.md`.
+
+Зависимости deploy (`requirements.txt`): huggingface_hub, packaging, PyYAML, psutil — все есть в lock L1. Остальное — stdlib.

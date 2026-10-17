@@ -95,8 +95,8 @@ def summarize(result: object) -> dict:
             "executor": meta.get("executor"), "device": meta.get("device"),
             "stages": {k: {x: v.get(x) for x in ("status", "origin", "seconds", "vram_peak_mb")}
                        for k, v in stages.items() if isinstance(v, dict)},
-            "models": meta.get("models"), "n_warnings": len(meta.get("warnings") or []),
-            "meta_keys": sorted(meta)}
+            "models": meta.get("models"), "vram_events": meta.get("vram_events"),
+            "n_warnings": len(meta.get("warnings") or []), "meta_keys": sorted(meta)}
 
 
 def count_attempts(log: Path) -> tuple[int, list[dict]]:
@@ -158,9 +158,11 @@ def write_pitch_log(path: Path, report: dict) -> None:
 
 
 def gpu_evidence() -> dict:
+    """VRAM ЭТОГО процесса. При executor=process (прод A03) модели живут в spawn-воркере — тогда
+    смотрите result.stages[*].vram_peak_mb и result.vram_events (пишет воркер), а не это поле."""
     torch = sys.modules.get("torch")
     if torch is None:
-        return {"torch_imported": False}
+        return {"torch_imported": False, "note": "модели в процессе-воркере A03: см. result.stages/vram_events"}
     out = {"torch_imported": True, "cuda_available": bool(torch.cuda.is_available())}
     if out["cuda_available"]:
         out["device"] = torch.cuda.get_device_name(0)

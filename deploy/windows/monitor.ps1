@@ -2,7 +2,7 @@
 #   powershell -ExecutionPolicy Bypass -File deploy\windows\monitor.ps1 [-IntervalSec 30]
 param([int]$IntervalSec = 30)
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$Csv = Join-Path $Repo "logs\monitor.csv"
+$Csv = Join-Path $Repo "runs\deploy\monitor.csv"
 New-Item -ItemType Directory -Force -Path (Split-Path $Csv) | Out-Null
 if (-not (Test-Path $Csv)) { "time,cpu_pct,ram_used_gb,ram_total_gb,gpu_util_pct,vram_used_mib,vram_total_mib,gpu_temp_c,gpu_power_w,python_ws_mb" | Set-Content $Csv }
 while ($true) {
