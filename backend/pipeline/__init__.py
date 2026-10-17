@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["run", "warmup", "run_with_context", "cancel", "release_gpu", "ModelRegistry", "PIPELINE_VERSION"]
+__all__ = ["run", "warmup", "run_with_context", "cancel", "release_gpu", "ModelRegistry", "WarmupError",
+           "PIPELINE_VERSION"]
 __version__ = "1.0.0"
 PIPELINE_VERSION = __version__
 
@@ -40,15 +41,20 @@ def release_gpu() -> dict:
     return _release()
 
 
-def warmup() -> None:
+def warmup(deadline_s: float | None = None) -> None:
+    """Прогрев. Успех — возврат None (ModelRegistry.warm=True); провал — WarmupError (сервис не готов)."""
     from .orchestrator import warmup as _warmup
 
-    _warmup()
+    _warmup(deadline_s)
 
 
-def __getattr__(name: str) -> Any:  # ленивый доступ к ModelRegistry
+def __getattr__(name: str) -> Any:  # ленивый доступ к ModelRegistry / WarmupError
     if name == "ModelRegistry":
         from .registry import ModelRegistry
 
         return ModelRegistry
+    if name == "WarmupError":
+        from .orchestrator import WarmupError
+
+        return WarmupError
     raise AttributeError(name)

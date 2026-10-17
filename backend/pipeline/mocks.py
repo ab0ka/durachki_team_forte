@@ -91,6 +91,15 @@ def discover(clip: Any, budget_s: float) -> list[Event]:
     return []
 
 
+def fuse(clip: Any, events: list[Event], risk: list, catalog: dict, job_id: str) -> Any:
+    """Фейк ml.fusion (только mock-режим): встроенное слияние оркестратора."""
+    from .fallbacks import fallback_fuse
+
+    res = fallback_fuse(clip, events, risk, catalog, job_id, {})
+    res.meta["fusion"] = "builtin-mock"
+    return res
+
+
 BUILTIN: dict[str, Any] = {
     "ml.detect.detect": detect,
     "ml.track.track": track,
@@ -101,5 +110,6 @@ BUILTIN: dict[str, Any] = {
     "ml.temporal.score": score,
     "ml.vlm.verify": verify,
     "ml.vlm.discover": discover,
+    "ml.fusion.fuse": fuse,
 }
 __version__ = MOCK_VERSION

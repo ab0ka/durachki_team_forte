@@ -259,15 +259,20 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
 
 def cmd_warmup(args: argparse.Namespace) -> int:
-    from .orchestrator import warmup
+    from .orchestrator import WarmupError, warmup
     from .registry import ModelRegistry
 
     t0 = time.perf_counter()
-    warmup()
+    rc = 0
+    try:
+        warmup(args.deadline)
+    except WarmupError as exc:
+        print(f"ПРОГРЕВ НЕ ПРОЙДЕН: {exc}", file=sys.stderr)
+        rc = 2
     reg = ModelRegistry.instance()
-    print(json.dumps({"seconds": round(time.perf_counter() - t0, 2), "report": reg.warmup_report},
-                     ensure_ascii=False, indent=2, default=str))
-    return 0
+    print(json.dumps({"ok": rc == 0, "warm": reg.warm, "seconds": round(time.perf_counter() - t0, 2),
+                      "report": reg.warmup_report}, ensure_ascii=False, indent=2, default=str))
+    return rc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -326,7 +331,8 @@ def build_parser() -> argparse.ArgumentParser:
     common(p)
     p.set_defaults(func=cmd_compare)
 
-    p = sub.add_parser("warmup", help="прогрев моделей (как при старте сервера)")
+    p = sub.add_parser("warmup", help="прогрев моделей (как при старте сервера); код 2 — не готов")
+    p.add_argument("--deadline", type=float, default=None, help="общий дедлайн прогрева, с (по умолч. warmup.deadline_s)")
     p.set_defaults(func=cmd_warmup)
     return ap
 

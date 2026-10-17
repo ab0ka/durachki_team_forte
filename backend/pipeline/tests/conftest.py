@@ -63,11 +63,15 @@ FAST = {  # короткие таймауты для тестов дедлайн
 
 @pytest.fixture
 def fake_ml(monkeypatch: pytest.MonkeyPatch) -> Callable[..., dict]:
-    """install(overrides={"ml.detect.detect": fn}, drop=["ml.vlm"], fusion=True) → модули в sys.modules."""
+    """install(overrides={"ml.detect.detect": fn}, drop=("ml.vlm",), ingest=True) → фейковые ml.* в sys.modules."""
 
     def install(overrides: dict[str, Callable] | None = None, drop: tuple[str, ...] = (),
-                versions: dict[str, str] | None = None) -> dict[str, types.ModuleType]:
+                versions: dict[str, str] | None = None, ingest: bool = False) -> dict[str, types.ModuleType]:
         funcs = dict(mocks.BUILTIN)
+        if ingest:   # «настоящий» ml.ingest для тестов прогрева без mock-режима (декодер OpenCV)
+            from backend.pipeline.media import SimpleClip
+
+            funcs["ml.ingest.load_video"] = lambda path, sample_fps=5.0: SimpleClip(path, sample_fps)
         funcs.update(overrides or {})
         mods: dict[str, types.ModuleType] = {}
         root = types.ModuleType("ml")

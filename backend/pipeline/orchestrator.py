@@ -203,42 +203,163 @@ def release_gpu() -> dict:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
-def warmup() -> None:
-    """Прогрев при старте сервера: поднимает воркер, вызывает хуки warmup() модулей и гоняет
-    синтетическое видео через пайплайн (кэш и partial выключены). Ошибки не пробрасываются."""
+class WarmupError(RuntimeError):
+    """Прогрев не пройден — сервис НЕ готов. ``report`` — подробности (= ModelRegistry.warmup_report)."""
+
+    def __init__(self, message: str, report: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.report = dict(report)
+
+
+_OK_HOOK = ("ok", "no_hook")
+_FAILED_STAGE = ("error", "timeout", "crashed", "missing", "cancelled")
+
+
+def warmup(deadline_s: Optional[float] = None) -> None:
+    """Прогрев при старте сервера. Успех → ``ModelRegistry.warm=True``; иначе ``WarmupError``
+    (A02 ловит исключение → ``warmup_failed``, сервис не ``ready``).
+
+    Успех требует ВСЕГО сразу, в пределах общего дедлайна ``warmup.deadline_s`` (включая ожидание
+    воркера и каждый RPC):
+    1. аренда воркера получена;
+    2. хуки ``warmup()`` модулей обязательных стадий прошли (``ok``/нет хука); «нет весов» в хуке,
+       отсутствие пакета, падение импорта — провал;
+    3. синтетический прогон: ``status=done``, ``meta.complete``, без ``degraded``, каждая обязательная
+       стадия ``ok`` из настоящего модуля (``builtin-mock``/запасной путь — только в явном mock-режиме
+       или при ``warmup.allow_fallbacks``); ``status=failed`` — провал и без исключения.
+    Дополнительные стадии — по явной политике ``warmup.optional_policy``: ``warn`` (по умолчанию —
+    готовность с перечнем деградаций в отчёте) или ``fail``; выключенные/невостребованные стадии
+    перечисляются в отчёте явно, а не считаются молча успешными.
+    """
     cfg = load_config()
     reg = ModelRegistry.instance(cfg)
-    report: dict[str, Any] = {}
-    t0 = time.perf_counter()
+    reg.warm = False
+    reg.warmup_error = None
+    total = float(deadline_s if deadline_s is not None else cfg_get(cfg, "warmup.deadline_s", 120))
+    t0 = time.monotonic()
+
+    def left() -> float:
+        return total - (time.monotonic() - t0)
+
+    mock = bool(cfg.get("mock"))
+    with_vlm = bool(cfg_get(cfg, "warmup.vlm", False))
+    optional_policy = str(cfg_get(cfg, "warmup.optional_policy", "warn")).lower()
+    allow_fallbacks = bool(cfg_get(cfg, "warmup.allow_fallbacks", False)) or mock
+    required = [s for s in STAGE_ORDER if is_required(s, cfg)]
+    enabled = [s for s in STAGE_ORDER if cfg_get(cfg, f"stages.{s}", True)
+               and (not s.startswith("vlm") or with_vlm) and (s != "refine" or cfg_get(cfg, "refine.enabled", False))]
+    req_modules = sorted({STAGES[s].module for s in required})
+    modules = sorted({STAGES[s].module for s in enabled} | set(req_modules))
+    report: dict[str, Any] = {
+        "ok": False, "deadline_s": total, "mock": mock, "required_stages": required,
+        "policy": {"optional": optional_policy, "allow_fallbacks": allow_fallbacks, "vlm": with_vlm},
+        "hooks": {}, "stages": {}, "failures": [], "warnings": [], "seconds": None}
+    failures: list[str] = report["failures"]
+    warnings: list[str] = report["warnings"]
+
+    # ---- 1-2. аренда воркера + хуки warmup() модулей (загрузка весов)
     try:
         ex = get_executor(cfg)
-        modules = sorted({STAGES[s].module for s in STAGE_ORDER if cfg_get(cfg, f"stages.{s}", True)
-                          and (s not in ("vlm_verify", "vlm_discover") or cfg_get(cfg, "warmup.vlm", False))})
-        with ex.lease(timeout=float(cfg_get(cfg, "warmup.deadline_s", 120))) as ok:
-            if ok:
-                report["hooks"] = ex.request("warmup", {"modules": modules},
-                                             timeout=float(cfg_get(cfg, "warmup.deadline_s", 120)))
-                reg.set_device("cuda" if ex.request("device", {}, timeout=60) == "cuda" else "cpu")
+        lease_s = max(0.0, left())
+        with ex.lease(timeout=lease_s) as leased:
+            if not leased:
+                failures.append(f"воркер занят другой задачей: аренда не получена за {lease_s:.1f} с")
+            else:
+                hooks = ex.request("warmup", {"modules": modules}, timeout=max(0.1, left()))
+                report["hooks"] = hooks
+                for name in modules:
+                    h = hooks.get(name) or {"status": "missing", "error": "нет ответа"}
+                    if h.get("status") in _OK_HOOK:
+                        continue
+                    msg = f"{name}: {h.get('status')}" + (f": {h.get('error')}" if h.get("error") else "")
+                    if h.get("status") == "missing" and mock:
+                        warnings.append(msg + " (mock-режим: встроенный фейк/запасной путь, проверит синтетика)")
+                    elif name in req_modules or optional_policy == "fail":
+                        failures.append(msg)
+                    else:
+                        warnings.append(msg + " (дополнительный модуль, политика warn)")
+                if not failures:
+                    dev = ex.request("device", {}, timeout=max(0.1, left()))
+                    reg.set_device("cuda" if dev == "cuda" else "cpu")
+    except WorkerTimeout as exc:
+        failures.append(f"таймаут прогрева моделей (общий дедлайн {total:.0f} с): {exc}")
     except Exception as exc:  # noqa: BLE001
-        report["hooks_error"] = f"{type(exc).__name__}: {exc}"
-    try:
-        import tempfile
+        failures.append(f"прогрев моделей: {type(exc).__name__}: {exc}")
 
-        from .media import make_synthetic_video
+    # ---- 3. синтетический прогон (только если модели поднялись)
+    if not failures:
+        if left() <= 0:
+            failures.append(f"дедлайн прогрева {total:.0f} с истёк до синтетического прогона")
+        else:
+            try:
+                failures += _warmup_synthetic(cfg, left(), required, mock, allow_fallbacks, optional_policy,
+                                              with_vlm, report)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"синтетический прогон: {type(exc).__name__}: {exc}")
 
-        with tempfile.TemporaryDirectory(prefix="sentinel-warmup-") as tmp:
-            path = make_synthetic_video(Path(tmp) / "warmup.mp4", seconds=float(cfg_get(cfg, "warmup.synthetic_seconds", 2.0)))
-            over: dict[str, Any] = {"cache": {"mode": "off"}, "partial": {"enabled": False}}
-            if not cfg_get(cfg, "warmup.vlm", False):
-                over["stages"] = {"vlm_verify": False, "vlm_discover": False}
-            res = run(path, "warmup", None, float(cfg_get(cfg, "warmup.deadline_s", 120)), overrides=over)
-            report["synthetic"] = {"status": res.status, "timings": res.meta.get("timings", {}),
-                                   "warnings": res.meta.get("warnings", [])[:10]}
-    except Exception as exc:  # noqa: BLE001
-        report["synthetic_error"] = f"{type(exc).__name__}: {exc}"
-    report["seconds"] = round(time.perf_counter() - t0, 2)
-    reg.warm = True
+    # ---- 4. общий дедлайн
+    elapsed = time.monotonic() - t0
+    if elapsed > total and not any("дедлайн" in f for f in failures):
+        failures.append(f"дедлайн прогрева {total:.0f} с истёк (прошло {elapsed:.1f} с)")
+    report["seconds"] = round(elapsed, 3)
+    report["ok"] = not failures
     reg.warmup_report = report
+    if failures:
+        msg = "прогрев не пройден: " + "; ".join(failures)
+        reg.warmup_error = msg
+        raise WarmupError(msg[:1500], report)
+    reg.warm = True
+
+
+def _warmup_synthetic(cfg: Mapping, budget_s: float, required: list[str], mock: bool, allow_fallbacks: bool,
+                      optional_policy: str, with_vlm: bool, report: dict) -> list[str]:
+    import tempfile
+
+    from .media import make_synthetic_video
+
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="sentinel-warmup-") as tmp:
+        path = make_synthetic_video(Path(tmp) / "warmup.mp4", seconds=float(cfg_get(cfg, "warmup.synthetic_seconds", 2.0)))
+        over: dict[str, Any] = {"cache": {"mode": "off"}, "partial": {"enabled": False}}
+        if not with_vlm:
+            over["stages"] = {"vlm_verify": False, "vlm_discover": False}
+        res = run(path, "warmup", None, max(0.1, budget_s), overrides=over)
+    meta = res.meta or {}
+    stages = meta.get("stages") or {}
+    report["synthetic"] = {"status": res.status, "verdict": res.verdict, "complete": meta.get("complete"),
+                           "degraded": bool(meta.get("degraded")), "error": meta.get("error"),
+                           "timings": meta.get("timings", {}), "warnings": (meta.get("warnings") or [])[:10]}
+    if res.status != "done":
+        failures.append(f"синтетический прогон: status={res.status}" + (f" ({meta['error']})" if meta.get("error") else ""))
+    elif meta.get("complete") is not True:
+        failures.append("синтетический прогон: анализ неполный (meta.complete=false)")
+    if meta.get("degraded"):
+        failures.append("синтетический прогон деградировал (обязательная стадия не отработала)")
+    for st_name in STAGE_ORDER:
+        st = stages.get(st_name) or {}
+        status, origin = st.get("status"), st.get("origin", "")
+        entry = {"status": status or "not_run", "origin": origin, "required": st_name in required}
+        if st_name in required:
+            if status not in OK_STATUSES:
+                failures.append(f"{st_name}: {status or 'не запускалась'}" + (f": {st.get('error')}" if st.get("error") else ""))
+            elif origin == "builtin-mock" and not mock:
+                failures.append(f"{st_name}: встроенный фейк вне mock-режима")
+            elif origin.startswith("fallback") and not allow_fallbacks:
+                failures.append(f"{st_name}: сработал запасной путь ({origin}) — модуль стадии не работает")
+        elif status in ("disabled",):
+            entry["policy"] = "disabled"             # выключена флагом — явно, не «успех»
+        elif status in ("skipped", None, "pending"):
+            entry["policy"] = "not_exercised"        # синтетика её не задействовала (нет кандидатов и т.п.)
+        elif status in _FAILED_STAGE:
+            msg = f"{st_name}: {status}" + (f": {st.get('error')}" if st.get("error") else "")
+            if optional_policy == "fail":
+                failures.append(msg)
+            else:
+                report["warnings"].append(msg + " (дополнительная стадия, политика warn)")
+                entry["policy"] = "degraded"
+        report["stages"][st_name] = entry
+    report["degraded_optional"] = [k for k, v in report["stages"].items() if v.get("policy") == "degraded"]
+    return failures
 
 
 # ============================================================== ядро
@@ -654,13 +775,22 @@ def _fusion(ctx: RunContext, events: list[Event], risk: list[tuple[float, float]
     if res.ok and hasattr(res.value, "violations") and getattr(res.value, "status", "") != "failed":
         result, rec.status, rec.origin = res.value, "ok", res.origin
     else:
-        rec.error = res.error.splitlines()[0][:300] if res.error else "fuse() вернул не AnalysisResult"
-        ctx.warn(f"fusion: {res.status}: {rec.error} — использовано встроенное слияние")
-        clip = ctx.evidence_clip
-        result = fallback_fuse(clip, events, risk, ctx.catalog, ctx.job_id, ctx.cfg, tracks)
-        rec.status, rec.origin = "ok", "fallback"
+        # Обязательная стадия не дала результата (исключение, таймаут, нет модуля или fuse() сам вернул
+        # status=failed). Встроенное слияние строит отчёт ТОЛЬКО ради уже найденных нарушений
+        # (degraded violation); «нет нарушения» по нему не выдаётся — _record заносит стадию в неполные.
+        if res.ok:
+            rec.status = "error"
+            meta_err = (getattr(res.value, "meta", None) or {}).get("error") if res.value is not None else None
+            rec.error = (f"fuse() вернул status=failed: {meta_err}" if getattr(res.value, "status", "") == "failed"
+                         else "fuse() вернул не AnalysisResult")[:300]
+        else:
+            rec.status = res.status if res.status in _FAILED_STAGE or res.status == "skipped" else "error"
+            rec.error = res.error.splitlines()[0][:300] if res.error else res.status
+        rec.origin = "fallback"
+        result = fallback_fuse(ctx.evidence_clip, events, risk, ctx.catalog, ctx.job_id, ctx.cfg, tracks)
+        result.meta["fusion_fallback"] = True
     rec.seconds = time.perf_counter() - t0
-    ctx.records["fusion"] = rec
+    _record(ctx, "fusion", rec)
     if not result.timeline:
         result.timeline = risk or derive_risk(ctx.clip_info.get("times", []), events)
     return result
