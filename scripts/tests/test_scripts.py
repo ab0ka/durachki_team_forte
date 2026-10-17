@@ -202,3 +202,32 @@ def test_compat_matrix_compare_and_scan(tmp_path):
     assert scan["coverage_producers"] == ["ml/x/core.py:9"]
     probe = cm.probe(tmp_path, "json", "dumps")
     assert probe["ok"] and probe["params"][0][0] == "obj"
+
+
+def test_resolve_deps(tmp_path):
+    import resolve_deps as rd
+
+    lock = rd.parse_lock("# lock\ntorch==2.11.0+cu128\nopencv-python-headless==4.14.0.94\nPyYAML==6.0.3\n"
+                         "transformers==5.20.1\n--extra-index-url x\n")
+    assert lock == {"torch": "2.11.0+cu128", "opencv-python-headless": "4.14.0.94", "pyyaml": "6.0.3",
+                    "transformers": "5.20.1"}
+    for mod, text in {"ml/a": "torch>=2.3\nPyYAML>=6,<7  # ok\nopencv-python==4.10.0.84\n",
+                      "ml/b": "transformers>=4.57,<5\nfastapi>=0.110\nultralytics\n-r other.txt\n",
+                      "eval": "pyyaml==6.0.1\n"}.items():
+        (tmp_path / mod).mkdir(parents=True)
+        (tmp_path / mod / "requirements.txt").write_text(text, encoding="utf-8")
+    pkgs, skipped = rd.collect(tmp_path)
+    rd.resolve(pkgs, lock)
+    st = {k: p.status for k, p in pkgs.items()}
+    assert st == {"torch": "OK", "pyyaml": "КОНФЛИКТ", "opencv-python": "ДУБЛЬ", "transformers": "КОНФЛИКТ",
+                  "fastapi": "НЕТ В LOCK", "ultralytics": "ЗАПРЕЩЁН"}
+    assert "eval: ==6.0.1" in pkgs["pyyaml"].detail and "ml/b" in pkgs["transformers"].detail
+    out = tmp_path / "resolved.txt"
+    rd.write_resolved(pkgs, out)
+    text = out.read_text(encoding="utf-8")
+    assert "torch==2.11.0+cu128" in text and "# РЕШИТЬ fastapi" in text and "fastapi>=" not in text
+    lock_file = tmp_path / "l.txt"
+    lock_file.write_text("torch==2.11.0+cu128\n", encoding="utf-8")
+    assert rd.main(["--tree", str(tmp_path), "--lock", str(lock_file), "--out", str(tmp_path / "r.md")]) == 0
+    assert rd.main(["--tree", str(tmp_path), "--lock", str(lock_file), "--out", str(tmp_path / "r.md"),
+                    "--strict"]) == 1
