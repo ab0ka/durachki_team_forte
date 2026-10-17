@@ -173,6 +173,7 @@ export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
   let partialResult: JobResult | undefined;
   if (status === "failed" && isObj(raw.partial)) {
     try {
+      // A02: partial = частичный результат (UI-report A01 или partial.json A03 со status=processing).
       partialResult = normalizeJob({ ...raw.partial, status: "done" }, fallbackJobId);
     } catch {
       partialResult = undefined;

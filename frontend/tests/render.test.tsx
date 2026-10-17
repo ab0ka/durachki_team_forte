@@ -115,3 +115,27 @@ describe("ProcessingView / AboutScreen", () => {
     expect(html).toContain("Apache-2.0");
   });
 });
+
+describe("JobScreen-логика: failed с partial.json A03 (стадии, coverage)", () => {
+  it("partial без нарушений, но со стадиями → подробный жёлтый отчёт с панелью полноты", () => {
+    const job = normalizeJob({
+      job_id: "f",
+      status: "failed",
+      error: "pipeline_failed",
+      partial: {
+        status: "processing",
+        verdict: null,
+        violations: [],
+        coverage_problem: "оркестратор сообщил незавершённый анализ (meta.complete=false)",
+        meta: { complete: false, stages: { ingest: { status: "ok", required: true }, temporal: { status: "ok" } }, coverage: { ingest: 1, temporal: 0 } },
+      },
+    });
+    expect(job.partialResult?.meta.stages).toBeTruthy();
+    const shown = { ...job.partialResult!, job_id: job.job_id, status: "failed" as const, error: job.error };
+    const html = wrap(<ResultView job={shown} raw={{}} />);
+    expect(html).toContain("Анализ не завершён");
+    expect(html).toContain("Полнота анализа");
+    expect(html).toContain("Временная модель");
+    expect(html).not.toContain("Нарушение не обнаружено");
+  });
+});

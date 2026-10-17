@@ -75,7 +75,13 @@ for (const file of videos) {
   try {
     await page.goto(`${BASE}#/`);
     await page.getByText("Перетащите видео сюда").waitFor({ timeout: 15000 });
-    await page.locator('input[type="file"]').setInputFiles(file);
+    // Playwright (≥1.56) молча не выставляет файл, если в ПУТИ кириллица (имена «Х-3.mov» в датасете) —
+    // такие файлы передаём буфером с исходным именем (до ~50 МБ на файл).
+    const base = path.basename(file);
+    const fileArg = /^[\x20-\x7E]+$/.test(file)
+      ? file
+      : { name: base, mimeType: /\.mp4$/i.test(base) ? "video/mp4" : "video/quicktime", buffer: readFileSync(file) };
+    await page.locator('input[type="file"]').setInputFiles(fileArg);
     const t0 = Date.now();
     await page.getByRole("button", { name: "Начать проверку" }).click();
     await page.waitForFunction(() => location.hash.startsWith("#/job/"), null, { timeout: 120000 });
