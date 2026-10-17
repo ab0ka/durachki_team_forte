@@ -210,7 +210,7 @@ class SceneScript:
 
     # ------------------------------------------------------------------ people
     def _cashier(self, t: float) -> Optional[PersonState]:
-        sc, o, d = self.scenario, self._o, self.duration
+        sc, o = self.scenario, self._o
         keys = [(0.0, *SEAT)]
         facing = 180.0
         if sc == "V02":
