@@ -125,6 +125,9 @@ python -m ml.vlm.bench --synthetic 6 --n 5                     # без данн
 python -m ml.vlm.bench --frames path/to/frames --n 10 --out bench.json
 # ручная проверка момента видео
 python -m ml.vlm.try video.mov --t 22 --type V05 [--mode verify|discover|both]
+# калибровка на локальной разметке: доля срабатываний discover/verify на позитивах (размеченная секунда)
+# и негативах (случайные моменты чистых роликов) — ТОЛЬКО агрегаты; имена X/Х нормализуются, дубли по md5 пропускаются
+python -m ml.vlm.calibrate --videos data/videos --labels labels.csv --neg-per-video 2 --out calib.json
 # GPU smoke-тест (локально): python -m pytest ml/vlm/tests -m gpu
 ```
 
@@ -176,6 +179,9 @@ llama.cpp, llama-cpp-python, autoawq, PyYAML — MIT; Pillow — HPND; opencv-py
    - `vlm.warmup()` вызывать в `backend.pipeline.warmup()`;
    - `vlm.unload()` — если VRAM нужна другим;
    - лимиты урезать через `limits={...}` (ключи — поля `VLMLimits` в `budget.py`);
+   - GPU-lock передавать такой, который A03 не держит в момент вызова `verify` (или `RLock`): VLM берёт его сама;
+     обычный `Lock`, уже захваченный вызывающим, приведёт к дедлоку;
+   - сигнал `motion_energy` из A08 можно отдать в `discover(..., motion=[(t, e), ...])`, чтобы не считать его заново;
    - при 5+ видео одновременно GPU-вызовы VLM сериализуются lock’ом, бюджет каждого видео — wall-clock.
 2. **A12 (fusion):** читать `event.extra["vlm"]`:
    - `agreement`, `contradiction`, `p_prior`, `p_vlm`, `p_post`;
@@ -200,6 +206,8 @@ llama.cpp, llama-cpp-python, autoawq, PyYAML — MIT; Pillow — HPND; opencv-py
      конфликтовать с одноимёнными тестами других модулей.
    - Предложение: зафиксировать в контракте семантику `Event.extra["vlm"]["agreement"]`.
 6. **A16 (eval):**
+   - `python -m ml.vlm.calibrate` даёт долю срабатываний discover/verify на позитивах и негативах; это основа
+     для решения о `discover.enabled` и подбора `vlm_weight`;
    - прогнать LOO с `SENTINEL_VLM_BACKEND=transformers`;
    - сравнить вердикты с VLM и без неё, частоту `contradicts` на чистых роликах;
    - покрутить `verify.vlm_weight` и `max_raise`;
@@ -231,7 +239,8 @@ frames.py              выбор моментов, боксы, ресайз, к
 prompting.py, prompts/ библиотека промптов <id>.<version>.<lang>.md (RU/EN)
 catalog.py             каталог A13 или встроенный fallback (без норм)
 backends/              mock, transformers, llama.cpp (server/python)
-bench.py, try.py (cli_try.py), localdump.py, _video.py   CLI и локальный дамп
+bench.py, try.py (cli_try.py), calibrate.py           CLI: скорость/VRAM, ручная проверка, калибровка
+localdump.py, _video.py                                 локальный дамп, запасной загрузчик видео
 _contract.py, _contract_fallback.py                     импорт контракта
 tests/                 pytest: mock + синтетика, GPU-тест помечен @gpu
 ```

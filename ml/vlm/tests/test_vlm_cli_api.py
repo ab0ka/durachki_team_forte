@@ -149,3 +149,26 @@ def test_bench_frames_dir(tmp_path, capsys):
 def test_bench_without_input(capsys):
     from ml.vlm.bench import main
     assert main([]) == 2
+
+
+def test_calibrate_aggregates_only(tmp_path, monkeypatch, capsys):
+    import shutil
+    vids = tmp_path / "videos"
+    vids.mkdir()
+    _write_video(vids / "X-1.avi", seconds=8.0)
+    _write_video(vids / "Х-3.avi", seconds=7.0)          # кириллическая Х (другое содержимое)
+    shutil.copy(vids / "X-1.avi", vids / "X-47.avi")      # дубликат по md5
+    (tmp_path / "labels.csv").write_text("file;label;t\nx-1.mov;нарушение;22 секунда\nХ-3.MOV;без нарушения;\n"
+                                         "X-47.mov;нарушение;5\n", encoding="utf-8")
+    monkeypatch.setenv("SENTINEL_VLM_MOCK_MODE", "phone")
+    from ml.vlm.calibrate import main, normalize_name
+    assert normalize_name("Х-3.MOV") == normalize_name("x-3.mov") == "x-3"
+    rc = main(["--videos", str(vids), "--labels", str(tmp_path / "labels.csv"), "--neg-per-video", "2",
+               "--dump-dir", str(tmp_path / "dump")])
+    out = capsys.readouterr().out
+    rep = json.loads(out)
+    assert rc == 0 and rep["videos_used"] == 2 and rep["duplicates_skipped"] == 1
+    assert rep["discover_n_pos"] == 1 and rep["discover_n_neg"] == 2
+    assert rep["discover_hit_rate_neg"] == 1.0  # mock «phone» находит везде — это и показывает FPR
+    assert rep["verify_n_pos"] == 1 and rep["verify_json_ok_rate"] == 1.0
+    assert "Кассир" not in out and "observed_facts" not in out  # никаких описаний сцен в stdout
