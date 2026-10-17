@@ -97,9 +97,12 @@ def stable_hash(obj: Any, n: int = 12) -> str:
 def feature_signature(cfg: dict, backend: str) -> dict:
     """Параметры, от которых зависят кэшированные эмбеддинги изображений."""
     f = cfg["features"]
+    from .features import FEATURE_VERSION
+
     return {
         "backend": backend,
         "model_id": f["model_id"] if backend != "mock" else f"mock{f['mock_dim']}",
         "focus": f["focus"],
-        "v": 2,
+        "zone_views": list(f.get("zone_views") or []),
+        "v": FEATURE_VERSION,
     }

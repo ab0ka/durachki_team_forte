@@ -110,3 +110,10 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
         assert e.type_id == "V99" and e.extra["type_source"] == "none"
         assert e.extra["zero_shot_hint"]["trained"] is False
         assert 0.0 <= e.confidence <= 1.0 and e.facts
+
+
+def test_simple_clip_uses_pts_and_monotonic_times(tmp_path):
+    clip = SimpleClip(str(write_video(tmp_path / "v.avi", seconds=4.0, fps=10)), sample_fps=5.0)
+    assert clip.time_source in ("pts", "index/fps")
+    assert all(b > a for a, b in zip(clip.times, clip.times[1:]))
+    assert abs(clip.times[1] - clip.times[0] - 0.2) < 0.05 and 3.5 <= clip.duration <= 4.2

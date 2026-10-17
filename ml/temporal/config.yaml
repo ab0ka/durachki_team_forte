@@ -18,6 +18,7 @@ features:
   batch_size: 64
   fp16: true                       # только на CUDA
   device: auto                     # auto | cpu | cuda
+  hf_cache: weights/hf/hub         # офлайн-веса (если каталог есть; env HF_HUB_CACHE/HF_HOME приоритетнее)
   views: [full, focus]             # full — весь кадр; focus — адаптивный кроп (зона кассира или область движения)
   cpu_views: [full]
   focus:

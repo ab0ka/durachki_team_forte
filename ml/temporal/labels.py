@@ -78,7 +78,8 @@ class VideoLabel:
 
 _NAME_KEYS = ("file", "name", "video", "filename", "файл", "имя", "видео", "ролик", "id")
 _LABEL_KEYS = ("label", "violation", "verdict", "class", "target", "наруш", "вердикт", "класс", "метка")
-_TIME_KEYS = ("time", "sec", "second", "timecode", "ts", "секунд", "время", "таймкод", "момент")
+_TIME_KEYS = ("t_all", "t_sec", "time", "sec", "second", "timecode", "ts", "секунд", "время", "таймкод",
+              "момент")
 _TYPE_KEYS = ("type_id", "type", "тип")
 
 

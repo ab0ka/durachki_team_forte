@@ -19,6 +19,7 @@ from .config import TYPE_IDS, cache_dir, feature_signature, is_mock, load_prompt
 
 log = logging.getLogger("sentinel.temporal")
 IMG = 224
+FEATURE_VERSION = 3  # поднимать при любом изменении извлечения: старый кэш перестанет совпадать по ключу
 
 
 # ----------------------------------------------------------------------------- backends
@@ -55,9 +56,11 @@ class SiglipBackend:
 
     name = "siglip2"
 
-    def __init__(self, model_id: str, device: str = "auto", fp16: bool = True) -> None:
+    def __init__(self, model_id: str, device: str = "auto", fp16: bool = True, cache_dir: Optional[str] = None) -> None:
         import torch
         from transformers import AutoModel, AutoProcessor
+
+        kw = {"cache_dir": cache_dir} if cache_dir else {}
 
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,17 +68,22 @@ class SiglipBackend:
         self.dtype = torch.float16 if (fp16 and device.startswith("cuda")) else torch.float32
         self.model_id = model_id
         try:
-            self.processor = AutoProcessor.from_pretrained(model_id)
+            self.processor = AutoProcessor.from_pretrained(model_id, **kw)
             ip = getattr(self.processor, "image_processor", None)
         except Exception:  # нет токенизатора рядом с весами — картинки всё равно считаем
             self.processor = None
             try:
                 from transformers import AutoImageProcessor
 
-                ip = AutoImageProcessor.from_pretrained(model_id)
+                ip = AutoImageProcessor.from_pretrained(model_id, **kw)
             except Exception:
                 ip = None
-        self.model = AutoModel.from_pretrained(model_id, torch_dtype=self.dtype).to(device).eval()
+        try:  # transformers 5.x: dtype=; 4.x: torch_dtype=
+            model = AutoModel.from_pretrained(model_id, dtype=self.dtype, **kw)
+        except TypeError:
+            model = AutoModel.from_pretrained(model_id, torch_dtype=self.dtype, **kw)
+        self.model = model.to(device).eval()
+        self._kw = kw
         self.mean = np.asarray(getattr(ip, "image_mean", None) or [0.5, 0.5, 0.5], dtype=np.float32)
         self.std = np.asarray(getattr(ip, "image_std", None) or [0.5, 0.5, 0.5], dtype=np.float32)
         self.logit_scale = float(self.model.logit_scale.exp().item()) if hasattr(self.model, "logit_scale") else 1.0
@@ -113,8 +121,9 @@ class SiglipBackend:
         else:
             from transformers import AutoTokenizer
 
-            inp = AutoTokenizer.from_pretrained(self.model_id)(list(texts), padding="max_length", max_length=64,
-                                                               truncation=True, return_tensors="pt")
+            inp = AutoTokenizer.from_pretrained(self.model_id, **self._kw)(list(texts), padding="max_length",
+                                                                           max_length=64, truncation=True,
+                                                                           return_tensors="pt")
         inp = {k: v.to(self.device) for k, v in inp.items() if k in ("input_ids", "attention_mask")}
         with torch.no_grad():
             try:
@@ -143,8 +152,21 @@ def get_backend(cfg: dict, force: Optional[str] = None) -> Any:
                     os.environ.setdefault("HF_HUB_OFFLINE", "1")
                     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
                 _BACKENDS[key] = SiglipBackend(f["model_id"], str(f.get("device", "auto")),
-                                               bool(f.get("fp16", True)))
+                                               bool(f.get("fp16", True)), hf_cache_dir(cfg))
         return _BACKENDS[key]
+
+
+def hf_cache_dir(cfg: dict) -> Optional[str]:
+    """Каталог офлайн-весов HF: env HF_HUB_CACHE/HF_HOME имеют приоритет, иначе features.hf_cache (если есть)."""
+    if os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME"):
+        return None  # transformers сам возьмёт из env
+    p = cfg["features"].get("hf_cache")
+    if not p:
+        return None
+    from .config import REPO_ROOT
+
+    path = Path(p) if Path(p).is_absolute() else REPO_ROOT / p
+    return str(path) if path.is_dir() else None
 
 
 def _l2(x: np.ndarray) -> np.ndarray:
