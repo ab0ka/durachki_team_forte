@@ -185,9 +185,11 @@ def test_fusion_module_used_and_fallback_on_error(fake_ml, synth_video):
     assert "n" in calls and res.meta["stages"]["fusion"]["origin"] == "module"
     assert "from-fusion" in res.meta["warnings"]
 
-    fake_ml({"ml.fusion.fuse": _boom})
+    fake_ml({"ml.fusion.fuse": _boom})          # сбой обязательной стадии fusion; правила нашли нарушение
     res = run(synth_video, "job-fuse2", None, 60)
-    assert res.meta["stages"]["fusion"]["origin"] == "fallback" and res.status == "done"
+    assert res.meta["stages"]["fusion"]["status"] == "error" and res.meta["stages"]["fusion"]["origin"] == "fallback"
+    assert res.status == "done" and res.verdict == "violation" and res.meta["degraded"] is True
+    assert res.meta["complete"] is False
 
 
 def test_run_with_context_outputs(fake_ml, synth_video, tmp_path):

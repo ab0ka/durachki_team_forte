@@ -775,13 +775,22 @@ def _fusion(ctx: RunContext, events: list[Event], risk: list[tuple[float, float]
     if res.ok and hasattr(res.value, "violations") and getattr(res.value, "status", "") != "failed":
         result, rec.status, rec.origin = res.value, "ok", res.origin
     else:
-        rec.error = res.error.splitlines()[0][:300] if res.error else "fuse() вернул не AnalysisResult"
-        ctx.warn(f"fusion: {res.status}: {rec.error} — использовано встроенное слияние")
-        clip = ctx.evidence_clip
-        result = fallback_fuse(clip, events, risk, ctx.catalog, ctx.job_id, ctx.cfg, tracks)
-        rec.status, rec.origin = "ok", "fallback"
+        # Обязательная стадия не дала результата (исключение, таймаут, нет модуля или fuse() сам вернул
+        # status=failed). Встроенное слияние строит отчёт ТОЛЬКО ради уже найденных нарушений
+        # (degraded violation); «нет нарушения» по нему не выдаётся — _record заносит стадию в неполные.
+        if res.ok:
+            rec.status = "error"
+            meta_err = (getattr(res.value, "meta", None) or {}).get("error") if res.value is not None else None
+            rec.error = (f"fuse() вернул status=failed: {meta_err}" if getattr(res.value, "status", "") == "failed"
+                         else "fuse() вернул не AnalysisResult")[:300]
+        else:
+            rec.status = res.status if res.status in _FAILED_STAGE or res.status == "skipped" else "error"
+            rec.error = res.error.splitlines()[0][:300] if res.error else res.status
+        rec.origin = "fallback"
+        result = fallback_fuse(ctx.evidence_clip, events, risk, ctx.catalog, ctx.job_id, ctx.cfg, tracks)
+        result.meta["fusion_fallback"] = True
     rec.seconds = time.perf_counter() - t0
-    ctx.records["fusion"] = rec
+    _record(ctx, "fusion", rec)
     if not result.timeline:
         result.timeline = risk or derive_risk(ctx.clip_info.get("times", []), events)
     return result
