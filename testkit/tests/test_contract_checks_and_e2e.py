@@ -17,6 +17,8 @@ def test_checks_catch_bad_outputs():
     assert cc.check_pose_frames([PoseFrame(0.0, 1, [(0.1, 0.1, 0.9)] * 5)])
     assert cc.check_scene_states([SceneState(0.0, {"n_persons": 1.5})])
     assert cc.check_scene_states([SceneState(0.0, {"safe_open": 2.0, "bogus": 1.0})])
+    assert cc.check_scene_states([SceneState(0.0, {"x_cashier_lost_in_view": 1.0, "scene_visibility": 0.2})]) == []
+    assert cc.check_detections([Detection(0.0, "personal_item", (0.1, 0.1, 0.2, 0.2), 0.5)]) == []
     assert cc.check_scene_states([SceneState(1.0, {}), SceneState(0.5, {})])
     assert cc.check_events([Event("X1", 0, 1, 2, 0.5, "rules")])
     assert cc.check_events([Event("V01", 0, 1, 0.5, 0.5, "magic")])

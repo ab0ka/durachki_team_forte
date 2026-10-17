@@ -125,8 +125,11 @@ def test_check_fallbacks(tmp_path):
     assert check_fallbacks.compare(tmp_path / "ml/c/_contract_fallback.py", canon)[0] == "DIVERGED"
     assert check_fallbacks.main(["--root", str(tmp_path)]) == 1
     (tmp_path / "ml/c/_contract_fallback.py").unlink()
+    (tmp_path / "ml/b/tests").mkdir()
+    (tmp_path / "ml/b/tests/test_x.py").write_text("from ml.b._contract_fallback import LABELS\n", encoding="utf-8")
+    assert check_fallbacks.unguarded_imports(tmp_path) == {"ml/b": ["ml/b/tests/test_x.py:1"]}
     assert check_fallbacks.main(["--root", str(tmp_path), "--drop"]) == 0
-    assert not list(tmp_path.rglob("_contract_fallback.py"))
+    assert [p.parent.name for p in tmp_path.rglob("_contract_fallback.py")] == ["b"]  # с прямым импортом — оставлен
 
 
 def test_guard_media(tmp_path):
@@ -164,3 +167,38 @@ def test_gitignore_is_anchored():
 def test_repo_tracked_files_pass_guard():
     assert subprocess.run([sys.executable, str(SCRIPTS / "guard_media.py"), "--all", "--root", str(SCRIPTS.parent)],
                           capture_output=True).returncode == 0
+
+
+def test_compat_matrix_compare_and_scan(tmp_path):
+    import compat_matrix as cm
+
+    ok = cm.compare("A06", "ml.track", "track", ["clip", "dets"], {}, True,
+                    {"ok": True, "params": [["clip", "POSITIONAL_OR_KEYWORD", None],
+                                            ["dets", "POSITIONAL_OR_KEYWORD", None]], "qualname": "ml.track.track"})
+    assert ok.verdict == "OK"
+    renamed = cm.compare("A06", "ml.track", "track", ["clip", "dets"], {}, True,
+                         {"ok": True, "params": [["c", "POSITIONAL_OR_KEYWORD", None],
+                                                 ["d", "POSITIONAL_OR_KEYWORD", None]]})
+    assert renamed.verdict == "ЗАМЕЧАНИЕ"
+    short = cm.compare("A06", "ml.track", "track", ["clip", "dets"], {}, True,
+                       {"ok": True, "params": [["clip", "POSITIONAL_OR_KEYWORD", None],
+                                               ["zones", "KEYWORD_ONLY", None]]})
+    assert short.verdict == "РАСХОЖДЕНИЕ"
+    missing = cm.compare("A06", "ml.track", "track", ["clip", "dets"], {}, True, {"ok": False, "error": "нет"})
+    assert missing.verdict == "НЕТ"
+    pkg = tmp_path / "ml" / "x"
+    (pkg / "tests").mkdir(parents=True)
+    (pkg / "tests" / "test_a.py").write_text("from ml.x._contract_fallback import LABELS\n", encoding="utf-8")
+    (pkg / "core.py").write_text(
+        "try:\n    from contracts.sentinel_contracts import *\nexcept ImportError:\n"
+        "    from ._contract_fallback import *\n"
+        "class Event:\n    pass\n"
+        "v = signals.get('bogus_signal', 0)\nw = sig['safe_open']\nmeta['coverage'] = 1.0\n", encoding="utf-8")
+    scan = cm.static_scan(tmp_path)
+    assert scan["unguarded_fallback"] == ["ml/x/tests/test_a.py:1"]
+    assert scan["duplicate_classes"] == ["ml/x/core.py:5 class Event"]
+    assert scan["unknown_signals"] == ["ml/x/core.py:7 `bogus_signal`"]
+    assert scan["unknown_as_zero"] == ["ml/x/core.py:7 `bogus_signal`"]
+    assert scan["coverage_producers"] == ["ml/x/core.py:9"]
+    probe = cm.probe(tmp_path, "json", "dumps")
+    assert probe["ok"] and probe["params"][0][0] == "obj"
