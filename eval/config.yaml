@@ -88,3 +88,16 @@ jury_sim:
   total_limit_s: 300.0
   big_file_mb: 150
   request_timeout_s: 120
+
+# --- Санити-полы и утечки (eval.sanity) ---
+sanity:
+  duration_corr_warn: 0.3   # |ρ Спирмена| скора с длительностью/номером файла ≥ порога → предупреждение
+
+# --- Абляции (eval.ablate): кандидат vs baseline на ОДНИХ И ТЕХ ЖЕ входах ---
+ablate:
+  fp_tolerance_abs: 1        # рост FP больше max(abs, rel·N) — не PASS, даже если recall вырос
+  fp_tolerance_rel: 0.05
+  min_hit2_gain: 0.05        # «значимый» рост hit@2 (доля событий)
+  latency_regress_rel: 0.20  # рост p90 латентности > 20% — регресс
+  vram_budget_mb: 7500       # пик VRAM выше — FAIL (8 ГБ карта, нужен запас)
+  sla_p90_s: 60.0
