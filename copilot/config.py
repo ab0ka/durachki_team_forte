@@ -25,6 +25,7 @@ _ENV_OVERRIDES: dict[str, tuple[str, str, Any]] = {
     "COPILOT_EMBED_DEVICE": ("embed", "device", str),
     "COPILOT_CACHE_DIR": ("embed", "cache_dir", str),
     "COPILOT_TOP_K": ("rag", "top_k", int),
+    "COPILOT_VLM_MODULE": ("vlm_service", "module", str),
 }
 
 

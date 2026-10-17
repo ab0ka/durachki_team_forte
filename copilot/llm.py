@@ -384,6 +384,37 @@ def _text_of(res: Any) -> tuple[str, bool, str]:
     return str(getattr(res, "text", "") or ""), bool(getattr(res, "timed_out", False)), str(getattr(res, "error", "") or "")
 
 
+def chat_outcome(res: Any) -> tuple[str, str, str, bool]:
+    """(text, kind, error, truncated). kind: "" | unavailable | busy | timeout | invalid | error.
+
+    Понимает ``ml.vlm.service.ChatResult`` (A11: ok/text/error/truncated/timed_out), dict из ``chat_request``,
+    GenResult и str. Текст, оборванный по времени (timed_out при ok=True), считается обрезанным.
+    """
+    text, timed_out, error = _text_of(res)
+    get = res.get if isinstance(res, dict) else (lambda k, d=None: getattr(res, k, d))
+    ok = None if isinstance(res, str) or res is None else get("ok", None)
+    truncated = bool(get("truncated", False)) if not isinstance(res, str) and res is not None else False
+    truncated = truncated or (timed_out and bool(text))
+    low = error.lower().strip()
+    if text and ok is not False:
+        return text, "", error, truncated
+    if low.startswith("unavailable"):
+        return "", "unavailable", error, False
+    if "busy" in low:
+        return "", "busy", error, False
+    if timed_out or low.startswith("timeout"):
+        return "", "timeout", error or "timeout", False
+    if low.startswith("invalid"):
+        return "", "invalid", error, False
+    if ok is False or error or not text:
+        return "", "error", error or "empty answer", False
+    return text, "", "", truncated
+
+
+class LLMUnavailable(RuntimeError):
+    """Генеративной модели нет или она не загружена в этом процессе — отвечаем без генерации."""
+
+
 def _flatten(messages: Sequence[Message]) -> tuple[str, str]:
     """messages -> (system, prompt) для API вида generate(system, prompt)."""
     system = "\n\n".join(m["content"] for m in messages if m.get("role") == "system")
@@ -392,13 +423,37 @@ def _flatten(messages: Sequence[Message]) -> tuple[str, str]:
     return system, "\n\n".join(turns)
 
 
+NOT_LOADED_HERE = "модель анализа не загружена в этом процессе (копилот её не загружает)"
+
+
+def _vlm_runtime_absent(module: Any) -> bool:
+    """Настоящий A11 (пакет ml.vlm) держит модель в ``ml.vlm.runtime``. Если он в этом процессе не
+    импортирован, модели здесь нет: так процесс API не тянет torch/transformers ради статуса копилота."""
+    return (str(getattr(module, "__package__", "") or "") == "ml.vlm" and bool(getattr(module, "__file__", None))
+            and "ml.vlm.runtime" not in sys.modules)
+
+
+def _params_of(fn: Any) -> tuple[set[str], bool]:
+    import inspect
+
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return set(), True
+    return set(sig.parameters), any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+
+
 class VLMServiceBackend:
     """Общая модель Qwen3-VL-4B через ``ml.vlm.service.chat`` (A11) — отдельная LLM на 8 ГБ не влезает.
 
-    Вызов с низким приоритетом (``priority="low"``, если сервис его принимает): анализ видео важнее.
-    Подпись ``chat`` определяется по параметрам: ``messages=[...]`` или ``system=``/``prompt=``;
-    ответ — str, объект с ``.text`` (GenResult) или dict. Занятость -> LLMBusy (сервис отвечает
-    в негенеративном режиме), таймаут -> LLMTimeout.
+    * Приоритет анализа обеспечивает A11 (``gpu.PriorityLock``: ожидающий анализ всегда раньше чата);
+      копилот лишь ограничивает ожидание (``wait_s``) и общий бюджет (ожидание + генерация ≤ дедлайна).
+    * Модель копилот НЕ загружает: если в этом процессе VLM не загружена (в проде она живёт в
+      процессе-воркере A03), генеративный режим честно недоступен (LLMUnavailable -> retrieval).
+      Для доступа к модели воркера — ``copilot.service.set_chat_fn(<RPC к ml.vlm.service.chat_request>)``.
+    * Подпись: ``chat(messages, **kw)`` (A11) — допустимые параметры берутся из ``get_service().chat``;
+      ``chat(payload: dict)`` (IPC) — один словарь; ``chat(system=, prompt=)`` — старый вариант.
+    * Ответ: ChatResult/dict/GenResult/str -> chat_outcome(); unavailable/busy/timeout различаются.
     """
 
     name = "vlm_service"
@@ -409,13 +464,49 @@ class VLMServiceBackend:
         self.vcfg = self.cfg.get("vlm_service", {}) or {}
         self._chat = chat_fn
         self._module = module
-        try:
-            import inspect
+        self._params, self._varkw = _params_of(chat_fn)
+        self._payload_style = self._params == {"payload"}
+        if self._varkw and module is not None and callable(getattr(module, "get_service", None)):
+            try:  # A11: chat(messages, **kw) -> VLMService.chat(messages, *, images, max_new_tokens, ...)
+                inner, inner_varkw = _params_of(module.get_service().chat)
+                if inner and not inner_varkw:
+                    self._params, self._varkw = inner | {"messages"}, False
+            except Exception:
+                pass
+        self.max_input_chars = int(self.vcfg.get("max_input_chars", 11000))
 
-            self._params = set(inspect.signature(chat_fn).parameters)
-            self._varkw = any(p.kind == p.VAR_KEYWORD for p in inspect.signature(chat_fn).parameters.values())
-        except (TypeError, ValueError):
-            self._params, self._varkw = set(), True
+    # ------------------------------------------------------------------ доступность
+    def backend_state(self) -> tuple[Optional[bool], str]:
+        """(загружена ли модель в этом процессе, причина). None — неизвестно (IPC/сторонний сервис)."""
+        gs = getattr(self._module, "get_service", None) if self._module is not None else None
+        if not callable(gs):
+            return None, ""
+        if _vlm_runtime_absent(self._module):
+            return False, NOT_LOADED_HERE
+        try:
+            be, reason = gs().backend()
+        except Exception as exc:
+            return False, f"VLM-сервис: ошибка ({type(exc).__name__})"
+        if be is None:
+            return False, f"нет модели: {reason}" if reason else "нет модели"
+        av = getattr(be, "available", None)
+        if callable(av):
+            try:
+                ok = av()
+                ok, why = ok if isinstance(ok, tuple) else (bool(ok), "")
+            except Exception as exc:
+                ok, why = False, type(exc).__name__
+            if not ok:
+                return False, f"модель недоступна: {why}" if why else "модель недоступна"
+        if getattr(be, "loaded", True):
+            return True, ""
+        return False, NOT_LOADED_HERE
+
+    def usable(self) -> tuple[bool, str]:
+        loaded, why = self.backend_state()
+        if loaded is False and not (why == NOT_LOADED_HERE and bool(self.vcfg.get("allow_cold_load", False))):
+            return False, why
+        return True, ""
 
     @classmethod
     def resolve(cls, cfg: dict[str, Any], warnings: list[str]) -> Optional["VLMServiceBackend"]:
@@ -430,6 +521,11 @@ class VLMServiceBackend:
         if not callable(fn):
             warnings.append(f"{mod_name}.{vcfg.get('function', 'chat')} не найден")
             return None
+        be = cls(fn, cfg, mod)
+        ok, why = be.usable()  # сначала дешёвая проверка: модель не загружена здесь — available() A11 не зовём
+        if not ok:
+            warnings.append(f"генеративный режим недоступен: {why}")
+            return None
         avail = getattr(mod, "available", None)
         if callable(avail):
             try:
@@ -441,35 +537,54 @@ class VLMServiceBackend:
             except Exception as exc:
                 warnings.append(f"VLM-сервис: ошибка проверки ({type(exc).__name__})")
                 return None
-        return cls(fn, cfg, mod)
+        return be
 
+    # ------------------------------------------------------------------ вызов
     def _accepts(self, name: str) -> bool:
         return self._varkw or name in self._params
+
+    def _call(self, messages: Sequence[Message], kwargs: dict[str, Any]) -> Any:
+        if self._payload_style:
+            return self._chat({"messages": list(messages), **kwargs})
+        if self._accepts("messages"):
+            call_kw = {"messages": list(messages), **kwargs}
+        else:
+            system, prompt = _flatten(messages)
+            call_kw = {"system": system, "prompt": prompt, **kwargs}
+            if self._accepts("images"):
+                call_kw["images"] = []
+        for _ in range(6):  # сервис отверг незнакомый параметр — убираем его и повторяем
+            try:
+                return self._chat(**call_kw)
+            except TypeError as exc:
+                m = re.search(r"unexpected keyword argument '(\w+)'", str(exc))
+                if not m or m.group(1) not in call_kw or m.group(1) in {"messages", "system", "prompt"}:
+                    raise
+                call_kw.pop(m.group(1))
+        return self._chat(**call_kw)
 
     def stream_chat(self, messages: Sequence[Message], max_tokens: int = 512, temperature: float = 0.2,
                     deadline: Optional[float] = None, **kw: Any) -> Iterator[str]:
         remaining = (deadline - time.monotonic()) if deadline is not None else float(self.cfg.get("llm", {}).get("timeout_s", 45))
-        if remaining <= 0:
+        if remaining <= 1.0:
             raise LLMTimeout("no time left for VLM chat")
+        ok, why = self.usable()  # состояние могло измениться (A03 выгрузил VLM между видео)
+        if not ok:
+            raise LLMUnavailable(why)
+        wait = max(0.0, min(float(self.vcfg.get("wait_s", 10)), remaining * 0.5))
+        gen_timeout = max(1.0, remaining - wait - 0.5)  # ожидание GPU + генерация укладываются в дедлайн
         kwargs: dict[str, Any] = {}
-        if self._accepts("messages"):
-            kwargs["messages"] = list(messages)
-        else:
-            system, prompt = _flatten(messages)
-            kwargs["system"], kwargs["prompt"] = system, prompt
-            if self._accepts("images"):
-                kwargs["images"] = []
         alts = {"max_new_tokens": "max_tokens", "timeout_s": "timeout"}
-        for name, value in (("max_new_tokens", int(max_tokens)), ("timeout_s", remaining),
-                            ("temperature", float(temperature)),
-                            ("priority", str(self.vcfg.get("priority", "low"))),
-                            ("wait_s", min(remaining, float(self.vcfg.get("wait_s", 10))))):
-            if self._accepts(name):
+        for name, value in (("max_new_tokens", int(max_tokens)), ("timeout_s", gen_timeout),
+                            ("wait_s", wait), ("temperature", float(temperature))):
+            if self._payload_style or self._accepts(name):
                 kwargs[name] = value
             elif name in alts and self._accepts(alts[name]):
                 kwargs[alts[name]] = value
+        if "priority" in self._params:  # только если сервис явно принимает (A11 ставит приоритет сам)
+            kwargs["priority"] = str(self.vcfg.get("priority", "low"))
         try:
-            res = self._chat(**kwargs)
+            res = self._call(messages, kwargs)
         except TimeoutError as exc:
             raise LLMTimeout(str(exc)) from exc
         except Exception as exc:
@@ -484,20 +599,28 @@ class VLMServiceBackend:
                 if deadline is not None and time.monotonic() > deadline:
                     raise LLMTimeout("VLM chat exceeded budget")
             return
-        text, timed_out, error = _text_of(res)
-        if timed_out and not text:
+        text, kind, error, truncated = chat_outcome(res)
+        if kind == "unavailable":
+            raise LLMUnavailable(error)
+        if kind == "busy":
+            raise LLMBusy(error or "busy")
+        if kind == "timeout":
             raise LLMTimeout(error or "VLM chat timed out")
-        if error and not text:
-            if "busy" in error.lower():
-                raise LLMBusy(error)
-            raise RuntimeError(f"VLM chat error: {error}")
+        if kind:
+            raise RuntimeError(f"VLM chat {kind}: {error}")
+        if truncated:  # обрезано по лимиту токенов/времени — оставляем только законченные предложения
+            from .guard import complete_prefix
+
+            text = complete_prefix(text.rstrip() + " ") or text
         yield text
 
     def release(self) -> None:
         return None  # моделью владеет A11/A03
 
     def info(self) -> dict[str, Any]:
-        return {"backend": self.name, "module": getattr(self._module, "__name__", "")}
+        loaded, why = self.backend_state()
+        return {"backend": self.name, "module": getattr(self._module, "__name__", "") if self._module else "injected",
+                "model_loaded_here": loaded, "note": why}
 
 
 class VLMRuntimeAdapter(VLMServiceBackend):

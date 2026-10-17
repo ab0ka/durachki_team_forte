@@ -25,6 +25,10 @@ def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("COPILOT_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    # герметичность: настоящий ml.vlm.service (A11, после мерджа) не должен влиять на тесты «нет модели»;
+    # тесты VLM подставляют свой фейковый модуль через monkeypatch.setitem
+    monkeypatch.setitem(sys.modules, "ml.vlm.service", None)
+    monkeypatch.delenv("COPILOT_VLM_MODULE", raising=False)
 
 
 @pytest.fixture()

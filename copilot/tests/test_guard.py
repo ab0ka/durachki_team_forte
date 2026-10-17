@@ -19,10 +19,22 @@ def test_valid_markers_become_footnotes(corpus, job_violation) -> None:
 
 def test_invented_marker_removed(corpus, job_violation) -> None:
     res = normalize_result(job_violation)
-    g = check_answer("Это запрещено [N1] и ещё [N7].", _refs(corpus), corpus, res)
-    assert "[N7]" in g.removed
+    g = check_answer("Телефон запрещён [N1]. А ещё запрещено вот это [N7].", _refs(corpus), corpus, res)
+    assert "[N7]" in g.removed and "вот это" not in g.answer   # утверждение с фальшивой ссылкой ушло целиком
     assert len(g.citations) == 1
     assert not g.grounded  # в сыром ответе была выдуманная ссылка
+
+
+def test_claim_about_nonexistent_event_dropped(corpus, job_clean) -> None:
+    res = normalize_result(job_clean)
+    g = check_answer("Кассир держит телефон у уха [V1].", [], corpus, res)
+    assert "телефон" not in g.answer and "[V1]" in g.removed
+
+
+def test_dangling_text_after_url_removal_dropped(corpus, job_violation) -> None:
+    res = normalize_result(job_violation)
+    g = check_answer("Телефон запрещён [N1]. Подробнее: https://evil.example/x", _refs(corpus), corpus, res)
+    assert g.answer == "Телефон запрещён [1]."
 
 
 def test_invented_clause_sentence_dropped(corpus, job_violation) -> None:
@@ -113,3 +125,31 @@ def test_insinuation_with_caveat_word_is_still_checked(corpus, job_violation) ->
     res = normalize_result(job_violation)
     g = check_answer("Это не означает, что кассир тайно украл деньги и скрылся через чёрный ход.", [], corpus, res)
     assert "украл" not in g.answer
+
+
+def test_invented_violation_type_dropped(corpus, job_violation) -> None:
+    res = normalize_result(job_violation)  # в результате: телефон (V05) и сейф (V03)
+    g = check_answer("Кассир держит телефон у уха [V1]. Также обнаружено нарушение: посторонний за стойкой.",
+                     _refs(corpus), corpus, res)
+    assert "посторонний" not in g.answer and "телефон у уха" in g.answer
+    assert any("нарушение не из результата" in x for x in g.removed)
+
+
+def test_reported_types_and_candidates_are_kept(corpus, job_violation) -> None:
+    raw = "Обнаружено нарушение с сейфом [V2]. Кандидат «посторонний» ниже порога и не вошёл в вердикт."
+    hint = {"type_id": "V01", "type": "Посторонний в кассовой зоне", "timecode_sec": 30.0, "score": 0.3,
+            "threshold": 0.5, "reasons_ru": ["ниже порога"]}
+    res = normalize_result({**job_violation, "meta": {"ui": {"review_hints": [hint]}}})
+    g = check_answer(raw, _refs(corpus), corpus, res)
+    assert "сейфом" in g.answer and "посторонний" in g.answer
+    # того же кандидата нет в результате — фразу о нём не пропускаем
+    g2 = check_answer(raw, _refs(corpus), corpus, normalize_result(job_violation))
+    assert "сейфом" in g2.answer and "посторонний" not in g2.answer
+
+
+def test_unverified_norm_cannot_be_called_verified(corpus, job_violation) -> None:
+    res = normalize_result(job_violation)  # нормы фикстуры не сверены (verified: false)
+    g = check_answer("Это прямо запрещает проверенная норма [N1]. Телефон запрещён [N1].", _refs(corpus), corpus, res)
+    assert "проверенная" not in g.answer and g.answer == "Телефон запрещён [1]."
+    ok = check_answer("Для этого типа в каталоге нет подтверждённого пункта.", _refs(corpus), corpus, res)
+    assert ok.answer.startswith("Для этого типа")  # честное «нет подтверждённого» — не утверждение о проверке

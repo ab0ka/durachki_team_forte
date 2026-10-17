@@ -195,3 +195,34 @@ def test_python_api_accepts_history_with_text(cfg, corpus, job_violation) -> Non
     llm = ScriptedLLM(["Пользоваться телефоном запрещено [N1]."])
     _svc(cfg, corpus, llm).answer(job_violation, "А норма?", [{"role": "user", "text": "Что с телефоном?"}])
     assert llm.calls[0][1] == {"role": "user", "content": "Что с телефоном?"}
+
+
+def test_identity_refusal_keeps_full_explanation(cfg, corpus, job_violation) -> None:
+    r = _svc(cfg, corpus).answer(job_violation, "Кто этот человек?", [])
+    assert "не распознаёт и не идентифицирует людей по лицу" in r["answer"]
+    assert r["removed_citations"] == []
+
+
+def test_history_of_other_job_is_dropped(cfg, corpus, job_violation) -> None:
+    llm = ScriptedLLM(["Кассир держит телефон у уха [V1]."])
+    hist = [{"role": "user", "content": "Что было в ролике про сейф?", "job_id": "other-job"},
+            {"role": "user", "content": "Что с телефоном?", "job_id": "job-test-1"},
+            {"role": "user", "content": "Без метки задачи"}]
+    _svc(cfg, corpus, llm).answer(job_violation, "А дальше?", hist)
+    contents = [m["content"] for m in llm.calls[0][1:-1]]
+    assert contents == ["Что с телефоном?", "Без метки задачи"]
+
+
+def test_stale_history_does_not_whitelist_facts(cfg, corpus, job_violation) -> None:
+    """Таймкод/сумма из старой истории (другого ролика) не становятся «фактами» для ответа."""
+    llm = ScriptedLLM(["На 95 с кассир передал 300 000 тенге. Кассир держит телефон у уха [V1]."])
+    hist = [{"role": "user", "content": "В прошлом ролике на 95 с передали 300 000 тенге?"},
+            {"role": "assistant", "content": "Да, на 95 с передали 300 000 тенге."}]
+    r = _svc(cfg, corpus, llm).answer(job_violation, "Что видно?", hist)
+    assert "95" not in r["answer"] and "300 000" not in r["answer"] and "телефон у уха" in r["answer"]
+
+
+def test_conversation_content_is_unobservable(cfg, corpus, job_violation) -> None:
+    for q in ("О чём кассир говорил по телефону?", "Что кассир сказал клиенту?"):
+        r = _svc(cfg, corpus).answer(job_violation, q, [])
+        assert r["refusal"] is True and r["answer"].startswith("По имеющимся данным"), q

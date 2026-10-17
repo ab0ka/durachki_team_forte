@@ -115,7 +115,8 @@ print(json.dumps({"available": st["available"], "reason": st["reason"], "error":
                   "answer": r["answer"], "heavy": heavy}))
 """
     env = {"PATH": "/usr/bin:/bin", "COPILOT_ENABLED": "1", "COPILOT_MODEL_PATH": str(tmp_path / "none.gguf"),
-           "COPILOT_CACHE_DIR": str(tmp_path / "cache"), "HF_HUB_OFFLINE": "1", "COPILOT_EMBED_BACKEND": "hashing"}
+           "COPILOT_CACHE_DIR": str(tmp_path / "cache"), "HF_HUB_OFFLINE": "1", "COPILOT_EMBED_BACKEND": "hashing",
+           "COPILOT_VLM_MODULE": "copilot._no_vlm_service_for_test"}  # «модели нет» и после мерджа A11
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60, env=env)
     assert out.returncode == 0, out.stderr
     res = json.loads(out.stdout.strip().splitlines()[-1])
@@ -363,7 +364,8 @@ def test_router_with_test_job_provider_variants(cfg, corpus, job_violation) -> N
     dc = AnalysisResult(job_id="dc", status="done", verdict="violation", violations=[
         Violation(type="Использование мобильного телефона при работе с ценностями", timecode_sec=12.0,
                   description="Кассир держит телефон", evidence_frames=[EvidenceFrame(12.0, "QQ==")], type_id="V05")])
-    store = {"dict": job_violation, "dc": dc, "json": json.dumps(job_violation, ensure_ascii=False)}
+    store = {"dict": {**job_violation, "job_id": "dict"}, "dc": dc,
+             "json": json.dumps({**job_violation, "job_id": "json"}, ensure_ascii=False)}
 
     def provider(job_id: str):
         if job_id == "explode":
@@ -459,4 +461,4 @@ def test_openapi_builds_with_double_mount() -> None:
         spec = app.openapi()
     assert not [w for w in caught if "operation" in str(w.message).lower()]
     ops = [op["operationId"] for p in spec["paths"].values() for op in p.values()]
-    assert len(ops) == len(set(ops)) == 6
+    assert len(ops) == len(set(ops)) == 8  # status, ask, report, suggestions × 2 префикса

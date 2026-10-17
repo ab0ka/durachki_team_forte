@@ -56,7 +56,9 @@ _ANSWER_VOCAB = {w[:4] for w in """признак возможного нару�
 анализ результат система фрагмент просмотреть проверить вручную документ сноска интервал секунда минута
 согласно требование запрещено допускается указано видно отмечено зафиксировано обнаружено рекомендуется
 сверить подтвердить отклонить алгоритм оценка вероятность человек определяется является случае ответ
-информация относящиеся найденные данных имеющимся момент означает""".split()}
+информация относящиеся найденные данных имеющимся момент означает пайплайн сообщил проанализировано целиком
+полнота неполный неизвестно каталог исключения описаны поиском пункта сверки роли кассир посетитель
+инкассатор зоне поведению предметам""".split()}
 
 # утверждения «нарушений нет» / «нарушение есть» — сверяются с вердиктом и полнотой анализа
 _CLAIM_NONE_RE = re.compile(
@@ -66,12 +68,16 @@ _CLAIM_NONE_RE = re.compile(
     re.I,
 )
 _CLAIM_SOME_RE = re.compile(r"(?:обнаружен\w*|выявлен\w*|зафиксирован\w*|есть)\s+(?:признак\w*\s+)?(?:возможного\s+)?нарушени", re.I)
+_CLAIM_STRONG_RE = re.compile(
+    r"вс[её]\s+в\s+порядке|касса\s+чист\w*|без\s+нарушений|нарушени\w*\s+нет\b|нет\s+(?:никаких\s+)?нарушени", re.I)
+_BAD = "\u2063BAD\u2063"  # внутренняя метка «предложение ссылается на несуществующее»
 _CAVEAT_RE = re.compile(r"не\s+означает|неполн|не\s+подтвержд|полнота|в\s+проанализированной\s+части", re.I)
 
 
 REFUSAL_PATTERNS = [
     r"установить нельзя", r"нельзя установить", r"не\s+устанавлива", r"в источниках нет", r"нет информации",
     r"нет данных", r"не могу ответить", r"не выполняется", r"не определяется", r"невозможно определить",
+    r"не\s+распозна", r"не\s+идентифицир",
     re.escape(REFUSAL_SCOPE.lower()),
 ]
 UNVERIFIED_ANSWER = f"{REFUSAL_NO_DATA}: ответ модели не подтверждён результатом анализа и источниками."
@@ -196,7 +202,7 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
         n = int(m.group(2))
         if n not in by_n:
             removed.append(m.group(0))
-            return ""
+            return _BAD  # утверждение со ссылкой на несуществующую норму уходит вместе с предложением
         if n not in order:
             order.append(n)
         return f"[{order.index(n) + 1}]"
@@ -209,17 +215,21 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
         v = viols.get(n)
         if v is None:
             removed.append(m.group(0))
-            return ""
+            return _BAD  # утверждение о несуществующем событии уходит вместе с предложением
         return f"(№{n}, {fmt_tc(v.get('timecode_sec'))})"
 
     text = _VMARK_RE.sub(_vmark, text)
 
-    # --- 3. контекст, на который ответ имеет право опираться
-    user_text = " ".join([question] + [str(t.get("content") or "") for t in history if t.get("role") == "user"])
+    # --- 3. контекст, на который ответ имеет право опираться: ТОЛЬКО текущая задача, каталог и текущий вопрос.
+    # История диалога — не источник фактов (может быть устаревшей, от другой задачи или поддельной).
+    user_text = question
     allowed_times = [float(t) for t in _result_times(result)] + _times_in(user_text)
-    for turn in history:
-        allowed_times += _times_in(str(turn.get("content") or ""))
     ref_clauses = {norm_clause(r.chunk.clause) for r in refs if r.chunk.clause}
+    if corpus is not None:  # пункты, упомянутые в пояснениях/исключениях каталога для типов событий (тоже контекст)
+        for v in viols.values():
+            info = corpus.type_info(str(v.get("type_id") or ""))
+            for txt in [str(info.get("legal_note") or "")] + [str(x) for x in info.get("exclusions") or []]:
+                ref_clauses |= {norm_clause(cm.group(0)) for cm in _CLAUSE_RE.finditer(txt)}
     known_urls = {norm_url(r.chunk.url) for r in refs if r.chunk.url}
     if corpus is not None:
         known_urls |= corpus.known_urls()
@@ -233,11 +243,15 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
 
     kept: list[str] = []
     for sent in _split_sentences(text):
-        bad = False
+        bad = _BAD in sent
+        url_cut = False
         for um in _URL_RE.finditer(sent):
             if norm_url(um.group(0)) not in known_urls:
                 removed.append(um.group(0))
                 sent = sent.replace(um.group(0), "").strip()
+                url_cut = True
+        if url_cut and len(re.findall(r"[а-яёa-z]{2,}", sent, re.I)) < 3:
+            bad = True  # после удаления ссылки осталась «Подробнее:» и т.п.
         for am in _ACT_RE.finditer(sent):
             if not _doc_known(am.group("title"), corpus, refs):
                 removed.append(am.group(0))
@@ -260,6 +274,12 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
                 bad = True
         if not bad and _contradicts(sent, result):
             removed.append(f"противоречит результату: {sent[:60]}")
+            bad = True
+        if not bad and _invented_violation(sent, result):
+            removed.append(f"нарушение не из результата: {sent[:60]}")
+            bad = True
+        if not bad and _claims_verified_norm(sent, order, by_n):
+            removed.append(f"непроверенная норма выдана за проверенную: {sent[:60]}")
             bad = True
         if not bad and not is_refusal(sent):
             stems = _stems(re.sub(r"\(№\d+, [\d:]+\)|\[\d+\]", " ", sent))
@@ -308,6 +328,40 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
                        removed=list(dict.fromkeys(removed)), raw_invalid=raw_invalid, warnings=warnings)
 
 
+# сильные признаки типа нарушения в тексте ответа (для проверки «нарушение не из результата»)
+_TYPE_WORDS = {
+    "V01": r"посторонн", "V02": r"покинул|отош[её]л\s+от\s+рабоч", "V03": r"сейф", "V04": r"двер",
+    "V05": r"телефон|смартфон", "V06": r"\bеда\b|\bпищ|напит|\bкофе\b|\bчай\b", "V07": r"инкасс",
+    "V08": r"пересч[её]т|пересчит", "V09": r"личн\w*\s+вещ|куртк|рюкзак",
+}
+_NOT_A_DETECTION_RE = re.compile(r"кандидат|ниже\s+порога|спорн|не\s+вошл|не\s+(?:обнаружен|выявлен|зафиксирован)", re.I)
+_VERIFIED_CLAIM_RE = re.compile(
+    r"(?:подтвержд[её]нн\w*|сверенн\w*|проверенн\w*|действующ\w*)\s+(?:норм|пункт)\w*"
+    r"|(?:норм|пункт)\w*\s+(?:\w+\s+){0,2}(?:подтвержден\w*|сверен\w*|проверен\w*)", re.I)
+
+
+def _invented_violation(sent: str, result: dict[str, Any]) -> bool:
+    """Утверждение «обнаружено нарушение X», где типа X нет ни в нарушениях, ни в спорных местах."""
+    from .prompts import review_hints
+
+    if not _CLAIM_SOME_RE.search(sent) or _NOT_A_DETECTION_RE.search(sent):
+        return False
+    present = {str(v.get("type_id") or "") for v in result.get("violations") or []}
+    present |= {str(h.get("type_id") or "") for h in review_hints(result)}
+    low = sent.lower().replace("ё", "е")
+    mentioned = {tid for tid, pat in _TYPE_WORDS.items() if re.search(pat.replace("ё", "е"), low)}
+    return bool(mentioned - present)
+
+
+def _claims_verified_norm(sent: str, order: list[int], by_n: dict[int, NormRef]) -> bool:
+    """«Проверенная/подтверждённая норма», хотя процитированная норма не сверена (или нормы нет)."""
+    if not _VERIFIED_CLAIM_RE.search(sent) or re.search(
+            r"(?:\bне|\bнет|\bбез|отсутству\w*|требует)\s+(?:\w+\s+)?(?:подтвержд|сверен|провер|сверки)", sent, re.I):
+        return False
+    refs = [by_n[order[int(k) - 1]] for k in re.findall(r"\[(\d+)\]", sent) if 0 < int(k) <= len(order)]
+    return not any(r.chunk.verified and r.chunk.status in {"", "confirmed"} for r in refs)
+
+
 def _contradicts(sent: str, result: dict[str, Any]) -> bool:
     """«Нарушений нет» при вердикте violation или при неполном/упавшем анализе; «нарушение есть» при чистом."""
     from .prompts import completeness
@@ -324,6 +378,8 @@ def _contradicts(sent: str, result: dict[str, Any]) -> bool:
             return True
         if has_viols and not scoped:
             return True
+        if state == "unknown" and _CLAIM_STRONG_RE.search(sent):
+            return True  # полнота не подтверждена — «всё в порядке» без оговорки не говорим
     elif _CLAIM_SOME_RE.search(sent) and not has_viols and result.get("status") == "done":
         return not re.search(r"\bне\s+(?:обнаружен|выявлен|зафиксирован)", sent, re.I)
     return False

@@ -126,3 +126,13 @@ def test_sse_disabled_returns_http_501_not_200(cfg, corpus, jobs) -> None:
     svc = CopilotService(cfg=load_config({**cfg, "enabled": False}), corpus=corpus)
     r = _client(svc, jobs).post("/api/v1/jobs/job-test-1/ask?stream=1", json={"question": "Почему?"})
     assert r.status_code == 501 and r.json()["detail"]["error"] == "disabled"
+
+
+def test_provider_returning_foreign_job_is_404(cfg, corpus, job_violation) -> None:
+    """Провайдер по ошибке отдал другую задачу — по ней не отвечаем и её не раскрываем."""
+    app = FastAPI()
+    app.include_router(make_router(get_job=lambda jid: job_violation, service=CopilotService(cfg=cfg, corpus=corpus)))
+    c = TestClient(app)
+    assert c.post("/api/v1/jobs/other-job/ask", json={"question": "Почему?"}).status_code == 404
+    assert c.get("/api/v1/jobs/other-job/report").status_code == 404
+    assert c.post("/api/v1/jobs/job-test-1/ask", json={"question": "Почему?"}).status_code == 200

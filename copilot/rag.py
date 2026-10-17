@@ -27,6 +27,13 @@ class Hit:
     score: float
     dense: float = 0.0
     lexical: float = 0.0
+    overlap: int = 0          # сколько НЕобщих слов вопроса есть во фрагменте (для порога «возможно относится»)
+
+
+# слова, совпадение по которым ничего не говорит о релевантности нормы
+_GENERIC = {"норма", "нормы", "пункт", "наруше", "примен", "исполь", "работ", "работе", "какая", "какой", "какие",
+            "почему", "кассир", "правил", "статья", "докуме", "требов", "можно", "нужно", "должен", "случае",
+            "являет", "основа", "отмече", "систем", "видео"}
 
 
 class BM25:
@@ -58,6 +65,11 @@ class BM25:
 
 def _terms(text: str) -> list[str]:
     return [stem(w) for w in tokenize(text) if len(w) > 2]
+
+
+def content_overlap(query: str, text: str) -> int:
+    q = {t for t in _terms(query) if len(t) > 3 and t not in _GENERIC}
+    return len(q & set(_terms(text)))
 
 
 class Retriever:
@@ -101,6 +113,13 @@ class Retriever:
                 pass
         return mat
 
+    def relevant(self, hit: Hit) -> bool:
+        """Достаточно ли фрагмент похож на вопрос, чтобы показать его как «найдено поиском»."""
+        rcfg = self.cfg.get("rag", {})
+        min_dense = float(rcfg.get("retrieved_min_dense_e5" if self.backend == "e5" else "retrieved_min_dense",
+                                   0.82 if self.backend == "e5" else 0.25))
+        return hit.overlap >= int(rcfg.get("retrieved_min_overlap", 2)) or hit.dense >= min_dense
+
     def min_score(self) -> float:
         rcfg = self.cfg.get("rag", {})
         if self.backend == "e5":
@@ -136,7 +155,8 @@ class Retriever:
             if dedupe and key in seen:
                 continue
             seen.add(key)
-            hits.append(Hit(chunk=c, score=float(scores[idx]), dense=float(dense[idx]), lexical=float(lex_n[idx])))
+            hits.append(Hit(chunk=c, score=float(scores[idx]), dense=float(dense[idx]), lexical=float(lex_n[idx]),
+                            overlap=content_overlap(query, c.embed_text)))
             if len(hits) >= k:
                 break
         return hits

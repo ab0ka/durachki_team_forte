@@ -1,236 +1,242 @@
 # Sentinel Copilot — подключение (A14 → интегратор L2)
 
-Copilot — **опциональный** модуль. Он ничего не меняет в анализе видео и по умолчанию выключен в
-проде. Подключение — один `include_router` в API (A02). Если его не подключить, удалить или
-выключить, остальная система работает как прежде: никто из других модулей copilot не импортирует.
+Copilot — **опциональный** модуль: объясняет проверяющему результат и нормы, на вердикт, таймкод и тип
+**не влияет** и ресурсы у анализа не забирает. По умолчанию в проде выключен (`enabled: mock`). Если его
+не подключить, удалить или выключить, остальная система работает как прежде.
 
-| Что | Поведение |
+| Ситуация | Поведение |
 |---|---|
-| Импорт `copilot`, `copilot.router` | без весов, без torch/llama_cpp/transformers, без сети, без чтения корпуса |
-| Copilot выключен (по умолчанию) | `POST …/ask` → **501** `error="disabled"`, `answer=""` |
-| Включён, но локальной модели нет | **501** `error="unavailable"`, `answer=""`; облачных API нет, автоскачивания нет |
-| Ошибка модели / таймаут / GPU занят | 500 `llm_error` / 504 `timeout` / 503 `busy`, JSON-тело; другие эндпоинты API не затронуты |
-| Неподтверждённые цитаты, суммы, таймкоды, домыслы | вырезаются до выдачи (и в SSE); если не осталось ничего — «По имеющимся данным это установить нельзя…» |
+| Импорт `copilot`, `copilot.router` | без весов, без torch/transformers/llama_cpp, без сети, без чтения корпуса |
+| Copilot выключен (по умолчанию в проде) | `POST …/ask` → **501** `error="disabled"`; `status.available=false` (A15 скрывает панель) |
+| Включён, генеративной модели в этом процессе нет | **200**, режим `retrieval`: ответ из фактов задачи и каталога норм, первая строка «(Генеративный режим недоступен…)»; `status`: `available=true, generative=false, mode=retrieval` |
+| Включён, VLM загружена в этом процессе или подключён `set_chat_fn` | режим `generative`: общая Qwen3-VL-4B через `ml.vlm.service` (A11) |
+| VLM не загружена здесь (в проде она в процессе-воркере A03) | copilot её **не загружает** (вторая копия на 8 ГБ = OOM) → `retrieval` |
+| Анализ держит GPU дольше `wait_s` / сервис ответил `busy` | модель не дожидаемся, ответ `retrieval` с пометкой «временно недоступен (GPU занят анализом)» |
+| Сервис ответил `unavailable` (модель выгружена, чат выключен) | `retrieval` с пометкой, статус пересчитается на следующем запросе |
+| Таймаут / ошибка модели | 504 `timeout` / 500 `llm_error`, JSON, `answer=""`; другие эндпоинты не затронуты |
+| Провайдер вернул **другую** задачу | **404** (по чужой задаче не отвечаем и её не раскрываем) |
+| Неподтверждённое в ответе модели | вырезается до выдачи (и в SSE); не осталось ничего → «По имеющимся данным это установить нельзя…» |
 
-## 0. Состояние соседних веток (проверено чтением кода, 2026-10-17)
-- **A02** (`claude/laughing-faraday-xe89m9`, `backend/api/main.py::_mount_copilot`) уже вызывает
-  `make_router(get_job=job_for_copilot, prefix="/api/v1"|"/ui/v1", dependencies=[...])`. Сигнатура
-  совпадает, тест `test_a02_style_double_mount_api_and_ui` воспроизводит двойной монтаж. Провайдер A02
-  возвращает dict ТЗ, `{"status": "processing"}`, failed-dict или `None`, всё это поддержано.
-  Маршрута `/jobs/{id}/report` у A02 нет, конфликтов путей нет. **Менять у A02 ничего не нужно.**
-- **A15** (`claude/busy-pasteur-y15o46`, `frontend/src/api/client.ts::ask`) шлёт
-  `{question, history: [{role, text}]}` и читает `answer` + `sources` (строки), при 501 скрывает панель.
-  Copilot принимает `text` как синоним `content` и отдаёт `sources` (подписи источников) рядом с
-  `citations`. Тест `test_a15_request_shape_history_with_text_and_sources` это проверяет.
-  **Менять у A15 ничего не нужно.**
+Mock (`backend: "mock"`) — только при `SENTINEL_MOCK=1` (тесты, демо), помечен в ответе и статусе.
+Production сам на mock не переключается.
 
-## 1. Импорты и подключение роутера (A02)
+## 0. Безопасный режим без отдельной LLM (рекомендация для L2)
+
+| Режим | Как включить | Что происходит |
+|---|---|---|
+| Выключен (по умолчанию) | ничего не делать (без `SENTINEL_MOCK`) или `COPILOT_ENABLED=0` | 501, панель скрыта; заключение `GET …/report` работает |
+| **Retrieval-only** | `COPILOT_ENABLED=1` | ответы из фактов задачи и каталога A13 с пометкой режима; без LLM, без GPU; в процессе API не импортируются `torch` и `ml.vlm.runtime` (проверено) |
+| Генеративный (позже, по решению L2) | `copilot.service.set_chat_fn(fn)` — `fn` = IPC к `ml.vlm.service.chat_request` в процессе-воркере A03 | ответы общей VLM; приоритет анализа обеспечивает `gpu.PriorityLock` A11 в воркере |
+
+Отдельной LLM у copilot нет и не будет: на 8 ГБ рядом с VLM она не помещается.
+
+## 1. Состояние соседей (проверено чтением веток, 2026-10-17)
+- **A02** (`backend/api/main.py::_mount_copilot`) монтирует `make_router(get_job, prefix="/api/v1"|"/ui/v1",
+  dependencies=[…])`; `job_for_copilot` отдаёт JSON этой задачи с `job_id` = запрошенному (`results.py`
+  проставляет `job_id`). Совместимо, менять ничего не нужно.
+- **A03** (`backend/pipeline/worker.py`): в проде модели живут в процессе `sentinel-gpu-worker` (spawn),
+  copilot — в процессе API. Канала для чата к воркеру нет → в проде copilot работает в `retrieval`, пока
+  L2/A03 не подключат `set_chat_fn` (см. §2).
+- **A11** (`ml/vlm`): `ml.vlm.service` есть в ветке A11 (`claude/inspiring-turing-2fm7rq`, b4b2ec5) и в
+  `claude/integration-cloud`, но **нет** в `integration` (5597969). Copilot проверен с обеими версиями
+  сервиса; без него — `retrieval`.
+- **A13** (`norms/`): каталог v2 (`legal_status`, `legal_note`, `exclusions`, `documents`) и источники
+  `retrieval: search_snippets` разбираются честно. Пример: для V05 (телефон) в каталоге нет
+  подтверждённого пункта — copilot отвечает «без пункта».
+- **A15** (`CopilotPanel.tsx`): `status.available=false` → панель скрыта; `POST …/ask` с
+  `{question, history:[{role, text}]}` → `{answer, sources}`; панель пересоздаётся на каждую задачу
+  (`JobScreen key={route.id}`), история между задачами не переносится.
+
+## 2. Подключение
 
 ```python
-# backend/api/... (файл A02) — подключение ленивое и необязательное
-from fastapi import Depends
+# A02 (уже сделано): лениво, тем же ключом/сессией, что и остальные эндпоинты
+from copilot.router import make_router
+app.include_router(make_router(get_job=provider, prefix="/api/v1"), dependencies=[Depends(require_api_key)])
+app.include_router(make_router(get_job=provider, prefix="/ui/v1"), dependencies=[Depends(ui_auth)])
 
-def _include_copilot(app, get_result, require_api_key) -> None:
-    try:
-        from copilot.router import make_router
-    except Exception:            # нет папки/зависимостей — API работает без copilot
-        return
-    app.include_router(
-        make_router(get_job=get_result),            # get_result(job_id) -> dict | AnalysisResult | JSON-str | None (может быть async)
-        dependencies=[Depends(require_api_key)],    # тот же X-API-Key, что у /api/v1/analyze и /api/v1/jobs/{id}
-    )
+# Необязательно (A02/A03): пока идёт анализ, копилот модель не трогает вовсе
+import copilot.service as cs
+cs.set_busy_probe(lambda: job_manager.has_running_jobs())   # любая функция () -> bool
+
+# Необязательно (L2/A03): генеративный режим через VLM процесса-воркера
+cs.set_chat_fn(lambda payload: worker_rpc("vlm_chat", payload))  # в воркере: ml.vlm.service.chat_request(payload)
 ```
 
-Альтернатива без замыкания: модульный `copilot.router.router` + `copilot.router.set_job_provider(get_result)`.
-Пока провайдер не задан, роутер отвечает 503.
+`provider(job_id)` возвращает результат именно этой задачи (dict по схеме API/UI-report,
+`AnalysisResult` или JSON-строку) или `None` (404). Если у результата другой `job_id` — 404.
+`status="processing"` → 409, исключение провайдера → 503.
 
-Публичные функции (Python):
+### Граница с A11 (`ml.vlm.service`) — как есть в коде A11
 ```python
-from copilot import answer, report, status, warmup, release   # всё лениво, исключений не бросает
-from copilot.router import make_router, set_job_provider, router
-from copilot.service import set_gpu_lock, set_service, CopilotService
+chat(messages, *, images=None, max_new_tokens=None, timeout_s=None, wait_s=None, temperature=0.0,
+     priority="low") -> ChatResult(ok, text, error, finish_reason, truncated, timed_out, …)
+chat_request(payload: dict) -> dict          # тот же ChatResult для IPC
+available() -> (bool, reason)                # без загрузки модели
+get_service().backend() -> (backend|None, reason)   # backend.loaded — загружена ли модель
 ```
+- Подпись читается из кода: `priority` передаётся, только если `chat` его принимает (старая версия A11 —
+  `chat(messages, **kw)` с keyword-only `VLMService.chat` без `priority`; новая — явный `priority`).
+  Незнакомый параметр (TypeError) убирается, вызов повторяется.
+- **Приоритет анализа** обеспечивает A11 (`gpu.PriorityLock`: ожидающий анализ всегда раньше чата).
+  Copilot ограничивает ожидание: `wait_s = min(vlm_service.wait_s, 50% бюджета)`, генерация — остаток;
+  ожидание + генерация ≤ `llm.timeout_s` (45 с). Проверено на настоящем `ml.vlm.gpu`: пока анализ держит
+  GPU, ответ `retrieval` за < 3 с, модель не вызывается.
+- **Без второй VLM:** перед вызовом copilot проверяет `get_service().backend()`; модель не загружена в этом
+  процессе → `retrieval` (A11 по умолчанию `allow_cold_load: true` загрузил бы её). Если `ml.vlm.runtime`
+  в процессе не импортирован, модели здесь нет — `backend()/available()` не вызываются вовсе (иначе
+  процесс API импортировал бы torch/transformers). Холодная загрузка — только явно
+  `vlm_service.allow_cold_load: true`.
+- **Ответ:** `ok=False, error="unavailable…"` → `retrieval`; `"busy"` → `retrieval` с пометкой;
+  `timed_out`/`"timeout"` без текста → 504; `"invalid…"`/прочее → 500. Обрезанный (`truncated`) или
+  оборванный по времени текст — только законченные предложения, затем guard.
+- **Лимит входа:** промпт ≤ `vlm_service.max_input_chars` (11000 < 12000 у A11): сначала отбрасывается
+  старая история, затем лишние нормы, затем укорачиваются цитаты; guard проверяет по тем же нормам.
 
-### Требования к авторизации (делает A02, роутер ключей не знает)
-- Все три эндпоинта copilot подключать **только** с той же dependency проверки ключа/сессии, что и
-  `GET /api/v1/jobs/{job_id}`. Без ключа → 401 (это проверено тестом с dependency).
-- `get_job(job_id)` обязан возвращать результат именно этой задачи и только если вызывающий имеет к
-  ней доступ (та же логика, что для `GET /api/v1/jobs/{id}`). Нет задачи или нет доступа → `None` (404).
-- Copilot не хранит историю диалога: её присылает клиент в теле запроса, и она обрезается до 8 реплик.
+### Авторизация
+`/ask`, `/report`, `/suggestions`, `/copilot/status` подключать только с той же dependency, что
+`GET /jobs/{id}`. Роутер ключей не знает. Провайдер отдаёт лишь задачи, доступные вызывающему.
 
-### Требования к общей GPU-очереди (A03)
-- По умолчанию copilot выключен и VRAM не занимает. Включать на ноутбуке 8 ГБ — только осознанно.
-- Если включён на той же GPU:
-  - `copilot.service.set_gpu_lock(lock)` — общий замок или очередь GPU. Нужен объект с
-    `acquire(timeout=...)` и `release()`, подойдёт `threading.Lock/Semaphore`. Copilot ждёт его не
-    дольше своего таймаута, иначе ответ `busy` (503). Анализ видео copilot не блокирует.
-  - `copilot.release()` перед стадиями VLM/детектора выгружает LLM и освобождает VRAM. После простоя
-    `llm.idle_unload_s` (300 с) модель выгружается сама.
-  - `llm.gpu_layers: auto` отдаёт GPU столько слоёв, чтобы осталось `llm.vram_reserve_mb` (1500 МБ).
-    `COPILOT_GPU_LAYERS=0` держит LLM только на CPU (рекомендуется при работающей VLM).
-- `copilot.warmup()` в `backend.pipeline.warmup()` не нужен. Если его вызвать, он вернёт `False`
-  при недоступности и не бросит исключение.
+## 3. Вход и выход
 
-## 2. Формат входа и выхода (синтетический пример)
-
-Вход `get_job` — результат по схеме API (`contracts.serialize.result_to_api`) или `AnalysisResult`:
+`POST …/jobs/{id}/ask` (тело `{"question": str(1..2000), "history": [{"role", "content"|"text", "job_id"?}] (≤40)}`) → 200:
 ```json
-{"job_id": "demo-1", "status": "done", "verdict": "violation",
- "violations": [{"type": "Использование мобильного телефона при работе с ценностями", "type_id": "V05",
-                 "timecode_sec": 22.0, "t_start": 20.0, "t_end": 25.0, "confidence": 0.81,
-                 "description": "Кассир держит телефон у уха, на столе видны наличные",
-                 "evidence_frames": [{"timestamp_sec": 22.0, "image_base64": "<JPEG base64>"}],
-                 "rules": [{"document": "...", "clause": "п. ...", "url": "...", "quote": "..."}]}]}
+{"answer": "…[1]…", "citations": [{"document": "...", "clause": "п. 20", "url": "https://adilet.zan.kz/...",
+  "fragment": "Ф3. Пункт 20 (приём наличных)", "ref": 1, "quote": "...", "verified": false,
+  "relation": "catalog", "status": "candidate", "note": "норма каталога для этого типа; статус в каталоге: кандидат, требует сверки; …",
+  "events": [1], "short": "Правила кассовых операций и инкассации (НБРК № 231)"}],
+ "sources": ["[1] Правила … (НБРК № 231), п. 20 — https://… (норма каталога; кандидат; не сверено)"],
+ "grounded": true, "refusal": false, "generative": true, "mode": "generative", "notice": null,
+ "intent": "why", "backend": "vlm_service", "removed_citations": [], "warnings": [], "latency_ms": 1234,
+ "disclaimer": "Подсказка для проверяющего, не юридическое заключение.", "error": null}
 ```
-`image_base64` в LLM не передаётся. `rules` необязательны и перепроверяются по каталогу.
-
-`POST /api/v1/jobs/demo-1/ask` с `X-API-Key`, тело
-`{"question": "Почему это нарушение?", "history": [{"role": "user"|"assistant", "content": "..."}]}`
-(вопрос 1..2000 символов, история ≤ 40 элементов, вместо `content` можно писать `text`) → **200**.
-Ниже реальный вывод в mock-режиме на тестовой фикстуре норм:
-```json
-{
-  "answer": "Основания (только наблюдаемые факты):\n- (№1, 00:22) Использование мобильного телефона при работе с ценностями, уверенность 0.81. Что видно: Кассир держит телефон у уха, на столе видны наличные. Норма: [1].\nЭто признаки возможного нарушения, решение принимает проверяющий.",
-  "citations": [{"document": "ФИКСТУРА: Тестовый регламент кассы", "clause": "п. 9",
-                 "url": "https://example.invalid/fixture/reglament#p9", "ref": 1,
-                 "quote": "Пользоваться мобильным телефоном при работе с ценностями запрещено.", "verified": false}],
-  "sources": ["[1] ФИКСТУРА: Тестовый регламент кассы, п. 9 — https://example.invalid/fixture/reglament#p9"],
-  "grounded": true, "refusal": false, "intent": "why", "backend": "mock", "job_id": "demo-1",
-  "removed_citations": [], "warnings": ["norms/catalog.yaml не найден — используется ТЕСТОВАЯ фикстура (не нормы РК)"],
-  "latency_ms": 61, "disclaimer": "Подсказка для проверяющего, не юридическое заключение.", "error": null
-}
-```
-- Обязательные поля ответа: `answer`, `citations[{document, clause, url}]`, `grounded`. Остальные поля
-  дополнительные. `sources` — те же источники готовыми строками для UI.
-- Сноска `[k]` в `answer` соответствует `citations[i].ref == k`.
-- `grounded=false` означает, что из сырого ответа модели что-то вырезано или ответ ни на что не опирается.
-- Нехватка данных: `answer` начинается с «По имеющимся данным это установить нельзя…», `refusal=true`.
-
-Ошибка (copilot выключен) → **501**:
-```json
-{"detail": {"answer": "", "citations": [], "sources": [], "grounded": false, "refusal": false, "error": "disabled",
-            "message": "Ассистент отключён в этой установке (включается COPILOT_ENABLED=1).",
-            "job_id": "demo-1", "disclaimer": "Подсказка для проверяющего, не юридическое заключение.", "warnings": []}}
-```
-Коды `error`:
+- **Только текущая задача и каталог.** История диалога — не источник фактов: таймкоды и суммы из
+  истории не разрешаются, реплики с чужим `job_id` отбрасываются. Нарушения, которых нет в результате
+  (ни в `violations`, ни в спорных местах), и «проверенная норма» для несверенной вырезаются.
+- `relation`: `catalog` (норма каталога A13 для типа события; `events` — номера нарушений) или
+  `retrieved` (найдено поиском, связь не подтверждена). `verified=false` или `status=candidate` —
+  «требует сверки». Нет пункта в каталоге — «без пункта».
+- `mode`: `generative` | `retrieval` | `mock`. При `retrieval` пометка режима в `notice` и первой строке.
+- Ошибки: `{"detail": {"error", "message", "answer": "", …}}`.
 
 | `error` | HTTP |
 |---|---|
-| `disabled`, `unavailable` | 501 |
-| `not_ready` (задача ещё считается) | 409 |
+| `job_not_found` (нет задачи или провайдер вернул чужую) | 404 |
+| `disabled` (и `unavailable` при `no_model_mode: unavailable`) | 501 |
+| `not_ready` | 409 |
 | `empty_question` | 422 |
-| `busy` | 503 |
+| `busy` (только `busy_policy: error`) | 503 |
 | `timeout` | 504 |
 | `llm_error`, `internal_error` | 500 |
 
-Тело ошибки всегда `{"detail": {...}}`. 404 означает, что задачи нет. 503 с
-`detail.code="job_provider_error"` означает, что упал `get_job`.
+`GET …/jobs/{id}/suggestions?limit=4` → `{"job_id", "suggestions": [...], "by_type": {"V05": [...]}}`
+(3–4 вопроса на тип из `copilot/suggestions.yaml`; вопросов о личности, сумме и умысле нет).
 
-SSE: `POST …/ask?stream=1` (или `Accept: text/event-stream`). В событиях `token` приходят
-**только проверенные** предложения, в конце приходит `done` с полным ответом (как выше) или
-`error`. Ошибка до первого токена отдаётся обычным HTTP-кодом, а не 200.
-```
-event: token
-data: {"text": "Таймкоды возможных нарушений:"}
+`GET …/jobs/{id}/report` → markdown; `?format=html` → автономный HTML (экранирован, CSP
+`default-src 'none'`, кадры только из валидного base64 JPEG). Работает без модели и при выключенном
+copilot. Каждое утверждение помечено:
+- **Наблюдение системы** (автоматически, не проверено человеком): тип, интервал, уверенность, описание,
+  «почему отмечено» (факты, детекторы, согласие VLM — из `meta.ui.evidence_overlays`/`meta.violation_extra`);
+- **Подтверждённый факт**: данные обработки (задача, статус, полнота, длительность, версия), сохранённые
+  кадры, отсутствие решения проверяющего в данных; норма — только если у типа `legal_status: confirmed`
+  (или каталог v1 без статуса) и цитата сверена (`verified: true`);
+- **Непроверенная норма**: кандидат, несверенная цитата, «без пункта», нет связи с типом в каталоге —
+  с причиной. Вывод системы помечен «наблюдение, не решение».
 
-event: token
-data: {"text": "\n- (№1, 00:22) Использование мобильного телефона при работе с ценностями (интервал 00:20–00:25)."}
+SSE (`?stream=1`): события `token` (только проверенные предложения), затем `done` или `error`.
 
-event: done
-data: {"answer": "...", "citations": [], "grounded": true, ...}
-```
+### Что copilot читает из результата
+`violations[].{type, type_id, timecode_sec, t_start, t_end, confidence, description, evidence_frames[].timestamp_sec, rules}`.
+Из `meta`: `completeness` (A01), `complete`/`partial` (A03), `coverage`, `analysis_complete`,
+`ui.evidence_overlays[].{facts, sources, vlm}` и `ui.review_hints` (A12), `violation_extra` (A01).
+Плюс `candidates`, `verdict_state`. Кадры, фигуры, `scores_raw` и `timeline` в контекст не попадают.
 
-Остальные эндпоинты:
-- `GET /api/v1/copilot/status` → `{"enabled", "available", "backend", "mock", "reason": null|"disabled"|"unavailable", "message", "llm", "warnings", "disclaimer"}`.
-- `GET /api/v1/jobs/{job_id}/report` → `text/markdown`, заключение для проверяющего. Работает без LLM, даже когда copilot выключен.
+**Полнота:** неполный анализ (failed, partial, `complete=false`, required stage failed, coverage < 1)
+никогда не превращается в «нарушений нет». Нет сведений о полноте — «полнота не подтверждена».
 
-**A15 (UI):** показывать панель, только если `status.available == true`. По `done` заменять
-накопленный текст на `done.answer` и показывать `citations` и `disclaimer`.
+## 4. Зависимости, переменные, веса
+`copilot/requirements.txt`: numpy, PyYAML, pydantic, fastapi. Опционально sentence-transformers (e5).
+Своих весов LLM у copilot нет.
 
-## 3. Зависимости, переменные окружения, пути весов
-
-`copilot/requirements.txt`. Обязательные лёгкие пакеты: `numpy`, `PyYAML`, `pydantic`, `fastapi`.
-Опциональные:
-- `llama-cpp-python` (MIT) — локальная LLM. Для GPU собирать с `CMAKE_ARGS="-DGGML_CUDA=on"`.
-- `sentence-transformers` (Apache-2.0) — эмбеддинги e5. Без них работает встроенный hashing-эмбеддер.
-
-| Переменная | По умолчанию | Смысл |
+| Переменная / ключ | По умолчанию | Смысл |
 |---|---|---|
-| `COPILOT_ENABLED` | не задана → `enabled: mock` (вкл. только при `SENTINEL_MOCK=1`) | `1` включить, `0` выключить |
-| `COPILOT_MODEL_PATH` | кандидаты из `config.yaml` | путь к GGUF |
-| `COPILOT_SERVER_URL` | — | локальный `llama-server` (`http://127.0.0.1:8081`); публичные адреса отклоняются |
-| `COPILOT_GPU_LAYERS` | `auto` | `0` CPU · `-1` всё на GPU · `N` частично |
-| `COPILOT_TIMEOUT_S` | `45` | бюджет одного ответа |
-| `COPILOT_IDLE_UNLOAD_S` | `300` | выгрузка модели после простоя |
-| `COPILOT_LORA_PATH` | — | GGUF-адаптер (не обучался) |
-| `COPILOT_EMBED_BACKEND` | `auto` | `auto` / `e5` / `hashing` |
-| `COPILOT_EMBED_MODEL` | `intfloat/multilingual-e5-small` | HF-id (только из локального кэша) или папка с весами |
-| `COPILOT_NORMS_DIR` | `norms/` | папка с `catalog.yaml` и `sources/*.md` (A13) |
-| `COPILOT_CACHE_DIR` | `cache/copilot` | кэш эмбеддингов корпуса |
-| `COPILOT_CONFIG` | — | дополнительный YAML поверх `copilot/config.yaml` |
-| `SENTINEL_MOCK` | — | `1` → mock-ответы и тестовая фикстура норм |
-| `HF_HUB_OFFLINE` | рекомендуется `1` | офлайн-режим HF |
+| `COPILOT_ENABLED` | — (`enabled: mock`) | `1` включить, `0` выключить |
+| `COPILOT_LLM_BACKEND` / `llm.backend` | `auto` | `auto` (vlm_service → llama_server) / `vlm_service` / `llama_server` / `llama_cpp` (только явно) / `mock` / `extractive` |
+| `llm.no_model_mode` | `retrieval` | `unavailable` — прежнее поведение 501 |
+| `llm.busy_policy` | `retrieval` | `error` → 503 |
+| `COPILOT_TIMEOUT_S` / `llm.timeout_s` | `45` | бюджет ответа (ожидание GPU + генерация) |
+| `vlm_service.{module,function,wait_s}` (`COPILOT_VLM_MODULE`) | `ml.vlm.service`, `chat`, `10` | привязка к A11 |
+| `vlm_service.allow_cold_load` | `false` | `true` разрешает copilot загрузить VLM в своём процессе (не для 8 ГБ рядом с воркером) |
+| `vlm_service.max_input_chars` | `11000` | лимит промпта (A11: 12000) |
+| `vlm_service.runtime_adapter` | `false` | временный адаптер к `ml.vlm.runtime` (только тёплая VLM) |
+| `embed.hf_cache_dir` | `weights/hf/hub` | офлайн-кэш для `intfloat/multilingual-e5-small` (`local_files_only`) |
+| `COPILOT_EMBED_BACKEND` | `auto` | `hashing` — без torch |
+| `COPILOT_NORMS_DIR` | `norms/` | каталог и источники A13 |
+| `corpus.cite_disabled` | `false` | нормы типов `disabled` не цитировать |
+| `report.html_include_frames` | `true` | кадры в HTML-заключении |
 
-Пути весов (все в `.gitignore`), первый существующий файл побеждает:
-1. `weights/copilot/sentinel-copilot-q4_k_m.gguf` — зарезервировано, сейчас не существует;
-2. `weights/copilot/Qwen3-4B-Instruct-2507-Q4_K_M.gguf` — рекомендуется, Apache-2.0, ~2.5 ГБ;
-3. `weights/copilot/Qwen2.5-7B-Instruct-Q4_K_M.gguf` — Apache-2.0, ~4.7 ГБ.
+## 5. Как полностью отключить
+1. Ничего не делать: без `SENTINEL_MOCK` copilot выключен (501, `available=false`), A15 скрывает панель.
+2. `COPILOT_ENABLED=0`.
+3. Не подключать роутер.
+4. Удалить `copilot/`: от него никто не зависит.
 
-e5 берётся из локального кэша HF (`snapshot_download(local_files_only=True)`) или из папки
-`COPILOT_EMBED_MODEL`. Модели нигде не скачиваются автоматически: веса один раз кладёт A17.
-
-## 4. Как полностью отключить copilot
-1. **Ничего не делать.** В проде без `SENTINEL_MOCK` copilot выключен (`enabled: mock`): `ask` даёт
-   501, `status.available=false`, VRAM не занимается, модель не грузится.
-2. **Явно:** `COPILOT_ENABLED=0`. Работает даже при `SENTINEL_MOCK=1`.
-3. **Не подключать роутер.** Убрать `include_router`. Copilot нигде больше не импортируется.
-4. **Удалить папку `copilot/`.** На пайплайн это не влияет: ни один модуль `ml/`, `backend/pipeline`
-   или `contracts/` от copilot не зависит. Ленивый `try/except` в A02 это переживёт.
-
-## 5. Тесты
+## 6. Тесты и команды для L2
 ```bash
-pip install -r copilot/requirements.txt
-python -m pytest copilot/tests -q                                    # всё, ~4 с, без GPU/весов/сети
-python -m pytest copilot -m "not gpu and not slow" -q                # как в CI A01 (module copilot)
-ruff check copilot                                                   # правила ruff из pyproject A01 (E4,E7,E9,F,B)
-python -m pytest copilot/tests/test_integration_readiness.py -q      # только готовность к интеграции
-python -m pytest copilot/tests/test_safety.py -q                     # локальность / нет облака / нет тяжёлых импортов
+python -m pytest copilot -m "not gpu and not slow" -q   # без GPU/весов/сети; с A11/A13 в дереве идут и их тесты границы
+ruff check copilot
 ```
+**Замер на машине L2** (GPU, `ml.vlm.service`, настоящие `norms/`), одна команда на режим:
+```bash
+COPILOT_ENABLED=1 python -m copilot.eval_grounding --backend auto      --out outputs/copilot/grounding_auto.json
+COPILOT_ENABLED=1 python -m copilot.eval_grounding --backend retrieval --out outputs/copilot/grounding_retrieval.json
+python -m copilot.eval_grounding --compare outputs/copilot/grounding_retrieval.json outputs/copilot/grounding_auto.json
+```
+- Сравниваются генеративный режим и retrieval на одних и тех же 18 синтетических вопросах; выход —
+  JSON и markdown в `outputs/copilot/` (в .gitignore); метрики: `pass_rate`, `safety_pass_rate`,
+  `guard_cut_rate`, ошибки/таймауты, `latency_ms_p50/p95`, `vram_peak_mb`.
+- FP/FN, таймкод и тип к copilot не относятся: он их не меняет.
+- Генеративный режим в этом замере требует VLM в том же процессе (или `set_chat_fn`).
 
-## 6. Что реально проверено и что требует локального GPU
+## 7. Что проверено (2026-10-17, Python 3.11, CPU, без весов и сети, только синтетические задачи)
+- Ветка A14: `python -m pytest copilot -q` → **246 passed, 5 skipped** (4 теста настоящего A11 и 1 тест
+  реального `norms/` пропускаются: этих модулей в ветке нет). `ruff check copilot` → чисто.
+- Имитация мерджа ветки в `origin/integration` (5597969), без коммита и пуша: merge чистый, меняются
+  только файлы `copilot/` (`check_ownership.py --agent A14` → только свои). `pytest copilot` →
+  **247 passed, 4 skipped** (нет `ml.vlm.service`); `check_licenses.py` → OK; `ruff check copilot`
+  (корневой конфиг) → чисто. `pytest backend/api` → 2 failed / 39 passed / 3 skipped — **так же без
+  моей ветки** (см. §8).
+- То же + `ml/vlm` из ветки A11 (b4b2ec5): `pytest copilot` → **251 passed** (в т.ч. 4 теста с настоящим
+  `ml.vlm.service`/`gpu`: генерация, «не загружена — не грузим», приоритет анализа, процесс API без
+  `ml.vlm.runtime`); `ml/vlm/tests/test_vlm_service.py` → 11 passed; copilot + A02 + A11 одной сессией
+  в обоих порядках → 304 passed, 2 failed (те же два теста A02).
+- Старый отчёт интеграции (`claude/integration-cloud` 2055fc4): copilot **7 failed** / 157 passed
+  воспроизведено; после мерджа ветки A14 → **251 passed**.
+- Смоук безопасного режима (`COPILOT_ENABLED=1`, реальные `norms/` и `ml.vlm.service`): статус
+  `retrieval`, ответ по V05 — «без пункта», чужая задача → 404, в заключении три вида пометок,
+  `torch` и `ml.vlm.runtime` не импортированы.
 
-**Проверено в этой ветке** (Python 3.11, CPU, без весов и сети): `pytest copilot/tests` → **104 passed**.
-Повторено как в CI A01 (`.github/workflows/ci.yml`, job `module copilot`): чистый venv, зависимости
-через `scripts/ci_requirements.py copilot`, `SENTINEL_MOCK=1`, `HF_HUB_OFFLINE=1`, pytest-настройки
-A01 (`--import-mode=importlib`). Результат: 104 passed, `ruff check copilot` → All checks passed,
-`scripts/check_licenses.py` на этом дереве → OK.
-- Импорт и старт приложения с роутером без весов. Subprocess с `COPILOT_ENABLED=1` без GGUF:
-  `status.available=false`, `answer.error="unavailable"`, `warmup()==False`. Тяжёлые модули не
-  импортируются, сокеты не открываются.
-- Ошибка модели, таймаут и внутренняя ошибка дают JSON 500/504. Соседние эндпоинты (имитация
-  `/api/v1/analyze`) продолжают отвечать. `warmup`/`release`/`status` не бросают исключений. Занятая
-  модель даёт `busy` за время дедлайна, а не бесконечное ожидание.
-- Нет автоскачивания: e5 только с `local_files_only=True`, иначе hashing. llama.cpp только
-  `Llama(model_path=…)`, без `from_pretrained`. Сеть заблокирована в тестах.
-- Не доходят до пользователя ни в обычном ответе, ни в SSE: выдуманные `[Nk]`, «п. 999», пункты из
-  корпуса, не переданные модели, названия актов, URL, таймкоды, суммы, предложения без опоры на
-  контекст. Нормы из `violations[].rules`, которых нет в каталоге, не цитируются.
-- Нехватка данных даёт «По имеющимся данным это установить нельзя…». Покрыто: момент без событий,
-  нет норм, невидимое (сумма, личность), упавшая задача, пустой вывод модели.
-- Router с тестовым провайдером: dict, `AnalysisResult`, JSON-строка, async-провайдер, 404, 409,
-  422, 503 (упал провайдер), 401 через dependency, SSE. Битые числовые поля не роняют сервис.
-- Совместимость с текущим кодом соседей: двойной монтаж как у A02 (`/api/v1` + `/ui/v1` с разной
-  авторизацией) и форма запроса/ответа A15 (`history[{role, text}]`, `sources`). Проверено тестами
-  на синтетике, не запуском их кода.
-- Бэкенд llama.cpp проверен только на фейковом модуле `llama_cpp`: ленивая загрузка, выгрузка,
-  дедлайн, частичный offload (расчёт).
+**Не проверено (NOT RUN — нужны GPU, веса, реальные данные L2):** генерация Qwen3-VL-4B через
+`ml.vlm.service` (качество, соблюдение маркеров `[N]`/`[V]`, `guard_cut_rate`, латентность, VRAM);
+IPC к воркеру через `set_chat_fn` (канала у A03 нет); e5 на реальных весах и пороги RAG; влияние
+вопросов на время анализа. Дообучения не было, цифр качества нет; скрипты LoRA (`copilot/train/`)
+проверены только `--dry-run`.
 
-**Не проверено, нужен локальный GPU, веса или реальные данные:**
-- реальный инференс GGUF (Qwen3-4B / Qwen2.5-7B) через llama-cpp-python или llama-server: скорость,
-  потребление VRAM рядом с VLM, качество русских ответов;
-- соблюдение формата `[Nk]`/`[Vk]` реальной моделью и доля ответов, которые guard урежет до «нет данных»;
-- эмбеддинги e5 на реальных весах (сейчас тесты идут на hashing) и пороги RAG на настоящем
-  `norms/catalog.yaml` A13;
-- сборка llama-cpp-python с CUDA под Windows 11 / WSL2 (A17).
-
-Дообучения (LoRA) **не было**, измерений качества и скорости **нет**.
+## 8. Несовместимости на границе (для L2, чужой код не менялся)
+1. `backend/api/tests/test_media.py::test_copilot_501_then_router` (A02) падает под `SENTINEL_MOCK=1`
+   (`make test`): тест ждёт «copilot нет» → 501, а в дереве есть настоящий copilot, и при
+   `SENTINEL_MOCK=1` он включён (`enabled: mock`) → 200 (`retrieval`). Без `SENTINEL_MOCK` и с
+   `COPILOT_ENABLED=0` тест проходит. Ожидаемое исправление в тесте A02: в первой части
+   `monkeypatch.setenv("COPILOT_ENABLED", "0")` (или скрыть модуль `copilot.router`). Падает и на
+   `origin/integration` без ветки A14.
+2. `backend/api/tests/test_jobs.py::test_pipeline_reporting_failed_or_garbage_is_failed` (A02/A03):
+   ожидает `"unusable result"` в `error`, приходит `"pipeline_failed: pipeline reported status=failed"`.
+   К copilot не относится, падает и без ветки A14.
+3. В `integration` нет `ml/vlm/service.py`, `gpu.py`, `qa.py` (A11, есть в `claude/integration-cloud`).
+   Copilot работает и без них (`retrieval`); после мерджа A11 генеративный режим возможен только там,
+   где VLM загружена в том же процессе, или через `set_chat_fn`.
+4. A11 по умолчанию `service.chat.allow_cold_load: true`: любой вызов `ml.vlm.service.chat` в процессе
+   API загрузил бы вторую VLM. Copilot его в таком случае не вызывает; для других потребителей решение
+   за L2/A11.
+5. `copilot/_contract_fallback.py` в ветке A14 не менялся: при мердже сохранится удаление из
+   `integration` (a6a96f3), конфликта нет.

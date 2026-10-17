@@ -279,7 +279,8 @@ def result_times(result: dict[str, Any]) -> list[float]:
 
 SOURCE_RU = {"rules": "правила по сигналам сцены", "temporal": "временная модель", "vlm": "проверка VLM",
              "fusion": "слияние источников", "pose": "поза/жесты", "scene": "состояние сцены"}
-VLM_RU = {"supports": "VLM подтвердила по кадрам", "contradicts": "VLM по кадрам не подтвердила",
+# «согласна», а не «подтвердила»: VLM — ещё одна автоматическая проверка, не подтверждение человеком
+VLM_RU = {"supports": "VLM по кадрам согласна с детектором", "contradicts": "VLM по кадрам не согласна с детектором",
           "uncertain": "VLM не уверена", "type_mismatch": "VLM видит на кадрах другой тип",
           "not_checked": "VLM не проверяла", "error": "проверка VLM не выполнена (ошибка)"}
 
@@ -400,7 +401,8 @@ def unobservable_items(result: dict[str, Any], corpus: Optional[Corpus]) -> list
     return items
 
 
-def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optional[Corpus] = None) -> str:
+def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optional[Corpus] = None,
+                  quote_chars: int = 1500) -> str:
     """Контекст для модели. Всё внешнее (поля результата, тексты норм) санитизировано и лежит в блоках
     данных; маркеры [Vk]/[Nk] ставит только этот код."""
     u = sanitize_untrusted
@@ -459,7 +461,7 @@ def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optio
             norm_lines.append(f"{r.marker} {u(c.document, 400)}" + (f", {u(c.clause, 60)}" if c.clause else "")
                               + (f" — {u(c.url, 300)}" if c.url else ""))
             norm_lines.append(f"    Пометки: {r.status_ru}")
-            norm_lines.append(f"    «{u(c.text, 1500)}»")
+            norm_lines.append(f"    «{u(c.text, quote_chars)}»")
         out.append(wrap_data("НОРМЫ (ссылайся только маркерами из этого списка)", "\n".join(norm_lines)))
     else:
         out.append("НОРМЫ: в источниках не найдено подходящих фрагментов.")
@@ -467,8 +469,10 @@ def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optio
 
 
 def build_messages(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optional[Corpus],
-                   question: str, history: Sequence[dict[str, str]] = ()) -> list[dict[str, str]]:
-    msgs: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + build_context(result, refs, corpus)}]
+                   question: str, history: Sequence[dict[str, str]] = (),
+                   quote_chars: int = 1500) -> list[dict[str, str]]:
+    msgs: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n"
+                                   + build_context(result, refs, corpus, quote_chars=quote_chars)}]
     for turn in history:
         role = turn.get("role")
         content = sanitize_untrusted(turn.get("content"), 2000)  # клиент может прислать и «ответы ассистента»

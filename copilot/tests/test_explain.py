@@ -45,7 +45,7 @@ def test_why_answer_shows_facts_detectors_vlm(cfg, corpus) -> None:
     r = CopilotService(cfg=cfg, corpus=corpus).answer(_job(), "Почему это отмечено?", [])
     a = r["answer"]
     assert "Наблюдаемые факты (от детекторов): телефон в руке кассира; наличные на столе" in a
-    assert "правила по сигналам сцены (0.72)" in a and "VLM подтвердила по кадрам" in a
+    assert "правила по сигналам сцены (0.72)" in a and "VLM по кадрам согласна с детектором" in a
     assert r["grounded"] is True and r["removed_citations"] == []
 
 
