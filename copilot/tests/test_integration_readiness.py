@@ -364,7 +364,8 @@ def test_router_with_test_job_provider_variants(cfg, corpus, job_violation) -> N
     dc = AnalysisResult(job_id="dc", status="done", verdict="violation", violations=[
         Violation(type="Использование мобильного телефона при работе с ценностями", timecode_sec=12.0,
                   description="Кассир держит телефон", evidence_frames=[EvidenceFrame(12.0, "QQ==")], type_id="V05")])
-    store = {"dict": job_violation, "dc": dc, "json": json.dumps(job_violation, ensure_ascii=False)}
+    store = {"dict": {**job_violation, "job_id": "dict"}, "dc": dc,
+             "json": json.dumps({**job_violation, "job_id": "json"}, ensure_ascii=False)}
 
     def provider(job_id: str):
         if job_id == "explode":

@@ -51,11 +51,22 @@ class Turn(BaseModel):
     role: Literal["user", "assistant"]
     # A15 шлёт {role, text}; OpenAI-стиль — {role, content}. Принимаем оба.
     content: str = Field(default="", max_length=8000, validation_alias=AliasChoices("content", "text"))
+    job_id: Optional[str] = Field(default=None, max_length=200)  # реплики другой задачи отбрасываются
 
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     history: list[Turn] = Field(default_factory=list, max_length=40)
+
+
+def _job_id_of(job: Any) -> Optional[str]:
+    if isinstance(job, (str, bytes)):
+        try:
+            job = json.loads(job)
+        except ValueError:
+            return None
+    jid = job.get("job_id") if isinstance(job, dict) else getattr(job, "job_id", None)
+    return None if jid is None else str(jid)
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -87,7 +98,8 @@ def make_router(get_job: Optional[JobProvider] = None, service: Any = None, pref
         except Exception as exc:  # сбой хранилища задач не превращаем в 500 без тела
             raise HTTPException(status_code=503, detail={"code": "job_provider_error",
                                                          "message": f"Не удалось получить результат задачи: {type(exc).__name__}"}) from exc
-        if job is None:
+        if job is None or _job_id_of(job) not in (None, "", job_id):
+            # провайдер вернул чужую задачу — не отвечаем по ней (не раскрываем её существование)
             raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "Задача не найдена"})
         return job
 
@@ -102,7 +114,7 @@ def make_router(get_job: Optional[JobProvider] = None, service: Any = None, pref
     async def ask(job_id: str, body: AskRequest, request: Request,
                   stream: bool = Query(False, description="SSE-стриминг токенов")) -> Any:
         job = await _load(job_id)
-        history = [t.model_dump() for t in body.history]
+        history = [t.model_dump(exclude_none=True) for t in body.history]
         want_sse = stream or "text/event-stream" in request.headers.get("accept", "")
         svc = _svc()
         if want_sse:

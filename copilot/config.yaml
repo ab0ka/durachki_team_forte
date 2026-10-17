@@ -73,12 +73,13 @@ llm:
   allow_private_hosts: true  # 10.x/172.16-31.x/192.168.x и docker-имена без точки
 
 vlm_service:
-  module: ml.vlm.service   # A11: chat(messages=[...] | system=, prompt=, max_new_tokens, timeout_s, priority)
+  module: ml.vlm.service   # A11: chat(messages, *, max_new_tokens, timeout_s, wait_s, temperature) -> ChatResult
   function: chat
-  priority: low            # анализ видео важнее; передаётся, если chat принимает priority
+  priority: low            # передаётся, только если chat явно принимает priority (A11 ставит приоритет чата сам)
   wait_s: 10               # сколько ждать GPU, прежде чем ответить без генерации
   runtime_adapter: false   # ВРЕМЕННО: прямой адаптер к ml.vlm.runtime, пока нет service.chat (только тёплая VLM)
-  allow_cold_load: false   # копилот не загружает VLM сам
+  allow_cold_load: false   # копилот НЕ загружает VLM сам: в проде она в процессе-воркере A03 (вторая копия = OOM)
+  max_input_chars: 11000   # A11 service.chat.max_input_chars = 12000 — промпт копилота укладывается с запасом
 
 guard:
   timecode_tolerance_s: 1.5

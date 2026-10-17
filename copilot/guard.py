@@ -220,11 +220,10 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
 
     text = _VMARK_RE.sub(_vmark, text)
 
-    # --- 3. контекст, на который ответ имеет право опираться
-    user_text = " ".join([question] + [str(t.get("content") or "") for t in history if t.get("role") == "user"])
+    # --- 3. контекст, на который ответ имеет право опираться: ТОЛЬКО текущая задача, каталог и текущий вопрос.
+    # История диалога — не источник фактов (может быть устаревшей, от другой задачи или поддельной).
+    user_text = question
     allowed_times = [float(t) for t in _result_times(result)] + _times_in(user_text)
-    for turn in history:
-        allowed_times += _times_in(str(turn.get("content") or ""))
     ref_clauses = {norm_clause(r.chunk.clause) for r in refs if r.chunk.clause}
     if corpus is not None:  # пункты, упомянутые в пояснениях/исключениях каталога для типов событий (тоже контекст)
         for v in viols.values():
@@ -276,6 +275,12 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
         if not bad and _contradicts(sent, result):
             removed.append(f"противоречит результату: {sent[:60]}")
             bad = True
+        if not bad and _invented_violation(sent, result):
+            removed.append(f"нарушение не из результата: {sent[:60]}")
+            bad = True
+        if not bad and _claims_verified_norm(sent, order, by_n):
+            removed.append(f"непроверенная норма выдана за проверенную: {sent[:60]}")
+            bad = True
         if not bad and not is_refusal(sent):
             stems = _stems(re.sub(r"\(№\d+, [\d:]+\)|\[\d+\]", " ", sent))
             if len(stems) >= 4 and len(stems & context_stems) / len(stems) < min_support:
@@ -321,6 +326,40 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
     warnings = [f"удалены неподтверждённые фрагменты: {', '.join(dict.fromkeys(removed))}"] if removed else []
     return GuardResult(answer=answer, citations=citations, grounded=grounded, refusal=refusal,
                        removed=list(dict.fromkeys(removed)), raw_invalid=raw_invalid, warnings=warnings)
+
+
+# сильные признаки типа нарушения в тексте ответа (для проверки «нарушение не из результата»)
+_TYPE_WORDS = {
+    "V01": r"посторонн", "V02": r"покинул|отош[её]л\s+от\s+рабоч", "V03": r"сейф", "V04": r"двер",
+    "V05": r"телефон|смартфон", "V06": r"\bеда\b|\bпищ|напит|\bкофе\b|\bчай\b", "V07": r"инкасс",
+    "V08": r"пересч[её]т|пересчит", "V09": r"личн\w*\s+вещ|куртк|рюкзак",
+}
+_NOT_A_DETECTION_RE = re.compile(r"кандидат|ниже\s+порога|спорн|не\s+вошл|не\s+(?:обнаружен|выявлен|зафиксирован)", re.I)
+_VERIFIED_CLAIM_RE = re.compile(
+    r"(?:подтвержд[её]нн\w*|сверенн\w*|проверенн\w*|действующ\w*)\s+(?:норм|пункт)\w*"
+    r"|(?:норм|пункт)\w*\s+(?:\w+\s+){0,2}(?:подтвержден\w*|сверен\w*|проверен\w*)", re.I)
+
+
+def _invented_violation(sent: str, result: dict[str, Any]) -> bool:
+    """Утверждение «обнаружено нарушение X», где типа X нет ни в нарушениях, ни в спорных местах."""
+    from .prompts import review_hints
+
+    if not _CLAIM_SOME_RE.search(sent) or _NOT_A_DETECTION_RE.search(sent):
+        return False
+    present = {str(v.get("type_id") or "") for v in result.get("violations") or []}
+    present |= {str(h.get("type_id") or "") for h in review_hints(result)}
+    low = sent.lower().replace("ё", "е")
+    mentioned = {tid for tid, pat in _TYPE_WORDS.items() if re.search(pat.replace("ё", "е"), low)}
+    return bool(mentioned - present)
+
+
+def _claims_verified_norm(sent: str, order: list[int], by_n: dict[int, NormRef]) -> bool:
+    """«Проверенная/подтверждённая норма», хотя процитированная норма не сверена (или нормы нет)."""
+    if not _VERIFIED_CLAIM_RE.search(sent) or re.search(
+            r"(?:\bне|\bнет|\bбез|отсутству\w*|требует)\s+(?:\w+\s+)?(?:подтвержд|сверен|провер|сверки)", sent, re.I):
+        return False
+    refs = [by_n[order[int(k) - 1]] for k in re.findall(r"\[(\d+)\]", sent) if 0 < int(k) <= len(order)]
+    return not any(r.chunk.verified and r.chunk.status in {"", "confirmed"} for r in refs)
 
 
 def _contradicts(sent: str, result: dict[str, Any]) -> bool:

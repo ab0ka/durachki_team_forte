@@ -65,9 +65,10 @@ def test_coverage_and_exclusions_intents(cfg, corpus, job_clean) -> None:
 
 def test_router_suggestions_endpoint(cfg, corpus, job_violation) -> None:
     app = FastAPI()
-    app.include_router(make_router(get_job={"j": job_violation}.get, service=CopilotService(cfg=cfg, corpus=corpus)))
+    app.include_router(make_router(get_job={"job-test-1": job_violation}.get,
+                                   service=CopilotService(cfg=cfg, corpus=corpus)))
     c = TestClient(app)
-    r = c.get("/api/v1/jobs/j/suggestions?limit=3")
+    r = c.get("/api/v1/jobs/job-test-1/suggestions?limit=3")
     assert r.status_code == 200 and len(r.json()["suggestions"]) == 3
     assert c.get("/api/v1/jobs/none/suggestions").status_code == 404
 
@@ -98,10 +99,11 @@ def test_html_report_without_frames_option(cfg, corpus, job_violation) -> None:
 
 def test_router_report_html(cfg, corpus, job_violation) -> None:
     app = FastAPI()
-    app.include_router(make_router(get_job={"j": job_violation}.get, service=CopilotService(cfg=cfg, corpus=corpus)))
+    app.include_router(make_router(get_job={"job-test-1": job_violation}.get,
+                                   service=CopilotService(cfg=cfg, corpus=corpus)))
     c = TestClient(app)
-    r = c.get("/api/v1/jobs/j/report?format=html")
+    r = c.get("/api/v1/jobs/job-test-1/report?format=html")
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
     assert "default-src 'none'" in r.headers["content-security-policy"]
-    assert c.get("/api/v1/jobs/j/report").headers["content-type"].startswith("text/markdown")
-    assert c.get("/api/v1/jobs/j/report?format=pdf").status_code == 422
+    assert c.get("/api/v1/jobs/job-test-1/report").headers["content-type"].startswith("text/markdown")
+    assert c.get("/api/v1/jobs/job-test-1/report?format=pdf").status_code == 422

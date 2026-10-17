@@ -24,7 +24,7 @@ from .config import copilot_enabled, default_config, is_mock
 from .corpus import Corpus, load_corpus, norm_url
 from .extractive import classify, compose, refusal_for, target_violations
 from .guard import UNVERIFIED_ANSWER, check_answer, complete_prefix
-from .llm import LLMBusy, LLMTimeout, RetrievalBackend, make_llm
+from .llm import LLMBusy, LLMTimeout, LLMUnavailable, RetrievalBackend, VLMServiceBackend, make_llm
 from .prompts import NormRef, build_messages, normalize_result
 
 log = logging.getLogger(__name__)
@@ -98,6 +98,28 @@ class CopilotService:
                 self._llm_resolved = True
                 self._resolved_at = time.monotonic()
             return self._llm
+
+    def _mark_unavailable(self, why: str) -> None:
+        """Модель оказалась недоступной во время вопроса: статус пересчитается при следующем запросе."""
+        with self._lock:
+            if why:
+                self.warnings.append(f"генеративный режим недоступен: {why}")
+            if not self._llm_injected:
+                self._resolved_at = 0.0
+                self._llm_resolved = False
+
+    def set_chat_fn(self, fn: Any) -> None:
+        """Подключить чат модели из другого процесса (A03: RPC к ml.vlm.service.chat_request в воркере).
+
+        ``fn(messages, **kw)`` или ``fn(payload: dict)``; ответ — ChatResult/dict(ok, text, error, …).
+        None — вернуть автоматический выбор бэкенда.
+        """
+        with self._lock:
+            if fn is None:
+                self._llm, self._llm_resolved, self._llm_injected = None, False, False
+                return
+            self._llm = VLMServiceBackend(fn, self.cfg, module=None)
+            self._llm_resolved, self._llm_injected, self._no_model = True, True, False
 
     def _mode(self, llm: Any) -> str:
         name = str(getattr(llm, "name", ""))
@@ -181,12 +203,15 @@ class CopilotService:
             log.warning("copilot release failed: %r", exc)
 
     # ------------------------------------------------------------------ helpers
-    def _clean_history(self, history: Any) -> list[dict[str, str]]:
+    def _clean_history(self, history: Any, job_id: str = "") -> list[dict[str, str]]:
+        """Последние реплики этой задачи. Реплики с чужим job_id отбрасываются; история — не источник фактов."""
         gcfg = self.cfg.get("guard", {})
         turns: list[dict[str, str]] = []
         for t in history if isinstance(history, list) else []:
             if not isinstance(t, dict) or t.get("role") not in {"user", "assistant"}:
                 continue
+            if job_id and t.get("job_id") not in (None, "", job_id):
+                continue  # реплика из диалога о другой задаче
             content = str(t.get("content") or t.get("text") or "").strip()  # {role, text} от A15 тоже
             if content:
                 turns.append({"role": str(t["role"]), "content": content})
@@ -279,7 +304,7 @@ class CopilotService:
             return {"error": self._error("unavailable", job_id)}
         if result.get("status") == "processing":
             return {"error": self._error("not_ready", job_id)}
-        hist = self._clean_history(history)
+        hist = self._clean_history(history, job_id)
         warnings: list[str] = list(self.corpus.warnings)
         intent = classify(q)
         refs = self._norm_refs(q, result, hist, warnings)
@@ -339,7 +364,7 @@ class CopilotService:
             if busy:  # приоритет у анализа видео: не трогаем GPU
                 raise LLMBusy("analysis in progress")
         lcfg = self.cfg.get("llm", {})
-        messages = build_messages(p["result"], p["refs"], self.corpus, p["q"], p["hist"])
+        messages = self._fit_messages(p, int(getattr(llm, "max_input_chars", 0) or 0))
         gpu_lock = self.gpu_lock if getattr(llm, "name", "") == "llama_cpp" else None
         if gpu_lock is not None and not gpu_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
             raise LLMBusy("shared GPU lock not acquired before deadline")
@@ -349,6 +374,33 @@ class CopilotService:
         finally:
             if gpu_lock is not None:
                 gpu_lock.release()
+
+    def _fit_messages(self, p: dict[str, Any], limit: int) -> list[dict[str, str]]:
+        """Уложить промпт в лимит сервиса модели (A11: max_input_chars): сначала история, затем число норм,
+        затем длина цитат. Урезанный список норм сохраняется в p["refs"] — guard проверяет по тому же списку."""
+        def size(msgs: list[dict[str, str]]) -> int:
+            return sum(len(m.get("content") or "") for m in msgs)
+
+        msgs = build_messages(p["result"], p["refs"], self.corpus, p["q"], p["hist"])
+        if limit <= 0 or size(msgs) <= limit:
+            return msgs
+        hist = list(p["hist"])
+        while hist and size(msgs) > limit:
+            hist = hist[1:]
+            msgs = build_messages(p["result"], p["refs"], self.corpus, p["q"], hist)
+        p["hist"] = hist
+        refs = list(p["refs"])
+        quote = 1500
+        while size(msgs) > limit and (len(refs) > 1 or quote > 300):
+            if len(refs) > 1:
+                refs = refs[:-1]
+            else:
+                quote = max(300, quote // 2)
+            msgs = build_messages(p["result"], refs, self.corpus, p["q"], hist, quote_chars=quote)
+        p["refs"] = refs
+        if size(msgs) > limit:
+            raise LLMUnavailable("контекст задачи не помещается в лимит модели")
+        return msgs
 
     def _retrieval_text(self, p: dict[str, Any]) -> str:
         """Негенеративный ответ из фактов задачи и найденных норм (тот же guard, что и для LLM)."""
@@ -373,6 +425,9 @@ class CopilotService:
             raw = "".join(self._generate(p, deadline))
         except (LLMTimeout, TimeoutError):
             return self._error("timeout", p["job_id"], backend=backend)
+        except LLMUnavailable as exc:
+            self._mark_unavailable(str(exc))
+            return self._finish(p, self._retrieval_text(p), "retrieval", t0, notice=NOTICE_NO_MODEL)
         except LLMBusy:
             if str(self.cfg.get("llm", {}).get("busy_policy", "retrieval")) != "retrieval":
                 return self._error("busy", p["job_id"], backend=backend)
@@ -447,6 +502,12 @@ class CopilotService:
                             emitted = clean
                     continue
                 if kind == "exc":
+                    if isinstance(val, LLMUnavailable) and not emitted:
+                        self._mark_unavailable(str(val))
+                        done = self._finish(p, self._retrieval_text(p), "retrieval", t0, notice=NOTICE_NO_MODEL)
+                        yield {"event": "token", "text": done["answer"]}
+                        yield {"event": "done", **done}
+                        return
                     if isinstance(val, LLMBusy) and not emitted and str(
                             self.cfg.get("llm", {}).get("busy_policy", "retrieval")) == "retrieval":
                         done = self._finish(p, self._retrieval_text(p), "retrieval", t0, notice=NOTICE_BUSY)
@@ -520,6 +581,11 @@ def release() -> None:
         get_service().release()
     except Exception as exc:
         log.warning("copilot release failed: %r", exc)
+
+
+def set_chat_fn(fn: Any) -> None:
+    """A03/L2: чат общей VLM из процесса-воркера (IPC к ``ml.vlm.service.chat_request``). См. INTEGRATION.md."""
+    get_service().set_chat_fn(fn)
 
 
 def set_busy_probe(fn: Any) -> None:
