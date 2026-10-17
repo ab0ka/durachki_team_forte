@@ -27,6 +27,7 @@ STAGE_FILES: dict[str, list[tuple[str, str]]] = {
     "pose": [("poses.jsonl", "pose"), ("pose_states.jsonl", "state")],
     "scene": [("states.jsonl", "state")],
     "rules": [("events_rules.json", "event")],
+    "seqrules": [("events_seqrules.json", "event"), ("observations.json", "obs")],
     "temporal": [("risk.json", "risk"), ("events_temporal.json", "event")],
     "vlm_verify": [("events_vlm_verify.json", "event")],
     "vlm_discover": [("events_vlm_discover.json", "event")],

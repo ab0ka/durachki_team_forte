@@ -16,6 +16,7 @@ stages:
   pose: true
   scene: true
   rules: true
+  seqrules: false            # правила по последовательностям (профиль pose_rules: eval/configs/l2/pose_rules.yaml)
   temporal: true
   vlm_verify: true
   vlm_discover: true
@@ -87,6 +88,7 @@ budgets_s:
   pose: 10
   scene: 3
   rules: 1
+  seqrules: 3
   temporal: 15
   refine: 10
   vlm_verify: 25

@@ -440,13 +440,17 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
     sc = _stage(ctx, "scene", [("ml.scene", "scene_states", (CLIP, dets, tracks, zones, pose_states), {})],
                 upstream=["detect", "track", "pose"])
     states = sc[0] if sc else []
-    if ctx.records["scene"].status not in OK_STATUSES and dets and not ctx.cancelled():
+    if ctx.records["scene"].status not in OK_STATUSES + ("disabled",) and dets and not ctx.cancelled():
         states = states_from_detections(ctx.clip_info.get("times", []), dets, pose_states)
         ctx.warn(f"scene: использованы грубые состояния из детекций ({len(states)} шт.) — анализ неполный")
     ru = _stage(ctx, "rules", [("ml.rules", "run_rules", (states, tracks, zones, ctx.catalog), {})],
                 upstream=["scene", "track"], stage_cfg={"catalog": catalog_hash(ctx.catalog)},
                 cacheable_in_from_cache=False)
     ev_rules = ru[0] if ru else []
+    sq = _stage(ctx, "seqrules", [("ml.seqrules", "run", (CLIP, dets, tracks, zones, poses, ctx.catalog), {})],
+                upstream=["detect", "track", "pose"], stage_cfg={"catalog": catalog_hash(ctx.catalog)})
+    ev_seq = _seqrules_outputs(ctx, sq)
+    ev_rules = list(ev_rules) + ev_seq
 
     # ---- временная модель (последовательно, тот же владелец GPU)
     tm = _stage(ctx, "temporal", [("ml.temporal", "score", (CLIP,), {})], upstream=["ingest"])
@@ -461,7 +465,7 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
     ev_verify: list[Event] = []
     if candidates or not cfg_get(cfg, "stages.vlm_verify", True):
         vv = _stage(ctx, "vlm_verify", [("ml.vlm", "verify", (CLIP, candidates, "$budget"), {})],
-                    upstream=["rules", "temporal"])
+                    upstream=["rules", "seqrules", "temporal"])
         ev_verify = vv[0] if vv else []
     else:
         _record(ctx, "vlm_verify", StageRecord(status="skipped", required=False, error="нет кандидатов"))
@@ -480,6 +484,28 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
 
 
 # ============================================================== стадии
+
+def _seqrules_outputs(ctx: RunContext, sq: Optional[tuple]) -> list[Event]:
+    """События seqrules + наблюдения для UI (data/jobs/<id>/observations.json). Ошибка правила при обязательной
+    стадии делает анализ неполным: «правило не сработало» ≠ «нарушения нет»."""
+    if not sq:
+        return []
+    events, observations = sq
+    meta = observations[0] if observations and observations[0].get("kind") == "meta" else {}
+    for w in meta.get("warnings", []) or []:
+        ctx.warn(str(w))
+    if is_required("seqrules", ctx.cfg):
+        for name, inf in (meta.get("rules") or {}).items():
+            if isinstance(inf, dict) and inf.get("status") == "error":
+                ctx.incomplete.append(f"seqrules/{name} (error: {inf.get('error', '')})")
+    ctx.outputs["observations"] = observations
+    try:
+        path = data_root() / "jobs" / _safe_id(ctx.job_id) / "observations.json"
+        serde.write_json(path, {"job_id": ctx.job_id, "sha256": ctx.sha, "items": observations})
+    except Exception as exc:  # noqa: BLE001
+        ctx.warn(f"observations.json не записан: {type(exc).__name__}: {exc}")
+    return list(events)
+
 
 def _refine(ctx: RunContext, candidates: list[Event], zones: list) -> list[Event]:
     """coarse→fine: плотная выборка окон вокруг кандидатов, detect→track→scene→rules на окне,
@@ -723,6 +749,10 @@ def _normalize(stage: str, outputs: list[Any], roundtrip: bool) -> tuple:
         raw = (list(outputs[0][0]), list(outputs[0][1]))
     elif stage == "pose":
         raw = (list(outputs[0]), list(outputs[1]))
+    elif stage == "seqrules":
+        if not isinstance(outputs[0], (tuple, list)) or len(outputs[0]) != 2:
+            raise TypeError("seqrules.run() должен вернуть (events, observations)")
+        raw = (list(outputs[0][0]), [dict(x) for x in outputs[0][1]])
     else:
         if not isinstance(outputs[0], (list, tuple)):
             raise TypeError(f"{stage}: ожидался список, получено {type(outputs[0]).__name__}")

@@ -14,6 +14,19 @@ if (Test-Path $EnvFile) {
         if ($v -ne "") { [Environment]::SetEnvironmentVariable($k.Trim(), $v, "Process") }
     }
 }
+# Optional profile (no secrets): SENTINEL_PROFILE=pose_rules -> deploy\profiles\pose_rules.env on top of deploy\.env
+if ($env:SENTINEL_PROFILE) {
+    $ProfileFile = Join-Path $Repo ("deploy\profiles\" + $env:SENTINEL_PROFILE + ".env")
+    if (-not (Test-Path $ProfileFile)) { Write-Host "Unknown SENTINEL_PROFILE: $env:SENTINEL_PROFILE" -ForegroundColor Red; exit 1 }
+    foreach ($raw in Get-Content $ProfileFile) {
+        $line = $raw.Trim()
+        if (-not $line -or $line.StartsWith("#") -or -not $line.Contains("=")) { continue }
+        $k, $v = $line.Split("=", 2)
+        $v = ($v -replace '\s+#.*$', '').Trim().Trim('"').Trim("'")
+        if ($v.StartsWith("/app/")) { $v = Join-Path $Repo ($v.Substring(5) -replace "/", "\") }
+        if ($v -ne "") { [Environment]::SetEnvironmentVariable($k.Trim(), $v, "Process") }
+    }
+}
 $env:HF_HUB_OFFLINE = "1"; $env:TRANSFORMERS_OFFLINE = "1"; $env:HF_DATASETS_OFFLINE = "1"
 $env:HF_HUB_DISABLE_TELEMETRY = "1"; $env:DO_NOT_TRACK = "1"; $env:SENTINEL_WORKERS = "1"; $env:PYTHONUTF8 = "1"
 if (-not $env:SENTINEL_WEIGHTS) { $env:SENTINEL_WEIGHTS = Join-Path $Repo "weights" }

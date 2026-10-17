@@ -116,6 +116,7 @@ def load_result(d: dict) -> AnalysisResult:
 LOADERS: dict[str, Callable[[dict], Any]] = {
     "detection": load_detection, "track": load_track, "zone": load_zone, "pose": load_pose,
     "state": load_state, "event": load_event,
+    "obs": dict,   # наблюдения ml.seqrules — JSON-словари как есть (meta + эпизоды)
 }
 
 
