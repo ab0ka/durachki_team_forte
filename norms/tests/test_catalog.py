@@ -184,3 +184,37 @@ def test_examples_helper():
     assert all(e["expected"] in ("candidate", "no_violation", "unknown") for e in all_ex)
     unk = [e for e in norms.examples("V02") if e["kind"] == "unknown"][0]
     assert any(val is None for val in unk["signals"].values())  # unknown ≠ false
+
+
+def test_v02_candidate_with_clause_22_and_client_condition():
+    t = norms.load_catalog()["types"]["V02"]
+    assert t["legal_status"] == "candidate"
+    assert t["rules"][0]["clause"] == "п. 22" and t["rules"][0]["verified"] is False
+    assert "до окончания обслуживания клиента" in t["rules"][0]["quote"]
+    assert "во время обслуживания клиента" in t["rule_checks"][0]["applicability"]
+    assert any("клиент" in c for c in t["rule_checks"][0]["conditions_visible"])
+    assert t["rules"][1]["clause"] is None  # номер пункта не установлен — честно null
+    assert norms.rule_refs("V02")  # candidate → норма выдаётся с verified=false
+
+
+def test_v08_client_presence_is_the_condition():
+    t = norms.load_catalog()["types"]["V08"]
+    assert "отсутствие клиента" in t["legal_note"] and "не по внешности" in t["legal_note"]
+    neg = [e for e in t["examples"] if e["kind"] == "negative"]
+    assert any(e["signals"].get("hands_hidden") == 1.0 for e in neg)  # руки скрыты при клиенте — не V08
+    assert all(e["expected"] == "no_violation" for e in neg)
+
+
+def test_v09_applicability_is_cash_unit_not_appearance():
+    t = norms.load_catalog()["types"]["V09"]
+    assert "кассовом узле" in t["legal_note"]
+    hidden = " ".join(t["rule_checks"][0]["conditions_not_visible"])
+    assert "принадлежность вещи" in hidden and "кассовый узел" in hidden
+
+
+def test_no_human_flags_set_by_agent():
+    for tid, t in norms.load_catalog()["types"].items():
+        for chk in t.get("rule_checks", []):
+            assert chk["quote_checked_by_human"] is False, tid
+            assert chk["applicability_checked_by_human"] is False, tid
+        assert t["legal_status"] != "confirmed", tid
