@@ -11,7 +11,7 @@ import numpy as np
 
 from ._contract import PoseFrameX, Track
 from .backends import WeightsNotFound, get_backend
-from .config import enabled_mode, is_mock_mode, load_config
+from .config import deep_merge, enabled_mode, is_mock_mode, load_config
 from .filters import smooth_keypoint_track
 from .status import set_status
 
@@ -44,10 +44,35 @@ class BoxLookup:
         return None
 
 
-def _select(lookups: dict[int, BoxLookup], tracks: dict[int, Track], t: float, sel: dict[str, Any]) -> list[tuple[int, np.ndarray]]:
+_BACKEND_CFG_KEY = {"mediapipe": "mediapipe", "rtmpose-onnx": "rtmpose", "mock": "mock"}
+
+
+def backend_selection(cfg: dict[str, Any], backend_name: str) -> dict[str, Any]:
+    """selection.* ⊕ backend.<имя>.selection (например, MediaPipe — только кассир, 1 кроп на кадр)."""
+    base = cfg.get("selection", {}) or {}
+    key = _BACKEND_CFG_KEY.get(backend_name, backend_name)
+    over = ((cfg.get("backend", {}) or {}).get(key, {}) or {}).get("selection", {}) or {}
+    return deep_merge(base, over) if over else dict(base)
+
+
+def allowed_tracks(tracks: dict[int, Track], sel: dict[str, Any]) -> Optional[set[int]]:
+    """Фильтр по ролям (selection.roles); None — без фильтра. roles_fallback=top1: ролей нет ни у кого → все."""
+    roles = sel.get("roles")
+    if not roles:
+        return None
+    ids = {tid for tid, tr in tracks.items() if tr.role in set(roles)}
+    if not ids and str(sel.get("roles_fallback", "top1")) == "top1":
+        return None
+    return ids
+
+
+def _select(lookups: dict[int, BoxLookup], tracks: dict[int, Track], t: float, sel: dict[str, Any],
+            allowed: Optional[set[int]] = None) -> list[tuple[int, np.ndarray]]:
     pri_map = sel.get("role_priority", {}) or {}
     cands = []
     for tid, lk in lookups.items():
+        if allowed is not None and tid not in allowed:
+            continue
         b = lk.at(t)
         if b is None:
             continue
@@ -87,6 +112,8 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
         set_status(state="failed", stage_status=stage, error=msg, warnings=[msg], n_crops=0,
                    elapsed_s=time.perf_counter() - t_start, coverage=_coverage(times, {}, 0, 1, persons))
         return []
+    sel = backend_selection(cfg, backend.name)
+    allowed = allowed_tracks(persons, sel)
     tol = float(sel.get("box_time_tolerance_s", 0.25))
     lookups = {tid: BoxLookup(tr, tol, float(sel.get("max_interp_gap_s", 1.0))) for tid, tr in persons.items()}
     budget = float(sel.get("budget_s", 10.0))
@@ -133,7 +160,7 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
     i = 0
     while i < len(times):
         t = times[i]
-        chosen = _select(lookups, persons, t, sel)
+        chosen = _select(lookups, persons, t, sel, allowed)
         if chosen:
             if n_crops + len(chosen) > max_total:
                 warnings.append(f"max_crops_total={max_total} достигнут на t={t:.2f}s")
