@@ -1,21 +1,29 @@
-"""Безопасный векторный парсер выражений правил (никакого ``eval``).
+"""Безопасный векторный парсер выражений правил (никакого ``eval``) с интервальной логикой.
 
 Выражение из ``rules.yaml`` разбирается через :mod:`ast`, проверяется по белому списку
 узлов и компилируется в дерево замыканий, которое считает значение сразу для всего
 временного ряда (numpy-массивы формы ``(N,)``).
 
+**Отсутствие сигнала ≠ отрицание.** Неизвестное значение (сигнал не пришёл, окклюзия,
+пропуск дольше forward-fill) — это интервал ``[lo, hi]`` допустимого диапазона сигнала
+(для 0..1 — ``[0, 1]``). Каждый узел возвращает пару ``(lo, hi)``:
+
+* ``lo`` — что *доказано* наблюдениями (используется для событий);
+* ``hi`` — что *возможно* при любых значениях неизвестных (используется для
+  ``insufficient_context``: «условие могло выполняться, но не наблюдалось»).
+
 Семантика (нечёткая логика, значения сигналов 0..1):
 
-* ``a and b`` → ``min(a, b)``, ``a or b`` → ``max(a, b)``, ``not a`` → ``1 - a``
-  (операнды логических операций обрезаются в 0..1);
-* сравнения (``<``, ``<=``, ``>``, ``>=``, ``==``, ``!=``, цепочки ``0.2 < x < 0.8``) → 0.0/1.0;
+* ``a and b`` → ``min``, ``a or b`` → ``max``, ``not a`` → ``1 - a`` (операнды обрезаются в 0..1;
+  для интервалов ``not [lo, hi] = [1-hi, 1-lo]``);
+* сравнения → 0/1 (``lo`` = выполняется при любых неизвестных, ``hi`` = может выполняться);
 * арифметика ``+ - * /`` (деление на 0 → 0), унарный минус;
 * точечные функции: ``min``, ``max``, ``abs``, ``clip(x, lo, hi)``, ``ramp(x, lo, hi)``,
   ``step(x, thr)``;
 * временные функции (окно — константа в секундах):
-  ``was(x, w)`` — максимум за последние ``w`` с (было ли), ``held(x, w)`` — минимум за ``w`` с
-  (держится ли непрерывно; при истории короче ``w`` → 0), ``avg(x, w)`` — среднее за ``w`` с,
-  ``ahead(x, w)`` — максимум на ``w`` с вперёд, ``ever(x)`` — максимум с начала ролика.
+  ``was(x, w)`` — максимум за последние ``w`` с, ``held(x, w)`` — минимум за ``w`` с
+  (при истории короче ``w`` нижняя граница = 0: «держится» не доказано), ``avg(x, w)`` —
+  среднее, ``ahead(x, w)`` — максимум на ``w`` с вперёд, ``ever(x)`` — максимум с начала.
 
 Имена — сигналы из ``SIGNALS`` (или любые другие ключи ``SceneState.signals``) и
 константы ``true``/``false``. Атрибуты, индексы, строки, лямбды, comprehension-ы,
@@ -33,6 +41,7 @@ __all__ = [
     "ExprError",
     "EvalContext",
     "CompiledExpr",
+    "Comparison",
     "compile_expr",
     "evaluate_scalar",
     "POINTWISE_FUNCS",
@@ -55,6 +64,8 @@ _ALLOWED_NODES = (
     ast.GtE, ast.Eq, ast.NotEq, ast.Name, ast.Load, ast.Constant, ast.Call,
 )
 
+Interval = tuple[Any, Any]  # (lo, hi): float или np.ndarray
+
 
 class ExprError(ValueError):
     """Ошибка разбора/проверки выражения правила."""
@@ -62,22 +73,27 @@ class ExprError(ValueError):
 
 @dataclass
 class EvalContext:
-    """Контекст вычисления: общая временная ось и ряды сигналов одинаковой длины."""
+    """Контекст вычисления: общая временная ось и ряды сигналов (NaN = неизвестно)."""
 
     times: np.ndarray
     signals: Mapping[str, np.ndarray]
-    default: float = 0.0
+    ranges: Mapping[str, tuple[float, float]] = field(default_factory=dict)
+    default_range: tuple[float, float] = (0.0, 1.0)
     _window_cache: dict = field(default_factory=dict, repr=False)
 
     @property
     def n(self) -> int:
         return int(self.times.shape[0])
 
-    def get(self, name: str) -> np.ndarray:
+    def get(self, name: str) -> Interval:
+        lo_r, hi_r = self.ranges.get(name, self.default_range)
         arr = self.signals.get(name)
         if arr is None:
-            return np.full(self.n, float(self.default))
-        return arr
+            return np.full(self.n, float(lo_r)), np.full(self.n, float(hi_r))
+        unknown = ~np.isfinite(arr)
+        if not unknown.any():
+            return arr, arr
+        return np.where(unknown, lo_r, arr), np.where(unknown, hi_r, arr)
 
     def left_index(self, window_s: float) -> np.ndarray:
         key = ("L", float(window_s))
@@ -100,8 +116,19 @@ class Comparison:
     op: str
     threshold: float
 
-    def check(self, value: float) -> bool:
-        return bool(_apply_cmp(self.op, np.asarray([value], float), np.asarray([self.threshold], float))[0] > 0.5)
+    def check(self, value: float) -> Optional[bool]:
+        """True/False по наблюдённому значению; ``None`` — значение неизвестно."""
+        if value is None or not np.isfinite(value):
+            return None
+        lo, _ = _cmp(self.op, (float(value), float(value)), (self.threshold, self.threshold))
+        return bool(np.asarray(lo) > 0.5)
+
+
+def _finite(x: Any, n: int) -> np.ndarray:
+    arr = np.asarray(x, dtype=float)
+    if arr.ndim == 0:
+        arr = np.full(n, float(arr))
+    return np.nan_to_num(arr, nan=0.0, posinf=1e9, neginf=-1e9)
 
 
 @dataclass
@@ -111,46 +138,84 @@ class CompiledExpr:
     funcs: frozenset[str]
     comparisons: tuple[Comparison, ...]
     max_window_s: float
-    _fn: Callable[[EvalContext], Any] = field(repr=False)
+    _fn: Callable[[EvalContext], Interval] = field(repr=False)
+
+    def bounds(self, ctx: EvalContext) -> tuple[np.ndarray, np.ndarray]:
+        """(доказано, возможно) для всего ряда."""
+        lo, hi = self._fn(ctx)
+        lo, hi = _finite(lo, ctx.n), _finite(hi, ctx.n)
+        return np.minimum(lo, hi), np.maximum(lo, hi)
 
     def __call__(self, ctx: EvalContext) -> np.ndarray:
-        res = self._fn(ctx)
-        arr = np.asarray(res, dtype=float)
-        if arr.ndim == 0:
-            arr = np.full(ctx.n, float(arr))
-        arr = np.where(np.isfinite(arr), arr, 0.0)
-        return arr
+        """Нижняя (доказанная наблюдениями) граница."""
+        return self.bounds(ctx)[0]
 
 
-def _truth(x: Any) -> Any:
-    return np.clip(x, 0.0, 1.0)
+# --------------------------------------------------------------------------- interval ops
+
+def _truth(iv: Interval) -> Interval:
+    return np.clip(iv[0], 0.0, 1.0), np.clip(iv[1], 0.0, 1.0)
 
 
-def _apply_cmp(op: str, a: Any, b: Any) -> Any:
+def _not(iv: Interval) -> Interval:
+    lo, hi = _truth(iv)
+    return 1.0 - hi, 1.0 - lo
+
+
+def _cmp(op: str, a: Interval, b: Interval) -> Interval:
+    a0, a1 = a
+    b0, b1 = b
     if op == "<":
-        r = np.less(a, b)
+        lo, hi = np.less(a1, b0), np.less(a0, b1)
     elif op == "<=":
-        r = np.less_equal(a, b)
+        lo, hi = np.less_equal(a1, b0), np.less_equal(a0, b1)
     elif op == ">":
-        r = np.greater(a, b)
+        lo, hi = np.greater(a0, b1), np.greater(a1, b0)
     elif op == ">=":
-        r = np.greater_equal(a, b)
-    elif op == "==":
-        r = np.isclose(a, b, atol=1e-9)
-    elif op == "!=":
-        r = ~np.isclose(a, b, atol=1e-9)
+        lo, hi = np.greater_equal(a0, b1), np.greater_equal(a1, b0)
+    elif op in ("==", "!="):
+        definite_eq = np.isclose(a0, a1) & np.isclose(b0, b1) & np.isclose(a0, b0)
+        overlap = np.less_equal(a0, np.add(b1, 1e-9)) & np.less_equal(b0, np.add(a1, 1e-9))
+        lo, hi = (definite_eq, overlap) if op == "==" else (~overlap, ~definite_eq)
     else:  # pragma: no cover - защищено белым списком
         raise ExprError(f"Недопустимый оператор сравнения: {op}")
-    return np.asarray(r, dtype=float)
+    return np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)
 
 
-def _safe_div(a: Any, b: Any) -> Any:
+def _safe_div_scalar(a: Any, b: Any) -> Any:
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     shape = np.broadcast(a, b).shape
     out = np.zeros(shape, dtype=float)
-    np.divide(a, b, out=out, where=np.broadcast_to(b != 0, shape))
+    np.divide(np.broadcast_to(a, shape), np.broadcast_to(b, shape), out=out, where=np.broadcast_to(b != 0, shape))
     return out
+
+
+def _mul(a: Interval, b: Interval) -> Interval:
+    prods = [np.multiply(x, y) for x in a for y in b]
+    return np.minimum.reduce(np.broadcast_arrays(*prods)), np.maximum.reduce(np.broadcast_arrays(*prods))
+
+
+def _div(a: Interval, b: Interval) -> Interval:
+    qs = [_safe_div_scalar(x, y) for x in a for y in b]
+    lo = np.minimum.reduce(np.broadcast_arrays(*qs))
+    hi = np.maximum.reduce(np.broadcast_arrays(*qs))
+    straddle = np.less(b[0], 0) & np.greater(b[1], 0) | (np.not_equal(b[0], b[1]) & (np.equal(b[0], 0) | np.equal(b[1], 0)))
+    if np.any(straddle):
+        lo = np.where(straddle, -np.inf, lo)
+        hi = np.where(straddle, np.inf, hi)
+    return lo, hi
+
+
+def _abs(a: Interval) -> Interval:
+    lo, hi = np.asarray(a[0], float), np.asarray(a[1], float)
+    out_lo = np.where(lo >= 0, lo, np.where(hi <= 0, -hi, 0.0))
+    out_hi = np.maximum(np.abs(lo), np.abs(hi))
+    return out_lo, out_hi
+
+
+def _ramp(x: Any, a: Any, b: Any) -> Any:
+    return np.clip(_safe_div_scalar(np.subtract(x, a), np.subtract(b, a)), 0.0, 1.0)
 
 
 def _as_array(x: Any, n: int) -> np.ndarray:
@@ -160,40 +225,57 @@ def _as_array(x: Any, n: int) -> np.ndarray:
     return arr
 
 
-def _window_reduce(ctx: EvalContext, x: Any, window_s: float, kind: str) -> np.ndarray:
+def _window_max(ctx: EvalContext, arr: np.ndarray, window_s: float, forward: bool = False) -> np.ndarray:
     n = ctx.n
-    arr = _as_array(x, n)
-    if n == 0:
-        return arr
-    if kind == "ever":
-        return np.maximum.accumulate(arr)
-    if kind == "ahead":
+    out = np.empty(n)
+    if forward:
         right = ctx.right_index(window_s)
-        out = np.empty(n)
         for i in range(n):
             out[i] = arr[i:max(i + 1, int(right[i]))].max()
-        return out
-    left = ctx.left_index(window_s)
-    if kind == "avg":
-        cs = np.concatenate([[0.0], np.cumsum(arr)])
-        idx = np.arange(n)
-        cnt = idx + 1 - left
-        return (cs[idx + 1] - cs[left]) / np.maximum(cnt, 1)
-    out = np.empty(n)
-    if kind == "was":
+    else:
+        left = ctx.left_index(window_s)
         for i in range(n):
             out[i] = arr[int(left[i]):i + 1].max()
-        return out
+    return out
+
+
+def _window_min(ctx: EvalContext, arr: np.ndarray, window_s: float) -> np.ndarray:
+    left = ctx.left_index(window_s)
+    out = np.empty(ctx.n)
+    for i in range(ctx.n):
+        out[i] = arr[int(left[i]):i + 1].min()
+    return out
+
+
+def _window_mean(ctx: EvalContext, arr: np.ndarray, window_s: float) -> np.ndarray:
+    left = ctx.left_index(window_s)
+    cs = np.concatenate([[0.0], np.cumsum(arr)])
+    idx = np.arange(ctx.n)
+    cnt = idx + 1 - left
+    return (cs[idx + 1] - cs[left]) / np.maximum(cnt, 1)
+
+
+def _temporal(ctx: EvalContext, iv: Interval, window_s: float, kind: str) -> Interval:
+    n = ctx.n
+    lo, hi = _as_array(iv[0], n), _as_array(iv[1], n)
+    if n == 0:
+        return lo, hi
+    if kind == "ever":
+        return np.maximum.accumulate(lo), np.maximum.accumulate(hi)
+    if kind == "was":
+        return _window_max(ctx, lo, window_s), _window_max(ctx, hi, window_s)
+    if kind == "ahead":
+        return _window_max(ctx, lo, window_s, True), _window_max(ctx, hi, window_s, True)
+    if kind == "avg":
+        return _window_mean(ctx, lo, window_s), _window_mean(ctx, hi, window_s)
     if kind == "held":
-        t0 = float(ctx.times[0])
-        for i in range(n):
-            if float(ctx.times[i]) - t0 < window_s - 1e-6:
-                out[i] = 0.0  # истории меньше окна — «держится» не доказано
-            else:
-                out[i] = arr[int(left[i]):i + 1].min()
-        return out
+        short = (ctx.times - float(ctx.times[0])) < window_s - 1e-6
+        out_lo = np.where(short, 0.0, _window_min(ctx, lo, window_s))  # истории меньше окна — не доказано
+        return out_lo, _window_min(ctx, hi, window_s)
     raise ExprError(f"Неизвестная временная функция: {kind}")  # pragma: no cover
 
+
+# --------------------------------------------------------------------------- compiler
 
 class _Compiler:
     def __init__(self, allowed_names: Optional[set[str]]) -> None:
@@ -203,7 +285,6 @@ class _Compiler:
         self.comparisons: list[Comparison] = []
         self.max_window = 0.0
 
-    # -- helpers ---------------------------------------------------------
     @staticmethod
     def _const_number(node: ast.AST, what: str) -> float:
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
@@ -212,8 +293,7 @@ class _Compiler:
             return float(node.value)
         raise ExprError(f"{what}: ожидалась числовая константа")
 
-    # -- main ------------------------------------------------------------
-    def compile(self, node: ast.AST) -> Callable[[EvalContext], Any]:
+    def compile(self, node: ast.AST) -> Callable[[EvalContext], Interval]:
         if isinstance(node, ast.Expression):
             return self.compile(node.body)
         if isinstance(node, ast.Constant):
@@ -224,12 +304,12 @@ class _Compiler:
                 fv = float(v)
             else:
                 raise ExprError(f"Недопустимая константа: {v!r}")
-            return lambda ctx, fv=fv: fv
+            return lambda ctx, fv=fv: (fv, fv)
         if isinstance(node, ast.Name):
             name = node.id
             if name in _CONSTANT_NAMES:
                 fv = _CONSTANT_NAMES[name]
-                return lambda ctx, fv=fv: fv
+                return lambda ctx, fv=fv: (fv, fv)
             if name.startswith("_"):
                 raise ExprError(f"Недопустимое имя: {name}")
             if self.allowed_names is not None and name not in self.allowed_names:
@@ -238,39 +318,43 @@ class _Compiler:
             return lambda ctx, name=name: ctx.get(name)
         if isinstance(node, ast.BoolOp):
             parts = [self.compile(v) for v in node.values]
-            if isinstance(node.op, ast.And):
-                def _and(ctx: EvalContext, parts=parts) -> Any:
-                    res = _truth(parts[0](ctx))
-                    for p in parts[1:]:
-                        res = np.minimum(res, _truth(p(ctx)))
-                    return res
-                return _and
+            red = np.minimum if isinstance(node.op, ast.And) else np.maximum
 
-            def _or(ctx: EvalContext, parts=parts) -> Any:
-                res = _truth(parts[0](ctx))
+            def _bool(ctx: EvalContext, parts=parts, red=red) -> Interval:
+                lo, hi = _truth(parts[0](ctx))
                 for p in parts[1:]:
-                    res = np.maximum(res, _truth(p(ctx)))
-                return res
-            return _or
+                    plo, phi = _truth(p(ctx))
+                    lo, hi = red(lo, plo), red(hi, phi)
+                return lo, hi
+            return _bool
         if isinstance(node, ast.UnaryOp):
             inner = self.compile(node.operand)
             if isinstance(node.op, ast.Not):
-                return lambda ctx, inner=inner: 1.0 - _truth(inner(ctx))
+                return lambda ctx, inner=inner: _not(inner(ctx))
             if isinstance(node.op, ast.USub):
-                return lambda ctx, inner=inner: -np.asarray(inner(ctx), dtype=float)
+                def _neg(ctx: EvalContext, inner=inner) -> Interval:
+                    lo, hi = inner(ctx)
+                    return np.negative(hi), np.negative(lo)
+                return _neg
             if isinstance(node.op, ast.UAdd):
                 return inner
             raise ExprError("Недопустимый унарный оператор")
         if isinstance(node, ast.BinOp):
             a, b = self.compile(node.left), self.compile(node.right)
             if isinstance(node.op, ast.Add):
-                return lambda ctx, a=a, b=b: np.add(a(ctx), b(ctx))
+                def _add(ctx: EvalContext, a=a, b=b) -> Interval:
+                    (a0, a1), (b0, b1) = a(ctx), b(ctx)
+                    return np.add(a0, b0), np.add(a1, b1)
+                return _add
             if isinstance(node.op, ast.Sub):
-                return lambda ctx, a=a, b=b: np.subtract(a(ctx), b(ctx))
+                def _sub(ctx: EvalContext, a=a, b=b) -> Interval:
+                    (a0, a1), (b0, b1) = a(ctx), b(ctx)
+                    return np.subtract(a0, b1), np.subtract(a1, b0)
+                return _sub
             if isinstance(node.op, ast.Mult):
-                return lambda ctx, a=a, b=b: np.multiply(a(ctx), b(ctx))
+                return lambda ctx, a=a, b=b: _mul(a(ctx), b(ctx))
             if isinstance(node.op, ast.Div):
-                return lambda ctx, a=a, b=b: _safe_div(a(ctx), b(ctx))
+                return lambda ctx, a=a, b=b: _div(a(ctx), b(ctx))
             raise ExprError("Недопустимый арифметический оператор")
         if isinstance(node, ast.Compare):
             operands = [node.left, *node.comparators]
@@ -283,13 +367,15 @@ class _Compiler:
                 ops.append(sym)
                 self._record_comparison(left, sym, right)
 
-            def _cmp(ctx: EvalContext, fns=fns, ops=ops) -> Any:
+            def _compare(ctx: EvalContext, fns=fns, ops=ops) -> Interval:
                 vals = [f(ctx) for f in fns]
-                res: Any = 1.0
+                lo: Any = 1.0
+                hi: Any = 1.0
                 for i, sym in enumerate(ops):
-                    res = np.minimum(res, _apply_cmp(sym, vals[i], vals[i + 1]))
-                return res
-            return _cmp
+                    clo, chi = _cmp(sym, vals[i], vals[i + 1])
+                    lo, hi = np.minimum(lo, clo), np.minimum(hi, chi)
+                return lo, hi
+            return _compare
         if isinstance(node, ast.Call):
             return self._compile_call(node)
         raise ExprError(f"Недопустимая конструкция: {type(node).__name__}")
@@ -304,14 +390,12 @@ class _Compiler:
         except ExprError:
             pass  # сравнение двух сигналов — в trace не выносим
 
-    def _compile_call(self, node: ast.Call) -> Callable[[EvalContext], Any]:
+    def _compile_call(self, node: ast.Call) -> Callable[[EvalContext], Interval]:
         if not isinstance(node.func, ast.Name):
             raise ExprError("Вызывать можно только функции из белого списка")
         fname = node.func.id
         if node.keywords:
             raise ExprError(f"{fname}(): именованные аргументы не поддерживаются")
-        if any(isinstance(a, ast.Starred) for a in node.args):
-            raise ExprError(f"{fname}(): *args не поддерживаются")
         args = node.args
         if fname in POINTWISE_FUNCS:
             self.funcs.add(fname)
@@ -321,36 +405,46 @@ class _Compiler:
                     raise ExprError(f"{fname}(): нужен хотя бы один аргумент")
                 red = np.minimum if fname == "min" else np.maximum
 
-                def _mm(ctx: EvalContext, fns=fns, red=red) -> Any:
-                    res = fns[0](ctx)
+                def _mm(ctx: EvalContext, fns=fns, red=red) -> Interval:
+                    lo, hi = fns[0](ctx)
                     for f in fns[1:]:
-                        res = red(res, f(ctx))
-                    return res
+                        flo, fhi = f(ctx)
+                        lo, hi = red(lo, flo), red(hi, fhi)
+                    return lo, hi
                 return _mm
             if fname == "abs":
                 if len(fns) != 1:
                     raise ExprError("abs(x): ровно один аргумент")
-                return lambda ctx, f=fns[0]: np.abs(f(ctx))
+                return lambda ctx, f=fns[0]: _abs(f(ctx))
             if fname == "clip":
                 if len(fns) != 3:
                     raise ExprError("clip(x, lo, hi): ровно три аргумента")
-                return lambda ctx, f=fns: np.clip(f[0](ctx), f[1](ctx), f[2](ctx))
+
+                def _clip(ctx: EvalContext, f=fns) -> Interval:
+                    (x0, x1), (l0, l1), (h0, h1) = f[0](ctx), f[1](ctx), f[2](ctx)
+                    return np.clip(x0, l0, h0), np.clip(x1, l1, h1)
+                return _clip
             if fname == "ramp":
                 if len(fns) != 3:
                     raise ExprError("ramp(x, lo, hi): ровно три аргумента")
-                return lambda ctx, f=fns: np.clip(
-                    _safe_div(np.subtract(f[0](ctx), f[1](ctx)), np.subtract(f[2](ctx), f[1](ctx))), 0.0, 1.0)
+                if not all(isinstance(a, (ast.Constant, ast.UnaryOp)) for a in args[1:]):
+                    raise ExprError("ramp(x, lo, hi): границы должны быть константами")
+                lo_c = self._const_number(args[1], "ramp(): lo")
+                hi_c = self._const_number(args[2], "ramp(): hi")
+                if hi_c <= lo_c:
+                    raise ExprError("ramp(x, lo, hi): нужно hi > lo")
+                return lambda ctx, f=fns[0], a=lo_c, b=hi_c: tuple(_ramp(v, a, b) for v in f(ctx))  # type: ignore[return-value]
             if fname == "step":
                 if len(fns) != 2:
                     raise ExprError("step(x, thr): ровно два аргумента")
-                return lambda ctx, f=fns: _apply_cmp(">=", f[0](ctx), f[1](ctx))
+                return lambda ctx, f=fns: _cmp(">=", f[0](ctx), f[1](ctx))
         if fname in TEMPORAL_FUNCS:
             self.funcs.add(fname)
             if fname == "ever":
                 if len(args) != 1:
                     raise ExprError("ever(x): ровно один аргумент")
                 inner = self.compile(args[0])
-                return lambda ctx, inner=inner: _window_reduce(ctx, inner(ctx), 0.0, "ever")
+                return lambda ctx, inner=inner: _temporal(ctx, inner(ctx), 0.0, "ever")
             if len(args) != 2:
                 raise ExprError(f"{fname}(x, окно_с): ровно два аргумента")
             inner = self.compile(args[0])
@@ -358,7 +452,7 @@ class _Compiler:
             if not (0.0 <= window <= 3600.0):
                 raise ExprError(f"{fname}(): окно должно быть в диапазоне 0..3600 с")
             self.max_window = max(self.max_window, window)
-            return lambda ctx, inner=inner, w=window, k=fname: _window_reduce(ctx, inner(ctx), w, k)
+            return lambda ctx, inner=inner, w=window, k=fname: _temporal(ctx, inner(ctx), w, k)
         raise ExprError(f"Функция не разрешена: {fname}")
 
 
@@ -368,8 +462,6 @@ def _check_tree(tree: ast.AST) -> None:
         count += 1
         if count > MAX_NODES:
             raise ExprError("Выражение слишком сложное")
-        if isinstance(node, ast.Starred):
-            raise ExprError("*args не поддерживаются")
         if not isinstance(node, _ALLOWED_NODES):
             raise ExprError(f"Недопустимая конструкция: {type(node).__name__}")
 
@@ -405,13 +497,13 @@ def compile_expr(source: Any, allowed_names: Optional[Iterable[str]] = None) -> 
 
 
 def evaluate_scalar(expr: CompiledExpr | str, variables: Mapping[str, float]) -> float:
-    """Вычислить выражение для одного набора скалярных переменных (формулы confidence)."""
+    """Вычислить выражение для одного набора известных скалярных переменных (формулы confidence)."""
     compiled = compile_expr(expr) if isinstance(expr, str) else expr
+    missing = sorted(n for n in compiled.names if n not in variables)
+    if missing:
+        raise ExprError(f"Нет переменных для формулы: {', '.join(missing)}")
     ctx = EvalContext(
         times=np.zeros(1),
         signals={k: np.asarray([float(v)], dtype=float) for k, v in variables.items()},
     )
-    missing = sorted(n for n in compiled.names if n not in variables)
-    if missing:
-        raise ExprError(f"Нет переменных для формулы: {', '.join(missing)}")
     return float(compiled(ctx)[0])

@@ -34,8 +34,15 @@ class SignalSeries:
     present: set[str] = field(default_factory=set)      # сигналы, пришедшие в states
     coverage: dict[str, float] = field(default_factory=dict)   # доля кадров с реальным значением
     derived: dict[str, str] = field(default_factory=dict)      # имя → источник ("tracks")
-    defaulted: set[str] = field(default_factory=set)    # сигналы, которых нет нигде (значение по умолчанию)
+    absent: set[str] = field(default_factory=set)       # сигналы, которых нет ни в одном состоянии (неизвестны)
     dt: float = 0.2                                     # медианный шаг сэмплирования
+
+    def known(self, name: str) -> np.ndarray:
+        """Маска кадров, где значение сигнала известно (после forward-fill)."""
+        arr = self.signals.get(name)
+        if arr is None:
+            return np.zeros(self.n, dtype=bool)
+        return np.isfinite(arr)
 
     @property
     def n(self) -> int:
@@ -86,12 +93,16 @@ def build_series(
     needed: Iterable[str] = (),
     *,
     defaults: Optional[Mapping[str, float]] = None,
-    default_value: float = 0.0,
     ffill_max_s: float = 1.5,
     merge_policy: str = "max",
     time_round: float = 1e-3,
 ) -> SignalSeries:
-    """Свести список состояний в выровненные ряды."""
+    """Свести список состояний в выровненные ряды.
+
+    Отсутствие сигнала ≠ отрицание: кадры без значения (и пропуски длиннее ``ffill_max_s``)
+    остаются ``NaN`` = «неизвестно». ``defaults`` — только явные, задокументированные
+    исключения (например, модуль, который по договорённости не шлёт нулевой сигнал).
+    """
     defaults = dict(defaults or {})
     buckets: dict[float, dict[str, float]] = {}
     for st in states or ():
@@ -122,15 +133,16 @@ def build_series(
     names = sorted(present | set(needed))
     signals: dict[str, np.ndarray] = {}
     coverage: dict[str, float] = {}
-    defaulted: set[str] = set()
+    absent: set[str] = set()
     rows = [buckets[k] for k in sorted(buckets)]
     for name in names:
         raw = np.array([row.get(name, np.nan) for row in rows], dtype=float) if n else np.zeros(0)
         have = np.isfinite(raw)
         coverage[name] = float(have.mean()) if n else 0.0
-        fill = float(defaults.get(name, default_value))
+        fill = float(defaults[name]) if name in defaults else np.nan
         if not have.any():
-            defaulted.add(name)
+            if name not in defaults:
+                absent.add(name)
             signals[name] = np.full(n, fill)
             continue
         out = raw.copy()
@@ -144,7 +156,7 @@ def build_series(
                 out[i] = fill
         signals[name] = out
     return SignalSeries(times=times, signals=signals, present=present, coverage=coverage,
-                        defaulted=defaulted, dt=dt)
+                        absent=absent, dt=dt)
 
 
 # --------------------------------------------------------------------------- geometry

@@ -18,6 +18,7 @@ except ImportError:  # пока ветка A01 не смерджена
 
 __all__ = [
     "RuleSpec",
+    "InactionSpec",
     "RulesConfig",
     "ConfigError",
     "DEFAULT_RULES_PATH",
@@ -25,12 +26,16 @@ __all__ = [
     "parse_rules_config",
     "apply_overrides",
     "read_raw_config",
+    "RULE_KINDS",
+    "T_PEAK_POLICIES",
 ]
 
 DEFAULT_RULES_PATH = Path(__file__).with_name("rules.yaml")
 ENV_RULES_PATH = "SENTINEL_RULES_YAML"
-T_PEAK_POLICIES = ("onset", "onset_plus", "max", "center")
+T_PEAK_POLICIES = ("evidence", "onset", "onset_plus", "max", "center")
 SMOOTH_METHODS = ("none", "median", "mean")
+RULE_KINDS = ("violation", "observation")
+GATE_MODES = ("strict", "lenient")
 TYPE_ID_RE = re.compile(r"^V\d{2}$")
 CONF_VARS = ("mean_strength", "max_strength", "duration", "dur_term", "base", "w_strength",
              "w_duration", "tau_s", "n_frames")
@@ -41,27 +46,50 @@ class ConfigError(ValueError):
 
 
 @dataclass
+class InactionSpec:
+    """Нарушение «по бездействию»: нужен наблюдаемый полный этап.
+
+    * ``before`` должно быть *доказано* (нижняя граница) хотя бы в одном кадре за
+      ``before_window_s`` до начала сегмента (например, кассир был у открытого сейфа);
+    * сегмент не должен начинаться в первые ``edge_s`` ролика (начало этапа не снято);
+    * доля кадров сегмента, где все сигналы правила известны, ≥ ``min_coverage``;
+    * сегмент короче ``min_duration_s``, упирающийся в конец ролика, — ``insufficient_context``.
+    """
+
+    before: Optional[CompiledExpr]
+    before_window_s: float = 30.0
+    edge_s: float = 1.0
+    min_coverage: float = 0.8
+
+
+@dataclass
 class RuleSpec:
     id: str
     type_id: str
     comment: str
     strength: CompiledExpr
     gate: Optional[CompiledExpr]
+    kind: str = "observation"
     enabled: bool = True
+    status_reason: str = ""
+    gate_mode: str = "strict"
+    anchor: Optional[CompiledExpr] = None
+    inaction: Optional[InactionSpec] = None
     on: float = 0.5
     off: float = 0.35
     smooth_method: str = "median"
     smooth_s: float = 0.6
     min_duration_s: float = 1.5
     merge_gap_s: float = 1.5
-    t_peak_policy: str = "onset_plus"
-    t_peak_offset_s: float = 0.5
+    t_peak_policy: str = "evidence"
+    t_peak_offset_s: float = 0.0
+    evidence_tol: float = 0.05
     conf_base: float = 0.35
     conf_w_strength: float = 0.35
     conf_w_duration: float = 0.25
     conf_tau_s: float = 6.0
     conf_min: float = 0.05
-    conf_max: float = 0.97
+    conf_max: float = 0.95
     conf_expr: Optional[CompiledExpr] = None
     weight: float = 1.0
     facts: list[str] = field(default_factory=list)
@@ -73,8 +101,9 @@ class RuleSpec:
     @property
     def names(self) -> frozenset[str]:
         names = set(self.strength.names)
-        if self.gate is not None:
-            names |= self.gate.names
+        for e in (self.gate, self.anchor, self.inaction.before if self.inaction else None):
+            if e is not None:
+                names |= e.names
         return frozenset(names)
 
 
@@ -83,8 +112,8 @@ class RulesConfig:
     version: int
     rules: list[RuleSpec]
     signal_defaults: dict[str, float] = field(default_factory=dict)
-    default_value: float = 0.0
-    ffill_max_s: float = 1.5
+    signal_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
+    ffill_max_s: float = 1.0
     merge_policy: str = "max"
     derive_from_tracks: bool = True
     presence_tol_s: float = 0.6
@@ -94,7 +123,12 @@ class RulesConfig:
     same_type_merge_gap_s: float = 2.0
     corroboration_bonus: float = 0.05
     max_events: int = 12
-    min_confidence: float = 0.2
+    min_confidence: float = 0.15
+    require_verified_norm: bool = True
+    emit_review_observations: bool = True
+    emit_insufficient_context: bool = True
+    observation_conf_cap: float = 0.45
+    insufficient_conf_cap: float = 0.3
     severity_factor: dict[str, float] = field(default_factory=lambda: {"high": 1.0, "medium": 0.97, "low": 0.93})
     known_signals: frozenset[str] = frozenset(SIGNALS)
     source_path: Optional[str] = None
@@ -109,6 +143,11 @@ class RulesConfig:
             if r.id == rule_id:
                 return r
         raise KeyError(rule_id)
+
+    def rules_table(self) -> list[dict[str, Any]]:
+        """Таблица правил: id, тип, вид, включено ли и почему (для README/UI)."""
+        return [{"id": r.id, "type_id": r.type_id, "kind": r.kind, "enabled": r.enabled,
+                 "inaction": r.inaction is not None, "reason": r.status_reason} for r in self.rules]
 
 
 def _num(d: Mapping[str, Any], key: str, default: float, lo: float = -1e9, hi: float = 1e9, where: str = "") -> float:
@@ -191,6 +230,16 @@ def apply_overrides(raw: Mapping[str, Any], sets: Sequence[str]) -> dict[str, An
     return out
 
 
+def _compile(r: Mapping[str, Any], key: str, where: str) -> Optional[CompiledExpr]:
+    v = r.get(key)
+    if v in (None, ""):
+        return None
+    try:
+        return compile_expr(v)
+    except ExprError as exc:
+        raise ConfigError(f"{where}{key}: {exc}") from None
+
+
 def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None) -> RulesConfig:
     warnings: list[str] = []
     glob = dict(raw.get("global") or {})
@@ -201,13 +250,23 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
     if not isinstance(rules_raw, list) or not rules_raw:
         raise ConfigError("rules: ожидался непустой список правил")
 
+    ranges: dict[str, tuple[float, float]] = {}
+    for k, v in (raw.get("signal_ranges") or {}).items():
+        try:
+            lo, hi = float(v[0]), float(v[1])
+        except (TypeError, ValueError, IndexError):
+            raise ConfigError(f"signal_ranges.{k}: ожидалась пара [lo, hi]") from None
+        if hi < lo:
+            raise ConfigError(f"signal_ranges.{k}: hi < lo")
+        ranges[str(k)] = (lo, hi)
+
     sev = glob.get("severity_factor") or {"high": 1.0, "medium": 0.97, "low": 0.93}
     cfg = RulesConfig(
         version=int(raw.get("version", 1)),
         rules=[],
         signal_defaults={str(k): float(v) for k, v in (raw.get("signal_defaults") or {}).items()},
-        default_value=_num(glob, "default_value", 0.0, where="global."),
-        ffill_max_s=_num(glob, "ffill_max_s", 1.5, 0, 60, "global."),
+        signal_ranges=ranges,
+        ffill_max_s=_num(glob, "ffill_max_s", 1.0, 0, 60, "global."),
         merge_policy=str(glob.get("merge_policy", "max")),
         derive_from_tracks=bool(glob.get("derive_from_tracks", True)),
         presence_tol_s=_num(glob, "presence_tol_s", 0.6, 0, 10, "global."),
@@ -217,7 +276,12 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         same_type_merge_gap_s=_num(glob, "same_type_merge_gap_s", 2.0, 0, 600, "global."),
         corroboration_bonus=_num(glob, "corroboration_bonus", 0.05, 0, 0.5, "global."),
         max_events=int(_num(glob, "max_events", 12, 1, 1000, "global.")),
-        min_confidence=_num(glob, "min_confidence", 0.2, 0, 1, "global."),
+        min_confidence=_num(glob, "min_confidence", 0.15, 0, 1, "global."),
+        require_verified_norm=bool(glob.get("require_verified_norm", True)),
+        emit_review_observations=bool(glob.get("emit_review_observations", True)),
+        emit_insufficient_context=bool(glob.get("emit_insufficient_context", True)),
+        observation_conf_cap=_num(glob, "observation_conf_cap", 0.45, 0, 1, "global."),
+        insufficient_conf_cap=_num(glob, "insufficient_conf_cap", 0.3, 0, 1, "global."),
         severity_factor={str(k): float(v) for k, v in sev.items()},
         known_signals=known,
         source_path=source_path,
@@ -241,18 +305,32 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         type_id = str(r.get("type_id") or "")
         if not TYPE_ID_RE.match(type_id):
             raise ConfigError(f"{where}type_id={type_id!r}: ожидалось V01..V99")
-        try:
-            strength = compile_expr(r.get("strength"))
-            gate = compile_expr(r["gate"]) if r.get("gate") not in (None, "") else None
-        except ExprError as exc:
-            raise ConfigError(f"{where}: {exc}") from None
-        for nm in sorted(strength.names | (gate.names if gate else frozenset())):
-            if nm not in known:
-                warnings.append(f"{rid}: сигнал {nm!r} не входит в SIGNALS/extra_signals")
+        kind = str(r.get("kind", "observation"))
+        if kind not in RULE_KINDS:
+            raise ConfigError(f"{where}kind={kind!r} (ожидалось {'|'.join(RULE_KINDS)})")
+        gate_mode = str(r.get("gate_mode", "strict"))
+        if gate_mode not in GATE_MODES:
+            raise ConfigError(f"{where}gate_mode={gate_mode!r} (ожидалось {'|'.join(GATE_MODES)})")
+        strength = _compile(r, "strength", where)
+        if strength is None:
+            raise ConfigError(f"{where}strength: обязательное выражение")
+        gate = _compile(r, "gate", where)
+        anchor = _compile(r, "anchor", where)
+        inaction = None
+        if r.get("inaction"):
+            ina = r["inaction"]
+            if not isinstance(ina, Mapping):
+                raise ConfigError(f"{where}inaction: ожидался словарь")
+            inaction = InactionSpec(
+                before=_compile(ina, "before", where + "inaction."),
+                before_window_s=_num(ina, "before_window_s", 30.0, 0, 3600, where + "inaction."),
+                edge_s=_num(ina, "edge_s", 1.0, 0, 60, where + "inaction."),
+                min_coverage=_num(ina, "min_coverage", 0.8, 0, 1, where + "inaction."),
+            )
         tp = r.get("t_peak") or {}
         if isinstance(tp, str):
             tp = {"policy": tp}
-        policy = str(tp.get("policy", "onset_plus"))
+        policy = str(tp.get("policy", "evidence"))
         if policy not in T_PEAK_POLICIES:
             raise ConfigError(f"{where}t_peak.policy={policy!r} (ожидалось {'|'.join(T_PEAK_POLICIES)})")
         smooth = r.get("smooth") or {}
@@ -275,13 +353,22 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         facts = [str(f) for f in (r.get("facts") or [])]
         for tmpl in facts:
             _template_fields(tmpl)
+        enabled = bool(r.get("enabled", True))
+        reason = str(r.get("status_reason") or "").strip()
+        if not reason:
+            warnings.append(f"{rid}: не указана причина enabled/disabled (status_reason)")
         spec = RuleSpec(
             id=rid,
             type_id=type_id,
             comment=str(r.get("comment") or "").strip(),
             strength=strength,
             gate=gate,
-            enabled=bool(r.get("enabled", True)),
+            kind=kind,
+            enabled=enabled,
+            status_reason=reason,
+            gate_mode=gate_mode,
+            anchor=anchor,
+            inaction=inaction,
             on=on,
             off=off,
             smooth_method=method,
@@ -289,13 +376,14 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
             min_duration_s=_num(r, "min_duration_s", 1.5, 0, 3600, where),
             merge_gap_s=_num(r, "merge_gap_s", 1.5, 0, 600, where),
             t_peak_policy=policy,
-            t_peak_offset_s=_num(tp, "offset_s", 0.5, -30, 30, where + "t_peak."),
+            t_peak_offset_s=_num(tp, "offset_s", 0.0, -30, 30, where + "t_peak."),
+            evidence_tol=_num(tp, "evidence_tol", 0.05, 0, 1, where + "t_peak."),
             conf_base=_num(conf, "base", 0.35, 0, 1, where + "confidence."),
             conf_w_strength=_num(conf, "w_strength", 0.35, 0, 1, where + "confidence."),
             conf_w_duration=_num(conf, "w_duration", 0.25, 0, 1, where + "confidence."),
             conf_tau_s=_num(conf, "tau_s", 6.0, 0.01, 3600, where + "confidence."),
             conf_min=_num(conf, "min", 0.05, 0, 1, where + "confidence."),
-            conf_max=_num(conf, "max", 0.97, 0, 1, where + "confidence."),
+            conf_max=_num(conf, "max", 0.95, 0, 1, where + "confidence."),
             conf_expr=conf_expr,
             weight=_num(r, "weight", 1.0, 0, 2, where),
             facts=facts,
@@ -304,6 +392,9 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
             yield_factor=_num(r, "yield_factor", 0.7, 0, 1, where),
             max_events=int(_num(r, "max_events", 3, 1, 100, where)),
         )
+        for nm in sorted(spec.names):
+            if nm not in known:
+                warnings.append(f"{rid}: сигнал {nm!r} не входит в SIGNALS/extra_signals")
         cfg.rules.append(spec)
     return cfg
 
