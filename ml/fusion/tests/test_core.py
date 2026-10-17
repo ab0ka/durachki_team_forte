@@ -98,8 +98,18 @@ def test_forbidden_only_fact_does_not_count(catalog):
     assert not out.reported and "no_observable_fact" in out.candidates[0].gate
 
 
-def test_type_without_norm_is_hint(catalog):
+def test_type_without_norm_reported_without_clause(catalog, no_frames):
+    # по FAQ 32 у нарушений датасета есть открытая норма; не найден пункт → честно «без пункта»
     out = run([ev("V06", t=10.0, facts=["на столе рядом с наличными стоит стакан"])], catalog)
+    assert out.reported and out.candidates[0].gate == []
+    res = fuse(FakeClip(), [ev("V06", t=5.0, facts=["на столе рядом с наличными стоит стакан"])], [], catalog, "j")
+    assert res.violations[0].rules == [] and "норма:" not in res.violations[0].description
+
+
+def test_v99_without_norm_is_hint(catalog):
+    cat = {"types": {k: v for k, v in catalog["types"].items() if k != "V99"} | {"V99": {"name": "Иное",
+                                                                                      "rules": []}}}
+    out = run([ev("V99", t=10.0, facts=["клиент перелезает через стойку"])], cat)
     assert not out.reported and out.candidates[0].gate == ["no_norm"]
 
 

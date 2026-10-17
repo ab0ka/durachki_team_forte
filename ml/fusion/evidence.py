@@ -36,6 +36,10 @@ LABEL_RU = {
     "cash_bag": "инкассаторская сумка", "bag": "сумка", "document": "документ", "keys": "ключи",
     "hand": "рука", "hands": "руки", "desk": "стол", "cash_tray": "лоток",
 }
+ZONE_RU = {
+    "cashier_area": "зона кассира", "desk": "зона стола", "safe": "зона сейфа", "door": "зона двери",
+    "client_area": "клиентская зона", "cash_tray": "зона лотка",
+}
 PERSON_KEYS = set(ROLE_RU)
 # BGR
 ROLE_COLOR = {
@@ -55,6 +59,8 @@ def parse_box_key(key: str) -> tuple[str, Optional[int]]:
     """'visitor:3' → ('visitor', 3); 'cash_bag' → ('cash_bag', None); 'cashier_hand' → ('cashier', None)."""
     k = str(key).strip().lower()
     num: Optional[int] = None
+    if k.startswith("zone:") or k.startswith("zone_"):
+        return "zone:" + k[5:].strip(), None
     m = _SUFFIX.match(k)
     if m and m.group("base"):
         k, num = m.group("base").strip(" _:#-"), int(m.group("num"))
@@ -69,12 +75,17 @@ def parse_box_key(key: str) -> tuple[str, Optional[int]]:
 
 def ru_label(key: str) -> str:
     base, num = parse_box_key(key)
+    if base.startswith("zone:"):
+        name = base[5:]
+        return ZONE_RU.get(name) or f"зона {LABEL_RU.get(name, name)}"
     text = ROLE_RU.get(base) or LABEL_RU.get(base) or base
     return f"{text} #{num}" if num is not None else text
 
 
 def box_color(key: str) -> tuple[int, int, int]:
     base, _ = parse_box_key(key)
+    if base.startswith("zone:"):
+        return (170, 170, 170)
     return ROLE_COLOR.get(base) or LABEL_COLOR.get(base) or (255, 220, 0)
 
 
@@ -219,6 +230,14 @@ def blur_regions(img: np.ndarray, regions: Sequence[tuple[int, int, int, int]]) 
     return out
 
 
+def _f(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def _hex(bgr: tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(bgr[2], bgr[1], bgr[0])
 
@@ -258,14 +277,23 @@ class EvidenceRenderer:
         if key in self._frames:
             return self._frames[key]
         img: Optional[np.ndarray] = None
-        exact = getattr(self.clip, "frame_at_pts", None) or getattr(self.clip, "frame_with_pts", None)
-        if callable(exact):
+        # A04: frame_at_ts(t) -> (img, фактический PTS); read_exact(t) -> FrameRef(image, timestamp_sec)
+        for name in ("frame_at_ts", "frame_at_pts", "frame_with_pts", "read_exact"):
+            exact = getattr(self.clip, name, None)
+            if img is not None or not callable(exact):
+                continue
             try:
                 res = exact(pts)
                 if isinstance(res, tuple) and len(res) == 2:
-                    img, pts = ensure_bgr(res[0]), float(res[1])
+                    img, real = ensure_bgr(res[0]), _f(res[1])
+                else:
+                    img, real = ensure_bgr(getattr(res, "image", None)), _f(getattr(res, "timestamp_sec", None))
+                if img is not None and real is not None:
+                    pts = real
+                elif img is not None:
+                    img = None  # кадр без фактического PTS — не годится для доказательства
             except Exception as exc:  # noqa: BLE001
-                self._warn_once("frame_at_pts", f"frame_at_pts failed: {exc!r}")
+                self._warn_once(name, f"{name} failed: {exc!r}")
         if img is None and callable(getattr(self.clip, "frame_at", None)):
             try:
                 img = ensure_bgr(self.clip.frame_at(pts))

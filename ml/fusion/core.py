@@ -14,6 +14,7 @@ from typing import Any, Iterable, Optional, Sequence
 
 from ._types import AnalysisResult, BBox, Violation
 from .catalog import known_type, resolve_catalog, rule_refs, type_info
+from .completeness import coverage_info
 from .config import load_config, load_thresholds, threshold_for
 from .describe import build_description, clean_facts, format_time
 from .serialize import event_to_dict, to_jsonable
@@ -56,6 +57,8 @@ class NormEvent:
     vlm: Optional[tuple[str, float]] = None   # ("confirm"|"reject"|"unsure", score)
     positive: bool = True        # False — только мнение VLM (отказ), без положительного вклада
     orig_type_id: Optional[str] = None
+    assessment: str = "candidate"   # candidate | norm_review | observation | insufficient (оценка A09)
+    conf_in: float = 0.0            # уверенность как пришла (до восстановления срезанной A09)
 
 
 @dataclass
@@ -86,6 +89,7 @@ class Candidate:
     reported: bool = False
     suppressed_by: Optional[str] = None
     gate: list[str] = field(default_factory=list)        # почему НЕ нарушение (пусто — гейт пройден)
+    assessment: str = "candidate"                        # сводная оценка upstream (см. NormEvent)
 
     @property
     def key(self) -> str:
@@ -113,6 +117,7 @@ class Candidate:
                 "reported": self.reported,
                 "suppressed_by": self.suppressed_by,
                 "gate": self.gate,
+                "assessment": self.assessment,
                 "n_obs_facts": len(self.obs_facts),
             },
             4,
@@ -236,6 +241,54 @@ def _norm_bbox(box: Any) -> Optional[BBox]:
     return (x1, y1, x2, y2)
 
 
+_ASSESSMENT_RANK = ("candidate", "norm_review", "observation", "insufficient")
+
+
+def _a09_uncapped(conf: float, extra: dict[str, Any]) -> float:
+    """Уверенность правила до потолка review_observation: extra.confidence_raw или trace.confidence_terms A09."""
+    for key in ("confidence_raw", "confidence_uncapped", "raw_confidence"):
+        if key in extra:
+            v = _f(extra[key], -1.0)
+            if v >= 0:
+                return _clamp(max(conf, v), 0.0, 1.0)
+    trace = extra.get("trace")
+    terms = trace.get("confidence_terms") if isinstance(trace, dict) else None
+    if not isinstance(terms, dict):
+        return conf
+    if "expr" in terms:
+        raw = _f(terms.get("expr"), float("nan"))
+    elif all(k in terms for k in ("base", "strength", "duration")):
+        raw = _f(terms["base"], 0.0) + _f(terms["strength"], 0.0) + _f(terms["duration"], 0.0)
+    else:
+        return conf
+    if math.isnan(raw):
+        return conf
+    value = min(_f(terms.get("cap", 1.0), 1.0), raw * _f(terms.get("factor", 1.0), 1.0))
+    value *= _f(terms.get("derived_factor", 1.0), 1.0)
+    return _clamp(max(conf, value), 0.0, 1.0)
+
+
+def upstream_assessment(conf: float, extra: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, float]:
+    """Оценка события правил A09 → (candidate|norm_review|observation|insufficient, уверенность для слияния)."""
+    gcfg = cfg.get("report_gate") or {}
+    if not gcfg.get("upstream_assessment", True):
+        return "candidate", conf
+    a = str(extra.get("assessment") or "").strip().lower()
+    if not a or a in {"candidate_violation", "candidate", "violation"}:
+        return "candidate", conf
+    if a in {"insufficient_context", "insufficient"}:
+        return "insufficient", conf
+    if a in {"review_observation", "review", "observation"}:
+        reasons = " ".join(str(r) for r in extra.get("assessment_reasons") or []).lower()
+        if "наблюдени" in reasons or "observation" in reasons:
+            return "observation", conf
+        if "норм" in reasons or "norm" in reasons or str(extra.get("norm_status", "")).lower() in {"unverified",
+                                                                                                 "absent"}:
+            return "norm_review", (_a09_uncapped(conf, extra) if gcfg.get("uncap_norm_review", True) else conf)
+        return "observation", conf
+    return "candidate", conf
+
+
 def normalize_events(
     events: Optional[Iterable[Any]],
     duration: float,
@@ -285,6 +338,8 @@ def normalize_events(
                     track_ids.append(int(tid))
                 except (TypeError, ValueError):
                     continue
+            conf_in = conf
+            assessment, conf = upstream_assessment(conf, extra, cfg)
             opinion = vlm_opinion(source, conf, extra)
             positive = not (source == "vlm" and opinion is not None and opinion[0] != "confirm")
             if positive and source == "vlm" and conf <= 0.0:
@@ -305,6 +360,8 @@ def normalize_events(
                     vlm=opinion,
                     positive=positive,
                     orig_type_id=orig_type,
+                    assessment=assessment,
+                    conf_in=conf_in,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — одно битое событие не должно ронять слияние
@@ -524,7 +581,18 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
         track_ids=track_ids,
         extra=extra,
         peak_source=peak_ev.source,
+        assessment=_cluster_assessment(positives),
     )
+
+
+def _cluster_assessment(positives: Sequence[NormEvent]) -> str:
+    """Лучшая оценка среди положительных событий (подтверждение VLM считается candidate)."""
+    best = len(_ASSESSMENT_RANK) - 1
+    for e in positives:
+        a = "candidate" if (e.vlm is not None and e.vlm[0] == "confirm") else e.assessment
+        if a in _ASSESSMENT_RANK:
+            best = min(best, _ASSESSMENT_RANK.index(a))
+    return _ASSESSMENT_RANK[best] if positives else "insufficient"
 
 
 def _best_type_near(events: Sequence[NormEvent], a: float, b: float, fallback: str,
@@ -635,12 +703,20 @@ def gate_reasons(c: Candidate, types: dict[str, dict[str, Any]], cfg: dict[str, 
         reasons.append("no_observable_fact")
     if not gcfg.get("temporal_only_types", False) and set(c.conf_by_source) <= {"temporal"}:
         reasons.append("temporal_only")
-    if gcfg.get("require_norm", True):
+    req = gcfg.get("require_norm_types")
+    if req is None:  # совместимость со старым ключом require_norm: true|false
+        req = ["*"] if gcfg.get("require_norm", False) else []
+    if "*" in req or c.type_id in req:
         if catalog_ok:
             if not rule_refs(types, c.type_id):
                 reasons.append("no_norm")
         elif str(gcfg.get("norm_missing_if_no_catalog", "report")).lower() == "hint":
             reasons.append("norms_catalog_unavailable")
+    if gcfg.get("upstream_assessment", True):
+        if c.assessment == "observation" and str(gcfg.get("observation_policy", "hint")) == "hint":
+            reasons.append("observation_only")
+        elif c.assessment == "insufficient" and str(gcfg.get("insufficient_policy", "hint")) == "hint":
+            reasons.append("insufficient_context")
     return reasons
 
 
@@ -774,6 +850,8 @@ _GATE_RU = {
     "no_observable_fact": "нет конкретного наблюдаемого факта от правил/VLM",
     "temporal_only": "сигнал только временной модели",
     "no_norm": "для типа нет применимой нормы в каталоге",
+    "observation_only": "наблюдение (телефон, еда, дверь, второй человек) само по себе не нарушение",
+    "insufficient_context": "этап не наблюдался полностью — неизвестно, а не «нет» и не «да»",
     "norms_catalog_unavailable": "каталог норм недоступен",
     "below_threshold": "скор ниже порога",
     "suppressed": "перекрыт более сильным нарушением другого типа",
@@ -802,6 +880,7 @@ def _hint(c: Candidate, types: dict[str, dict[str, Any]], cfg: dict[str, Any]) -
         "reasons_ru": [_GATE_RU.get(r, r) for r in reasons],
         "suppressed_by": c.suppressed_by,
         "origin": c.origin,
+        "assessment": c.assessment,
     }
 
 
@@ -861,6 +940,7 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
         cand.t_peak = timecode(cand.t_peak, duration, nd)
     if not catalog_ok:
         warnings.append("norms: в каталоге нет ни одной нормы — нарушения выдаются без ссылок на нормы")
+    coverage = coverage_info(clip, duration, cfg)
     t_scores = time.perf_counter() - t0
 
     renderer = None
@@ -943,6 +1023,28 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
         "warnings": warnings,
         "disclaimer": "Результат — подсказка для проверяющего, а не юридическое заключение.",
     }
+    meta["coverage"] = coverage
+    ccfg = cfg.get("completeness") or {}
+    unknown_fails = str(ccfg.get("unknown_coverage", "failed")).lower() == "failed"
+    incomplete = coverage["complete"] is False or (coverage["complete"] is None and unknown_fails)
+    if coverage["complete"] is None:
+        warnings.append("coverage: нет данных о покрытии видео (clip.meta / clip.times)")
+    if ccfg.get("coverage_gate", True) and incomplete:
+        reason_list = coverage["reasons"] or ["покрытие видео анализом неизвестно"]
+        if outcome.verdict == "violation":
+            warnings.append("анализ видео неполный (" + "; ".join(reason_list) + "): найденные нарушения "
+                            "показаны, но другие могли быть пропущены")
+            meta["analysis_complete"] = False
+        else:
+            msg = ("Анализ видео неполный: " + "; ".join(reason_list) +
+                   ". Отсутствие нарушений не подтверждено — вердикт не выносится.")
+            meta["analysis_complete"] = False
+            meta["failure"] = {"reason": "partial_coverage" if coverage["complete"] is False else "unknown_coverage",
+                               "details": reason_list, "message_ru": msg}
+            meta["ui"]["incomplete"] = {"failed_stages": [], "details": {"coverage": reason_list}, "message_ru": msg}
+            warnings.append(msg)
+            return AnalysisResult(job_id=str(job_id), status="failed", verdict=None, violations=[],
+                                  timeline=outcome.timeline, meta=meta)
     return AnalysisResult(
         job_id=str(job_id),
         status="done",
