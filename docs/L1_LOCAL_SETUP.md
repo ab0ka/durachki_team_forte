@@ -43,6 +43,8 @@
 | `types_review.py --root . [--catalog …] [--confirmed …]` | HTML для человека, `labels_types.csv`, черновик DATA_FINDINGS (CPU) |
 | `check_local.py --root . [--hash] [--load] [--eval-src …] [--catalog …]` | окружение, наличие/хэши весов, (опц.) загрузка+forward на CPU, данные, метки, совместимость с `eval` |
 | `type_catalog.py` | список типов из `norms/catalog.yaml` (`--catalog` → `<root>/norms/catalog.yaml` → снимок integration-cloud@2055fc4 = V01–V09, V99) |
+| `eval_run.py <run_dir> [--compare <run_dir>]` | метрики прогона сервиса (`summary.json` + `<video>.json`) против разметки: accuracy с 95% ДИ, recall/specificity, FN/FP по id, типы в TP/FP, AUC confidence/risk_max, таймкод, время, статусы стадий; сравнение двух прогонов (что починилось/сломалось). CSV по видео — `cache/eval_runs/` |
+| `error_review.py <run_dir>` | локальная страница разбора FN+FP: плеер, кривая риска с метками, контакт-листы вокруг метки/таймкода сервиса, кадры-доказательства и описание сервиса, форма «причина/тип» → `error_review.csv`. `cache/error_review/<run>/` (**не публиковать**) |
 | `siglip2_*_baseline.py`, `vlm_smoke.py` | baseline и smoke-тест VLM (GPU) |
 
 Тесты (только синтетика, CPU): `.venv/Scripts/python.exe -m pytest tools/dataprep/tests -q`.
@@ -192,6 +194,10 @@ fallback: вызов «висит» минутами при 100% загрузк�
 .venv\Scripts\python.exe -I -X utf8 tools\dataprep\check_local.py --root . --only labels --catalog C:\Users\LEGION\Desktop\durachki_L2\norms\catalog.yaml
 # тесты инструментов (синтетика)
 .venv\Scripts\python.exe -m pytest tools\dataprep\tests -q
+
+# замер прогона сервиса против разметки (+ сравнение с предыдущим) и страница разбора ошибок, CPU
+.venv\Scripts\python.exe -I -X utf8 tools\dataprep\eval_run.py C:\Users\LEGION\Desktop\durachki_L2\runs\l2\<exp> --root . --compare C:\Users\LEGION\Desktop\durachki_L2\runs\l2\<prev>
+.venv\Scripts\python.exe -I -X utf8 tools\dataprep\error_review.py C:\Users\LEGION\Desktop\durachki_L2\runs\l2\<exp> --root .
 
 # импорт после подтверждения человеком (файлы, выгруженные из cache\types_review\index.html):
 .venv\Scripts\python.exe -I -X utf8 tools\dataprep\types_review.py --root . `
