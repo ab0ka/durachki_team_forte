@@ -73,6 +73,14 @@ signals:
   # нет кассира в кадре). Значение ≥ 0.5 ⇔ сигнал активен после гистерезиса, < 0.5 — наблюдаемое «нет».
   # Жесты без предмета (рука у головы, рука ко рту, кисти не видны) — только в extra["gestures"],
   # это НЕ доказательство телефона / еды / сокрытия рук.
+  # Немного надёжных сигналов вместо множества хрупких жестов (фаза 2). Выключенные считаются только по
+  # явному включению (код сохранён): phone_to_ear (рука у уха сверху почти всегда перекрыта, телефон и так
+  # ловит phone_in_hand), cashier_facing_away (зависит от разметки L/R и зон).
+  enabled: [phone_in_hand, eating_drinking, hands_hidden, handover_motion]
+  extras:                       # доп. выходы в extra; новые режимы выключены до замера L2
+    bending_to_safe: false      # хрупкий жест (наклон к сейфу)
+    item_placed_on_desk: false  # новый режим: кто и когда положил предмет на стол (V09/V07-кандидаты)
+    motion: false               # новый режим: sitting/standing/walking + направление движения кассира (V02)
   kp_min_score: 0.3             # точка используется в геометрии, если score >= порога
   default_aspect_wh: 0.5472     # W/H кадра, если неизвестен (портрет 464x848)
   scale:
@@ -161,6 +169,31 @@ signals:
     thr_off: 0.4
     min_duration_s: 0.6
     max_gap_s: 0.6
+  item_placed_on_desk:          # extra; нужны зона desk и объект-треки в tracks, иначе unknown
+    labels: [bag, cash_bag, document, keys, cell_phone, cup, bottle, food, cash]
+    zone_names: [desk]
+    zone_margin: 0.03           # центр предмета ближе к зоне desk (доли высоты кадра)
+    persist_s: 2.0              # предмет «лёг»: неподвижен не меньше
+    stable_dist: 0.03           # допуск смещения центра «лежащего» предмета (доли высоты кадра)
+    pre_s: 2.0                  # кисть у предмета не раньше, чем за pre_s до «лёг»
+    post_s: 0.6
+    release_s: 3.0              # кисть уходит от предмета (≥ far) в течение release_s после «лёг»
+    near: 0.5                   # кисть–bbox предмета (в s)
+    far: 1.0
+    reid_gap_s: 2.0             # новый трек на месте старого того же класса — смена id, не событие
+    hold_s: 2.0                 # сколько держать значение после «лёг»
+  motion:                       # extra["motion"]; скорость центра корпуса в масштабах тела s за секунду
+    window_s: 1.0               # окно оценки скорости
+    walk_speed_min: 0.6         # ниже — не идёт (переминается, ёрзает на стуле)
+    walk_speed_full: 1.2        # выше — уверенно идёт
+    thr_on: 0.6
+    thr_off: 0.4
+    min_duration_s: 0.8
+    max_gap_s: 0.4
+    sit_hi: 0.6                 # sitting ≥ sit_hi → «сидит»; ≤ sit_lo → «стоит»
+    sit_lo: 0.4
+    toward_cos: 0.7             # направление отрезка ходьбы к центру зоны (cos ≥) → toward / (≤ -) → away_from
+    zone_names: [door, desk, safe, cashier_area, client_area, cash_tray]
   posture:                      # extra; sitting/standing — эвристика, None при низкой уверенности
     sit_angle_lo_deg: 35        # угол бедро/корпус: ниже — стоит
     sit_angle_hi_deg: 70        # выше — сидит
