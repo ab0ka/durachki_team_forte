@@ -23,6 +23,9 @@
      quote_level согласован с источником (fulltext / snippet / none).
   8. Встроенный fallback (norms/_fallback.py) совпадает с YAML.
 Текст между <!-- not-quotable --> и <!-- /not-quotable --> (пересказы) в сверке цитат не участвует.
+В файлах-фрагментах (retrieval: search_snippets | partial) цитировать можно ТОЛЬКО блоки ``>``
+(фрагменты источника), но не собственные заметки агента; цитата не может склеивать два блока.
+В полном тексте (fulltext) цитируемо всё тело файла.
 """
 from __future__ import annotations
 
@@ -60,6 +63,25 @@ def normalize(text: str) -> str:
     text = text.translate(_TRANSLATE)
     text = re.sub(r"\s+", " ", text)
     return text.strip().casefold()
+
+
+def quotable_text(body: str, retrieval: str) -> str:
+    """Нормализованный текст, в котором ищутся цитаты (см. docstring модуля)."""
+    body = _NOT_QUOTABLE_RE.sub("\n\n", body)
+    if retrieval == "fulltext":
+        return normalize(body)
+    blocks: list[str] = []
+    cur: list[str] = []
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(">"):
+            cur.append(stripped[1:])
+        elif cur:
+            blocks.append(" ".join(cur))
+            cur = []
+    if cur:
+        blocks.append(" ".join(cur))
+    return " \u2016 ".join(normalize(b) for b in blocks)  # разделитель исключает склейку блоков
 
 
 def parse_front_matter(text: str) -> tuple[dict[str, str], str]:
@@ -135,7 +157,7 @@ def _load_sources(catalog: dict[str, Any], base_dir: Path, rep: Report) -> dict[
             rep.errors.append(f"{where}.source_file: файл {doc['source_file']} не найден")
         else:
             meta, body = parse_front_matter(path.read_text(encoding="utf-8"))
-            entry["meta"], entry["body"] = meta, normalize(_NOT_QUOTABLE_RE.sub(" ", body))
+            entry["meta"], entry["body"] = meta, quotable_text(body, meta.get("retrieval", ""))
             if not meta:
                 rep.errors.append(f"{doc['source_file']}: нет front matter (url, title, accessed, retrieval)")
             else:

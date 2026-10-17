@@ -134,3 +134,27 @@ def test_cli_on_mini_fixture(capsys):
     out = capsys.readouterr().out
     # мини-фикстура не содержит V02..V08 → CLI (полный набор типов) должен упасть
     assert rc == 1 and '"ok": false' in out
+
+
+def test_agent_notes_in_snippet_file_are_not_quotable():
+    cat = _mini()
+    cat["types"]["V01"]["rules"][0]["quote"] = "Строка выше разбита переносом"
+    assert _run(cat).quotes[0].status == "NOT_FOUND"
+
+
+def test_quote_cannot_span_two_blocks():
+    text = "> первый фрагмент окончание\n\n> второй фрагмент\n"
+    q = v.quotable_text(text, "search_snippets")
+    assert v.normalize("первый фрагмент окончание") in q
+    assert v.normalize("окончание второй фрагмент") not in q
+    assert v.normalize("окончание второй") in v.quotable_text(text.replace(">", ""), "fulltext")
+
+
+def test_real_sources_header_notes_are_not_quotable():
+    import norms
+
+    body = (norms.SOURCES_DIR / "nbrk_231_2019_cash_operations.md").read_text(encoding="utf-8")
+    meta, rest = v.parse_front_matter(body)
+    q = v.quotable_text(rest, meta["retrieval"])
+    assert v.normalize("Статус на самой странице adilet НЕ проверен") not in q
+    assert v.normalize("Наличные деньги принимаются и пересчитываются кассовым работником в присутствии клиента.") in q
