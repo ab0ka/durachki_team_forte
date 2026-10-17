@@ -7,16 +7,17 @@
 данных говорит «По имеющимся данным это установить нельзя». На вердикт, таймкод и тип не влияет, GPU у
 анализа не отнимает. Есть «Заключение проверяющего» в markdown/HTML и подсказки вопросов для UI.
 
-**Статус:** опциональный, по умолчанию в проде выключен (`enabled: mock`). Генерация — общая
-Qwen3-VL-4B через `ml.vlm.service.chat` (A11), низкий приоритет. Нет модели или GPU занят → честный
-негенеративный режим `retrieval`. Дообучения не было, реальная генерация на GPU не запускалась, цифр
-качества нет (см. «Проверки»).
+**Статус:** опциональный, по умолчанию в проде выключен (`enabled: mock`). Безопасный режим без
+отдельной LLM — `COPILOT_ENABLED=1` → `retrieval` (факты задачи + каталог A13, без GPU). Генерация —
+общая Qwen3-VL-4B через `ml.vlm.service` (A11), только если модель уже загружена в этом процессе или
+подключён `set_chat_fn` к воркеру A03; сам copilot VLM не загружает. Дообучения не было, реальная
+генерация на GPU не запускалась, цифр качества нет (см. «Проверки»).
 
 ## Что внутри
 
 | Файл | Назначение |
 |---|---|
-| `service.py` | `answer/stream/status/warmup/release`, `set_busy_probe`, `set_gpu_lock`; режимы generative/retrieval/mock; таймаут; коды ошибок |
+| `service.py` | `answer/stream/status/warmup/release`, `set_busy_probe`, `set_gpu_lock`, `set_chat_fn`; режимы generative/retrieval/mock; лимит промпта; таймаут; коды ошибок |
 | `router.py` | `POST …/jobs/{id}/ask` (+SSE), `GET …/copilot/status`, `GET …/jobs/{id}/report[?format=html]`, `GET …/jobs/{id}/suggestions` |
 | `llm.py` | `VLMServiceBackend` (`ml.vlm.service.chat`), `VLMRuntimeAdapter` (временный, выключен), `RetrievalBackend`, llama.cpp server/in-process (только явно), `ScriptedLLM` (тесты) |
 | `guard.py` | пост-проверка: маркеры `[N]`/`[V]`, пункты, акты, URL, таймкоды, суммы, опора на контекст, противоречия вердикту и полноте |
@@ -24,7 +25,7 @@ Qwen3-VL-4B через `ml.vlm.service.chat` (A11), низкий приорит�
 | `prompts.py` | системный промпт, нормализация и сжатие результата, полнота анализа, «почему отмечено», контекст |
 | `extractive.py` | намерения вопроса, детерминированные ответы (retrieval/mock), обязательные отказы |
 | `corpus.py`, `rag.py`, `embed.py` | каталог и источники A13 (формат v2), чанкинг, гибридный поиск e5/hashing + BM25 |
-| `report.py` | заключение md/HTML (экранирование, CSP, кадры только из валидного JPEG) |
+| `report.py` | заключение md/HTML: наблюдение системы / подтверждённый факт / непроверенная норма; экранирование, CSP, кадры только из валидного JPEG |
 | `suggestions.py`, `suggestions.yaml` | 3–4 вопроса на тип V01–V09/V99 |
 | `eval_grounding.py` | синтетическая проверка groundedness (одна команда замера для L2) |
 | `train/make_dataset.py`, `train/lora.py` | ОПЦИОНАЛЬНЫЙ LoRA (вне критического пути, не запускался): датасет из guard-чистых шаблонных ответов; LoRA только q/k/v/o языковой части, `--dry-run` без torch; `train/requirements-lora.txt` (peft — отдельно, lock L1 не трогать) |
@@ -67,22 +68,37 @@ Qwen3-VL-4B через `ml.vlm.service.chat` (A11), низкий приорит�
     `python -m copilot.train.make_dataset --n 1500` → `python -m copilot.train.lora --dry-run` →
     `python -m copilot.train.lora --base <снапшот Qwen3-VL-4B> --load-4bit`.
 
-## Проверки (реально выполнены)
-- `python -m pytest copilot/tests -q` → **221 passed, 1 skipped** (Python 3.11, CPU, без весов и сети).
-  Пропущенный тест — на реальном `norms/`, он запускается, если папка есть в ветке.
-- `ruff check copilot` по правилам A01 → чисто.
+## Решения (после аудита: надёжный необязательный модуль)
+11. **Граница с A11 — по реальному коду:** `ChatResult(ok, text, error, truncated, timed_out)`, подпись
+    `chat` читается из кода (`priority` — только если принимается), `unavailable` → retrieval, `busy` →
+    retrieval с пометкой, таймаут → 504; ожидание GPU + генерация ≤ бюджета; промпт ≤ лимита A11.
+12. **Без второй VLM:** модель не загружена в этом процессе → retrieval; без `ml.vlm.runtime` в процессе
+    copilot даже не спрашивает A11 (процесс API не тянет torch). Шов для воркера — `set_chat_fn`.
+13. **Только текущая задача:** провайдер вернул чужую задачу → 404; реплики истории с чужим `job_id`
+    отбрасываются; история не источник фактов (таймкоды и суммы — из результата и вопроса).
+14. **Без выдумок:** guard режет нарушения, которых нет в результате, и «проверенную норму» для
+    несверенной; содержание разговоров — невидимое.
+15. **Заключение размечено:** наблюдение системы (не проверено человеком), подтверждённый факт (данные
+    обработки; норма — только `legal_status: confirmed` + сверенная цитата), непроверенная норма с
+    причиной. Согласие VLM — автоматическая проверка, не подтверждение.
+
+## Проверки (реально выполнены, 2026-10-17)
+- Ветка: `python -m pytest copilot -q` → **246 passed, 5 skipped** (Python 3.11, CPU, без весов и сети;
+  пропуски — тесты настоящего A11 и реального `norms/`, которых нет в ветке). `ruff check copilot` → чисто.
+- Имитация мерджа в `origin/integration` (5597969): чисто, только `copilot/`; `pytest copilot` →
+  247 passed, 4 skipped; с `ml/vlm` из ветки A11 → **251 passed** (тесты настоящего `ml.vlm.service`
+  проходят). Старый отчёт (2055fc4: 7 failed) после мерджа → 251 passed. Подробно — INTEGRATION.md §7.
 - Синтетический `eval_grounding`: mock/retrieval 100%, guard ничего не режет. «Плохая модель» (скрипт):
   safety 100%, guard урезает 89% ответов.
-- Не проверено: генерация Qwen3-VL через `ml.vlm.service.chat` (его ещё нет у A11), латентность и VRAM,
-  e5 на реальных весах, отсутствие влияния на время анализа. Это замеряет L2 (INTEGRATION.md §5).
+- Не проверено: генерация Qwen3-VL через `ml.vlm.service` на GPU, латентность и VRAM, IPC к воркеру,
+  e5 на реальных весах, отсутствие влияния на время анализа. Это замеряет L2 (INTEGRATION.md §6).
 
 ## Для интегратора — коротко
-- **A11:** экспортировать `ml.vlm.service.chat(messages, max_new_tokens, timeout_s, priority, …)` и,
-  по возможности, `available()`. Контракт — в INTEGRATION.md §1.
-- **A02/A03:** `copilot.service.set_busy_probe(lambda: <идёт анализ>)`. Copilot подключать тем же
-  ключом и сессией (уже так в ветке A02).
-- **A15:** опционально `GET …/suggestions` вместо захардкоженных вопросов и `?format=html` для
-  заключения. Пометку режима показывать как есть (она в `answer`).
-- **A13:** `rules` с `verified: true` и `legal_status: confirmed` автоматически станут «подтверждённой
-  нормой». Сейчас подтверждённых нет, поэтому copilot честно пишет «требует сверки» или «без пункта».
-- Удалить `copilot/_contract_fallback.py` после мерджа контрактов A01.
+- **Безопасный режим:** `COPILOT_ENABLED=1` → retrieval без LLM; без флага в проде — 501 (панель скрыта).
+- **A02/A03:** при желании генерации — `copilot.service.set_chat_fn(<IPC к ml.vlm.service.chat_request
+  в воркере>)`; `set_busy_probe(lambda: <идёт анализ>)` — необязательно.
+- **A02 (тест):** `test_copilot_501_then_router` под `SENTINEL_MOCK=1` видит настоящий copilot → 200;
+  в первой части теста нужен `COPILOT_ENABLED=0` (INTEGRATION.md §8).
+- **A15:** опционально `GET …/suggestions` и `?format=html`. Пометку режима показывать как есть.
+- **A13:** `rules` с `verified: true` у типа с `legal_status: confirmed` автоматически станут
+  «подтверждённой нормой». Сейчас подтверждённых нет — copilot пишет «требует сверки» или «без пункта».
