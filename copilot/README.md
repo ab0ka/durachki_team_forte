@@ -27,6 +27,7 @@ Qwen3-VL-4B через `ml.vlm.service.chat` (A11), низкий приорит�
 | `report.py` | заключение md/HTML (экранирование, CSP, кадры только из валидного JPEG) |
 | `suggestions.py`, `suggestions.yaml` | 3–4 вопроса на тип V01–V09/V99 |
 | `eval_grounding.py` | синтетическая проверка groundedness (одна команда замера для L2) |
+| `train/make_dataset.py`, `train/lora.py` | ОПЦИОНАЛЬНЫЙ LoRA (вне критического пути, не запускался): датасет из guard-чистых шаблонных ответов; LoRA только q/k/v/o языковой части, `--dry-run` без torch; `train/requirements-lora.txt` (peft — отдельно, lock L1 не трогать) |
 | `fixtures/norms`, `fixtures/norms_a13` | **тестовые** вымышленные нормы (URL `*.invalid`), только для тестов и mock |
 
 ## Решения (фаза 2, приняты автономно)
@@ -58,11 +59,16 @@ Qwen3-VL-4B через `ml.vlm.service.chat` (A11), низкий приорит�
    только с уже загруженной («тёплой») VLM.
 9. **HTML-заключение встраивает кадры** (локальный файл для проверяющего), только валидный JPEG.
    Выключается `report.html_include_frames: false`.
-10. **LoRA вне критического пути:** запуск только если у L2 останется время, без замера не
-    рекламировать. Формат промпта для датасета — `prompts.build_messages`.
+10. **LoRA вне критического пути:** скрипты готовы (`copilot/train/`), но не запускались. Запуск
+    только если у L2 останется время, применять адаптер (A11) — только если `eval_grounding` до/после
+    покажет выигрыш, без замера не рекламировать. Датасет — дистилляция безопасных шаблонных ответов в
+    формате рантайма (`prompts.build_messages`), в него идут только цели, которые guard пропускает
+    целиком:
+    `python -m copilot.train.make_dataset --n 1500` → `python -m copilot.train.lora --dry-run` →
+    `python -m copilot.train.lora --base <снапшот Qwen3-VL-4B> --load-4bit`.
 
 ## Проверки (реально выполнены)
-- `python -m pytest copilot/tests -q` → **214 passed, 1 skipped** (Python 3.11, CPU, без весов и сети).
+- `python -m pytest copilot/tests -q` → **218 passed, 1 skipped** (Python 3.11, CPU, без весов и сети).
   Пропущенный тест — на реальном `norms/`, он запускается, если папка есть в ветке.
 - `ruff check copilot` по правилам A01 → чисто.
 - Синтетический `eval_grounding`: mock/retrieval 100%, guard ничего не режет. «Плохая модель» (скрипт):
