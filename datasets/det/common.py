@@ -35,27 +35,28 @@ VIDEO_EXT = (".mov", ".mp4", ".avi", ".mkv", ".m4v")
 
 # Единый список классов. Порядок = category_id в COCO (1..N), его не менять: на него завязаны веса.
 # contract — имя в contracts.LABELS (у контракта закрытый сейф называется «safe»).
-# prompts/thr — только для пред-разметки OWLv2 (вид сверху); порог занижен: лишний бокс удалить быстрее, чем нарисовать.
+# prompts/thr/max — только для пред-разметки OWLv2; подобраны по реальным кадрам 17.10 (высокий угловой ракурс):
+# OWLv2 хорошо находит, где объект, но путает классы — их правит человек, а пороги режут шум.
 CLASSES: list[dict] = [
-    {"name": "cash", "contract": "cash", "color": "#2ca02c", "thr": 0.10, "max": 12,
-     "prompts": ["a stack of banknotes", "paper money", "cash banknotes on a desk", "a bundle of money"]},
-    {"name": "cash_bag", "contract": "cash_bag", "color": "#8c564b", "thr": 0.10, "max": 6,
+    {"name": "cash", "contract": "cash", "color": "#2ca02c", "thr": 0.10, "max": 6,
+     "prompts": ["a stack of banknotes", "paper money", "cash banknotes on a desk", "banknotes in a hand"]},
+    {"name": "cash_bag", "contract": "cash_bag", "color": "#8c564b", "thr": 0.10, "max": 3,
      "prompts": ["a cash collection bag", "a sealed money bag", "a plastic security bag", "a canvas sack"]},
-    {"name": "safe_closed", "contract": "safe", "color": "#7f7f7f", "thr": 0.12, "max": 3,
+    {"name": "safe_closed", "contract": "safe", "color": "#7f7f7f", "thr": 0.12, "max": 2,
      "prompts": ["a closed metal safe", "a steel safe box", "a closed safe door"]},
-    {"name": "safe_open", "contract": "safe_open", "color": "#d62728", "thr": 0.10, "max": 3,
+    {"name": "safe_open", "contract": "safe_open", "color": "#d62728", "thr": 0.12, "max": 2,
      "prompts": ["an open safe", "an open safe with shelves", "an open metal cabinet"]},
-    {"name": "cell_phone", "contract": "cell_phone", "color": "#9467bd", "thr": 0.12, "max": 6,
+    {"name": "cell_phone", "contract": "cell_phone", "color": "#9467bd", "thr": 0.18, "max": 3,
      "prompts": ["a cell phone", "a smartphone", "a mobile phone in a hand"]},
     {"name": "cup", "contract": "cup", "color": "#17becf", "thr": 0.12, "max": 6,
      "prompts": ["a cup", "a mug", "a paper cup"]},
     {"name": "food", "contract": "food", "color": "#bcbd22", "thr": 0.12, "max": 6,
      "prompts": ["food", "a sandwich", "a snack", "fruit"]},
-    {"name": "money_counter", "contract": "money_counter", "color": "#ff7f0e", "thr": 0.10, "max": 3,
+    {"name": "money_counter", "contract": "money_counter", "color": "#ff7f0e", "thr": 0.12, "max": 2,
      "prompts": ["a banknote counting machine", "a money counter machine", "a cash counting device"]},
-    {"name": "door_open", "contract": "door_open", "color": "#e377c2", "thr": 0.12, "max": 3,
+    {"name": "door_open", "contract": "door_open", "color": "#e377c2", "thr": 0.20, "max": 1,
      "prompts": ["an open door", "an open doorway"]},
-    {"name": "person", "contract": "person", "color": "#1f77b4", "thr": 0.20, "max": 8,
+    {"name": "person", "contract": "person", "color": "#1f77b4", "thr": 0.22, "max": 6,
      "prompts": ["a person", "a person seen from above", "a head and shoulders seen from above"]},
 ]
 CLASS_NAMES = [c["name"] for c in CLASSES]
