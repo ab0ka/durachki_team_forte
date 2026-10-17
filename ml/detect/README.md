@@ -20,14 +20,15 @@
 | Mock (`SENTINEL_MOCK=1`) — только тесты и демо | готово | выкл. |
 
 ### Что реально проверено (CPU, без GPU, без реальных данных и весов)
-`python -m pytest ml/detect/tests`: **65 passed** (torch 2.14.1 CPU, transformers 5.20.1, Python 3.13), `pyflakes` чисто.
+`python -m pytest ml/detect/tests`: **67 passed** (torch 2.14.1 CPU, transformers 5.20.1, Python 3.13), `pyflakes` чисто.
 - Загрузка крошечной RT-DETRv2 из раскладки `weights/hf/hub` (как у L1) и из `save_pretrained`-папки. Сеть в тесте запрещена.
 - `desk_inventory`/`safe_door_state` на синтетике:
   - бывает только present или unknown, «нет» не выдаётся;
   - фильтр по зонам;
   - объект, мелькнувший на 1 из 3 кадров, считается unknown;
   - cash_bag выдаётся только после контрастной проверки;
-  - стационарный телефон гасит COCO «cell phone»;
+  - стационарный телефон гасит COCO «cell phone» на всех кадрах окна;
+  - кэш не переиспользуется между разными объектами клипа;
   - для сейфа выдаются open / closed / unknown;
   - предупреждение, если стол закрыт людьми;
   - битые кадры не роняют вызов;
@@ -104,7 +105,7 @@ python -m ml.detect.probe --video <ролик.mov> --fps 2 --zones <zones.json> 
 # или --frames <папка с кадрами>; zones.json — зоны A06: [{"name","polygon"}] | {"zones": [...]}
 ```
 Выход — `runs/probe_a05/<ролик>/probe_report.json`:
-- **detect:** `latency_ms_per_frame` (mean/p50/p95), пик VRAM, по классам — n, доля кадров, квантили score;
+- **detect:** `latency_ms_per_frame` (mean/p50/p95, без холодного первого батча — он отдельно в `cold_first_batch_ms_per_frame`), пик VRAM, по классам — n, доля кадров, квантили score;
 - **inventory[mode]:** `latency_ms_per_call`, VRAM, present/unknown по видам, open/closed/unknown сейфа.
 
 Картинки `vis/<режим>/*.jpg` с боксами и зонами лежат только на локальном диске (в папке есть `.gitignore` со `*`). По ним человек глазами проверяет ложные cash, cash_bag и open.

@@ -166,7 +166,7 @@ def run_probe(frames: list[tuple[str, np.ndarray]], out: Path, modes: Sequence[s
     report["detect"]["load_s"] = round(time.perf_counter() - t0, 3)
     report["detect"]["backends"] = be.names
     report["warnings"] += be.warnings
-    per_frame_ms: list[float] = []
+    batches_ms: list[list[float]] = []
     dets: list[RawDets] = []
     for s in range(0, len(frames), max(1, batch)):
         chunk = [f for _, f in frames[s:s + batch]]
@@ -175,12 +175,15 @@ def run_probe(frames: list[tuple[str, np.ndarray]], out: Path, modes: Sequence[s
         parts = [b.predict(chunk) for b in be.closed]
         _sync()
         dt = (time.perf_counter() - t1) * 1000.0
-        per_frame_ms += [dt / len(chunk)] * len(chunk)
+        batches_ms.append([dt / len(chunk)] * len(chunk))
         for k in range(len(chunk)):
             d = classwise_nms(RawDets.concat([p[k] for p in parts]), cfg["merge"]["iou_thr"])
             keep = [i for i, lab in enumerate(d.labels) if d.scores[i] >= label_threshold(score_thr, lab)]
             dets.append(d.select(keep))
-    report["detect"]["latency_ms_per_frame"] = _lat(per_frame_ms[1:] if len(per_frame_ms) > 1 else per_frame_ms)
+    # первый батч — холодный старт (cudnn autotune, аллокации): отдельно, в статистику не входит
+    warm = [x for b in batches_ms[1:] for x in b] if len(batches_ms) > 1 else [x for b in batches_ms for x in b]
+    report["detect"]["latency_ms_per_frame"] = _lat(warm)
+    report["detect"]["cold_first_batch_ms_per_frame"] = round(batches_ms[0][0], 2) if batches_ms else None
     report["detect"]["batch"] = batch
     report["detect"]["vram"] = _vram_peak()
     by_cls: dict[str, list[float]] = defaultdict(list)

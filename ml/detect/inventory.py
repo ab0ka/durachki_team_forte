@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import threading
+import weakref
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -204,21 +205,33 @@ def get_frame(clip: Any, t: float) -> Optional[np.ndarray]:
 
 
 class _LRU:
+    """Кэш результатов по (клип, t). Запись валидна, только пока жив ТОТ ЖЕ объект клипа (weakref):
+    id() освобождённого клипа может достаться новому видео — без проверки это дало бы чужие детекции."""
+
     def __init__(self, cap: int = 256):
         self.cap = cap
-        self.d: OrderedDict[tuple, Any] = OrderedDict()
+        self.d: OrderedDict[tuple, tuple[Any, Any]] = OrderedDict()
         self.lock = threading.Lock()
 
-    def get(self, key: tuple) -> Any:
+    def get(self, key: tuple, owner: Any) -> Any:
         with self.lock:
-            if key in self.d:
-                self.d.move_to_end(key)
-                return self.d[key]
-        return None
+            hit = self.d.get(key)
+            if hit is None:
+                return None
+            ref, val = hit
+            if ref is None or ref() is not owner:
+                del self.d[key]
+                return None
+            self.d.move_to_end(key)
+            return val
 
-    def put(self, key: tuple, val: Any) -> None:
+    def put(self, key: tuple, owner: Any, val: Any) -> None:
+        try:
+            ref = weakref.ref(owner)
+        except TypeError:   # объект без поддержки weakref — не кэшируем
+            return
         with self.lock:
-            self.d[key] = val
+            self.d[key] = (ref, val)
             self.d.move_to_end(key)
             while len(self.d) > self.cap:
                 self.d.popitem(last=False)
@@ -238,21 +251,21 @@ def _clip_key(clip: Any) -> tuple:
 
 def _closed_dets(clip: Any, t: float, frame: np.ndarray, closed: Sequence[Any]) -> RawDets:
     key = ("closed", _clip_key(clip), round(t, 4), tuple(getattr(b, "name", "") for b in closed))
-    hit = _CACHE.get(key)
+    hit = _CACHE.get(key, clip)
     if hit is not None:
         return hit
     d = RawDets.concat([b.predict([frame])[0] for b in closed])
-    _CACHE.put(key, d)
+    _CACHE.put(key, clip, d)
     return d
 
 
 def _owl_scores(clip: Any, t: float, frame: np.ndarray, scorer: Any) -> tuple[np.ndarray, np.ndarray]:
     key = ("owl", _clip_key(clip), round(t, 4), getattr(scorer, "name", ""), tuple(scorer.texts))
-    hit = _CACHE.get(key)
+    hit = _CACHE.get(key, clip)
     if hit is not None:
         return hit
     r = scorer.score([frame])[0]
-    _CACHE.put(key, r)
+    _CACHE.put(key, clip, r)
     return r
 
 
@@ -318,6 +331,9 @@ def _desk_inventory(clip: Any, t: float, zones: Any, config: Optional[dict[str, 
     checked = {k: 0 for k in KINDS}
     notes: dict[str, list[str]] = {k: [] for k in KINDS}
     occl: list[float] = []
+    phone_cands_by_t: dict[float, list[tuple[float, np.ndarray, str]]] = {}
+    owl_phone_by_t: dict[float, tuple[float, tuple, str]] = {}
+    landline_all: list[np.ndarray] = []
     n_ok = 0
     has_ft = any(str(getattr(b, "name", "")).startswith("finetuned") for b in closed)
     for tk in ts:
@@ -356,7 +372,7 @@ def _desk_inventory(clip: Any, t: float, zones: Any, config: Optional[dict[str, 
             checked["cash"] += 1
             checked["cash_bag"] += 1
 
-        landline_boxes = np.zeros((0, 4), np.float32)
+        phone_cands_by_t[tk] = phone_cands
         if tk in owl_ts:
             boxes, probs = _owl_scores(clip, tk, frame, scorer)
             G = _group_scores(probs, scorer.texts, rov.get("queries", {}))
@@ -380,22 +396,34 @@ def _desk_inventory(clip: Any, t: float, zones: Any, config: Optional[dict[str, 
             pick(generic, G["generic_bag"], "personal_item", "generic_bag")
             pick(generic, G["generic_bag"], "bag", "generic_bag")
             pick(G["personal_item"] >= rthr.get("personal_item", 0.3), G["personal_item"], "personal_item", "jacket/coat")
-            mobile = (G["phone"] >= rthr.get("phone", 0.25)) & (G["phone"] - G["landline"] >= margin)
-            pick(mobile, G["phone"], "phone", "mobile>landline")
+            mobile = (G["phone"] >= rthr.get("phone", 0.25)) & (G["phone"] - G["landline"] >= margin) & inz
+            if mobile.any():
+                j = int(np.argmax(np.where(mobile, G["phone"], -1.0)))
+                owl_phone_by_t[tk] = (float(G["phone"][j]), tuple(round(float(v), 5) for v in boxes[j]),
+                                      f"{src}:mobile>landline")
             land = (G["landline"] >= rthr.get("landline", 0.25)) & (G["landline"] - G["phone"] >= margin) & inz
-            landline_boxes = boxes[land]
+            if land.any():
+                landline_all.append(boxes[land])
             pick(G["cup"] >= rthr.get("cup", 0.25), G["cup"], "cup", "cup")
             pick(G["food"] >= rthr.get("food", 0.3), G["food"], "food", "food")
             for k in OWL_ONLY:
                 checked[k] += 1
-        for sc, box, src in phone_cands:
-            # контраст «стационарный телефон»: COCO cell phone на месте стационарного — гасим
-            if len(landline_boxes) and iou_matrix(box[None], landline_boxes).max() >= 0.3:
-                notes["phone"].append("на месте детекции «cell phone» перевешивает «стационарный телефон» — погашено")
-                continue
-            offer("phone", sc, box, src)
         for kind, (sc, box, src) in frame_best.items():
             best[kind].append((sc, tk, box, src))
+
+    # телефон — после всех кадров: стационарный телефон, найденный OWL хоть на одном кадре окна, гасит COCO
+    # «cell phone» в том же месте на ВСЕХ кадрах окна (стационарный телефон неподвижен)
+    landline = np.concatenate(landline_all) if landline_all else np.zeros((0, 4), np.float32)
+    for tk, cands in phone_cands_by_t.items():
+        fb: Optional[tuple[float, tuple, str]] = owl_phone_by_t.get(tk)
+        for sc, box, src in cands:
+            if len(landline) and iou_matrix(box[None], landline).max() >= 0.3:
+                notes["phone"].append("на месте детекции «cell phone» перевешивает «стационарный телефон» — погашено")
+                continue
+            if fb is None or sc > fb[0]:
+                fb = (float(sc), tuple(round(float(v), 5) for v in box), src)
+        if fb is not None:
+            best["phone"].append((fb[0], tk, fb[1], fb[2]))
 
     need_default = max(1, int(inv.get("min_frames_present", 2)))
     items: dict[str, ItemState] = {}

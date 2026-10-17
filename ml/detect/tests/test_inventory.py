@@ -147,3 +147,29 @@ def test_zone_helpers():
     assert box_zone_fraction(np.array([[0, 0, 1, 1]]), [])[0] == 1.0
     assert zone_occlusion(polys, np.array([[0.0, 0.0, 1.0, 1.0]])) == pytest.approx(1.0)
     assert zone_occlusion(polys, np.zeros((0, 4))) == 0.0
+
+
+def test_landline_veto_applies_to_all_window_frames(mock_mode, monkeypatch):
+    import ml.detect.backends as B
+
+    groups = dict(B.MOCK_GROUP_COLORS)
+    groups["phone"], groups["landline"] = [], ["cell_phone"]
+    monkeypatch.setattr(B, "MOCK_GROUP_COLORS", groups)
+    # 5 кадров окна, OWL — только на 2: COCO-«телефон» на остальных 3 кадрах тоже должен погаснуть
+    cfg = {"inventory": {"mode": "rare_open_vocab", "n_frames": 5, "window_s": 1.6}}
+    inv = desk_inventory(desk_scene(), 1.0, ZONES, config=cfg)
+    assert inv.items["phone"].state == "unknown" and inv.items["phone"].frames_seen == 0
+
+
+def test_cache_not_reused_across_clip_objects(mock_mode):
+    import gc
+
+    from ml.detect.inventory import _CACHE
+
+    a = scene(SynthObject("cup", "ellipse", (0.20, 0.35, 0.26, 0.40)))
+    assert desk_inventory(a, 1.0, ZONES).present("cup")
+    assert len(_CACHE.d) > 0
+    del a
+    gc.collect()
+    b = scene()                                              # пустой стол, тот же path/времена
+    assert desk_inventory(b, 1.0, ZONES).items["cup"].state == "unknown"
