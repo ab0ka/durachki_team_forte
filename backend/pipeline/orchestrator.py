@@ -30,7 +30,8 @@ from .fallbacks import EvidenceClip, derive_risk, fallback_fuse, states_from_det
 from .media import ascii_safe_path, probe_video
 from .registry import ModelRegistry
 from .stages import STAGES, catalog_hash, is_required, load_catalog_safe
-from .worker import CLIP, CallResult, WorkerCancelled, WorkerCrashed, WorkerTimeout, get_executor
+from .refine import Window, apply_refinement, apply_timecode_policy, build_windows
+from .worker import CLIP, CallResult, ClipRef, WorkerCancelled, WorkerCrashed, WorkerTimeout, get_executor
 
 log = logging.getLogger("sentinel.pipeline")
 
@@ -291,6 +292,8 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
     # ---- адаптивный sample_fps
     ctx.probe = probe = probe_video(ctx.video_path)
     ctx.sample_fps = choose_sample_fps(probe.get("duration"), ctx.budget.remaining(), ctx.device, cfg)
+    if cfg_get(cfg, "refine.enabled", False):  # coarse→fine: обзор всей длительности реже, окна — плотно
+        ctx.sample_fps = min(ctx.sample_fps, float(cfg_get(cfg, "refine.overview_fps", 2.0)))
     ctx.work_path = ascii_safe_path(ctx.video_path, data_root() / "jobs" / _safe_id(ctx.job_id),
                                     str(cfg_get(cfg, "paths.ascii_safe", "auto")))
 
@@ -324,6 +327,8 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
     risk, ev_temporal = tm if tm else ([], [])
 
     candidates = list(ev_rules) + list(ev_temporal)
+    candidates = _refine(ctx, candidates, zones)                 # H1: выключено по умолчанию
+    candidates = apply_timecode_policy(candidates, cfg)          # H2: по умолчанию "module" (без изменений)
     _partial(ctx, candidates, risk, "after_core")
 
     # ---- VLM (дополнительные)
@@ -341,7 +346,7 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
     dv = _stage(ctx, "vlm_discover", [("ml.vlm", "discover", (CLIP, "$budget"), {})], upstream=["ingest"])
     ev_discover = dv[0] if dv else []
 
-    events = list(ev_rules) + list(ev_temporal) + list(ev_verify) + list(ev_discover)
+    events = list(candidates) + apply_timecode_policy(list(ev_verify) + list(ev_discover), cfg)
     ctx.outputs["events_all"] = events
     if ctx.budget.near_deadline():
         _partial(ctx, events, risk, "before_fusion")
@@ -349,6 +354,80 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
 
 
 # ============================================================== стадии
+
+def _refine(ctx: RunContext, candidates: list[Event], zones: list) -> list[Event]:
+    """coarse→fine: плотная выборка окон вокруг кандидатов, detect→track→scene→rules на окне,
+    уточнение начала события. Кандидаты никогда не отбрасываются (см. refine.py)."""
+    cfg = ctx.cfg
+    rec = StageRecord(required=False)
+    if not cfg_get(cfg, "refine.enabled", False):
+        rec.status, rec.error = "disabled", "refine.enabled=false (режим по умолчанию выключен)"
+        ctx.records["refine"] = rec
+        return candidates
+    if not candidates:
+        rec.status, rec.error = "skipped", "нет кандидатов"
+        ctx.records["refine"] = rec
+        return candidates
+    if ctx.cancelled() or ctx.out_of_time():
+        rec.status, rec.error = "skipped", "отмена/дедлайн"
+        _record(ctx, "refine", rec)
+        return candidates
+    can, why = ctx.budget.can_start("refine")
+    if not can:
+        rec.status, rec.error = "skipped", why
+        _record(ctx, "refine", rec)
+        return candidates
+    ctx.report(STAGES["refine"].label, ctx.stage_progress_base("refine"))
+    fps = float(cfg_get(cfg, "refine.fps", 8.0))
+    max_frames = int(cfg_get(cfg, "refine.max_frames", 96))
+    reuse_zones = bool(cfg_get(cfg, "refine.reuse_overview_zones", True))
+    windows: list[Window] = build_windows(candidates, cfg, reference_duration(ctx.clip_info, ctx.probe))
+    t0 = time.perf_counter()
+    end = time.monotonic() + ctx.budget.timeout("refine")
+    for w in windows:
+        ref = ClipRef(window=(round(w.t0, 3), round(w.t1, 3), fps, max_frames))
+        try:
+            dets = _window_call(ctx, end, "ml.detect", "detect", (ref,), {"every_n": 1})
+            tracks_w, zones_w = _window_call(ctx, end, "ml.track", "track", (ref, dets), {})
+            zz = zones if (reuse_zones and zones) else zones_w
+            states = _window_call(ctx, end, "ml.scene", "scene_states", (ref, dets, tracks_w, zz, []), {})
+            evs = _window_call(ctx, end, "ml.rules", "run_rules", (states, tracks_w, zz, ctx.catalog), {})
+            w.events = serde.roundtrip_list(list(evs or []), "event")
+            w.processed = True
+        except _WindowStop as exc:
+            w.error = str(exc)
+            if exc.fatal:
+                break
+    refined, stats = apply_refinement(candidates, windows)
+    rec.seconds = time.perf_counter() - t0
+    rec.n_out = len(refined)
+    rec.origin = "module"
+    errors = [w.error for w in windows if w.error]
+    if stats["processed"]:
+        rec.status = "ok"
+    else:
+        rec.status, rec.error = "error", "; ".join(errors)[:300] or "ни одно окно не обработано"
+    _record(ctx, "refine", rec)
+    ctx.outputs["refine_stats"] = {**stats, "fps": fps, "max_frames": max_frames, "errors": errors[:5],
+                                   "windows_s": [[round(w.t0, 2), round(w.t1, 2)] for w in windows]}
+    return refined
+
+
+class _WindowStop(Exception):
+    def __init__(self, msg: str, fatal: bool = False) -> None:
+        super().__init__(msg)
+        self.fatal = fatal
+
+
+def _window_call(ctx: RunContext, end: float, module: str, func: str, args: tuple, kwargs: dict) -> Any:
+    left = end - time.monotonic()
+    if left <= 0.3 or ctx.cancelled() or ctx.out_of_time():
+        raise _WindowStop("бюджет уточнения исчерпан", fatal=True)
+    res = ctx.executor.call(module, func, args, kwargs, left)
+    if not res.ok:
+        raise _WindowStop(f"{module}.{func}: {res.status}: {res.error.splitlines()[0][:150] if res.error else ''}",
+                          fatal=res.status in ("timeout", "cancelled", "crashed"))
+    return res.value
 
 def _ingest(ctx: RunContext) -> bool:
     rec = StageRecord(required=True)
@@ -699,6 +778,10 @@ def _meta(ctx: RunContext) -> dict:
         meta["executor"] = ctx.executor.stats()
     if ctx.outputs.get("vram_events"):
         meta["vram_events"] = ctx.outputs["vram_events"]
+    if ctx.outputs.get("refine_stats"):
+        meta["refine"] = ctx.outputs["refine_stats"]
+    meta["modes"] = {"refine": bool(cfg_get(ctx.cfg, "refine.enabled", False)),
+                     "timecode_policy": str(cfg_get(ctx.cfg, "timecode.policy", "module"))}
     if reg is not None:
         meta["registry"] = {"warm": reg.warm}
     if ctx.budget.remaining() < 0:

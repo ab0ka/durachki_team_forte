@@ -30,6 +30,7 @@ STAGES: dict[str, Stage] = {s.name: s for s in [
     Stage("scene", "Состояние сцены", "ml.scene", "scene_states", False, 0.06),
     Stage("rules", "Правила", "ml.rules", "run_rules", False, 0.03),
     Stage("temporal", "Временная модель", "ml.temporal", "score", True, 0.15),
+    Stage("refine", "Уточнение окон", "ml.detect", "detect", True, 0.06),
     Stage("vlm_verify", "Проверка VLM", "ml.vlm", "verify", True, 0.14),
     Stage("vlm_discover", "Проверка VLM", "ml.vlm", "discover", True, 0.10),
     Stage("fusion", "Формирование отчёта", "ml.fusion", "fuse", False, 0.08),

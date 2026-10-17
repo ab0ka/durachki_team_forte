@@ -118,3 +118,13 @@ def test_deadline_respected_when_worker_keeps_dying(synth_video, monkeypatch, fa
     assert elapsed < deadline + 4.0, f"run() занял {elapsed:.1f} с при дедлайне {deadline} с"
     assert res.status == "failed" and res.verdict is None
     assert res.meta["stages"]["detect"]["status"] == "timeout"
+
+
+def test_process_worker_refine_windows(synth_video, monkeypatch):
+    monkeypatch.setenv("SENTINEL_EXECUTOR", "process")
+    res = run(synth_video, "job-proc-refine", None, 120, overrides={"mock": True, "refine": {"enabled": True}})
+    assert res.status == "done", res.meta.get("error")
+    st = res.meta["stages"]["refine"]["status"]
+    assert st in ("ok", "skipped"), res.meta["stages"]["refine"]
+    if st == "ok":
+        assert res.meta["refine"]["processed"] >= 1

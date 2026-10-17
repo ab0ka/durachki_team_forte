@@ -92,7 +92,8 @@ def stage_coverage(records: Mapping[str, Any], outputs: Mapping[str, Any], clip_
         if out[stage] is not None and ingest is not None:
             out[stage] = min(out[stage], ingest)
     out["rules"] = out.get("scene") if _ok(records.get("rules")) else (None if "rules" not in records else 0.0)
-    out["vlm_verify"] = None   # проверяет окна кандидатов, а не всё видео: см. meta.vlm_verified
+    out["refine"] = None       # окна вокруг кандидатов, а не всё видео: см. meta.refine
+    out["vlm_verify"] = None   # проверяет окна кандидатов, а не всё видео
     out["vlm_discover"] = None  # модуль не сообщает просмотренные окна → неизвестно
     out["fusion"] = 1.0 if _ok(records.get("fusion")) else (None if "fusion" not in records else 0.0)
     return out

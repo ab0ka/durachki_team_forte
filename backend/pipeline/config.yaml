@@ -30,6 +30,26 @@ on_required_failure: violation_only   # violation_only | fail  (fail — все�
 
 detect_every_n: 1            # аргумент every_n для ml.detect.detect
 
+# H1 (по умолчанию ВЫКЛ до замера L2): coarse→fine. Обзор всей длительности с overview_fps →
+# кандидаты → окна [t_start − pre_s, t_end + post_s] с плотной выборкой fps → detect/track/scene/rules
+# на окне → уточнённое начало события. Кандидаты не отбрасываются; окна не зависят от движения/риска.
+refine:
+  enabled: false
+  overview_fps: 2.0
+  fps: 8.0
+  pre_s: 4.0
+  post_s: 3.0
+  merge_gap_s: 2.0
+  max_windows: 4
+  max_frames: 96
+  reuse_overview_zones: true
+
+# H2 (по умолчанию как отдал модуль): какой момент события отдавать как timecode_sec.
+# module — t_peak модуля; onset — начало нарушения (t_start); onset_offset — t_start + offset_s.
+timecode:
+  policy: module
+  offset_s: 0.0
+
 executor:
   mode: process              # process (прод: один процесс-воркер владеет GPU, kill по таймауту)
                              # | inline (тесты/отладка: в текущем процессе, таймаут не останавливает CUDA)
@@ -64,6 +84,7 @@ budgets_s:
   scene: 3
   rules: 1
   temporal: 15
+  refine: 10
   vlm_verify: 25
   vlm_discover: 20
   fusion: 4
@@ -81,7 +102,7 @@ reserve_s:
   essential_min: 1.5         # обязательная стадия стартует, только если осталось больше
   respawn_s: 8               # воркер убит и до дедлайна меньше — слияние без его перезапуска (в процессе API)
 
-optional_stages: [pose, temporal, vlm_verify, vlm_discover]  # пропускаются по бюджету (с warning)
+optional_stages: [pose, temporal, refine, vlm_verify, vlm_discover]  # пропускаются по бюджету (с warning)
 min_start_fraction: 0.6      # необязательная стадия стартует, если влезает ≥ 60% её (масштабированного) бюджета
 
 # Полнота: meta.coverage — доля длительности, реально проанализированная стадией (по таймстемпам
