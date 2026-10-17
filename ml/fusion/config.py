@@ -56,6 +56,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "insufficient_policy": "hint",
         "uncap_norm_review": True,
     },
+    "policies": {
+        "v02_after_window": {"enabled": False, "remain_min": 0.5, "removed_max": 0.2, "removed_factor": 0.35},
+        "v01_client_side": {"enabled": False},
+        "negative_evidence": {"enabled": False, "weight": 0.5},
+    },
     "output": {
         "max_violations": 10,
         "timeline_step_s": 0.5,

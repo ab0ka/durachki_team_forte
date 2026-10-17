@@ -74,6 +74,19 @@ report_gate:
   # violation восстанавливаем исходную уверенность: extra.confidence_raw → иначе из extra.trace.confidence_terms.
   uncap_norm_review: true
 
+# Поведенческие политики (спецификация команды). ВСЕ ВЫКЛЮЧЕНЫ, пока L2 не измерил выигрыш (python -m ml.fusion.ab).
+policies:
+  v02_after_window:          # «ушла и оставила»: решение по столу/сейфу в окне после ухода (extra.state_after / trace)
+    enabled: false
+    remain_min: 0.5          # наличные/сумка/открытый сейф ≥ — ценности остались → кандидат
+    removed_max: 0.2         # все три известны и ≤ — убрано, сейф закрыт → норма (подсказка)
+    removed_factor: 0.35
+  v01_client_side:           # клиент напротив со своей стороны — норма (extra.person_side / zone)
+    enabled: false
+  negative_evidence:         # extra.negative: {сейф закрыт: 0.9, стол пуст: 0.8} снижает скор
+    enabled: false
+    weight: 0.5
+
 output:
   max_violations: 10
   timeline_step_s: 0.5

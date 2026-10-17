@@ -15,6 +15,7 @@ from typing import Any, Iterable, Optional, Sequence
 from ._types import AnalysisResult, BBox, Violation
 from .catalog import known_type, resolve_catalog, rule_refs, type_info
 from .completeness import coverage_info
+from .policies import apply_policies
 from .config import load_config, load_thresholds, threshold_for
 from .describe import build_description, clean_facts, format_time
 from .serialize import event_to_dict, to_jsonable
@@ -731,6 +732,7 @@ def gate_reasons(c: Candidate, types: dict[str, dict[str, Any]], cfg: dict[str, 
                 reasons.append("no_norm")
         elif str(gcfg.get("norm_missing_if_no_catalog", "report")).lower() == "hint":
             reasons.append("norms_catalog_unavailable")
+    reasons.extend(str(r) for r in c.extra.get("policy_gate") or [] if str(r) not in reasons)
     if gcfg.get("upstream_assessment", True):
         if c.assessment == "observation" and str(gcfg.get("observation_policy", "hint")) == "hint":
             reasons.append("observation_only")
@@ -789,7 +791,11 @@ def fuse_scores(
     norm, warnings = normalize_events(events, duration, types, cfg)
     curve = RiskCurve(risk)
     gap = _f((cfg.get("grouping") or {}).get("merge_gap_s", 3.0), 3.0)
-    cands = [score_group(g, curve, cfg) for g in group_events(norm, gap)]
+    cands = []
+    for g in group_events(norm, gap):
+        cand = score_group(g, curve, cfg)
+        apply_policies(cand, g, cfg)
+        cands.append(cand)
     cands = [c for c in cands if c.confidence > 0 or c.n_events > 0]
     cands += risk_only_candidates(curve, cands, norm, types, cfg)
     cross_type_nms(cands, cfg)
@@ -870,6 +876,8 @@ _GATE_RU = {
     "temporal_only": "сигнал только временной модели",
     "no_norm": "для типа нет применимой нормы в каталоге",
     "observation_only": "наблюдение (телефон, еда, дверь, второй человек) само по себе не нарушение",
+    "valuables_removed": "после ухода кассира наличные и сумка убраны, сейф закрыт — норма",
+    "client_side": "человек на клиентской стороне напротив кассира — норма",
     "insufficient_context": "этап не наблюдался полностью — неизвестно, а не «нет» и не «да»",
     "norms_catalog_unavailable": "каталог норм недоступен",
     "below_threshold": "скор ниже порога",
@@ -900,6 +908,8 @@ def _hint(c: Candidate, types: dict[str, dict[str, Any]], cfg: dict[str, Any]) -
         "suppressed_by": c.suppressed_by,
         "origin": c.origin,
         "assessment": c.assessment,
+        "policies": c.extra.get("policies", []),
+        "counter_facts": c.extra.get("counter_facts", []),
     }
 
 
