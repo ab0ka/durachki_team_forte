@@ -611,13 +611,20 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
 
 
 def _cluster_assessment(positives: Sequence[NormEvent]) -> str:
-    """Лучшая оценка среди положительных событий (подтверждение VLM считается candidate)."""
+    """Лучшая оценка среди фактических источников (rules/VLM); подтверждение VLM считается candidate.
+
+    temporal/прочие события без оценки upstream не «повышают» кластер: иначе правило-наблюдение A09
+    рядом с temporal-событием обходило бы гейт observation_only.
+    """
+    voters = [e for e in positives if e.source in ("rules", "vlm") or "assessment" in e.extra]
+    if not voters:
+        return "candidate" if positives else "insufficient"
     best = len(_ASSESSMENT_RANK) - 1
-    for e in positives:
+    for e in voters:
         a = "candidate" if (e.vlm is not None and e.vlm[0] == "confirm") else e.assessment
         if a in _ASSESSMENT_RANK:
             best = min(best, _ASSESSMENT_RANK.index(a))
-    return _ASSESSMENT_RANK[best] if positives else "insufficient"
+    return _ASSESSMENT_RANK[best]
 
 
 def _best_type_near(events: Sequence[NormEvent], a: float, b: float, fallback: str,

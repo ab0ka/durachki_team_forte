@@ -32,6 +32,9 @@ def _num(v: Any) -> Optional[float]:
     if isinstance(v, bool):
         return 1.0 if v else 0.0
     if isinstance(v, dict):
+        known = v.get("known_frac")
+        if known is not None and _num(known) is not None and float(_num(known)) < 0.6:
+            return None  # сигнал известен лишь в части кадров (окклюзия, свет выключен) — неизвестно
         for k in ("mean", "value", "at_peak", "max"):
             if k in v:
                 return _num(v[k])

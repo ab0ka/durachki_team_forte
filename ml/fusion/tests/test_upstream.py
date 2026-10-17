@@ -145,3 +145,10 @@ def test_zone_and_hash_box_keys():
     assert ru_label("zone:safe") == "зона сейфа"
     assert ru_label("zone:cashier_area") == "зона кассира"
     assert parse_box_key("zone:safe")[0] == "zone:safe"
+
+
+def test_temporal_does_not_lift_observation_rule():
+    temporal = ev("V05", t=10.2, conf=0.9, source="temporal", facts=[])
+    out = run([a09("V05", reasons=OBS_REASON), temporal])
+    c = out.candidates[0]
+    assert c.assessment == "observation" and not out.reported and "observation_only" in c.gate
