@@ -23,7 +23,9 @@
 * временные функции (окно — константа в секундах):
   ``was(x, w)`` — максимум за последние ``w`` с, ``held(x, w)`` — минимум за ``w`` с
   (при истории короче ``w`` нижняя граница = 0: «держится» не доказано), ``avg(x, w)`` —
-  среднее, ``ahead(x, w)`` — максимум на ``w`` с вперёд, ``ever(x)`` — максимум с начала.
+  среднее, ``ahead(x, w)`` — максимум на ``w`` с вперёд, ``ever(x)`` — максимум с начала,
+  ``prev_min(x, w)`` / ``prev_max(x, w)`` — минимум/максимум строго в прошлом ``[t-w, t)``
+  (без прошлого — неизвестно); например вход: ``n_persons >= prev_min(n_persons, 3) + 1``.
 
 Имена — сигналы из ``SIGNALS`` (или любые другие ключи ``SceneState.signals``) и
 константы ``true``/``false``. Атрибуты, индексы, строки, лямбды, comprehension-ы,
@@ -52,7 +54,8 @@ MAX_EXPR_LEN = 2000
 MAX_NODES = 300
 
 POINTWISE_FUNCS = frozenset({"min", "max", "abs", "clip", "ramp", "step"})
-TEMPORAL_FUNCS = frozenset({"was", "held", "avg", "ahead", "ever"})
+TEMPORAL_FUNCS = frozenset({"was", "held", "avg", "ahead", "ever", "prev_min", "prev_max"})
+_UNBOUNDED = 1e9  # «неизвестно» для выражений без диапазона (нет прошлого у prev_*)
 _CONSTANT_NAMES = {"true": 1.0, "false": 0.0, "True": 1.0, "False": 0.0}
 
 _CMP_SYMBOL = {
@@ -269,6 +272,17 @@ def _temporal(ctx: EvalContext, iv: Interval, window_s: float, kind: str) -> Int
         return _window_max(ctx, lo, window_s, True), _window_max(ctx, hi, window_s, True)
     if kind == "avg":
         return _window_mean(ctx, lo, window_s), _window_mean(ctx, hi, window_s)
+    if kind in ("prev_min", "prev_max"):
+        left = ctx.left_index(window_s)
+        red = np.min if kind == "prev_min" else np.max
+        out_lo = np.full(n, -_UNBOUNDED)
+        out_hi = np.full(n, _UNBOUNDED)
+        for i in range(n):
+            j0 = int(left[i])
+            if i > j0:
+                out_lo[i] = red(lo[j0:i])
+                out_hi[i] = red(hi[j0:i])
+        return out_lo, out_hi
     if kind == "held":
         short = (ctx.times - float(ctx.times[0])) < window_s - 1e-6
         out_lo = np.where(short, 0.0, _window_min(ctx, lo, window_s))  # истории меньше окна — не доказано
