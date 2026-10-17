@@ -4,7 +4,8 @@
 Выход (всё локально, НЕ в git):
   cache/types_review/index.html — открыть в Chrome/Edge; правки автосохраняются в браузере;
       кнопки выгружают labels_types.csv / clean_procedures.csv / review_state.json (в «Загрузки»);
-  data/labels_types.csv — VLM-предложения (source=vlm, confirmed=0) или подтверждённое человеком (--confirmed);
+  data/labels_types.csv — по строке на размеченное событие; type_id ТОЛЬКО у подтверждённых человеком (--confirmed,
+      NEW → V99), у остальных type_id пуст, предложение VLM — в vlm_type_id; md5-конфликт помечен UNRESOLVED;
   cache/DATA_FINDINGS.md — черновик находок; дописывает и правит человек.
 В stdout — только агрегаты.
 
@@ -39,8 +40,11 @@ def probe_types(ans: dict | None) -> list[str]:
         return []
     return sorted({ATTRS[k][1] for k, v in ans.items() if k in ATTRS and v[0] == "yes" and ATTRS[k][1] in CATALOG})
 
+# type_id заполняется ТОЛЬКО подтверждённым человеком (eval.read_types_csv пропускает строки с пустым type_id);
+# предложение VLM — vlm_type_id, неподтверждённый выбор человека — draft_type_id.
 COLS = ["video_id", "t_sec", "type_id", "confidence", "what_is_visible", "actors", "objects", "onset_or_peak",
-        "event_time_sec", "new_type", "alt_type_id", "source", "confirmed", "notes"]
+        "event_time_sec", "new_type", "draft_type_id", "vlm_type_id", "alt_type_id", "source", "confirmed",
+        "conflict", "notes"]
 
 RULES = {
     "V01": ("outsider_in_cashier_area, n_persons, collector_present",
@@ -114,13 +118,60 @@ def vlm_events(recs: list[dict]) -> list[dict]:
 
 
 def read_confirmed(p: Path | None) -> dict[tuple, dict]:
+    """Только строки confirmed=1 из выгрузки HTML; остальное (черновики, предложения VLM) игнорируется."""
     if not p or not p.exists():
         return {}
     out = {}
-    for d in csv.DictReader(open(p, encoding="utf-8-sig")):
-        if str(d.get("confirmed", "")).strip() in ("1", "true", "True"):
-            out[(d["video_id"], float(d["t_sec"]))] = d
+    with open(p, encoding="utf-8-sig") as f:
+        for d in csv.DictReader(f):
+            if str(d.get("confirmed", "")).strip() in ("1", "true", "True"):
+                out[(d["video_id"], float(d["t_sec"]))] = d
     return out
+
+
+def confirmed_type(raw: str | None) -> str:
+    """Выбор человека → type_id для eval: V01..V08/V99 как есть, NEW → V99 (контракт), NONE/UNSURE/пусто → ''."""
+    t = (raw or "").strip().upper()
+    if t == "NEW":
+        return "V99"
+    return t if t in CATALOG or t == "V99" else ""
+
+
+def pair_decision(state: dict | None, vid: str) -> str:
+    for k, v in (state or {}).items():
+        if k.startswith("pair:") and vid in k[5:].split("+"):
+            return str((v or {}).get("decision", "")).strip()
+    return ""
+
+
+def label_rows(events: list[dict], conf_rows: dict, conflict: dict[str, str], state: dict | None = None) -> list[dict]:
+    """Строки data/labels_types.csv. Предложения VLM НЕ становятся разметкой: type_id пуст, пока нет confirmed=1."""
+    rows = []
+    for e in events:
+        vid, t = e["video_id"], e["t_sec"]
+        base = dict(video_id=vid, t_sec=f"{t:g}", vlm_type_id=e.get("type_id", ""), alt_type_id=e.get("alt_type_id", ""),
+                    conflict=conflict.get(vid, ""), draft_type_id="")
+        c = conf_rows.get((vid, t))
+        if c:
+            tid = confirmed_type(c.get("type_id"))
+            notes = s(c.get("notes"))
+            if not tid:
+                notes = f"HUMAN:{(c.get('type_id') or 'EMPTY').strip().upper()} (тип не присвоен); {notes}".strip("; ")
+            row = dict(base, type_id=tid, confidence=s(c.get("confidence")), what_is_visible=s(c.get("what_is_visible")),
+                       actors=s(c.get("actors")), objects=s(c.get("objects")), onset_or_peak=s(c.get("onset_or_peak")),
+                       event_time_sec=s(c.get("event_time_sec")), new_type=s(c.get("new_type")) if tid == "V99" else "",
+                       source="human", confirmed=1, notes=notes)
+        else:
+            row = dict(base, type_id="", confidence="", what_is_visible=e.get("what_is_visible", ""),
+                       actors=e.get("actors", ""), objects=e.get("objects", ""), onset_or_peak="", event_time_sec="",
+                       new_type="", source="vlm", confirmed=0, notes="UNCONFIRMED: предложение VLM, не разметка")
+        if conflict.get(vid):
+            dec = pair_decision(state, vid)
+            tag = f"PAIR_DECISION:{dec}" if dec and dec != "unclear" else \
+                f"UNRESOLVED: тот же файл, что {conflict[vid]}, таймкоды расходятся — решает человек"
+            row["notes"] = f"{tag}; {row['notes']}".strip("; ")
+        rows.append(row)
+    return rows
 
 
 # ----------------------------------------------------------------------------- HTML
@@ -319,10 +370,13 @@ function exportTypes() {
   const lines = [csvRow(D.cols)];
   for (const e of D.events) {
     const st = evState(e);
-    const rec = {video_id: e.video_id, t_sec: e.t_sec, type_id: st.type_id, confidence: st.confidence,
+    // type_id — только для подтверждённых; иначе выбор человека уходит в draft_type_id (импорт его не берёт)
+    const rec = {video_id: e.video_id, t_sec: e.t_sec, type_id: st.confirmed ? st.type_id : '',
+      draft_type_id: st.confirmed ? '' : st.type_id, vlm_type_id: e.type_id, confidence: st.confidence,
       what_is_visible: st.what_is_visible, actors: st.actors, objects: st.objects, onset_or_peak: st.onset_or_peak,
       event_time_sec: st.event_time_sec, new_type: st.type_id === 'NEW' ? st.new_type : '', alt_type_id: e.alt_type_id,
-      source: st.confirmed ? 'human' : 'vlm', confirmed: st.confirmed ? 1 : 0, notes: st.notes};
+      source: st.confirmed ? 'human' : 'vlm', confirmed: st.confirmed ? 1 : 0, conflict: D.conflict[e.video_id] || '',
+      notes: st.notes};
     lines.push(csvRow(D.cols.map(c => rec[c])));
   }
   download('labels_types.csv', lines.join('\n') + '\n', 'text/csv');
@@ -549,18 +603,11 @@ def main():
     (rdir / "index.html").write_text(build_html(nan_to_none(events), pairs, clean, man, conflict, a.doubt),
                                      encoding="utf-8")
     out = root / "data/labels_types.csv"
+    rows_out = label_rows(events, conf_rows, conflict, state)
     with open(out, "w", newline="", encoding="utf-8") as f:
         wr = csv.DictWriter(f, fieldnames=COLS, lineterminator="\n", extrasaction="ignore")
         wr.writeheader()
-        for e in events:
-            c = conf_rows.get((e["video_id"], e["t_sec"]))
-            if c:
-                wr.writerow({**{k: c.get(k, "") for k in COLS}, "source": "human", "confirmed": 1})
-            else:
-                wr.writerow({**{k: e.get(k, "") for k in COLS}, "t_sec": f"{e['t_sec']:g}",
-                             "confidence": "" if math.isnan(e["confidence"]) else f"{e['confidence']:.2f}",
-                             "event_time_sec": "" if math.isnan(e["event_time_sec"]) else f"{e['event_time_sec']:g}",
-                             "source": "vlm", "confirmed": 0, "notes": ""})
+        wr.writerows(rows_out)
     (root / "cache/DATA_FINDINGS.md").write_text(
         findings(events, conf_rows, pairs, clean, man, a.clean_notes, state, a.doubt, probes), encoding="utf-8")
     if probes:
@@ -568,7 +615,9 @@ def main():
               f"{sum(1 for e in events if e['probe'])}; events with no probe candidate: "
               f"{sum(1 for e in events if e['probe'] and not e['probe_types'])}")
     print(f"html: {rdir / 'index.html'} | events={len(events)} pairs={len(pairs)} clean={len(clean)}")
-    print(f"labels_types.csv: {len(events)} rows, confirmed by human: {len(conf_rows)}")
+    print(f"labels_types.csv: {len(rows_out)} rows | confirmed by human: {sum(r['confirmed'] == 1 for r in rows_out)} "
+          f"| with type_id (eval GT): {sum(bool(r['type_id']) for r in rows_out)} "
+          f"| unresolved conflicts: {sum(r['notes'].startswith('UNRESOLVED') for r in rows_out)}")
     print(f"DATA_FINDINGS draft: {root / 'cache/DATA_FINDINGS.md'}")
 
 
