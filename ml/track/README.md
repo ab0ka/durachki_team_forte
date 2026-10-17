@@ -4,6 +4,96 @@
 Моделей и весов нет: своя реализация ByteTrack на numpy и геометрические эвристики.
 `models.json` поэтому пустой (`[]`).
 
+## Фаза 2 — что изменилось (решения записаны здесь)
+
+### Решения по спецификации команды (включены по умолчанию: это требования, а не гипотезы)
+| Что | Было | Стало |
+|---|---|---|
+| «Кто первый» | `w_start = 0.25` | `w_start = 0`. Кассир — тот, кто **сидит у стола со стороны кассы**. Может войти через дверь в первые секунды. |
+| Сторона кассы | из позиции выбранного кассира | направление «центр стола → сейф», то есть из предметов, а не из людей (`side_support = "safe"`). Без сейфа сторона не подтверждена: `conf` кассира ≤ 0,7. |
+| Неоднозначность кассира | среди всех кандидатов | только среди **одновременно** присутствующих. Фрагменты одного кассира (ушёл и вернулся) друг другу не конкуренты. |
+| Возврат после разрыва трека | `unknown` без внешности | `cashier` (`cashier_by_behavior`, `conf ≤ 0,65`), если сторона кассы подтверждена сейфом и человек сам сидит там. Иначе `unknown` (`possible_cashier_return`): цикла «зона ↔ роль» нет. |
+| Клиент напротив | `visitor` | `visitor`, `conf ≥ 0,8` и причина `seated_at_client_side`: это норма. |
+| Цвет одежды | гистограмма одежды включена | **выключена** (`appearance.enabled: false`): «цвет одежды и яркость — не признаки». Код остаётся гипотезой H-APP. |
+| Время | индекс кадра / fps в `viz` | только PTS (`CAP_PROP_POS_MSEC`); в трекере — `Detection.t`. |
+| Неуверенное | — | `TrackQueries` считает роль с `conf < 0,5` и зону с `conf < 0,35` неизвестными: ответ `value=None`. |
+| `cashier_area` | оболочка всех позиций кассира у стола | только по наблюдениям **«сидит у стола»**: зона не растягивается туда, где кассир стоял, уйдя с места. |
+| Тесты | `conftest` ставил `SENTINEL_MOCK=1` на весь процесс | убрано: мок-флаг не утекает в чужие тесты, модуль моков не имеет. |
+| Покрытие | — | `info["coverage"]`: `frames_total`, `frames_processed`, `frames_with_detections`, `span_frac`, `visibility_loss`, `visibility_check`. Пустые детекции ≠ «людей нет». |
+
+### Явные функции-события для правил (`ml/track/queries.py`)
+```python
+from ml.track import track_full, TrackQueries
+res = track_full(clip, dets); q = TrackQueries(res.tracks, res.zones, res.info)
+q.cashier_left_workplace(t)   # Answer(value=True|False|None, conf, source, track_ids, t_event=момент начала, detail)
+q.cashier_left_room(t)        # last_seen_in_door_zone (conf выше) | last_seen_at_frame_edge (вышел из кадра — не обязательно из помещения)
+q.person_entered(t, role=None, window_s=1.0)   # вход = появление в двери / у края кадра
+q.n_outsiders(t)              # value = число visitor; detail = {"unknown", "upper_bound", "low_quality"}
+q.outsider_at_cashier_side(t) # True — visitor у кассы/сейфа; None — там unknown; False — никого; collector не считается
+q.events()                    # все переходы: person_entered, cashier_left_workplace, cashier_returned_workplace,
+                              # cashier_left_room, outsider_at_cashier_side, unknown_at_cashier_side
+```
+- `value=None` означает **«неизвестно»**: окклюзия, пропуск детектора, потеря видимости, не определены зона или кассир. Это не `False` и не «нарушения нет».
+- `unknown` никогда не превращается в «постороннего»: такие люди уходят в `detail["unknown"]` и в событие `unknown_at_cashier_side` («на проверку»).
+- `t_event` — момент **начала** перехода: вышла из зоны рабочего места, появился в двери, последний раз видна в двери.
+- **Устранённый источник ложных срабатываний.** Раньше обрыв трека в глубине кадра выглядел как «вошёл человек»: это давало ложные V01/V04 после окклюзии, пропуска детектора или включения света. Теперь новое появление в глубине кадра не считается входом. Наивный режим оставлен для сравнения: `queries.entry_requires_boundary: false`. Тест: `test_fragment_birth_in_view_is_not_entry_eliminated_fp_source`.
+- Replay нашёл и устранил ещё два источника ложных событий:
+  - кассир, входящий в первые секунды, получал «ушёл с рабочего места» — теперь уход возможен только после того, как он там был;
+  - `cashier_area` растягивалась на место, где кассир стоял, уйдя.
+- **Потеря видимости** (например, выключили свет) определяется **без яркости**: одновременно пропали все статичные предметы-якоря. Во время потери все ответы — `None`, а появления сразу после неё не считаются входами.
+
+### Флаги-гипотезы (по умолчанию ВЫКЛ до замера L2 на реальных данных)
+| Флаг | По умолчанию | Гипотеза | Чем мерить |
+|---|---|---|---|
+| `queries.smoothing: hysteresis` (`min_state 2 с`, `merge 3 с`) | `off` | **H-SMOOTH**: гистерезис и объединение дребезга событий уменьшают ложные тревоги без потери таймкода | `replay --variant smooth` (ниже) |
+| `visibility.bridge_tracks: true` | `false` | **H-VIS**: склейка треков через потерю видимости по положению уменьшает фрагментацию ID | `replay --variant vis_bridge` |
+| `appearance.enabled: true` | `false` | **H-APP**: склейка по гистограмме одежды (противоречит спецификации «одежда — не признак», только для замера) | `replay --variant appearance` |
+| `queries.entry_requires_boundary: false` | `true` | наивные входы — эталон «до исправления» | `replay --variant naive_entries` |
+
+### Replay: текущий режим против одного изменения сглаживания
+Синтетика: 8 сценариев × 8 возмущений (none, dropout, jitter, occlusion, blackout, mirror, perspective, noise) × 2 сида = 128 прогонов на вариант. Замерено в облаке на CPU; это **поведение кода на синтетике, не точность на роликах**.
+
+| Метрика (сумма по 128 прогонам) | baseline | smooth |
+|---|---|---|
+| fragmentation / switches / spurious (ID) | 53 / 0 / 0 | 53 / 0 / 0 |
+| ложные тревоги (уход, уход из помещения, посторонний у кассы) | 17 | 3 |
+| пропущенные тревоги | 6 | 6 |
+| `cashier_left_workplace` tp/fp/fn, средняя \|Δt\| | 32/12/0, 0,48 с | 32/0/0, 0,48 с |
+| `person_entered` tp/fp/fn | 80/3/0 | 80/3/0 |
+| latency p50, мс (вся стадия + события) | 239 | 243 |
+
+Что видно в таблице:
+- Фрагментация ID — в основном от сценариев blackout и occlusion, где после потери видимости трек начинается заново. Её снимает H-VIS (`test_blackout_no_false_tracks_and_bridge_flag`).
+- Остаточные пропуски тревог — `cashier_left_room` в сценариях blackout и occlusion. Это честный `None`, а не ошибка.
+- Сглаживание событийное, поэтому ID не меняются.
+
+```bash
+python -m ml.track.replay --variant smooth --seeds 2            # синтетика, около 1,5 мин CPU; ml/track/_out/replay/
+python -m ml.track.report --demo v02_bounce [--smoothing hysteresis]   # PNG: СИНТЕТИЧЕСКОЕ демо
+python -m ml.track.report --cache cache/<sha>                   # PNG-таймлайн по реальному кэшу (локально)
+```
+
+### Команда замера для L2 (одна; реальные детекции, локально)
+```bash
+python -m ml.track.replay --real --dets-glob "cache/*/detections.json" --labels <labels.csv> \
+    --variant smooth --tol 2.0 --out ml/track/_out/replay_real
+```
+- **Сравниваем**: `baseline` (текущие значения) против `smooth` (H-SMOOTH). Другие флаги — `--variant vis_bridge`, `appearance` или `naive_entries`, по одному за раз.
+- **Вход**:
+  - детекции A05 в `cache/<id>/detections.json`: список `{t, label, bbox, score}`, где `t` из PTS;
+  - необязательный `meta.json` с `width`, `height`, `times`, `duration`;
+  - CSV меток с колонками `video|file`, `label|violation`, `second|t`. Имена нормализуются: латинская X = кириллическая Х.
+- **Выход**: `replay.json` и `replay.md`.
+- **Метрики для решения**:
+  - «чистые ролики с тревогой» — прокси ложных срабатываний;
+  - «ролики с нарушением без тревоги» — прокси пропусков;
+  - попадание тревоги в ±2 с от размеченной секунды;
+  - среднее число треков людей;
+  - latency p50 стадии;
+  - VRAM = 0 (стадия только на CPU).
+- **Правило**: включать флаг, только если прокси ложных срабатываний снизился, а прокси пропусков и попадания не ухудшились. Тип нарушения на этой стадии не меряется: тип не размечен.
+- **Оговорка**: все 42 строки уже использованы в разведке, поэтому независимым тестом этот замер не является.
+
 ## Что сделано
 | Часть | Файл | Суть |
 |---|---|---|
@@ -55,8 +145,9 @@ person_signals(tracks, zones, times, *, extended=False) -> list[SceneState]
 
 ## Запуск
 ```bash
-pip install -r ml/track/requirements.txt
-python -m pytest ml/track/tests -q                     # 35 тестов, без GPU/весов/данных (~8 с)
+pip install -r ml/track/requirements.txt -c <lock L1>   # версии не менять вслепую (opencv < 5)
+python -m pytest ml/track/tests -q                     # 61 тест, без GPU/весов/данных (~15 с)
+python -m pytest ml/track/tests -q -m perturbation     # только возмущения ракурса (perspective/mirror/rotation)
 python -m ml.track.viz video.mov --cache cache/<sha> [--out out.mp4] [--recompute] [--blur-heads]
 ```
 `viz` берёт детекции из `cache/<sha>/detections.json` (или `dets.json`, `detect.json`, `*.pkl`), а если их нет — из `ml.detect.detect(clip)`. Кадры читает через `ml.ingest.load_video`, иначе через встроенный `SimpleClip` на cv2 с автоповоротом. Пишет `track.json` и `track_viz.mp4`. Видео не коммитить: в `ml/track/.gitignore` они уже исключены.
@@ -74,6 +165,10 @@ python -m ml.track.viz video.mov --cache cache/<sha> [--out out.mp4] [--recomput
 - Скорость на синтетике (облачный CPU, без GPU): 145 с, 725 кадров, 4371 детекция → **1,43 с** на всю стадию. Реальные ролики не измерялись: данных здесь нет.
 
 ## Ограничения (честно)
+- Фаза 2 проверена только на синтетике: в облаке нет реальных роликов и GPU. Все пороги ждут замера L2 (команда выше).
+- Без сейфа в кадре сторона кассы не подтверждена: кассир — тот, кто дольше сидит у стола, а при двух сидящих по разные стороны выбор слабее (`conf ≤ 0,7`).
+- Возврат кассира без сейфа в кадре → `unknown` (`possible_cashier_return`): цвет одежды выключен спецификацией.
+- `n_outsiders` считает `visitor`; `unknown` — только в `upper_bound`. Отличить «второго сотрудника» от «постороннего» по траектории нельзя: это решают правила и VLM.
 - Пороги не тюнены на реальных данных: синтетика ≠ реальная сцена. Все пороги — в `config.yaml`.
 - Смена ID при плотном контакте людей (передача сумки «из рук в руки») в ассоциации не исправляется: внешность используется только при склейке треклетов.
 - Без кадров (`clip.frame` недоступен) или без cv2 внешности нет. Тогда длинные разрывы не склеиваются, возврат кассира → `unknown`.
@@ -86,10 +181,16 @@ python -m ml.track.viz video.mov --cache cache/<sha> [--out out.mp4] [--recomput
 - **Подключение** в `backend.pipeline`: `tracks, zones = ml.track.track(clip, dets)`. Для provenance вызывать `ml.track.track_full(...)` и класть `res.info` в `AnalysisResult.meta["track"]` или в кэш через `ml.track.serialize.save_track_cache(cache_dir, tracks, zones, info)`.
 - `track()` **проставляет `track_id` в переданные `Detection`** (in-place) — A08 может связывать детекции с треками.
 - **A08/A09**: `entries_exits`, `dwell`, `proximity`, `gaps`, `presence_state` и `person_signals` — чистые функции над контрактными `Track`/`Zone`. Рекомендация: не считать `unknown` автоматически посторонним (вес 0,5 в `person_signals`), а `lost_in_view` не считать уходом.
+- **A09: события в кандидаты нарушений** (решение принимают правила, здесь только наблюдения):
+  - **V02**: `cashier_left_workplace(t).value is True`, а в окне после `t_event` по A08 на столе `cash` или `cash_bag` либо сейф открыт. Таймкод — `t_event`. Уход с убранными ценностями и закрытым сейфом — норма.
+  - **V01**: `outsider_at_cashier_side(t).value is True` — кандидат. `None` (там `unknown`) — на проверку VLM, не автоматическое нарушение. `n_outsiders(t).detail["upper_bound"] >= 2` во время обслуживания — кандидат «второй посторонний».
+  - **V04**: `person_entered(t)` при открытом сейфе или наличных на столе (A08).
+  - **V07**: роль `collector` плюс состояние сумки по A08: сумка оставлена или ушла не в сейф.
+- **A03**: класть `res.info["coverage"]` в `meta.coverage`. Если `frames_processed == 0` или есть `visibility_loss`, ответ «нарушений нет» без проверки полноты недопустим.
 - **ENV**:
   - `SENTINEL_TRACK_CONFIG=/path.yaml` — свой конфиг;
   - `SENTINEL_TRACK_APPEARANCE=0` — выключить гистограммы одежды;
-  - `SENTINEL_MOCK=1` — ни на что не влияет: моделей нет, модуль всегда работает одинаково.
+  - мок-режима нет и не будет: модуль без моделей; синтетика (`ml/track/synth.py`) используется только в тестах, replay и демо и помечена.
 - **Контракт**: импорт через `ml/track/contract.py`: `contracts.sentinel_contracts`, а если его нет — `_contract_fallback.py`. Fallback удалить после мерджа A01.
 - **Предложение A01 (не реализовано самостоятельно)**: добавить в `Track` поле `extra: dict` (provenance роли: `reasons`, `features`) и в `Zone` поле `extra: dict` (`method`, `independent`). Сейчас это только в `track_full().info`.
 - **TODO на реальных данных**:
