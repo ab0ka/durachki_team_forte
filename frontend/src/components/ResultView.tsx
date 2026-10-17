@@ -219,7 +219,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             </p>
           </section>
 
-          <details className="card group p-4">
+          <details className="card no-print group p-4">
             <summary className="label cursor-pointer list-none">Технические детали ▾</summary>
             <div className="mt-3 space-y-3 text-xs text-slate-600 dark:text-slate-300">
               <div className="flex items-center justify-between gap-2">
