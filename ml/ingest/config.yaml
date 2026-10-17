@@ -1,0 +1,47 @@
+# ml/ingest — все пороги и параметры модуля (тюнятся на реальных данных).
+# Переопределить файл целиком: env SENTINEL_INGEST_CONFIG=/path/to/ingest.yaml
+# Отсутствующие ключи берутся из встроенных значений по умолчанию (ml/ingest/config.py).
+
+decode:
+  backend: auto            # auto | pyav | opencv  (auto: PyAV, при ошибке — OpenCV)
+  threads: 0               # потоки декодера, 0 = авто
+  skip_nonref: false       # true: декодировать только опорные кадры (I/P) — быстрее, сэмплы чуть неравномернее
+  adaptive_skip: true      # авто-включение skip_nonref, если прогноз декода > budget_s
+  budget_s: 20.0           # бюджет на декодирование одного ролика (для adaptive_skip)
+  max_decode_errors: 200   # битых пакетов до отказа от бэкенда
+
+storage:
+  mode: jpeg               # jpeg | raw | memmap — как хранить сэмплы в памяти
+  jpeg_quality: 92
+  max_side: 1280           # сэмплы ужимаются по длинной стороне (0 = без ужатия); frame_at — всегда полный размер
+  lru_size: 96             # сколько декодированных сэмплов держать в LRU
+  copy_on_access: true     # frame(i) возвращает копию (кэш нельзя испортить рисованием поверх)
+  encode_workers: 4        # потоки JPEG-кодирования/метрик при загрузке
+
+frame_at:
+  cache_size: 32           # LRU точных кадров (доказательства)
+
+quality:
+  analysis_width: 160      # ширина серого кадра для метрик (меньше = быстрее)
+  blur_ksize: 5            # гаусс перед разностью кадров (подавляет шум/JPEG)
+  diff_threshold: 18       # |Δяркости| (0..255), с которого пиксель считается «изменившимся»
+  motion_norm: 0.06        # доля изменившихся пикселей, соответствующая motion_energy = 1.0
+  dark_level: 16           # пиксель «тёмный», если яркость <= dark_level
+  bright_level: 245        # пиксель «засвеченный», если яркость >= bright_level
+  blurry_laplacian: 40.0   # var(Laplacian) ниже — кадр считаем размытым (на analysis_width)
+  dark_mean: 0.15          # средняя яркость ниже — кадр тёмный
+  bright_mean: 0.88        # средняя яркость выше — кадр пересвечен
+  frozen_motion: 0.0005    # motion_frac ниже — кадр «заморожен» (дубликат)
+
+activity:
+  smooth_s: 0.6            # окно сглаживания кривой движения
+  threshold: 0.12          # motion_energy выше — «активный» участок
+  pad_s: 1.0               # расширение активных сегментов
+  min_gap_s: 1.0           # сегменты ближе — склеиваются
+  idle_every_n: 5          # gating: в спокойных участках брать каждый N-й сэмпл
+  active_every_n: 1        # gating: в активных — каждый
+
+probe:
+  min_duration_s: 1.0
+  max_duration_s: 900.0
+  ffprobe_timeout_s: 20.0
