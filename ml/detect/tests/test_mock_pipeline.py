@@ -111,3 +111,22 @@ def test_budget_forces_stride(mock_mode, monkeypatch):
     st = last_stats()
     assert st["stride_final"] > 1 and st["status"] == "degraded"
     assert len({d.t for d in dets}) < len(clip.times)
+
+
+def test_last_stats_are_per_thread(mock_mode):
+    import threading
+
+    clip_a, _ = synth_clip(duration_s=1.0)
+    clip_b, _ = synth_clip(duration_s=2.0)
+    seen = {}
+
+    def run(name, clip):
+        detect(clip)
+        seen[name] = last_stats()["n_sampled"]
+
+    ts = [threading.Thread(target=run, args=("a", clip_a)), threading.Thread(target=run, args=("b", clip_b))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert seen == {"a": len(clip_a.times), "b": len(clip_b.times)}

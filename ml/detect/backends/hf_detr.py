@@ -69,6 +69,8 @@ class HFDetrBackend:
         self.model = model.eval().to(self.device)
         if self.fp16:
             self.model = self.model.half()
+        if self.device.startswith("cuda"):
+            torch.backends.cudnn.benchmark = True  # вход фиксированного размера
         self.size = _size_from_processor(processor, input_size) if processor is not None else (input_size, input_size)
         self.rescale = float(getattr(processor, "rescale_factor", 1 / 255.0)) if processor is not None else 1 / 255.0
         do_norm = bool(getattr(processor, "do_normalize", False)) if processor is not None else False
@@ -111,9 +113,22 @@ class HFDetrBackend:
                                [self._cls_labels[j] for j in ki], [self._cls_src[j] for j in ki]))
         return res
 
+    def _forward_safe(self, frames: Sequence[np.ndarray]) -> list[RawDets]:
+        try:
+            return self._forward(frames)
+        except RuntimeError as e:
+            if not self.fp16 or "out of memory" in str(e).lower():
+                raise
+            import torch
+
+            log.warning("%s: fp16 forward failed (%s) — switching to fp32", self.name, e)
+            self.fp16, self.dtype = False, torch.float32
+            self.model = self.model.float()
+            return self._forward(frames)
+
     def predict(self, frames: Sequence[np.ndarray]) -> list[RawDets]:
         out: list[Optional[RawDets]] = [None] * len(frames)
         for _shape, idx in group_by_shape(frames).items():
-            for r, i in zip(self._forward([frames[j] for j in idx]), idx):
+            for r, i in zip(self._forward_safe([frames[j] for j in idx]), idx):
                 out[i] = r
         return [r if r is not None else RawDets() for r in out]

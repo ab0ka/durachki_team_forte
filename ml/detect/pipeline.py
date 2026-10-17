@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Any, Optional, Sequence
 
@@ -30,12 +31,20 @@ from .gating import KeyframeSelector, MotionMeter, motion_from_quality
 
 log = logging.getLogger("ml.detect")
 
-_LAST_STATS: dict[str, Any] = {}
+_TLS = threading.local()          # last_stats — свои у каждого потока (A03 может гнать несколько видео)
+_RUN_LOCK = threading.Lock()      # один detect() за раз на процесс: GPU 8 GB, параллель не ускоряет, а рискует OOM
+
+
+def _stats() -> dict[str, Any]:
+    st = getattr(_TLS, "stats", None)
+    if st is None:
+        st = _TLS.stats = {}
+    return st
 
 
 def last_stats() -> dict[str, Any]:
-    """Тайминги/бэкенды/предупреждения последнего вызова detect() — для meta в AnalysisResult (A03/A12)."""
-    return dict(_LAST_STATS)
+    """Тайминги/бэкенды/предупреждения последнего вызова detect() в этом потоке — для meta (A03/A12)."""
+    return dict(_stats())
 
 
 class _Budget:
@@ -111,7 +120,15 @@ def _to_detections(t: float, d: RawDets) -> list[Detection]:
 
 
 def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]] = None) -> list[Detection]:
-    """Детекции на кадрах clip.times[::every_n]. bbox — нормированные (x1,y1,x2,y2) к кадру после поворота."""
+    """Детекции на кадрах clip.times[::every_n]. bbox — нормированные (x1,y1,x2,y2) к кадру после поворота.
+
+    Нет локальных весов → DetectorUnavailable (или [] при runtime.on_unavailable=empty); статус — в last_stats().
+    """
+    with _RUN_LOCK:
+        return _detect(clip, every_n, config)
+
+
+def _detect(clip: VideoClip, every_n: int, config: Optional[dict[str, Any]]) -> list[Detection]:
     cfg = load_config(config)
     rt, cs, tta, tl, ov, gt, mg = (cfg[k] for k in ("runtime", "closed_set", "tta", "tiling", "open_vocab",
                                                      "gating", "merge"))
@@ -122,8 +139,8 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
     stats: dict[str, Any] = {"status": "ok", "n_sampled": n, "n_processed": 0, "n_keyframes": 0, "n_flip": 0,
                              "n_tiles": 0, "n_open": 0, "timings": {}, "warnings": [], "backends": [],
                              "mock": is_mock()}
-    _LAST_STATS.clear()
-    _LAST_STATS.update(stats)
+    _stats().clear()
+    _stats().update(stats)
     if n == 0:
         return []
     tm = stats["timings"]
@@ -138,7 +155,7 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
     except DetectorUnavailable as e:
         stats["status"] = "unavailable"
         warnings.append(f"detect: unavailable: {e}")
-        _LAST_STATS.update(stats)
+        _stats().update(stats)
         if str(rt.get("on_unavailable", "raise")) == "empty":
             return []
         raise
@@ -303,7 +320,7 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
     stats["extras_cut"] = not budget.extras_allowed()
     if stats["extras_cut"] and stats["status"] == "ok":
         stats["status"] = "degraded"
-    _LAST_STATS.update(stats)
+    _stats().update(stats)
     out.sort(key=lambda d: (d.t, d.label, -d.score))
     return out
 
