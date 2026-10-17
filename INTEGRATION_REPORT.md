@@ -5,7 +5,37 @@
 (повторяемо: `git fetch origin && python scripts/integration_merge.py`). Конфликты, если появятся,
 разрешаются по владению папками (владелец папки побеждает; корень и `contracts/` — A01).
 
-## 1. Что слилось (второй проход, после fetch через ~35 мин)
+## 0. Третий проход (последний; ~09:10 UTC) — актуальное состояние
+
+Все ветки снова влиты (A01 0209b98, A04 a97f69f, A05 dfee603, A06 353c826, A07 c790b45, A08 22f47e7, A13 d2a38db,
+A09 3cb3002, A10 09a28a4, A11 5e802bc, A12 9ca9a0e, A03 938e658+, A02 10fcb27, A14 dca3b5b, A15 4e90ec2, A16 c298da3,
+A17 88e985d, L1 ca6dc3d) — **конфликтов 0**; ещё 4 новых импорта `_contract_fallback` переведены на `contracts`.
+
+**`pytest -m "not gpu and not slow"`: 1806 passed, 20 failed, 7 skipped, 22 deselected (219 с).**
+
+Glue этого прохода — корневой `conftest.py` (изоляция окружения между модулями): `eval/tests/conftest.py` (A16)
+при импорте ставит `SENTINEL_MOCK=1` на всю сессию, `testkit/e2e_stub.py` (A01) — во время теста; в общем прогоне
+это включало mock у чужих модулей → защитный `mock_not_allowed` A02 (+29 ложных падений). Снимок `SENTINEL_*`
+берётся при импорте корневого conftest и восстанавливается вокруг каждого теста вне `eval/`. Было 49 → стало 20.
+Владельцам: A16 — ставить `SENTINEL_MOCK` через `monkeypatch`, A01 — `e2e_stub` не должен менять `os.environ`.
+
+Найдено и исправлено в A03 по ходу интеграции: (1) `run()` в mock-конфиге мутировал `os.environ` (утечка mock в
+процесс API) — убрано; (2) регрессия пробной интеграции A01 (дедлайн 40 с → ответ 110 с) — все RPC воркера
+ограничены дедлайном; (3) `meta.coverage` переведён на канон A01 `compute_coverage` — без него A01 отдавал `failed`
+вместо `no_violation`. Проверка в интеграции: `python -m backend.pipeline run <synth> --mock` → `done/no_violation`,
+`coverage.ratio=1.0`, сериализатор A01 принимает; `compare --mock` проходит оба режима через процесс-воркер.
+
+| Падающие тесты (20) | Чьё | Суть |
+|---|---|---|
+| `deploy/tests/test_merge_requirements.py::test_repo_merge_is_clean` | **A11**, A12 | `transformers<5` (ml/vlm) и `pillow<13` (ml/fusion) против лока L1 (5.20.1 / 13.0.0) — блокер VLM на L2 |
+| `ml/vlm/tests/test_vlm_prompts.py` ×2, `ml/vlm/tests/test_vlm_compare.py` ×2 | A11 | промпт verify без type_id/названия; сравнение fixes/breaks |
+| `copilot/tests/*` ×7 (падают и изолированно) | A14 | доступность/501 без весов, выбор llama.cpp, remote URL |
+| `backend/api/tests/test_phase2.py::test_outcome_policy[no_violation-*]` ×2, `test_violation_without_timecode_is_dropped`, `test_mock_result_refused`; `test_jobs.py::test_pipeline_reporting_failed_or_garbage_is_failed` | A02 (+A01) | фикстуры без `meta.coverage` (канон A01 теперь требует его для `no_violation`); тексты ошибок |
+| `eval/tests/test_eval_loo.py::test_logo_exploratory_and_nested` | A16 | `fit()` missing 'start', 'default' |
+| `eval/tests/test_eval_run_split.py::test_run_inproc_end_to_end` | A16 (+A01) | фейковый пайплайн без `meta.coverage` → `failed` у сериализатора A01 |
+| `ml/fusion/tests/test_core.py::test_no_catalog_reports_with_warning` | A12 | без каталога ожидается `violation` |
+
+## 1. Что слилось (второй проход; история)
 
 | # | Агент | Ветка | Голова | Конфликты |
 |---|---|---|---|---|
@@ -43,7 +73,7 @@
 * Запрещённых файлов (видео, веса, кадры датасета) нет. Есть `frontend/screenshots/*.png` (14 файлов, ≈5 МБ) —
   скриншоты UI на mock-данных (A15), не кадры датасета.
 
-## 3. Тесты: `pytest -m "not gpu and not slow"`
+## 3. Тесты второго прохода (история): `pytest -m "not gpu and not slow"`
 
 Окружение облака: CPU, Python 3.11.17, **без torch/transformers/весов**; numpy 2.4.6, **opencv 5.0.0** (лок L1:
 `opencv < 5` — L2 должен перепрогнать на локе), PyYAML, jsonschema, fastapi, httpx, pillow, scipy, PyAV.
