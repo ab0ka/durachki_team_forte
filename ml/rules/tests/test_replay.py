@@ -166,3 +166,18 @@ def test_ablation_and_propose(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     assert main(["--cache", str(cache), "--labels", str(labels), "--names", str(summary), "--propose"]) == 0
     out = capsys.readouterr().out
     assert "joint" in out or "не найдено" in out
+
+
+def test_rule_fires_count_only_verdict_events_as_fp_sources(tmp_path: Path) -> None:
+    """insufficient_context на чистом видео — не «срабатывание на чистых» (иначе ложный источник FP)."""
+    from ml.rules.replay import run_replay
+    from ml.rules.config import load_rules_config
+
+    cache = {"x1": {"name": "X-1", "states": [{"t": s.t, "signals": s.signals} for s in make_states(
+        60.0, segments=[(20.0, 35.0, {"cashier_present": 0.0, "cashier_in_workplace": 0.0, "cash_visible": None})])],
+        "tracks": [], "zones": []}}
+    labels = {"x1": [{"name": "X-1", "violation": False, "t": None}]}
+    res = run_replay(cache, labels, load_rules_config(), {"types": {}})
+    fires = res["rule_fires"]["V02_cash_left_unattended"]
+    assert fires["clean"] == 0 and fires["insufficient"] >= 1
+    assert res["summary"]["fp"] == 0

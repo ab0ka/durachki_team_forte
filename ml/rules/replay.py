@@ -197,9 +197,14 @@ def run_replay(cache: dict[str, dict[str, Any]], labels: dict[str, list[dict[str
                 row["hit"] = abs(row["dt"]) <= tol
         bucket = "violation" if row["gt"] else ("clean" if row["gt"] is False else "unlabeled")
         for e in evs:
+            # в источники FP/TP идут только события, которые считаются в вердикте; наблюдения и
+            # insufficient_context — отдельными колонками (не «срабатывания на чистых»)
+            col = bucket if _is_positive(e, verdict, count_review) else (
+                "insufficient" if assessment_of(e) == INSUFFICIENT else "observation")
             for rid in e.extra.get("rule_ids", []):
-                d = rule_fires.setdefault(rid, {"violation": 0, "clean": 0, "unlabeled": 0})
-                d[bucket] += 1
+                d = rule_fires.setdefault(rid, {"violation": 0, "clean": 0, "unlabeled": 0,
+                                                "observation": 0, "insufficient": 0})
+                d[col] += 1
         videos.append(row)
     return {"videos": videos, "summary": summarize(videos, tol, timings, count_review, verdict),
             "rule_fires": rule_fires}
@@ -306,8 +311,10 @@ def _print_report(res: dict[str, Any], tol: float, show_events: bool, catalog_sr
           f"max={_fmt(s['latency_ms']['max'], 1)} мс | VRAM: 0 (CPU)")
     fires = s.get("rule_fires") or res.get("rule_fires")
     if fires:
-        print(_table([[rid, d["violation"], d["clean"], d["unlabeled"]] for rid, d in sorted(fires.items())],
-                     ["правило", "на нарушениях", "на чистых", "без разметки"]))
+        print(_table([[rid, d["violation"], d["clean"], d["unlabeled"], d.get("observation", 0),
+                       d.get("insufficient", 0)] for rid, d in sorted(fires.items())],
+                     ["правило", "кандидат: на нарушениях", "кандидат: на чистых (FP)", "кандидат: без разметки",
+                      "наблюдения", "insufficient"]))
 
 
 def _variants(raw: dict, hyp_arg: str) -> list[tuple[str, str, list[str]]]:
