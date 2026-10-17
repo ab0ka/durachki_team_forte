@@ -106,18 +106,25 @@ def to_frame(xy_norm: np.ndarray, geom: tuple[float, float, float, float]) -> np
     return np.stack([x0 + xy_norm[:, 0] * cw, y0 + xy_norm[:, 1] * ch], axis=1).astype(np.float32)
 
 
-def pick_pose(cands: Sequence[tuple[np.ndarray, np.ndarray]], box_px: Sequence[float], min_score: float = 0.3) -> int:
-    """Из нескольких поз в кропе — та, чьи видимые точки больше лежат в bbox трека (×1.1), с учётом score."""
+def pick_pose(cands: Sequence[tuple[np.ndarray, np.ndarray]], box_px: Sequence[float], min_score: float = 0.3,
+              min_inside: float = 0.5) -> int:
+    """Из поз в кропе — та, чьи видимые точки больше лежат в bbox трека (×1.1), с учётом score.
+
+    -1 — ни одна поза не принадлежит треку (меньше min_inside видимых точек внутри bbox): в кроп с паддингом
+    попал сосед, и приписывать его скелет этому треку нельзя.
+    """
     x1, y1, x2, y2 = (float(v) for v in box_px)
     mx, my = 0.05 * (x2 - x1), 0.05 * (y2 - y1)
     best, best_v = -1, -1.0
     for i, (xy, sc) in enumerate(cands):
         vis = sc >= min_score
         if not vis.any():
-            v = 0.0
-        else:
-            inside = ((xy[:, 0] >= x1 - mx) & (xy[:, 0] <= x2 + mx) & (xy[:, 1] >= y1 - my) & (xy[:, 1] <= y2 + my))
-            v = float((inside & vis).sum()) / float(vis.sum()) * float(sc[vis].mean())
+            continue
+        inside = ((xy[:, 0] >= x1 - mx) & (xy[:, 0] <= x2 + mx) & (xy[:, 1] >= y1 - my) & (xy[:, 1] <= y2 + my))
+        frac = float((inside & vis).sum()) / float(vis.sum())
+        if frac < min_inside:
+            continue
+        v = frac * float(sc[vis].mean())
         if v > best_v:
             best, best_v = i, v
     return best
@@ -205,8 +212,9 @@ class MediaPipePose:
             for lm in self._detect(img[..., ::-1]):
                 xy, sc = mp33_to_coco17(lm)
                 cands.append((to_frame(xy, geom), np.clip(sc * self.vis_scale, 0.0, 1.0).astype(np.float32)))
-            if not cands:
-                out.append((np.zeros((17, 2), np.float32), np.zeros(17, np.float32)))  # не найдено → unknown
+            k = pick_pose(cands, box, self.min_score) if cands else -1
+            if k < 0:  # поза не найдена или не этого трека → нулевые score (estimate() её не выдаст)
+                out.append((np.zeros((17, 2), np.float32), np.zeros(17, np.float32)))
                 continue
-            out.append(cands[pick_pose(cands, box, self.min_score)])
+            out.append(cands[k])
         return out

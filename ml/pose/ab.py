@@ -16,7 +16,9 @@
 Попарно — согласие бэкендов (PCK@0.5 плеча; эталона нет — это не точность).
 
 Выход: <out>/ab_report.json, ab_report.md, per_crop.csv и (по умолчанию) <out>/overlays/<бэкенд>/*.jpg —
-скелеты с размытыми головами. Картинки — только на локальный диск: в <out> кладётся .gitignore с «*».
+скелеты. Голова размывается только по найденным точкам головы; если их нет, размывается весь bbox человека
+(место головы не угадывается); счётчики — в ab_report.json → overlay_blur. Картинки — только на локальный
+диск: в <out> кладётся .gitignore с «*».
 Реальные кадры и картинки никуда не отправляются; JSON/MD содержат только числа и имена файлов.
 """
 from __future__ import annotations
@@ -231,25 +233,37 @@ def agreement(a: dict[tuple[int, Any], tuple[np.ndarray, np.ndarray, float]],
 
 
 def draw_overlay(frame: np.ndarray, results: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]], thr: float,
-                 blur_heads: bool = True) -> np.ndarray:
+                 blur_heads: bool = True, counts: Optional[dict[str, int]] = None) -> np.ndarray:
+    """Скелеты поверх кадра (только для локального диска).
+
+    Приватность: голова размывается по видимым точкам головы (COCO 0..4). Если точек головы нет, место головы
+    НЕ угадывается («верх bbox» на потолочной камере — не обязательно голова): размывается весь bbox
+    человека. counts (если передан) получает {"head_keypoints": n, "whole_bbox": m}.
+    """
     import cv2
 
     img = frame.copy()
     h, w = img.shape[:2]
+
+    def _blur(x0: float, y0: float, x1: float, y1: float, r: float) -> None:
+        xa, ya, xb, yb = int(max(0, x0)), int(max(0, y0)), int(min(w, x1)), int(min(h, y1))
+        if xb > xa and yb > ya:
+            k = max(3, int(r) | 1)
+            img[ya:yb, xa:xb] = cv2.GaussianBlur(img[ya:yb, xa:xb], (k, k), 0)
+
     if blur_heads:
         for kp, sc, box in results:
             head = [kp[k] for k in GROUPS["head"] if sc[k] >= thr]
             if head:
                 c = np.mean(head, axis=0)
                 r = max(12.0, 0.6 * _scale(kp, sc, box, thr))
-            else:  # голова не найдена — размываем верх bbox
-                c = np.array([(box[0] + box[2]) / 2, box[1] + 0.12 * (box[3] - box[1])])
-                r = max(12.0, 0.15 * float(box[3] - box[1]))
-            x0, y0 = int(max(0, c[0] - r)), int(max(0, c[1] - r))
-            x1, y1 = int(min(w, c[0] + r)), int(min(h, c[1] + r))
-            if x1 > x0 and y1 > y0:
-                k = max(3, int(r) | 1)
-                img[y0:y1, x0:x1] = cv2.GaussianBlur(img[y0:y1, x0:x1], (k, k), 0)
+                _blur(c[0] - r, c[1] - r, c[0] + r, c[1] + r, r)
+                key = "head_keypoints"
+            else:  # точек головы нет — не гадаем, где голова: размываем всего человека
+                _blur(box[0], box[1], box[2], box[3], max(12.0, 0.1 * float(box[3] - box[1])))
+                key = "whole_bbox"
+            if counts is not None:
+                counts[key] = counts.get(key, 0) + 1
     for kp, sc, box in results:
         cv2.rectangle(img, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (200, 200, 200), 1)
         for a, b in SKELETON:
@@ -286,6 +300,7 @@ def run_variant(name: str, frames: Sequence[FrameItem], boxes: dict[str, list[di
     lat, rows, seqs = [], [], {}
     per_crop: dict[tuple[int, Any], tuple[np.ndarray, np.ndarray, float]] = {}
     all_scores, detected, mem_peak = [], 0, mem_init
+    blur_counts: dict[str, int] = {}
     items_for_batch: list[tuple[np.ndarray, np.ndarray]] = []
     warm = 0
     whole = [{"bbox": [0.0, 0.0, 1.0, 1.0], "track_id": 0, "role": "unknown"}]
@@ -328,7 +343,8 @@ def run_variant(name: str, frames: Sequence[FrameItem], boxes: dict[str, list[di
         if overlays and res_frame:
             od = out / "overlays" / name
             od.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(od / (Path(fname).stem + ".jpg")), draw_overlay(frame, res_frame, thr, blur_heads))
+            cv2.imwrite(str(od / (Path(fname).stem + ".jpg")),
+                        draw_overlay(frame, res_frame, thr, blur_heads, blur_counts))
     batch_ms = None
     bs = int(getattr(backend, "batch_size", 1) or 1)
     if bs > 1 and items_for_batch:
@@ -349,6 +365,7 @@ def run_variant(name: str, frames: Sequence[FrameItem], boxes: dict[str, list[di
                        "p50": round(float(np.percentile(lat, 50)), 3) if lat else None,
                        "p95": round(float(np.percentile(lat, 95)), 3) if lat else None,
                        "batched_per_crop": batch_ms, "batch_size": bs},
+        "overlay_blur": ({"enabled": blur_heads, **blur_counts} if overlays else None),
         "vram_mib": {"before": mem0, "after_init": mem_init, "peak": mem_peak,
                      "delta_peak": None if (mem0 is None or mem_peak is None) else round(mem_peak - mem0, 1)},
     }

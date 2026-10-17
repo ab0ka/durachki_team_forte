@@ -23,13 +23,22 @@ COCO17_NAMES = [
 
 
 def kp_array(keypoints: Sequence[Sequence[float]]) -> np.ndarray:
-    """list[(x, y, score)] → float32 (17, 3); недостающие точки — нули."""
+    """list[(x, y, score)] → float32 (17, 3). Недостающие/битые точки (не 3 числа, NaN/inf) — score 0 (unknown),
+    score обрезается в 0..1. Чужая схема (2 числа на точку, 33 точки) не превращается в «уверенные» точки."""
     arr = np.zeros((NUM_KP, 3), dtype=np.float32)
     if keypoints is None:
         return arr
-    src = np.asarray(keypoints, dtype=np.float32).reshape(-1, 3) if len(keypoints) else np.zeros((0, 3))
-    n = min(NUM_KP, src.shape[0])
-    arr[:n] = src[:n]
+    try:
+        items = list(keypoints)[:NUM_KP]
+    except TypeError:
+        return arr
+    for k, kp in enumerate(items):
+        try:
+            x, y, sc = (float(v) for v in kp)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(x) and np.isfinite(y) and np.isfinite(sc):
+            arr[k] = (x, y, min(max(sc, 0.0), 1.0))
     return arr
 
 

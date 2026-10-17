@@ -54,6 +54,9 @@ selection:
   priority_zones: [cashier_area, desk, safe, cash_tray]
   zone_bonus: 2.0               # бонус приоритета за пересечение bbox с priority_zones (если zones переданы)
   min_box_area: 0.002           # норм. площадь bbox; меньше — не оцениваем позу
+  # Невалидный bbox трека (NaN/inf, x2<=x1/y2<=y1, вне 0..1 — например, пиксели) → поза не оценивается.
+  min_pose_score: 0.3           # если ни одна точка позы не уверенна (max score ниже) — позу не выдаём (unknown)
+  geometry_margin: 0.35         # точки дальше этой доли размера bbox за его краем — чужие → score 0
   box_time_tolerance_s: 0.25    # bbox трека считается «в кадре», если есть наблюдение в ±tol
   max_interp_gap_s: 1.0         # линейная интерполяция bbox между наблюдениями трека
   budget_s: 10.0                # мягкий бюджет estimate(); при превышении прогноза — адаптивный шаг по кадрам

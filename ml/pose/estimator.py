@@ -22,7 +22,15 @@ class BoxLookup:
     """bbox трека в момент t: ближайшее наблюдение в ±tol или линейная интерполяция (разрыв ≤ max_gap)."""
 
     def __init__(self, track: Track, tol: float, max_gap: float) -> None:
-        items = sorted(((float(t), np.asarray(b, dtype=np.float64)) for t, b in track.boxes), key=lambda x: x[0])
+        items = []
+        for t, b in track.boxes:
+            try:
+                tt, bb = float(t), np.asarray(b, dtype=np.float64).reshape(4)
+            except (TypeError, ValueError):
+                continue  # битое наблюдение трека — пропуск (проверка геометрии — в valid_box)
+            if np.isfinite(tt):
+                items.append((tt, bb))
+        items.sort(key=lambda x: x[0])
         self.ts = [t for t, _ in items]
         self.bb = [b for _, b in items]
         self.tol = tol
@@ -66,8 +74,27 @@ def allowed_tracks(tracks: dict[int, Track], sel: dict[str, Any]) -> Optional[se
     return ids
 
 
+def valid_box(b: Any, min_area: float) -> Optional[np.ndarray]:
+    """Нормированный bbox x1<x2, y1<y2 в пределах кадра (допуск 2%) и не меньше min_area; иначе None."""
+    try:
+        arr = np.asarray(b, dtype=np.float64).reshape(4)
+    except (TypeError, ValueError):
+        return None
+    if not np.all(np.isfinite(arr)):
+        return None
+    if arr.min() < -0.02 or arr.max() > 1.02:  # не нормирован (пиксели) или далеко за кадром
+        return None
+    arr = np.clip(arr, 0.0, 1.0)
+    if arr[2] <= arr[0] or arr[3] <= arr[1]:
+        return None
+    if float((arr[2] - arr[0]) * (arr[3] - arr[1])) < min_area:
+        return None
+    return arr
+
+
 def _select(lookups: dict[int, BoxLookup], tracks: dict[int, Track], t: float, sel: dict[str, Any],
-            allowed: Optional[set[int]] = None) -> list[tuple[int, np.ndarray]]:
+            allowed: Optional[set[int]] = None, invalid: Optional[dict[int, int]] = None
+            ) -> list[tuple[int, np.ndarray]]:
     pri_map = sel.get("role_priority", {}) or {}
     cands = []
     for tid, lk in lookups.items():
@@ -76,10 +103,12 @@ def _select(lookups: dict[int, BoxLookup], tracks: dict[int, Track], t: float, s
         b = lk.at(t)
         if b is None:
             continue
-        b = np.clip(b, 0.0, 1.0)
-        area = float((b[2] - b[0]) * (b[3] - b[1]))
-        if area < float(sel.get("min_box_area", 0.002)):
+        b = valid_box(b, float(sel.get("min_box_area", 0.002)))
+        if b is None:  # NaN/inf, перевёрнутый, вне 0..1 (пиксели?), нулевой площади — не гадаем позу
+            if invalid is not None:
+                invalid[tid] = invalid.get(tid, 0) + 1
             continue
+        area = float((b[2] - b[0]) * (b[3] - b[1]))
         tr = tracks[tid]
         pri = float(pri_map.get(tr.role, 1.0)) + float(tr.role_conf or 0.0) + 0.5 * math.sqrt(area)
         cands.append((pri, tid, b))
@@ -95,8 +124,8 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
     times = [float(t) for t in (getattr(clip, "times", None) or [])]
     mode = enabled_mode(cfg)
     if mode == "false":
-        set_status(state="disabled", stage_status="skipped", reason="ml/pose отключена (enabled: false)",
-                   coverage=_coverage(times, {}, 0, 1, persons))
+        set_status(state="disabled", stage_status="skipped", available=False,
+                   reason="ml/pose отключена (enabled: false)", coverage=_coverage(times, {}, 0, 1, persons))
         return []
     if not persons or not times:
         set_status(state="no_persons", stage_status="ok", n_crops=0, elapsed_s=0.0,
@@ -109,7 +138,7 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
         msg = "pose backend unavailable: " + "; ".join(errors)
         log.warning("%s — позы пропущены, сигналы позы будут unknown", msg)
         stage = "skipped" if (mode == "auto" and only_missing) else "failed"
-        set_status(state="failed", stage_status=stage, error=msg, warnings=[msg], n_crops=0,
+        set_status(state="unavailable", stage_status=stage, available=False, error=msg, warnings=[msg], n_crops=0,
                    elapsed_s=time.perf_counter() - t_start, coverage=_coverage(times, {}, 0, 1, persons))
         return []
     sel = backend_selection(cfg, backend.name)
@@ -129,9 +158,13 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
     n_crops = 0
     n_frames = 0
     stride = 1
+    invalid: dict[int, int] = {}
+    min_pose_score = float(sel.get("min_pose_score", cfg.get("signals", {}).get("kp_min_score", 0.3)))
+    geo_margin = float(sel.get("geometry_margin", 0.35))
+    empty_poses = 0
 
     def flush() -> bool:
-        nonlocal error, state
+        nonlocal error, state, empty_poses
         if not pending:
             return True
         items = [(p[0], p[1]) for p in pending]
@@ -141,18 +174,31 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
         except Exception as exc:  # noqa: BLE001 — не роняем пайплайн, но и не скрываем
             error = f"{backend.name}.infer: {type(exc).__name__}: {exc}"
             log.warning("pose inference failed — %s", error)
-            state = "failed" if not results else "partial"
+            state = "failed"  # даже если часть поз уже есть: стадия не дошла до конца
             pending.clear()
             return False
         for (frame, box_px, t, tid, bbox_n, wh), (kp, sc) in zip(pending, outs):
             w, h = wh
+            kp = np.asarray(kp, dtype=np.float32).reshape(-1, 2)[:17]
+            sc = np.nan_to_num(np.asarray(sc, dtype=np.float32).reshape(-1)[:17], nan=0.0)
+            if kp.shape[0] < 17 or sc.shape[0] < 17 or not np.all(np.isfinite(kp)) or float(sc.max()) < min_pose_score:
+                empty_poses += 1  # поза не найдена / неуверенна: не выдаём скелет (unknown), а не нули
+                continue
             kn = np.zeros((17, 3), dtype=np.float32)
             kn[:, 0] = kp[:, 0] / w
             kn[:, 1] = kp[:, 1] / h
             kn[:, 2] = sc
             outside = (kn[:, 0] < -0.02) | (kn[:, 0] > 1.02) | (kn[:, 1] < -0.02) | (kn[:, 1] > 1.02)
             kn[outside, 2] *= 0.5
+            # точки далеко за bbox своего трека не принадлежат этому человеку → score 0 (unknown)
+            bw, bh = float(bbox_n[2] - bbox_n[0]), float(bbox_n[3] - bbox_n[1])
+            far = ((kn[:, 0] < bbox_n[0] - geo_margin * bw) | (kn[:, 0] > bbox_n[2] + geo_margin * bw) |
+                   (kn[:, 1] < bbox_n[1] - geo_margin * bh) | (kn[:, 1] > bbox_n[3] + geo_margin * bh))
+            kn[far, 2] = 0.0
             kn[:, :2] = np.clip(kn[:, :2], 0.0, 1.0)
+            if float(kn[:, 2].max()) < min_pose_score:
+                empty_poses += 1
+                continue
             results.setdefault(tid, []).append((t, kn, bbox_n, wh))
         pending.clear()
         return True
@@ -160,7 +206,7 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
     i = 0
     while i < len(times):
         t = times[i]
-        chosen = _select(lookups, persons, t, sel, allowed)
+        chosen = _select(lookups, persons, t, sel, allowed, invalid)
         if chosen:
             if n_crops + len(chosen) > max_total:
                 warnings.append(f"max_crops_total={max_total} достигнут на t={t:.2f}s")
@@ -211,11 +257,25 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
                                     keypoints=[(float(x), float(y), float(s)) for x, y, s in kps[j]], extra=extra))
     poses.sort(key=lambda p: (p.t, p.track_id if p.track_id is not None else -1))
     capped = any("max_crops_total" in w for w in warnings)
-    if (stride > 1 or capped) and state == "ok":
+    if invalid:
+        warnings.append(f"невалидные bbox пропущены: {sum(invalid.values())} (треки {sorted(invalid)[:10]})")
+    if state == "ok" and n_crops and not poses:
+        state = "no_poses"
+        warnings.append("поза не найдена ни на одном кропе — сигналы позы unknown")
+    elif state == "ok" and (stride > 1 or capped):
         state = "partial"
-    stage = {"ok": "ok", "partial": "ok", "mock": "mock"}.get(state, "failed")
-    set_status(state=state, stage_status=stage, backend=backend.name, error=error, warnings=warnings + errors,
-               n_crops=n_crops, n_frames=n_frames, stride=stride, elapsed_s=round(time.perf_counter() - t_start, 3),
+    if state == "failed":
+        stage = "failed"
+    elif state == "mock":
+        stage = "mock"
+    elif capped:
+        stage = "timeout"  # лимит кропов: конец видео без позы (см. coverage.analyzed_until_sec)
+    else:
+        stage = "ok"
+    set_status(state=state, stage_status=stage, available=True, backend=backend.name, mock=backend.name == "mock",
+               error=error, warnings=warnings + errors, n_crops=n_crops, n_frames=n_frames, stride=stride,
+               poses_emitted=len(poses), empty_poses=empty_poses, invalid_boxes=sum(invalid.values()),
+               elapsed_s=round(time.perf_counter() - t_start, 3),
                providers=list(getattr(backend, "providers", []) or []),
                coverage=_coverage(times, results, n_frames, stride, persons, capped=capped,
                                   stopped_early=error is not None))
