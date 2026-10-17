@@ -31,7 +31,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
-from .catalog import norm_status, resolve_catalog, type_info
+from .catalog import legal_basis_of, norm_status, resolve_catalog, type_info
 from .config import RuleSpec, RulesConfig, load_rules_config
 from .expr import EvalContext
 from .signals import SignalSeries, build_series, derive_from_tracks, polygon_bbox, track_box_at
@@ -74,6 +74,16 @@ SIGNAL_RU: dict[str, str] = {
     "handover_motion": "движение передачи",
     "motion_energy": "интенсивность движения",
 }
+
+
+DETECTIONS = ("violation_candidate", "observation", "insufficient_context")
+
+
+def detection_of(rule: RuleSpec, assessment: str) -> str:
+    """Ось обнаружения (поведение по видео), независимая от правовой опоры."""
+    if assessment == INSUFFICIENT:
+        return "insufficient_context"
+    return "violation_candidate" if rule.kind == "violation" else "observation"
 
 
 def assessment_of(ev: Any) -> str:
@@ -249,9 +259,39 @@ class RulesReport:
             return out
         return pts
 
+    def coverage(self) -> dict[str, Any]:
+        """Полнота наблюдений для meta.coverage: неполный анализ ≠ «нарушений нет».
+
+        ``signals`` — доля кадров с известным значением сигнала; ``rules`` — доля кадров, где известны
+        все сигналы обязательных предикатов правила (0 — правило не могло ничего доказать).
+        """
+        s = self.series
+        out: dict[str, Any] = {"n_frames": s.n,
+                               "t_first": _r(s.times[0], 2) if s.n else None,
+                               "t_last": _r(s.times[-1], 2) if s.n else None,
+                               "signals": {}, "rules": {}}
+        if s.n == 0:
+            return out
+        for nm in sorted(s.signals):
+            out["signals"][nm] = _rf(s.known(nm).mean(), 3)
+        for rule in (self.config.enabled_rules if self.config else []):
+            names = sorted(rule.mandatory_names)
+            if not names:
+                continue
+            known = np.ones(s.n, dtype=bool)
+            for nm in names:
+                known &= s.known(nm)
+            out["rules"][rule.id] = _rf(known.mean(), 3)
+        out["not_evaluable_rules"] = sorted(r for r, v in out["rules"].items() if v == 0.0)
+        return out
+
     def summary(self) -> dict[str, Any]:
         groups = split_by_assessment(self.events)
+        det: dict[str, int] = {d: 0 for d in DETECTIONS}
+        for e in self.events:
+            det[e.extra.get("detection", "observation")] = det.get(e.extra.get("detection", "observation"), 0) + 1
         return {"n_events": len(self.events), **{a: len(v) for a, v in groups.items()},
+                "detection": det,
                 "absent_signals": sorted(self.series.absent), "derived_signals": dict(self.series.derived),
                 "catalog_source": self.catalog_source, "warnings": list(self.warnings)}
 
@@ -426,6 +466,8 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
             "rule_id": rule.id,
             "rule_ids": [rule.id],
             "assessment": assessment,
+            "detection": detection_of(rule, assessment),
+            "legal_basis": legal_basis_of(norm["status"]),
             "assessment_reasons": list(reasons),
             "legal_claim": False,  # правила не делают юридических выводов — только признаки
             "type_name": info["name"],
@@ -600,6 +642,9 @@ def _merge_same_type(events: list[Any], cfg: RulesConfig) -> list[Any]:
             conf = min(cap, primary.confidence + cfg.corroboration_bonus * max(0, n_corrob))
             extra = dict(primary.extra)
             extra["rule_ids"] = rule_ids
+            det_rank = {"violation_candidate": 3, "observation": 2, "insufficient_context": 1}
+            extra["detection"] = max((e.extra.get("detection", "observation") for e in g),
+                                     key=lambda d: det_rank.get(d, 0))
             extra["evidence_t"] = sorted({t for e in top for t in e.extra.get("evidence_t", [])} | {first.t_peak})[:3]
             extra["merged"] = [{"rule_id": e.extra.get("rule_id"), "assessment": e.extra.get("assessment"),
                                 "t_start": e.t_start, "t_end": e.t_end, "t_peak": e.t_peak,
@@ -656,7 +701,8 @@ def evaluate(states: Sequence[Any], tracks: Sequence[Any] = (), zones: Sequence[
     for r in cfg.enabled_rules:
         needed |= r.names
     series = build_series(states, needed, defaults=cfg.signal_defaults, ffill_max_s=cfg.ffill_max_s,
-                          merge_policy=cfg.merge_policy)
+                          merge_policy=cfg.merge_policy, known_min_conf=cfg.known_min_conf,
+                          observed_one_sided=cfg.observed_one_sided)
     report = RulesReport(events=[], series=series, warnings=warnings, catalog_source=cat_src, config=cfg)
     if series.n == 0:
         warnings.append("нет состояний сцены — правила не применялись")

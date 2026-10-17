@@ -100,6 +100,11 @@ class RuleSpec:
     max_events: int = 3
 
     @property
+    def mandatory_names(self) -> frozenset[str]:
+        """Сигналы обязательных предикатов (strength), без исключений/якорей."""
+        return frozenset(self.strength.names)
+
+    @property
     def names(self) -> frozenset[str]:
         names = set(self.strength.names)
         for e in (self.gate, self.anchor, self.inaction.before if self.inaction else None):
@@ -115,6 +120,8 @@ class RulesConfig:
     signal_defaults: dict[str, float] = field(default_factory=dict)
     signal_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
     ffill_max_s: float = 1.0
+    known_min_conf: float = 0.5
+    observed_one_sided: bool = True
     merge_policy: str = "max"
     derive_from_tracks: bool = True
     presence_tol_s: float = 0.6
@@ -269,6 +276,8 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         signal_defaults={str(k): float(v) for k, v in (raw.get("signal_defaults") or {}).items()},
         signal_ranges=ranges,
         ffill_max_s=_num(glob, "ffill_max_s", 1.0, 0, 60, "global."),
+        known_min_conf=_num(glob, "known_min_conf", 0.5, 0, 1, "global."),
+        observed_one_sided=bool(glob.get("observed_one_sided", True)),
         merge_policy=str(glob.get("merge_policy", "max")),
         derive_from_tracks=bool(glob.get("derive_from_tracks", True)),
         presence_tol_s=_num(glob, "presence_tol_s", 0.6, 0, 10, "global."),

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-__all__ = ["FALLBACK_CATALOG", "resolve_catalog", "type_info", "norm_status", "SEVERITY_DEFAULT"]
+__all__ = ["FALLBACK_CATALOG", "resolve_catalog", "type_info", "norm_status", "legal_basis_of", "SEVERITY_DEFAULT"]
 
 SEVERITY_DEFAULT = "medium"
 
@@ -26,6 +26,7 @@ FALLBACK_CATALOG: dict[str, Any] = {
         "V06": {"name": "Приём пищи или напитков на рабочем месте с наличными", "severity": "low"},
         "V07": {"name": "Нарушение порядка приёма-передачи инкассаторской сумки", "severity": "high"},
         "V08": {"name": "Пересчёт или передача наличных вне обзора камеры", "severity": "medium"},
+        "V09": {"name": "Личные вещи на кассовом столе", "severity": "low"},
         "V99": {"name": "Иное подозрительное действие", "severity": "low"},
     },
 }
@@ -66,22 +67,34 @@ def type_info(catalog: Mapping[str, Any], type_id: str) -> dict[str, Any]:
 
 
 def norm_status(catalog: Mapping[str, Any], type_id: str) -> dict[str, Any]:
-    """Есть ли у типа проверенная норма в каталоге A13.
+    """Есть ли у типа подтверждённая норма в каталоге A13.
 
-    ``status``: ``verified`` (хотя бы одна запись ``rules`` с ``verified: true`` и непустым URL),
-    ``unverified`` (нормы есть, но не проверены), ``absent`` (типа/норм нет — в т.ч. fallback).
-    Сами нормы здесь не используются и не выдумываются — только флаг для оценки события.
+    ``status``:
+    ``verified`` — запись ``rules`` с ``verified: true`` и непустым URL, а ``legal_status`` (если A13 его
+    задал) равен ``confirmed``; ``candidate`` — ``legal_status: candidate`` (пункт найден, «требует
+    сверки»); ``disabled`` — ``legal_status: disabled``; ``unverified`` — нормы есть, но не проверены;
+    ``absent`` — типа/норм нет (в т.ч. fallback). Нормы здесь не используются и не выдумываются.
     """
     types = catalog.get("types") or {}
     entry = types.get(type_id)
     if not isinstance(entry, Mapping):
-        return {"status": "absent", "n_rules": 0, "n_verified": 0}
+        return {"status": "absent", "n_rules": 0, "n_verified": 0, "legal_status": None}
+    legal = str(entry.get("legal_status") or "").strip().lower() or None
     refs = [r for r in (entry.get("rules") or []) if isinstance(r, Mapping)]
     verified = [r for r in refs if r.get("verified") is True and str(r.get("url") or "").strip()]
-    if verified:
+    if legal == "disabled":
+        status = "disabled"
+    elif verified and legal in (None, "confirmed"):
         status = "verified"
+    elif legal == "candidate":
+        status = "candidate"
     elif refs:
         status = "unverified"
     else:
         status = "absent"
-    return {"status": status, "n_rules": len(refs), "n_verified": len(verified)}
+    return {"status": status, "n_rules": len(refs), "n_verified": len(verified), "legal_status": legal}
+
+
+def legal_basis_of(status: str) -> str:
+    """Правовая опора события: ``confirmed`` | ``candidate`` (требует сверки) | ``none``."""
+    return {"verified": "confirmed", "candidate": "candidate"}.get(status, "none")
