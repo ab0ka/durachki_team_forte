@@ -261,3 +261,45 @@ def test_unknown_job_404(client_factory):
     with client_factory(spec(ok_run)) as c:
         assert c.get("/api/v1/jobs/0123456789abcdef", headers=H).status_code == 404
         assert c.get("/api/v1/jobs/..%2F..%2Fetc", headers=H).status_code == 404
+
+
+def test_timeout_calls_pipeline_cancel_and_frees_gpu(client_factory):
+    """A03 cancel(job_id): после таймаута API просит пайплайн остановиться — run() возвращается,
+    GPU освобождается без gpu_hung, следующая задача выполняется."""
+    from backend.api.worker import PipelineSpec
+    stop = threading.Event()
+    cancelled = []
+
+    def run(video_path, job_id, progress, deadline_s=240):
+        if not cancelled:
+            stop.wait(10)
+        return make_result(job_id)
+
+    def cancel(job_id):
+        cancelled.append(job_id)
+        stop.set()
+        return True
+    kw = dict(watchdog_s=0.8, budget_s=0.7, job_cap_s=0.3, min_deadline_s=0.1, deadline_grace_s=0.1,
+              hung_gpu_s=0.2)
+    try:
+        with client_factory(PipelineSpec(run=run, cancel=cancel, mode="real"), **kw) as c:
+            j1 = upload(c, FTYP_ONLY).json()["job_id"]
+            d1 = wait_job(c, j1)
+            assert d1["status"] == "failed" and "timeout" in d1["error"]
+            end = time.time() + 3
+            while time.time() < end and not cancelled:
+                time.sleep(0.02)
+            assert cancelled == [j1]
+            assert wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])["status"] == "done"
+            assert c.get("/readyz").status_code == 200
+    finally:
+        stop.set()
+
+
+def test_release_gpu_called_on_shutdown(client_factory):
+    from backend.api.worker import PipelineSpec
+    released = []
+    with client_factory(PipelineSpec(run=ok_run, release_gpu=lambda: released.append(1) or {},
+                                     mode="real")) as c:
+        assert c.get("/healthz").status_code == 200
+    assert released == [1]

@@ -50,6 +50,8 @@ class PipelineSpec:
     manages_gpu: bool = False     # pipeline сам держит GPU-лок -> API не оборачивает run()
     accepts_deadline_at: bool = False
     version: str = ""
+    cancel: Optional[Callable[[str], Any]] = None      # A03: cancel(job_id) — остановить и освободить GPU
+    release_gpu: Optional[Callable[[], Any]] = None    # A03: release_gpu() — при остановке сервиса
 
 
 def _accepts_kw(fn: Callable[..., Any], name: str) -> bool:
@@ -77,9 +79,12 @@ def resolve_pipeline(settings: Settings) -> PipelineSpec:
     warm = getattr(mod, "warmup", None) if not fn else None
     manages = any(hasattr(mod, a) for a in ("GPU_LOCK", "GPU_SEMAPHORE", "gpu_lock"))
     version = str(getattr(mod, "PIPELINE_VERSION", None) or getattr(mod, "__version__", None) or "")
+    cancel = getattr(mod, "cancel", None) if not fn else None
+    release = getattr(mod, "release_gpu", None) if not fn else None
     return PipelineSpec(run=run, warmup=warm if callable(warm) else None, mode="real",
                         manages_gpu=manages, accepts_deadline_at=_accepts_kw(run, "deadline_at"),
-                        version=version)
+                        version=version, cancel=cancel if callable(cancel) else None,
+                        release_gpu=release if callable(release) else None)
 
 
 def mock_env_active() -> bool:
@@ -220,6 +225,12 @@ class JobManager:
         self._stop.set()
         with self._cv:
             self._cv.notify_all()
+        spec = self.pipeline
+        if spec is not None and spec.release_gpu is not None:  # не оставлять процесс-воркер A03
+            t = threading.Thread(target=self._safe_call, args=(spec.release_gpu, "release_gpu"),
+                                 name="sentinel-release-gpu", daemon=True)
+            t.start()
+            t.join(5.0)
         end = time.monotonic() + timeout
         for t in list(self._threads):
             t.join(max(0.0, end - time.monotonic()))
@@ -707,11 +718,23 @@ class JobManager:
             th = info.get("thread")
             if th is not None and th.is_alive():
                 self._zombies[th] = {"job_id": job_id, "since": now}
+        spec = self.pipeline
+        if self.s.cancel_on_timeout and spec is not None and spec.cancel is not None:
+            # A03 останавливает воркер и выгружает модели: run() вернётся, GPU освободится сам
+            self._spawn(lambda: self._safe_call(spec.cancel, "cancel", job_id), f"sentinel-cancel-{job_id[:8]}")
         if self.s.zombie_release_gpu:
             self.gpu.release(job_id)
         else:
             log.warning("pipeline.run still running after timeout; GPU stays with it (single owner)",
                         extra={"job_id": job_id})
+
+    @staticmethod
+    def _safe_call(fn: Callable[..., Any], what: str, *args: Any) -> None:
+        try:
+            r = fn(*args)
+            log.info(f"pipeline.{what} done", extra={"result": str(r)[:200]})
+        except Exception as e:
+            log.warning(f"pipeline.{what} failed", extra={"error": f"{type(e).__name__}: {e}"[:200]})
 
     # ------------------------------------------------------------ restart / cleanup
     def _recover(self) -> None:

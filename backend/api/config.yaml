@@ -23,6 +23,7 @@ max_queue: 12                   # backlog: активных (в очереди +
 max_attempts: 3                 # перезапусков после падения процесса
 max_zombie_workers: 2           # сколько «зависших» потоков терпим, подменяя их новыми
 zombie_release_gpu: false       # false: GPU остаётся за зависшим run() (один владелец GPU вместе с A03)
+cancel_on_timeout: true         # по таймауту вызвать backend.pipeline.cancel(job_id) (A03), если он есть
 hung_gpu_s: 60                  # зависший run() держит GPU дольше -> /readyz 503 (сигнал перезапуска)
 restart_fresh_budget: false     # false: после рестарта дедлайн по-прежнему от приёма файла
 pass_deadline_at: true          # передавать run(..., deadline_at=приём+budget_s), если run его принимает

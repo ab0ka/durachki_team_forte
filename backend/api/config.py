@@ -34,6 +34,7 @@ class Settings:
     max_attempts: int = 3
     max_zombie_workers: int = 2
     zombie_release_gpu: bool = False
+    cancel_on_timeout: bool = True
     hung_gpu_s: float = 60.0
     restart_fresh_budget: bool = False
     pass_deadline_at: bool = True
