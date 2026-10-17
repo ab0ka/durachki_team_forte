@@ -81,7 +81,7 @@ def test_checkpoint_roundtrip(toy, cfg, tmp_path):
 def test_temporal_head_shapes_and_learning(toy, cfg, tmp_path):
     torch = pytest.importorskip("torch")
     samples, bank, spec = _prep(toy, cfg)
-    from ml.temporal.model import build_model, loss_fn
+    from ml.temporal.model import build_model
 
     gru_cfg = {**cfg, "model": {**cfg["model"], "arch": "tcn_gru"}}
     net = build_model(spec.in_dim, gru_cfg)               # вариант с BiGRU и упакованными последовательностями

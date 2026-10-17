@@ -10,7 +10,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 from .config import TYPE_IDS
-from .features import FeatureSet, TextBank, sims, type_scores
+from .features import FeatureSet, TextBank, type_scores
 
 
 @dataclass

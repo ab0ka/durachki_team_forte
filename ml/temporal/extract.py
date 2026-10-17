@@ -18,7 +18,7 @@ from typing import Optional, Sequence
 
 from .augment import make_augmenter
 from .config import cache_dir, feature_signature, load_config, stable_hash
-from .features import FeatureSet, cache_path, extract_clip, get_backend, get_text_bank
+from .features import cache_path, extract_clip, get_backend, get_text_bank
 from .labels import assign_groups, file_md5, find_videos, read_labels
 
 log = logging.getLogger("sentinel.temporal")

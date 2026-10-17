@@ -7,7 +7,7 @@ import pytest
 
 def test_siglip_backend_image_path_tiny_random(tmp_path):
     pytest.importorskip("torch")
-    tf = pytest.importorskip("transformers")
+    pytest.importorskip("transformers")
     from transformers import SiglipConfig, SiglipImageProcessor, SiglipModel
 
     cfg = SiglipConfig(

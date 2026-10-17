@@ -129,6 +129,9 @@ python -m pytest ml/temporal/tests -q                                          #
 - **A01:** `_contract_fallback.py` — копия контракта. Удалить после мерджа `contracts/`; импорт уже
   через `try: from contracts.sentinel_contracts import ...`. Пустой `ml/__init__.py` добавлен
   (разрешённое исключение).
+- **Git:** ветка `claude/upbeat-ride-3bylsq` начинается с коммита A01 `076a23b`, который не связан с `main`
+  (`02b6e4d`, пустой корень). Поэтому GitHub отказывается открывать PR («no history in common»).
+  История не переписывалась, `main` не мерджился — истории объединяет интегратор.
 - **TODO:** откалибровать `prompts.yaml` и `infer.*` на реальных данных. Сравнить baseline и temporal
   по `nested`/`holdout`. Если команда разметит типы — добавить `type_id` и переобучить.
   Опционально — ONNX-экспорт SigLIP2 для CPU.
