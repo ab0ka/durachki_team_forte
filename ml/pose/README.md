@@ -1,10 +1,10 @@
 # ml/pose — поза COCO-17 и поза-сигналы (агент A07)
 
-Дополнительный источник сигналов для Kassa Sentinel. Поза — **подсказка**, не доказательство:
-рука у уха не доказывает телефон, рука у рта — еду, пропавшие точки — сокрытие рук.
-Предметные выводы делаются только при наличии предмета (трек `cell_phone` / `cup` / `bottle` / `food`
-в аргументе `tracks`) и достаточной видимости. Низкая уверенность / окклюзия → **unknown**, а не ложный ноль
-и не нарушение.
+Поза — **дополнительный источник подсказок**, а не доказательство. Рука у уха не доказывает телефон,
+рука у рта — еду, пропавшие точки — сокрытие рук. Предметные выводы делаются только при наличии предмета
+(объект-трек `cell_phone` / `cup` / `bottle` / `food` в аргументе `tracks`) и достаточной видимости.
+Низкая уверенность или окклюзия → **unknown**, а не ложный ноль и не нарушение. Production никогда
+не переключается на mock сам; неполный анализ позы виден в `status()["coverage"]`.
 
 ## Публичные функции (сигнатуры контракта v1 не менялись)
 
@@ -13,148 +13,219 @@ from ml.pose import estimate, pose_signals, warmup, status
 
 poses  = estimate(clip, tracks)               # -> list[PoseFrame] (фактически PoseFrameX, наследник)
 states = pose_signals(poses, tracks, zones)   # -> list[SceneState] (фактически PoseSceneState, наследник)
-warmup()   # -> bool: загрузить и прогреть бэкенд; False — бэкенд недоступен
-status()   # -> dict: итог последнего estimate(): state, backend, error, warnings, n_crops, stride, elapsed_s
+warmup()   # -> bool: загрузить и прогреть бэкенд; False — выключен или недоступен
+status()   # -> dict: итог последнего estimate(): state, stage_status, backend, error, warnings, coverage
 ```
 
-* `estimate` никогда не бросает исключение из-за позы: нет весов / сбой onnxruntime → `[]`,
-  `status()["state"] == "failed"` и `error` с причиной, warning в логгер `ml.pose`.
-  **Поддельные (mock) позы при сбое не подставляются** — mock только по явному `SENTINEL_MOCK=1`.
-* Импорт пакета без побочных эффектов; numpy/cv2/onnxruntime импортируются лениво.
+`estimate` никогда не бросает исключение из-за позы. Нет весов или сбой → `[]`, причина в `status()`
+и в логгере `ml.pose`. Импорт пакета без побочных эффектов: numpy, cv2, onnxruntime и mediapipe
+импортируются лениво.
 
-### Семантика `SceneState.signals`
+Инструмент замера: `python -m ml.pose.ab` (см. раздел «Замер для L2»).
 
-| значение | смысл |
-|---|---|
-| ключа нет | **unknown**: окклюзия, низкий score точек, нет нужного предмета, нет кассира в кадре |
-| `< 0.5` | наблюдаемое «нет» (нужные точки видны; для предметных сигналов — предмет есть, но не у руки/головы) |
-| `≥ 0.5` | сигнал активен после гистерезиса и требований к длительности |
+## Флаги (каждый новый режим по умолчанию выключен до замера L2)
 
-Список неопределимых в момент `t` сигналов — `state.extra["unknown"]`.
-
-| сигнал | что считаем по позе | обязательный предмет / условие | unknown, когда |
+| флаг | где | по умолчанию | смысл |
 |---|---|---|---|
-| `phone_to_ear` | запястье у уха/головы ≥ 1.5 с (гистерезис) | трек `cell_phone` у головы/кисти хотя бы в одном кадре отрезка | голова/кисти не видны; жест есть, телефона нет |
-| `phone_in_hand` | запястье рядом с bbox телефона ≥ 1 с | трек `cell_phone` в момент t | телефона в кадре нет |
-| `eating_drinking` | повторяющееся движение кисти ко рту (кисть идёт к голове, а не голова к кистям) | трек `cup`/`bottle`/`food` у кисти/рта во время подхода | жест без предмета; рот/кисти не видны |
-| `hands_hidden` | обе кисти видны → `0.0` («руки не скрыты») | позитив из позы **выключен** (`allow_positive_from_pose: false`) | кисти не видны (это окклюзия, а не умысел) |
-| `cashier_facing_away` | нормаль к линии плеч направлена от зоны `desk` (или на `door`) ≥ 2 с | зона `desk` (или `cash_tray`) | нет зоны; плечи не видны/«схлопнуты» |
-| `handover_motion` | вытянутые кисти двух людей сближаются (над `desk`/`cash_tray`, если зоны есть) | — (это движение, не утверждение о предмете) | у кого-то из пары не видно кистей |
+| `enabled` | config / `SENTINEL_POSE_ENABLED=0\|1\|auto` | `auto` | `false` → `estimate()` = `[]`, `stage_status: skipped`, все сигналы позы unknown. `auto` → нет весов = `skipped` (не `failed`). `1` → нет бэкенда = `failed` |
+| бэкенд | `backend.order` / `SENTINEL_POSE_BACKEND=rtmpose_onnx\|mediapipe\|mock` | `[rtmpose_onnx]` | один бэкенд на запуск. MediaPipe — переключаемый вариант; mock — только явно (тесты и демо) |
+| `signals.enabled` | config | `phone_in_hand, eating_drinking, hands_hidden, handover_motion` | какие ключи SIGNALS считать. Хрупкие `phone_to_ear` и `cashier_facing_away` — opt-in, код сохранён |
+| `signals.extras.motion` | config | `false` | `extra["motion"]`: sitting / standing / walking + направление |
+| `signals.extras.item_placed_on_desk` | config | `false` | `extra["placements"]`: кто и когда положил предмет на стол |
+| `signals.extras.bending_to_safe` | config | `false` | хрупкий жест «наклон к сейфу» |
+| пресеты | `SENTINEL_POSE_CONFIG=ml/pose/presets/<x>.yaml` | — | `extras_on.yaml` (motion + items), `fragile_on.yaml` (жесты фазы 1) |
 
-«Кассирские» сигналы (`phone_*`, `eating_drinking`, `hands_hidden`, `cashier_facing_away`) берутся только
-по трекам с `role == "cashier"` (`signals.staff_roles`). Значения по всем людям — в `extra["by_track"]`.
+Все флаги читаются при каждом вызове, а не при импорте (работает и `eval.ablate --inproc-arms`).
+
+## Сигналы и семантика
+
+| значение в `SceneState.signals` | смысл |
+|---|---|
+| ключа нет | **unknown**: окклюзия, низкий score, нет нужного предмета, нет кассира в кадре |
+| `< 0.5` | наблюдаемое «нет»: нужные точки видны; для предметных сигналов предмет есть, но не у руки/рта |
+| `≥ 0.5` | сигнал активен после гистерезиса (`thr_on`/`thr_off`), требований к длительности и склейки дребезга (`max_gap_s`) |
+
+| сигнал (по умолчанию) | условие активности | unknown, когда |
+|---|---|---|
+| `phone_in_hand` | кисть кассира у bbox трека `cell_phone` ≥ 1 с | телефона в кадре нет |
+| `eating_drinking` | повторяющееся «кисть ко рту» (кисть идёт к голове, а не голова к рукам) **и** `cup`/`bottle`/`food` у рта, пока кисть у рта | жест без предмета у рта; рот или кисти не видны |
+| `hands_hidden` | только `0.0` при видимых кистях; позитив из позы выключен | кисти не видны: это окклюзия, а не умысел |
+| `handover_motion` | вытянутые кисти двух людей сближаются (над `desk`/`cash_tray`, если зоны есть) | у кого-то из пары не видно кистей |
+| `phone_to_ear` (opt-in) | кисть у уха ≥ 1.5 с **и** `cell_phone` у головы/кисти | жест без телефона |
+| `cashier_facing_away` (opt-in) | нормаль к линии плеч направлена от зоны `desk` ≥ 2 с | нет зоны `desk`, плечи не видны |
+
+«Кассирские» сигналы считаются только по трекам с `role == "cashier"`. Значения по всем людям — в
+`extra["by_track"]`. Роль задаёт A06 по поведению и зоне, а не по порядку появления.
 
 ### `PoseSceneState.extra`
 
-* `gestures` — подсказки без предмета, **не доказательства**: `hand_at_head`, `hand_to_mouth`,
-  `hands_not_visible` (0..1, только для кассира);
-* `by_track[tid]` — `role`, `signals`, `gestures`, `bending_to_safe`, `sitting`, `bbox` для каждого человека;
-* `track_ids[signal]`, `boxes[signal]` — кто и где (bbox норм.) дал активный сигнал (для `Event.track_ids/bboxes`);
-* `bending_to_safe` (нужна зона `safe`), `sitting` / `standing` (эвристика; `None` при низкой уверенности);
-* `handover_pairs` — `[tid_a, tid_b, role_a, role_b, value]` для активных пар;
-* `n_posed`, `staff_track_ids`, `pose_status` (из `status()`), `unknown`.
+* `runs[signal] = {t_start, t_end, t_peak}` — для активного отрезка. `t_start` — начало перехода
+  (кандидат таймкода: «поднесла», «подошёл»), `t_peak` — максимум (для еды — первый контакт кисти со
+  ртом). Какую точку отдавать жюри, решает замер, а не глаз.
+* `track_ids[signal]`, `boxes[signal]` — кто и где (bbox норм.) дал активный сигнал.
+* `gestures` — подсказки без предмета, **не доказательства**: `hand_to_mouth`, `hands_not_visible`
+  (+ `hand_at_head`, если включён `phone_to_ear`).
+* `motion` (если `extras.motion`) — `{state: walking|standing|sitting|unknown, speed, run}` кассира.
+  `run = {t_start, t_end, direction, toward, away_from}`: `t_start` — момент «отошла», `toward`/`away_from` —
+  зона (`door`, `desk`, `safe`, …) по направлению движения. `None` — данных нет.
+* `item_placed_on_desk` / `placements` (если `extras.item_placed_on_desk`) — `1.0` в окне события, иначе
+  `0.0`; `None` — нет зоны `desk` или объект-треков. Событие: `{t_start (кисть у предмета), t_settle
+  (предмет лёг), person_track_id, role, object_track_id, label, bbox}`. Событием не считаются: предмет,
+  лежавший с начала ролика; новый трек на месте старого (смена id); появление предмета без кисти рядом.
+* `by_track`, `staff_track_ids`, `handover_pairs`, `n_posed`, `pose_status`, `enabled`, `unknown`.
 
 ### `PoseFrameX.extra`
 
 `bbox` (норм.), `source` (`rtmpose-onnx` | `mediapipe` | `mock`), `frame_wh`, `role`, `smoothed`,
-`schema: "coco17"`, опционально `raw_keypoints`. `keypoints` — всегда 17 точек в порядке COCO-17,
-`(x, y)` нормированы к кадру после поворота, `score ∈ 0..1`.
+`schema: "coco17"`. `keypoints` — всегда 17 точек COCO-17, `(x, y)` нормированы к кадру после поворота,
+`score ∈ 0..1`. Горизонтальное видео «под другим углом» обрабатывается так же: геометрия изотропная
+по `frame_wh`, расстояния — в масштабах тела.
 
-## Как это устроено
+## Бэкенды
 
-* **Бэкенд (один)**: RTMPose-m (COCO-17) на onnxruntime, CUDA → CPU. Свой батчинг кропов через кадры
-  (`batch_size: 16`, если ONNX с динамическим batch; иначе цикл), пре/пост-обработка как в rtmlib
-  (affine-кроп с padding 1.25, SimCC-декод). MediaPipe — opt-in с **явным** маппингом
-  `MP33_TO_COCO17` (тест сверяет имена точек). Whole-body (RTMW) — не по умолчанию.
-* **Выбор людей / лимиты**: только `label == "person"`, приоритет по роли (cashier > collector > visitor >
-  unknown) + `role_conf` + размер; `max_persons_per_frame: 3`, `max_crops_total: 2500`, `min_box_area`.
-* **Бюджет**: `budget_s: 10` — после `budget_probe_frames` кадров прогнозируем время и увеличиваем шаг
-  по сэмплам (до `max_stride: 5`); `status()["stride"]`, `state == "partial"`.
-* **Сглаживание**: One-Euro по времени (неравномерная сетка) с confidence gating: точка со score < 0.3
-  не обновляет фильтр, её координаты держатся `hold_s`, score остаётся низким.
-* **Геометрия**: изотропные координаты (x × W/H кадра), расстояния в единицах масштаба тела
-  (75-й перцентиль ширины плеч трека → по ушам → по bbox). Никаких пиксельных координат зон в коде —
-  только зоны из аргумента `zones` (A06).
-* **Гистерезис**: офлайн (видео целиком): семена ≥ `thr_on`, рост по ≥ `thr_off`, склейка разрывов
-  ≤ `max_gap_s`, отсев короче `min_duration_s`. Unknown-кадры — разрывы, а не нули.
+* **RTMPose-m ONNX** (`rtmpose_onnx`, порядок по умолчанию): onnxruntime CUDA → CPU, батчинг кропов
+  через кадры, SimCC-декод как в rtmlib. У L2 веса не скачаны: при `enabled: auto` стадия честно
+  `skipped` и не блокирует сервис.
+* **MediaPipe Pose Landmarker** (`mediapipe`, Tasks API, переключаемый вариант): кроп кассира
+  (bbox × 1.4, за краем кадра — чёрное поле) с апскейлом короткой стороны до 384 px (не больше ×3).
+  `num_poses: 2` — из кропа берётся поза, точки которой лежат в bbox трека. 33 landmark-а **явно**
+  перекладываются в COCO-17 (`MP33_TO_COCO17`, тест сверяет имена). `score = min(visibility, presence)`.
+  Поза не найдена → нулевые score (unknown). Отбор: только `role == cashier`, один кроп на кадр; если
+  роли нет ни у кого — top-1 по приоритету. Старый `mp.solutions` в mediapipe 0.10.35 отсутствует —
+  использую только Tasks API.
+* **mock** — только `SENTINEL_MOCK=1` / `SENTINEL_POSE_BACKEND=mock`; в отчётах помечен `mock`/`MOCK`.
 
-Все пороги — в `ml/pose/config.yaml` (ключи `thr_on`/`thr_off`: в YAML 1.1 `on`/`off` — булевы).
+Лимиты: `max_persons_per_frame: 3` (MediaPipe — 1), `max_crops_total: 2500`, бюджет `budget_s: 10`
+с адаптивным шагом по сэмплам. Шаг > 1 или упор в лимит → `state: partial`, это видно в `coverage`.
 
-## Запуск
+## Замер для L2 (видео, кадры и описания сцен — только локально)
+
+Новую сеть поз не обучаем. Каждая гипотеза — отдельная команда, одно изменение за раз.
+
+**H-A07-1. Вклад позы в итог пайплайна** (FP/FN по видео, попадание таймкода, тип, latency, VRAM — по
+протоколу A16):
+
+```bash
+python -m eval.ablate --name H-A07-pose-mp \
+  --baseline-env SENTINEL_POSE_ENABLED=0 \
+  --candidate-env SENTINEL_POSE_ENABLED=1 --candidate-env SENTINEL_POSE_BACKEND=mediapipe \
+  --candidate-env SENTINEL_POSE_MP_TASK=weights/pose/pose_landmarker_full.task \
+  --videos data/raw --labels data/labels.csv --manifest data/manifest.csv --out runs/ablate/H-A07-pose-mp
+```
+
+Решение: нет выигрыша по FN/FP или растёт latency → оставить `enabled: false` (код сохраняется).
+Эффект будет ненулевым, только если A08/A09 читают сигналы позы.
+
+**H-A07-2. Качество бэкендов на одинаковых кадрах** (уверенность и видимость запястий, локтей и головы,
+дрожание, мс/кроп, VRAM):
+
+```bash
+python -m ml.pose.ab --video data/raw/<ролик>.mov [--video ...] --out <локальная папка вне репо> \
+  --backends mediapipe,mediapipe_noup[,rtmpose_onnx]
+# или на готовых кадрах: --frames <dir> --boxes boxes.json
+```
+
+Выход: `ab_report.md` / `ab_report.json` (только числа и имена файлов), `per_crop.csv`, а также
+`overlays/<вариант>/*.jpg` — скелеты с размытыми головами, только на локальный диск (в папку кладётся
+`.gitignore` с `*`; `--no-overlays` отключает картинки). Недоступный вариант (нет весов) помечается
+`unavailable` и не прерывает прогон. `mediapipe` vs `mediapipe_noup` измеряет пользу апскейла.
+Согласие между бэкендами (PCK@0.5) — не точность: эталона нет.
+
+**H-A07-3. Новые extra** (`motion`, `item_placed_on_desk`) — только после того, как A09 начнёт их читать:
+`--baseline-env SENTINEL_POSE_ENABLED=1 --candidate-env SENTINEL_POSE_CONFIG=ml/pose/presets/extras_on.yaml`
+(остальные аргументы — как в H-A07-1).
+
+## Установка
 
 ```bash
 pip install -r ml/pose/requirements.txt
-python -m pytest ml/pose/tests -q                 # CPU, без весов и сети
-SENTINEL_MOCK=1 python -c "import ml.pose as p; print(p.warmup(), p.status())"
+# MediaPipe (opt-in): без зависимостей, иначе приедет opencv-contrib-python 5.x и сломает lock opencv<5
+pip install --no-deps "mediapipe==0.10.35" && pip install absl-py flatbuffers certifi matplotlib
+# Linux-контейнер: apt-get install libgles2 libegl1 (иначе PoseLandmarker не создаётся). Windows не проверялся.
 ```
 
-Веса (один раз, дальше офлайн): скачать zip из `models.json`, распаковать `*.onnx` в
-`$SENTINEL_WEIGHTS_DIR/pose/` (имя файла должно содержать `rtmpose-m`) или указать путь явно
-`SENTINEL_POSE_ONNX=/path/end2end.onnx`. Также находится кэш rtmlib (`~/.cache/rtmlib/hub/checkpoints`).
+Веса (один раз, дальше офлайн), см. `models.json`:
+
+* MediaPipe — `pose_landmarker_full.task` в `$SENTINEL_WEIGHTS_DIR/pose/` или `SENTINEL_POSE_MP_TASK=<путь>`.
+* RTMPose — `*rtmpose-m*.onnx` в `$SENTINEL_WEIGHTS_DIR/pose/` или `SENTINEL_POSE_ONNX=<путь>`.
 
 | env | назначение |
 |---|---|
-| `SENTINEL_MOCK=1` / `SENTINEL_POSE_BACKEND=mock` | mock-позы (шаблон в bbox), без весов |
-| `SENTINEL_POSE_MOCK_SCRIPT` | скрипт действий mock: `phone_to_ear:2-6@1;eating:7-12;hands_hidden:...;facing_away:...` |
-| `SENTINEL_POSE_ONNX` | явный путь к ONNX RTMPose |
-| `SENTINEL_WEIGHTS_DIR` | корень офлайн-весов (ищем `pose/**/*rtmpose-m*.onnx`) |
-| `SENTINEL_POSE_CONFIG` | YAML поверх `config.yaml` (deep-merge) |
-
-## Модели и лицензии
-
-См. `models.json`: RTMPose-m body7 (OpenMMLab, Apache-2.0, разрешён организаторами), MediaPipe Pose
-(Apache-2.0, opt-in). Ultralytics/AGPL, CC-BY-NC и облачные API не используются.
+| `SENTINEL_POSE_ENABLED` | `0` / `1` / `auto` — главный флаг позы |
+| `SENTINEL_POSE_BACKEND` | `rtmpose_onnx` / `mediapipe` / `mock` |
+| `SENTINEL_POSE_CONFIG` | YAML поверх `config.yaml` (deep-merge), например пресеты из `presets/` |
+| `SENTINEL_POSE_ONNX`, `SENTINEL_POSE_MP_TASK`, `SENTINEL_WEIGHTS_DIR` | пути к офлайн-весам |
+| `SENTINEL_MOCK=1`, `SENTINEL_POSE_MOCK_SCRIPT` | mock-позы и скрипт действий — только тесты/демо |
 
 ## Проверено / не проверено
 
-* Проверено: 39 pytest-тестов на CPU (Python 3.11, numpy 2.4, opencv 4.14, PyYAML 6.0, pytest 9.1) —
-  синтетические последовательности точек и синтетическое видео через `cv2.VideoWriter` с mock-бэкендом;
-  декод SimCC + обратное affine-преобразование сверены на синтетическом пике.
-* **Не проверено** (в сессии не было GPU, весов и данных): реальные веса RTMPose (download.openmmlab.com
-  недоступен из песочницы), скорость на RTX 4060, качество точек с потолочной камеры, пороги на реальных
-  роликах. Цифры скорости не приводятся, чтобы не выдумывать измерения.
+* Проверено в песочнице (CPU, Python 3.11, numpy 2.4, opencv-python-headless 4.14, PyYAML 6.0, pytest 9.1):
+  `python -m pytest ml/pose/tests` — 78 passed, 1 skipped (real-smoke MediaPipe пропускается без модели).
+  С моделью (`SENTINEL_POSE_MP_TASK`) проходит и он: настоящий mediapipe 0.10.35 Tasks API создаёт
+  PoseLandmarker и обрабатывает синтетический кадр. Установка `--no-deps` с opencv < 5 проверена в чистом
+  venv. `python -m ml.pose.ab` прогнан с настоящим MediaPipe на синтетических кадрах (без людей, поэтому
+  поза не найдена — проверялся только путь кода).
+* Синтетические тесты: позитивы и негативы на каждый сигнал. Негативы: пересчёт денег; голова к рукам;
+  стакан на столе + кисть ко рту; поправила волосы (стакан и телефон на столе); почесала ухо 2 с
+  (телефон на столе); рука у уха без телефона; пропавшие кисти; низкая уверенность.
+* **Не проверено** (нет GPU, весов RTMPose и данных): качество поз на потолочной камере, находит ли
+  MediaPipe людей сверху, скорость и VRAM на RTX 4060, пороги на реальных роликах, работа на Windows.
+  Цифр скорости не привожу: миллисекунды из песочницы на синтетике не отражают целевую машину.
 
 ## Ограничения
 
-* Вид сверху: ноги и часть кистей закрыты столом — поэтому много unknown, это ожидаемо.
-* «Рука у щеки» и «телефон у уха» по позе неразличимы — отсюда требование трека `cell_phone`.
-* Ориентация по плечам требует корректной разметки L/R моделью; при «схлопнутых» плечах (боком к
-  наклонной камере) надёжность падает → unknown.
-* `sitting/standing` — грубая эвристика.
+* Сверху ноги и часть кистей закрыты столом — много unknown, это ожидаемо и честно.
+* Детектор BlazePose (MediaPipe) опирается на голову/лицо; при виде сверху он может не находить людей —
+  это проверит H-A07-2.
+* `sitting/standing` — грубая эвристика; `walking` надёжнее (скорость корпуса в масштабах тела).
+* При выключенном свете точки пропадают — сигналы unknown, а не «нет нарушения».
 
 ## Для интегратора
 
-1. **A06 (`ml.track.track`)**: чтобы предметные сигналы были определимы, верните в `tracks` также
-   объект-треки с `label` из LABELS: `cell_phone`, `cup`, `bottle`, `food` (и `cash`, `money_counter`,
-   `cash_bag` для контекста). Сигнатуры не меняются. Если объект-треков нет — `phone_*` и
-   `eating_drinking` останутся unknown (это не ошибка). Роль `cashier` нужна для «кассирских» сигналов.
-2. **A08 (`scene_states(..., pose_states)`)**: отсутствие ключа = unknown, не подставлять `0.0`;
-   `extra` доступен как `getattr(state, "extra", {})`.
-3. **A09 (rules)**: активен ⇔ `≥ 0.5`; `extra["gestures"]` не использовать как доказательство нарушения
-   (только как повод для VLM-верификации A11); для `Event.track_ids/bboxes` — `extra["track_ids"]`,
-   `extra["boxes"]`.
-4. **A03 (pipeline)**: `ml.pose.warmup()` в `backend.pipeline.warmup()`; после `estimate` положить
-   `ml.pose.status()` в `AnalysisResult.meta` (warnings при `state in {"failed","partial"}`). Позу
-   держать необязательной стадией: при `[]` остальной пайплайн работает без неё.
-5. **A17 (deploy)**: офлайн-вес RTMPose-m в `$SENTINEL_WEIGHTS_DIR/pose/`; `onnxruntime-gpu` требует
-   CUDA 12 + cuDNN 9 (на Windows — DLL в PATH), иначе автоматически CPU.
-6. **A01 (контракт)** — предложение для v2, сейчас не реализовано: добавить в `PoseFrame` и `SceneState`
-   поле `extra: dict = field(default_factory=dict)` (сейчас — наследники `PoseFrameX`/`PoseSceneState`)
-   и зафиксировать в контракте «нет ключа в signals = unknown».
-7. После мерджа A01 удалить `ml/pose/_contract_fallback.py` (импорт в `ml/pose/_contract.py` уже
-   сначала пробует `contracts.sentinel_contracts`).
-8. `ml/pose/tests/__init__.py` есть намеренно: тесты импортируются как пакет `ml.pose.tests.*`, чтобы
-   одноимённые тест-файлы других модулей не конфликтовали (нужен пустой `ml/__init__.py`).
-
-TODO: тюнинг порогов на реальных роликах (A16, LOO); сверить `bgr_to_rgb` с `pipeline.json` из zip
-весов; опционально RTMW (кисти) для `phone_in_hand` без детектора.
+1. **История ветки.** Ветка создана до появления `main` (несвязанная история), поэтому PR в `main` GitHub
+   не открывает. Вливать по `scripts/merge_order.md` A01:
+   `git merge --no-ff --allow-unrelated-histories origin/claude/nice-gates-fjt926`. Конфликт возможен
+   только по пустому `ml/__init__.py` — берите любую сторону.
+2. **A03 (pipeline):** `ml.pose.warmup()` в warmup; после `estimate` записать
+   `meta.completeness.stages["pose"] = status()["stage_status"]` и `status()["coverage"]`. Позу **не**
+   включать в `required_stages`: это необязательная стадия, её `skipped`/`failed` не должен лишать
+   вердикта. Но и не превращать «поза не посчитана» в «нарушений нет».
+3. **A06:** возвращать в `tracks` объект-треки (`cell_phone`, `cup`, `bottle`, `food`, `bag`, `cash_bag`,
+   `cash`, `document`, `keys`) — без них предметные сигналы и `placements` остаются unknown. Роль
+   `cashier` — по поведению и зоне.
+4. **A08/A09:** отсутствующий ключ — unknown (не подставлять 0). `extra["gestures"]` не считать
+   доказательством. Таймкод брать из `extra["runs"][...]["t_start"]` / `motion.run.t_start` /
+   `placements[].t_start` (политику t_peak выбирает замер). Кандидаты по спецификации: уход кассира —
+   `motion.run.away_from == "desk"` + состояние стола и сейфа (A08) в окне после ухода; личные вещи на
+   столе — `placements` с `label == "bag"`; передача сумки из рук в руки — `handover_motion` (норма, если
+   сразу в сейф).
+5. **A17:** офлайн-модель `pose_landmarker_full.task` (sha256 в `models.json`), mediapipe ставить
+   `--no-deps` (см. «Установка»).
+6. **A01 (контракт v2, предложение):** поле `extra: dict` в `PoseFrame`/`SceneState` (сейчас — наследники)
+   и правило «нет ключа в signals = unknown». После мерджа A01 удалить `ml/pose/_contract_fallback.py`
+   (`scripts/check_fallbacks.py`).
+7. `ml/pose/tests/__init__.py` есть намеренно: тесты импортируются как `ml.pose.tests.*` и не конфликтуют
+   с одноимёнными файлами других модулей.
 
 ## Журнал решений
 
-* По дополнению к ТЗ: один реальный бэкенд (RTMPose ONNX), лимиты кропов, mock не используется как
-  fallback, публичные сигнатуры ровно как в контракте (без дополнительных аргументов).
-* Unknown = отсутствие ключа: контракт не меняется, а «нет данных» не путается с «нет нарушения».
-* `hands_hidden` из позы позитивом не бывает (по умолчанию): пропавшие точки сверху — обычная окклюзия.
-* Нос не используется для ориентации по умолчанию (`nose_weight: 0`): на наклонной камере его смещение
-  от плеч определяется высотой головы, а не направлением.
-* Ключи порогов `thr_on`/`thr_off`: `on`/`off` в YAML 1.1 превращаются в `True`/`False`.
+Фаза 1:
+* Unknown — это отсутствие ключа: контракт не меняется, а «нет данных» не путается с «нет нарушения».
+* `hands_hidden` из позы позитивом не бывает: пропавшие точки сверху — обычная окклюзия.
+* Нос не используется для ориентации (`nose_weight: 0`): на наклонной камере смещение носа от плеч
+  определяется высотой головы.
+* Ключи порогов `thr_on`/`thr_off`: в YAML 1.1 `on`/`off` превращаются в `True`/`False`.
+
+Фаза 2:
+* Главный флаг `enabled: auto`. Нет весов — это `skipped`, а не `failed`: RTMPose у L2 не скачан, и это не
+  должно портить полноту. `enabled: 1` делает отсутствие бэкенда явным `failed` для замера.
+* MediaPipe переписан на Tasks API (старого `mp.solutions` в 0.10.35 нет), кроп кассира + апскейл.
+  Включается только явно, до замера H-A07-2.
+* Немного надёжных сигналов: `phone_to_ear` и `cashier_facing_away` выключены по умолчанию (сверху ухо
+  почти всегда закрыто, телефон и так ловит `phone_in_hand`; ориентация зависит от L/R и зон).
+* Еда и питьё: предмет должен быть **у рта во время контакта кисти со ртом**. Стакан у руки в начале
+  движения не считается: «стакан на столе + поправила волосы» иначе дало бы ложное питьё.
+* Таймкод — начало перехода (`t_start`), пик — отдельно (`t_peak`); выбор политики — замером.
+* `item_placed_on_desk` и `motion` — новые режимы, по умолчанию выключены. Признаки — только геометрия в
+  масштабах тела и зоны из `zones`; без пиксельных координат, цвета одежды и яркости.
+* `ml.pose.ab` пишет картинки только в локальную папку с `.gitignore` `*`, головы размыты.
