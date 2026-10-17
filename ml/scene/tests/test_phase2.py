@@ -302,6 +302,7 @@ def test_h6_legacy_outsider_anchor_only_flag():
     clip = make_clip(DUR)
     _, tr_off = scene_states_with_trace(clip, dets, [cashier, tall_client], zones_default(), [])
     _, tr_on = scene_states_with_trace(clip, dets, [cashier, tall_client], zones_default(), [], config={"presence": {"outsider_anchor_only": True}})
-    assert float(np.mean(tr_off["raw"]["outsider_in_cashier_area"])) > 0.3
-    # с флагом клиент (опорная точка в client_area) не вносит вклада; остаётся только априор 0.15 кассира с неизвестной ролью
+    # клиент со своей стороны (членство в client_area ≥ членства в зоне кассира) не вносит вклада уже по умолчанию
+    # (исправление после аудита); с H6 — тоже. Остаётся только априор 0.15 кассира с неизвестной ролью.
+    assert float(np.max(tr_off["raw"]["outsider_in_cashier_area"])) <= 0.15 + 1e-9
     assert float(np.max(tr_on["raw"]["outsider_in_cashier_area"])) <= 0.15 + 1e-9

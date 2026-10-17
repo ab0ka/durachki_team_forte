@@ -94,7 +94,9 @@ door:
 
 cash:
   min_det_score: 0.2
-  zone_weights: {desk: 1.0, cash_tray: 1.0, cashier_area: 0.8, other: 0.5}
+  zone_weights: {desk: 1.0, cash_tray: 1.0, cashier_area: 0.8, client_area: 0.0, other: 0.0}   # контракт: «наличные на столе»;
+                              # купюры у клиента/вне зон кассы не считаются (иначе ложный V02 после ухода кассира)
+  unlocalized_c_max: 0.45     # нет зон стола/лотка/кассира — место наличных не проверить: «да» не становится известным
   w_det: 1.0
   w_color: 0.6
   det_absent_p: 0.3
