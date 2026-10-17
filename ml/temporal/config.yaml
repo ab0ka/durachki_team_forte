@@ -47,6 +47,9 @@ labels:
   # Конфликт меток внутри группы дубликатов (один файл «нарушение», другой «без»):
   # positive — группа считается позитивной (все исходные метки сохраняются в index/отчёте); exclude — исключить
   conflict_policy: positive
+  # Разные таймкоды у дубликатов (Х-4/Х-47: 57 и 68 с) — решает человек. both — обе секунды остаются
+  # якорями (ничего не выбрано произвольно); video_only — кадровый надзор снят, только метка видео.
+  time_conflict_policy: both
   duplicate_groups:                # группы дубликатов (по md5 находятся автоматически, это — страховка)
     - [X-4, X-47]
     - [X-5, X-48]
@@ -71,6 +74,9 @@ model:                             # temporal head (TCN+BiGRU) — сравне�
 
 train:
   seed: 13
+  # Вес в обучении: group — каждая группа (уникальное видео, дубликаты свёрнуты) весит одинаково, её версии
+  # (оригинал + аугментации) делят этот вес; frame — старый режим (каждый кадр = 1, длинные чистые ролики доминируют)
+  weighting: group
   epochs: 60
   steps_per_epoch: 12
   batch_size: 8
@@ -104,10 +110,22 @@ cv:
   epochs: 40                       # эпох temporal head в CV
   holdout_frac: 0.0                # >0: отложить нетронутый сгруппированный holdout (оценивается один раз)
   hit_tolerances_s: [1, 2, 3]
+  timecode_policies: [peak, onset]  # какие политики таймкода мерить в отчёте
+  duration_watchdog_rho: 0.3       # |ρ(скор, длительность)| на чистых роликах выше — предупреждение
   threshold_margin: 0.02           # порог = max(score негативов inner-OOF) + margin (FP=0) / FP≤1
   min_recall_fp0: 0.8
 
 infer:
+  # Пулинг уровня видео (исправление: max по кадрам смещён в пользу длинных чистых роликов):
+  # max — старый (для сравнения) | topk — среднее pool_k лучших окон | topk_null — topk, нормированный по
+  # числу окон через null-CDF чистых роликов (подгоняется внутренним CV только на train).
+  pooling: topk_null
+  pool_k: 4                        # окон по risk_step_s (4 × 0.5 с = 2 с)
+  null_tau_s: 4.0                  # длина блока null-модели (≈ время декорреляции риска)
+  peak_rel: 0.6                    # события score(): пики ≥ peak_rel × максимум кривой (если видео помечено)
+  timecode_policy: peak            # peak | onset | change_onset — выбрать по замеру (cv: timecode_by_policy)
+  onset_ratio: 0.5
+  onset_max_s: 6.0
   risk_step_s: 0.5
   smooth_s: 1.0                    # сглаживание риск-кривой (окно, сек)
   event_threshold: 0.55            # пик выше — событие (перекрывается weights/temporal/meta.json:threshold)

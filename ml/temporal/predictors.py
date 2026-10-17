@@ -62,24 +62,46 @@ class BaselineLR:
         return np.concatenate([X, moving_average(X, win)], axis=1)
 
     def fit(self, samples: Sequence[Sample], cfg: dict, seed: int = 0) -> "BaselineLR":
+        X, y, wt, tt, _ = self.gather(samples, cfg)
+        return self._fit_arrays(X, y, wt, tt, samples, cfg, seed)
+
+    def gather(self, samples: Sequence[Sample], cfg: dict) -> tuple:
+        """Кадры обучения: X (+контекст), мягкие цели y, веса wt (сумма 1), type idx, индекс группы."""
         tr = cfg["train"]
-        Xs, ys, ws, ts = [], [], [], []
-        for s in samples:
+        group_mode = str(tr.get("weighting", "group")) == "group"
+        n_pos = max(1, sum(1 for s in samples if s.label))
+        n_neg = max(1, sum(1 for s in samples if not s.label))
+        Xs, ys, ws, ts, gs = [], [], [], [], []
+        for gi, s in enumerate(samples):
+            nv = max(1, len(s.X))
             for X, g in zip(s.X, s.grid):
                 fps = 1.0 / max(float(g[1] - g[0]), 1e-6) if len(g) > 1 else 4.0
                 y, w = frame_targets(g, s.label, s.times, tr["sigma_s"], tr["far_radius_s"], tr["far_weight"])
+                if group_mode:  # группа весит 0.5/n_класса независимо от длины ролика и числа версий
+                    tot = float(w.sum())
+                    if tot <= 0:
+                        continue
+                    w = w / tot / nv * (0.5 / (n_pos if s.label else n_neg))
                 Xs.append(self._ctx(X, fps)); ys.append(y); ws.append(w)
                 ts.append(np.full(len(y), _type_idx(s.type_id), np.int64))
+                gs.append(np.full(len(y), gi, np.int64))
         X = np.concatenate(Xs).astype(np.float32)
         y = np.concatenate(ys).astype(np.float32)
         w = np.concatenate(ws).astype(np.float32)
         keep = w > 0
-        X, y, w, tt = X[keep], y[keep], w[keep], np.concatenate(ts)[keep]
-        pos = float((w * y).sum())
-        neg = float((w * (1 - y)).sum())
-        pw = float(np.clip(neg / max(pos, 1e-6), 1.0, tr.get("pos_weight_max", 20.0))) if pos > 0 else 1.0
-        wt = w * (1 + (pw - 1) * y)
+        X, y, w, tt, gg = X[keep], y[keep], w[keep], np.concatenate(ts)[keep], np.concatenate(gs)[keep]
+        if group_mode:
+            wt = w
+        else:  # старый режим: каждый кадр = 1, баланс классов по массе кадров
+            pos = float((w * y).sum())
+            neg = float((w * (1 - y)).sum())
+            pw = float(np.clip(neg / max(pos, 1e-6), 1.0, tr.get("pos_weight_max", 20.0))) if pos > 0 else 1.0
+            wt = w * (1 + (pw - 1) * y)
         wt = wt / max(wt.sum(), 1e-6)
+        return X, y, wt, tt, gg
+
+    def _fit_arrays(self, X: np.ndarray, y: np.ndarray, wt: np.ndarray, tt: np.ndarray, samples: Sequence[Sample],
+                    cfg: dict, seed: int) -> "BaselineLR":
         F = X.shape[1]
         rng = np.random.default_rng(seed)
         theta = np.concatenate([rng.normal(0, 0.01, F), [0.0]]).astype(np.float64)

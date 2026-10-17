@@ -23,6 +23,7 @@ class Sample:
     md5: str = ""
     sources: list[dict] = field(default_factory=list)          # исходные метки файлов группы дубликатов
     conflict: bool = False
+    time_conflict: bool = False              # в группе дубликатов разные таймкоды (решает человек)
     versions: list[FeatureSet] = field(default_factory=list)   # [оригинал, аугментации...]
     X: list[np.ndarray] = field(default_factory=list)           # входы на сетке модели для каждой версии
     grid: list[np.ndarray] = field(default_factory=list)        # таймстемпы сетки для каждой версии

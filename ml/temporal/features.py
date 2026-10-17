@@ -432,6 +432,8 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
         emit(k, fr)
     flush(final=True)
     emb = np.concatenate(out_emb, axis=0) if out_emb else np.zeros((0, backend.dim), np.float32)
+    # точность кэша (float16) сразу: свежий и кэшированный пути дают бит-в-бит одинаковый вход (и как на обучении)
+    emb = emb.astype(np.float16).astype(np.float32)
     n_done = len(emb) // len(views)
     emb = emb[: n_done * len(views)].reshape(n_done, len(views), -1)
     times, boxes, energy, area = times[:n_done], boxes[:n_done], energy[:n_done], area[:n_done]

@@ -15,7 +15,11 @@ def test_nested_cv_baseline_report(cfg):
     assert n["tp"] + n["fp"] + n["fn"] + n["tn"] == 12
     assert {"hit@1s", "hit@2s", "hit@3s", "dt_median"} <= set(f)
     assert all(0.05 <= v["thr_inner"] <= 0.95 for v in rep["per_video"])
-    assert 0.05 <= rep["deploy_threshold"] <= 0.95
+    assert set(rep["by_pooling"]) == {"max", "topk", "topk_null"}
+    assert {"duration_only_auc", "spearman_neg", "warn"} <= set(rep["duration_watchdog"])
+    assert {"peak", "onset"} <= set(rep["timecode_by_policy"])
+    assert "разведочная" in rep["evaluation_status"]
+    assert all(set(v["scores_by_pooling"]) == {"max", "topk", "topk_null"} for v in rep["per_video"])
 
 
 def test_run_with_holdout_and_selection(cfg):

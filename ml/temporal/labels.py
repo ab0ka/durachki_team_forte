@@ -74,6 +74,7 @@ class VideoLabel:
     md5: str = ""
     sources: list[dict] = field(default_factory=list)  # исходные метки файлов группы (не теряются при слиянии)
     conflict: bool = False         # в группе дубликатов метки «нарушение»/«без» расходятся
+    time_conflict: bool = False    # в группе дубликатов разные таймкоды (> 1.5 с) — решает человек
 
 
 _NAME_KEYS = ("file", "name", "video", "filename", "файл", "имя", "видео", "ролик", "id")
@@ -211,7 +212,8 @@ def assign_groups(labels: dict[str, VideoLabel], md5s: dict[str, str] | None = N
     return groups
 
 
-def merge_duplicates(labels: dict[str, VideoLabel], conflict_policy: str = "positive") -> dict[str, VideoLabel]:
+def merge_duplicates(labels: dict[str, VideoLabel], conflict_policy: str = "positive",
+                     time_conflict_policy: str = "both") -> dict[str, VideoLabel]:
     """Свернуть группу дубликатов в одну обучающую запись, НЕ выбирая метку произвольно:
     все исходные метки остаются в ``sources``; таймкоды позитивных файлов объединяются
     (Х-4≡Х-47 -> якоря [57, 68]); расхождение «нарушение/без» помечается ``conflict`` и решается
@@ -226,12 +228,17 @@ def merge_duplicates(labels: dict[str, VideoLabel], conflict_policy: str = "posi
         conflict = len({it.label for it in items}) > 1
         if conflict and conflict_policy == "exclude":
             continue
+        pos_times = [sorted(it.times) for it in items if it.label and it.times]
+        time_conflict = any(min(abs(a - b) for b in other) > 1.5 for ts in pos_times for other in pos_times
+                            for a in ts if other is not ts and other)
         label = max(it.label for it in items)
         times = sorted({t for it in items if it.label for t in it.times}) if label else []
         types = {it.type_id for it in items if it.label and it.type_id}
         out[g] = VideoLabel(name=g, label=label, times=times, type_id=types.pop() if len(types) == 1 else "",
                             files=[f for it in items for f in it.files], group=g, md5=items[0].md5,
-                            sources=sources, conflict=conflict)
+                            sources=sources, conflict=conflict, time_conflict=time_conflict)
+        if time_conflict and time_conflict_policy == "video_only":
+            out[g].times = []  # кадровый надзор снят, остаётся метка уровня видео (MIL); таймкод решает человек
     return out
 
 

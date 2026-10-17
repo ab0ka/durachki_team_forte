@@ -30,7 +30,7 @@ def test_extract_clip_mock_shapes_and_focus(tmp_path):
     fs = extract_clip(clip, MockBackend(32), cfg, fps=4.0, views=["full", "focus"])
     T = len(fs)
     assert T >= 20 and fs.emb.shape == (T, 2, 32) and fs.dyn.shape == (T, 4) and fs.boxes.shape == (T, 4)
-    assert np.allclose(np.linalg.norm(fs.emb, axis=-1), 1.0, atol=1e-4)
+    assert np.allclose(np.linalg.norm(fs.emb, axis=-1), 1.0, atol=2e-3)   # float16-точность кэша
     assert np.all(fs.boxes[:, 0] < fs.boxes[:, 2]) and np.all(fs.boxes[:, 1] < fs.boxes[:, 3])
     assert np.all((fs.boxes >= 0) & (fs.boxes <= 1))
     assert fs.meta["focus_mode"] == "motion"
@@ -105,6 +105,10 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
     assert st["status"] == "ok" and st["kind"] == "baseline"
     ts = [t for t, _ in risk]
     assert np.allclose(np.diff(ts), 0.5) and all(0.0 <= r <= 1.0 for _, r in risk)
+    renamed = tmp_path / "renamed_copy.avi"                  # имя файла не признак: тот же контент -> тот же риск
+    renamed.write_bytes((vids / "Х-1.avi").read_bytes())
+    risk2, _ = temporal.score(SimpleClip(str(renamed), sample_fps=5.0))
+    assert risk2 == risk
     for e in events:
         assert e.source == "temporal" and e.t_start <= e.t_peak <= e.t_end
         assert e.type_id == "V99" and e.extra["type_source"] == "none"

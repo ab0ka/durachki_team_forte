@@ -77,7 +77,7 @@ def _clip_key(clip: Any, cfg: dict, backend: str, fps: float, views: list, zones
 def score(clip: Any, zones: Any = None, budget_s: Optional[float] = None
           ) -> tuple[list[tuple[float, float]], list[Any]]:
     """Публичная функция (сигнатура контракта: score(clip)); zones/budget_s — необязательные расширения."""
-    from .postproc import find_peaks, risk_curve
+    from .postproc import find_peaks, pool_score, risk_curve
 
     t0 = time.monotonic()
     cfg = load_config()
@@ -128,19 +128,36 @@ def score(clip: Any, zones: Any = None, budget_s: Optional[float] = None
         return [], []
 
     duration = float(getattr(clip, "duration", 0.0) or grid[-1])
-    t_curve, r_curve = risk_curve(probs, grid, cfg, duration)
+    # пулинг/шаг — как при калибровке чекпоинта (null-CDF и порог подобраны именно для них)
+    pcfg = {**cfg, "infer": {**inf, **{k: v for k, v in (meta.get("pooling") or {}).items() if v is not None}}}
+    t_curve, r_curve = risk_curve(probs, grid, pcfg, duration)
     thr = float(meta.get("threshold", inf["event_threshold"]))
-    peaks = find_peaks(t_curve, r_curve, thr, float(inf["min_peak_distance_s"]), int(inf["max_events"]),
-                       float(inf["extent_ratio"]))
-    zs, zs_keys = type_scores(fs, bank)
+    vscore = pool_score(r_curve, pcfg, np.asarray(meta.get("null") or [], np.float64), duration)
     events = []
-    for pk in peaks:
-        events.append(_make_event(pk, model, meta, grid, tprobs, fs, zs, zs_keys, bank))
-    _LAST.update(status="ok", kind=model.kind, threshold=thr, n_events=len(events),
-                 video_score=float(r_curve.max()) if len(r_curve) else 0.0,
+    if vscore >= thr and len(r_curve):  # видео помечено калиброванным скором -> события из пиков кривой
+        rmax = float(r_curve.max())
+        peaks = find_peaks(t_curve, r_curve, float(inf.get("peak_rel", 0.6)) * rmax,
+                           float(inf["min_peak_distance_s"]), int(inf["max_events"]), float(inf["extent_ratio"]))
+        zs, zs_keys = type_scores(fs, bank)
+        for pk in peaks:
+            pk["confidence"] = vscore * pk["peak"] / max(rmax, 1e-9)
+            pk["t_peak"] = _apply_policy(t_curve, r_curve, pk, pcfg)
+            events.append(_make_event(pk, model, meta, grid, tprobs, fs, zs, zs_keys, bank))
+    _LAST.update(status="ok", kind=model.kind, threshold=thr, n_events=len(events), video_score=round(vscore, 4),
+                 pooling=pcfg["infer"].get("pooling"), max_risk=float(r_curve.max()) if len(r_curve) else 0.0,
                  elapsed_s=round(time.monotonic() - t0, 3), n_frames=len(fs), fps=fs.meta.get("fps"),
                  views=fs.views, truncated_at=fs.meta.get("truncated_at"))
     return [(round(float(t), 2), round(float(r), 4)) for t, r in zip(t_curve, r_curve)], events
+
+
+def _apply_policy(t: np.ndarray, r: np.ndarray, pk: dict, cfg: dict) -> float:
+    from .postproc import onset_index
+
+    inf = cfg["infer"]
+    if str(inf.get("timecode_policy", "peak")) == "onset":
+        a = onset_index(t, r, int(pk["i"]), float(inf.get("onset_ratio", 0.5)), float(inf.get("onset_max_s", 6.0)))
+        return float(t[a])
+    return float(pk["t_peak"])
 
 
 def _window(times: np.ndarray, t: float, half: float) -> np.ndarray:
@@ -155,7 +172,8 @@ def _make_event(pk: dict, model: Any, meta: dict, grid: np.ndarray, tprobs: Opti
                 fs: FeatureSet, zs: np.ndarray, zs_keys: list[str], bank: Any) -> Any:
     tp, a, b = pk["t_peak"], pk["t_start"], pk["t_end"]
     extra: dict[str, Any] = {"kind": model.kind, "peak_risk": round(pk["peak"], 4),
-                             "threshold": meta.get("threshold"), "model_created": meta.get("created")}
+                             "threshold": meta.get("threshold"), "model_created": meta.get("created"),
+                             "timecode_policy": cfg_policy(meta)}
     type_id = "V99"
     if tprobs is not None and getattr(model, "type_trained", False):
         tp_mean = tprobs[_window(grid, tp, 1.5)].mean(axis=0)
@@ -182,6 +200,10 @@ def _make_event(pk: dict, model: Any, meta: dict, grid: np.ndarray, tprobs: Opti
         if box != (0.0, 0.0, 1.0, 1.0):
             bboxes["temporal_focus"] = box
             extra["temporal_focus_mode"] = fs.meta.get("focus_mode")
-    return Event(type_id=type_id, t_start=round(a, 2), t_end=round(b, 2), t_peak=round(tp, 2),
-                 confidence=round(float(pk["peak"]), 4), source="temporal", facts=facts, bboxes=bboxes,
-                 extra=extra)
+    return Event(type_id=type_id, t_start=round(min(a, tp), 2), t_end=round(max(b, tp), 2), t_peak=round(tp, 2),
+                 confidence=round(float(pk.get("confidence", pk["peak"])), 4), source="temporal", facts=facts,
+                 bboxes=bboxes, extra=extra)
+
+
+def cfg_policy(meta: dict) -> str:
+    return str(load_config()["infer"].get("timecode_policy", "peak"))
