@@ -1,0 +1,6 @@
+# ml/scene (A08) — только CPU, без нейросетей и весов
+numpy>=1.26            # BSD-3-Clause
+opencv-python-headless>=4.8,<5   # Apache-2.0 — кропы ROI, CS-SSIM, phase correlation, HSV
+pyyaml>=6.0            # MIT — config.yaml
+matplotlib>=3.7        # PSF/BSD-style — только для python -m ml.scene.plot (отладка)
+pytest>=8.0            # MIT — тесты

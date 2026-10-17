@@ -1,0 +1,9 @@
+[
+  {
+    "name": "scene_signals_lr (опционально, обучается локально)",
+    "hf_id_or_url": "local: weights/scene/scene_signals.json — python -m ml.scene.train_signals",
+    "license": "Apache-2.0",
+    "size_mb": 0.01,
+    "purpose": "Логрегрессия/маленький MLP (numpy, JSON без pickle) на ROI-признаках для safe_open/door_open/cash_visible; обучается только на проверенных метках команды; по умолчанию не используется (файла нет)"
+  }
+]
