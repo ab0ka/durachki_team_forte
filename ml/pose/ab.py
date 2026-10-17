@@ -1,11 +1,14 @@
 """A/B бэкендов позы на одинаковых кадрах (для L2; локально, без сети).
 
     python -m ml.pose.ab --frames <dir> --out <локальная папка> [--boxes boxes.json]
-                         [--backends rtmpose_onnx,mediapipe,mediapipe_noup] [--fps 5] [--max-frames N]
+                         [--backends rtmpose_onnx,mediapipe,mediapipe_noup] [--max-frames N]
+    python -m ml.pose.ab --video a.mov [--video b.mov ...] --out <локальная папка>   # кадры+bbox из пайплайна
 
-Кадры — изображения в <dir> (сортировка по имени = порядок времени, t = i / fps). bbox людей —
-из --boxes (JSON: {"<имя кадра>": [[x1,y1,x2,y2] | {"bbox": [...], "track_id": 1, "role": "cashier"}]},
-нормированные 0..1 или пиксели); без --boxes кроп = весь кадр (для RTMPose это хуже, чем bbox трекера).
+Кадры — изображения в <dir> (сортировка по имени = порядок времени). bbox людей — из --boxes (JSON:
+{"<имя кадра>": [[x1,y1,x2,y2] | {"bbox": [...], "track_id": 1, "role": "cashier"}]}, нормированные 0..1
+или пиксели); без --boxes кроп = весь кадр (для RTMPose хуже, чем bbox трекера). С --video кадры берутся
+через ml.ingest.load_video (время из PTS), bbox и роли — из ml.detect + ml.track (person-треки); кадры
+без людей пропускаются.
 
 Метрики на бэкенд: доля кропов с позой; уверенность и доля видимых точек по группам (голова, плечи,
 локти, запястья, таз); дрожание (скорость и «ускорение» точек между соседними кадрами в масштабах тела);
@@ -54,6 +57,46 @@ VARIANTS: dict[str, tuple[str, dict[str, Any]]] = {
 def list_frames(frames_dir: str, max_frames: Optional[int] = None) -> list[Path]:
     files = sorted(p for p in Path(frames_dir).iterdir() if p.suffix.lower() in IMG_EXT)
     return files[:max_frames] if max_frames else files
+
+
+FrameItem = tuple[str, Callable[[], Any]]  # (имя кадра, ленивый загрузчик BGR-кадра)
+
+
+def frames_from_dir(frames_dir: str, max_frames: Optional[int] = None) -> list[FrameItem]:
+    import cv2
+
+    return [(p.name, (lambda p=p: cv2.imread(str(p), cv2.IMREAD_COLOR))) for p in list_frames(frames_dir, max_frames)]
+
+
+def frames_from_videos(videos: Sequence[str], sample_fps: float = 5.0, max_frames: Optional[int] = None
+                       ) -> tuple[list[FrameItem], dict[str, list[dict[str, Any]]]]:
+    """Кадры и bbox людей из пайплайна команды (ingest → detect → track); всё локально."""
+    from ml.detect import detect  # type: ignore[import-not-found]
+    from ml.ingest import load_video  # type: ignore[import-not-found]
+    from ml.track import track  # type: ignore[import-not-found]
+
+    from .estimator import BoxLookup
+
+    items: list[FrameItem] = []
+    boxes: dict[str, list[dict[str, Any]]] = {}
+    for v in videos:
+        clip = load_video(v, sample_fps)
+        tracks, _zones = track(clip, detect(clip))
+        persons = [(tr, BoxLookup(tr, 0.25, 1.0)) for tr in tracks if tr.label == "person" and tr.boxes]
+        stem = Path(v).stem
+        n = len(clip.times) if not max_frames else min(len(clip.times), max_frames)
+        for i in range(n):
+            entry = []
+            for tr, lk in persons:
+                b = lk.at(float(clip.times[i]))
+                if b is not None:
+                    entry.append({"bbox": [float(x) for x in b], "track_id": f"{stem}:{tr.track_id}", "role": tr.role})
+            if not entry:
+                continue
+            name = f"{stem}__{i:05d}.jpg"
+            boxes[name] = entry
+            items.append((name, (lambda c=clip, k=i: c.frame(k))))
+    return items, boxes
 
 
 def load_boxes(path: Optional[str]) -> dict[str, list[dict[str, Any]]]:
@@ -222,7 +265,7 @@ def draw_overlay(frame: np.ndarray, results: Sequence[tuple[np.ndarray, np.ndarr
 # ---------------------------------------------------------------- run
 
 
-def run_variant(name: str, frames: Sequence[Path], boxes: dict[str, list[dict[str, Any]]], cfg: dict[str, Any],
+def run_variant(name: str, frames: Sequence[FrameItem], boxes: dict[str, list[dict[str, Any]]], cfg: dict[str, Any],
                 out: Path, overlays: bool, blur_heads: bool, roles: Optional[set[str]],
                 make_backend: Optional[Callable[[str, dict[str, Any]], Any]] = None) -> tuple[dict[str, Any], dict]:
     import cv2
@@ -245,12 +288,13 @@ def run_variant(name: str, frames: Sequence[Path], boxes: dict[str, list[dict[st
     all_scores, detected, mem_peak = [], 0, mem_init
     items_for_batch: list[tuple[np.ndarray, np.ndarray]] = []
     warm = 0
-    for fi, path in enumerate(frames):
-        frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    whole = [{"bbox": [0.0, 0.0, 1.0, 1.0], "track_id": 0, "role": "unknown"}]
+    for fi, (fname, load) in enumerate(frames):
+        frame = load()
         if frame is None:
             continue
         h, w = frame.shape[:2]
-        entry = boxes.get(path.name) or [{"bbox": [0.0, 0.0, 1.0, 1.0], "track_id": 0, "role": "unknown"}]
+        entry = boxes.get(fname, []) if boxes else whole  # bbox заданы → кадр без людей пропускаем
         bxs = [b for b in boxes_px(entry, w, h) if roles is None or b.get("role") in roles]
         res_frame = []
         for bi, b in enumerate(bxs):
@@ -272,7 +316,7 @@ def run_variant(name: str, frames: Sequence[Path], boxes: dict[str, list[dict[st
             res_frame.append((kp, sc, b["px"]))
             if len(items_for_batch) < 64:
                 items_for_batch.append((frame, b["px"]))
-            row = {"frame": path.name, "box": bi, "track_id": b.get("track_id", bi), "backend": name,
+            row = {"frame": fname, "box": bi, "track_id": b.get("track_id", bi), "backend": name,
                    "latency_ms": round(dt, 3)}
             for g, idx in GROUPS.items():
                 row[f"{g}_score"] = round(float(sc[list(idx)].mean()), 4)
@@ -284,7 +328,7 @@ def run_variant(name: str, frames: Sequence[Path], boxes: dict[str, list[dict[st
         if overlays and res_frame:
             od = out / "overlays" / name
             od.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(od / (path.stem + ".jpg")), draw_overlay(frame, res_frame, thr, blur_heads))
+            cv2.imwrite(str(od / (Path(fname).stem + ".jpg")), draw_overlay(frame, res_frame, thr, blur_heads))
     batch_ms = None
     bs = int(getattr(backend, "batch_size", 1) or 1)
     if bs > 1 and items_for_batch:
@@ -341,7 +385,10 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
 def main(argv: Optional[Sequence[str]] = None,
          make_backend: Optional[Callable[[str, dict[str, Any]], Any]] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m ml.pose.ab", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--frames", required=True, help="папка с кадрами (jpg/png), порядок = имя файла")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--frames", help="папка с кадрами (jpg/png), порядок = имя файла")
+    src.add_argument("--video", action="append", help="видео (можно несколько): кадры+bbox через ingest/detect/track")
+    ap.add_argument("--sample-fps", type=float, default=5.0, help="для --video")
     ap.add_argument("--out", required=True, help="локальная папка результатов (в неё кладётся .gitignore '*')")
     ap.add_argument("--boxes", default=None, help="JSON с bbox людей по именам кадров")
     ap.add_argument("--backends", default="rtmpose_onnx,mediapipe,mediapipe_noup",
@@ -358,14 +405,23 @@ def main(argv: Optional[Sequence[str]] = None,
         ap.error(f"неизвестные варианты: {bad}")
     out = Path(args.out)
     protect_out_dir(out)
-    frames = list_frames(args.frames, args.max_frames)
+    if args.video:
+        try:
+            frames, boxes = frames_from_videos(args.video, args.sample_fps, args.max_frames)
+        except ImportError as exc:
+            print(f"--video требует модули пайплайна (ml.ingest, ml.detect, ml.track): {exc}", file=sys.stderr)
+            return 2
+        src_desc = "ml.track (person-треки)"
+    else:
+        frames = frames_from_dir(args.frames, args.max_frames)
+        boxes = load_boxes(args.boxes)
+        src_desc = args.boxes or "весь кадр"
     if not frames:
-        print(f"нет кадров в {args.frames}", file=sys.stderr)
+        print("нет кадров (или нет людей в кадрах)", file=sys.stderr)
         return 2
-    boxes = load_boxes(args.boxes)
     roles = {r.strip() for r in args.roles.split(",")} if args.roles else None
     cfg = load_config()
-    report: dict[str, Any] = {"n_frames": len(frames), "boxes_source": args.boxes or "весь кадр",
+    report: dict[str, Any] = {"n_frames": len(frames), "boxes_source": src_desc,
                               "kp_min_score": float(cfg["signals"].get("kp_min_score", 0.3)),
                               "backends": {}, "agreement": {}}
     all_rows, crops = [], {}

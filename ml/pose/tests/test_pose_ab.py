@@ -90,3 +90,32 @@ def test_jitter_and_groups_math():
     assert j["accel_p50"] == pytest.approx(0.0, abs=1e-6)      # равномерное движение — не дрожание
     g = ab.group_stats(np.vstack([sc, np.zeros(17)]), 0.3)
     assert g["wrists"]["visible_frac"] == 0.5
+
+
+def test_ab_video_mode_uses_pipeline_modules(monkeypatch, tmp_path):
+    """--video: кадры и bbox из ingest/detect/track (здесь — фейковые модули, без реальных данных)."""
+    import sys
+    import types
+
+    from ml.pose._contract import Track
+
+    class Clip:
+        times = [0.0, 0.2, 0.4, 0.6, 0.8]  # человек виден до 0.2 с (+допуск 0.25 с → кадр 0.4 с тоже)
+
+        def frame(self, i):
+            return np.full((424, 232, 3), 50, np.uint8)
+
+    fake = {
+        "ml.ingest": types.SimpleNamespace(load_video=lambda path, fps=5.0: Clip()),
+        "ml.detect": types.SimpleNamespace(detect=lambda clip, every_n=1: []),
+        "ml.track": types.SimpleNamespace(track=lambda clip, dets: (
+            [Track(3, "person", "cashier", 0.9, [(t, (0.3, 0.3, 0.6, 0.7)) for t in Clip.times[:2]])], [])),
+    }
+    for k, v in fake.items():
+        monkeypatch.setitem(sys.modules, k, v)
+    out = tmp_path / "abv"
+    rc = ab.main(["--video", str(tmp_path / "x.mov"), "--out", str(out), "--backends", "mock", "--no-overlays"],
+                 make_backend=_factory)
+    assert rc == 0
+    rep = json.loads((out / "ab_report.json").read_text(encoding="utf-8"))
+    assert rep["n_frames"] == 3 and rep["backends"]["mock"]["n_crops"] == 3   # кадры без людей пропущены
