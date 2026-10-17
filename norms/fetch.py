@@ -5,6 +5,8 @@
     python -m norms.fetch                 # все документы из catalog.yaml → sources/*.md
     python -m norms.fetch nbrk_14_2020    # один документ по id из раздела documents
     python -m norms.fetch --dry-run       # только показать, что будет скачано
+    python -m norms.fetch --from-dir norms_fetched            # импорт файлов, скачанных L1
+    python -m norms.fetch --git-ref origin/data/norms-sources # импорт прямо из ветки L1 (без checkout)
 
 После скачивания файл получает ``retrieval: fulltext``, а прежние поисковые фрагменты
 остаются в git-истории. Затем ``python -m norms.validate`` покажет цитаты, которых нет
@@ -88,12 +90,43 @@ def render_source_md(doc_id: str, doc: dict, text: str, accessed: Optional[str] 
     )
 
 
+def import_local(catalog: dict, ids: list[str], args: argparse.Namespace) -> int:
+    """Полные тексты из папки/ветки L1 → sources/<doc>.md (retrieval: fulltext) для известных документов."""
+    from . import texts
+
+    try:
+        loaded = (texts.load_dir(args.from_dir, catalog) if args.from_dir
+                  else texts.load_git_ref(args.git_ref, args.git_subdir, catalog))
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    docs: dict = catalog.get("documents", {})
+    written = 0
+    for d in loaded:
+        if d.doc_id not in docs or d.doc_id not in ids:
+            print(f"SKIP {d.label}: документ {d.doc_id!r} не из раздела documents (для pick годится и так)")
+            continue
+        target = args.out_dir / docs[d.doc_id]["source_file"]
+        print(f"{d.doc_id}: {d.label} -> {target}")
+        if not args.dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(render_source_md(d.doc_id, docs[d.doc_id], d.text), encoding="utf-8")
+            written += 1
+    if not args.dry_run:
+        print(f"Импортировано: {written}. Дальше: python -m norms.pick --check-catalog и python -m norms.validate")
+    return 0 if written or args.dry_run else 1
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m norms.fetch", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("ids", nargs="*", help="id документов из catalog.yaml: documents (по умолчанию все)")
     ap.add_argument("--catalog", type=Path, default=CATALOG_PATH)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--from-dir", type=Path, default=None, help="импорт локальных .html/.md/.txt вместо скачивания")
+    ap.add_argument("--git-ref", default=None, help="импорт из git-ветки, например origin/data/norms-sources")
+    ap.add_argument("--git-subdir", default="norms_fetched")
+    ap.add_argument("--out-dir", type=Path, default=NORMS_DIR, help="куда писать sources/ (по умолчанию norms/)")
     args = ap.parse_args(argv)
 
     import yaml
@@ -101,6 +134,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     catalog = yaml.safe_load(args.catalog.read_text(encoding="utf-8"))
     docs: dict = catalog.get("documents", {})
     ids = args.ids or list(docs)
+    if args.from_dir or args.git_ref:
+        return import_local(catalog, ids, args)
     rc = 0
     for doc_id in ids:
         doc = docs.get(doc_id)
