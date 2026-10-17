@@ -88,3 +88,11 @@ def test_negative_evidence_downweights_once(catalog):
     c = out.candidates[0]
     assert c.confidence == pytest.approx(0.8 * (1 - 0.5 * 0.9), abs=1e-4)
     assert c.extra["counter_facts"] == ["сейф закрыт", "стол пуст"]
+
+
+def test_v02_low_known_fraction_is_unknown(catalog):
+    trace = {"cash_visible": {"mean": 0.0, "known_frac": 0.3}, "cash_bag_visible": {"mean": 0.0, "known_frac": 0.9},
+             "safe_open": {"mean": 0.0, "known_frac": 0.9}}
+    out = run([v02(trace=trace)], cfg_with(v02_after_window=True), catalog)
+    c = out.candidates[0]
+    assert c.reported and c.extra["policies"][0]["effect"] == "partial_unknown"

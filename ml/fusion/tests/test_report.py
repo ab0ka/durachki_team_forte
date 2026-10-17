@@ -37,7 +37,7 @@ def test_template_from_catalog_and_safe_placeholders():
     info = {"name": "Тест", "description_template": "На {t} зафиксировано: {facts}. Ссылка {unknown}"}
     text = build_description("V01", info, ["дверь открыта"], 65.0, CFG)
     assert text.startswith("На 01:05 зафиксировано: дверь открыта.")
-    assert "{" not in text and text.endswith("Требуется проверка человеком.")
+    assert "{" not in text and text.endswith("Это признаки возможного нарушения — требуется проверка человеком.")
 
 
 def test_template_with_forbidden_sentence_is_dropped():
@@ -147,3 +147,26 @@ def test_event_dict_roundtrip():
 @pytest.mark.parametrize("t,expected", [(0.0, "00:00"), (22.4, "00:22,4"), (125.0, "02:05")])
 def test_format_time(t, expected):
     assert format_time(t) == expected
+
+
+@pytest.mark.parametrize("claim", ["кассир пересчитала 50 000 тенге", "сумма операции не совпадает",
+                                   "проверяет подлинность купюр", "лицо без допуска", "неуполномоченное лицо у сейфа",
+                                   "сделал это с умыслом", "намеренно отвернулся"])
+def test_no_amount_authenticity_permission_intent(claim):
+    text = build_description("V01", FALLBACK_TYPES["V01"], [claim, "человек находится за кассовым столом"], 5.0, CFG)
+    assert claim not in text and "человек находится за кассовым столом" in text and not has_forbidden(text, CFG)
+
+
+def test_a13_template_keeps_honest_norm_sentence():
+    info = {"name": "Посторонний в зоне кассира",
+            "description_template": "{t}: наблюдение для проверки человеком — {facts}. Нормативное основание не "
+                                    "подтверждено; по видео нельзя установить допуск и личность человека."}
+    text = build_description("V01", info, ["человек находится за кассовым столом"], 22.4, CFG)
+    assert "Нормативное основание не подтверждено" in text and "допуск" in text   # дисклеймер не вырезан
+    assert "возможного нарушения" in text and len(SENTENCE.findall(text)) == 3
+    assert text.endswith("требуется проверка человеком.")
+
+
+def test_fallback_names_are_catalog_banking_names():
+    assert FALLBACK_TYPES["V01"]["name"] == "Посторонний в зоне кассира"
+    assert FALLBACK_TYPES["V09"]["name"] == "Личные вещи на рабочем месте кассира"

@@ -465,7 +465,8 @@ def _source_weight(cfg: dict[str, Any], source: str) -> float:
 
 def temporal_mode(cfg: dict[str, Any]) -> str:
     """off (по умолчанию) | bonus | score — влияние temporal/риск-кривой на скор кластера."""
-    mode = str(cfg.get("temporal_mode", "off")).strip().lower()
+    raw = cfg.get("temporal_mode", "off")
+    mode = "off" if raw is False or raw is None else str(raw).strip().lower()   # YAML: голое off → False
     return mode if mode in {"off", "bonus", "score"} else "off"
 
 
@@ -573,9 +574,13 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
     extra: dict[str, Any] = {}
     for e in [peak_ev] + ordered:
         for k in ("keypoints", "poses", "head_boxes", "person_bboxes", "persons", "roles", "type_probs",
-                  "type_scores"):
+                  "type_scores", "state_after"):
             if k in e.extra and k not in extra:
                 extra[k] = e.extra[k]
+    ev_t = sorted({round(_f(t), 3) for e in span for t in (e.extra.get("evidence_t") or [])
+                   if not math.isnan(_f(t, float("nan")))})
+    if ev_t:
+        extra["evidence_t"] = ev_t[:6]
     orig_types = sorted({e.orig_type_id for e in group if e.orig_type_id})
     if orig_types:
         extra["orig_type_ids"] = orig_types
@@ -606,13 +611,20 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
 
 
 def _cluster_assessment(positives: Sequence[NormEvent]) -> str:
-    """Лучшая оценка среди положительных событий (подтверждение VLM считается candidate)."""
+    """Лучшая оценка среди фактических источников (rules/VLM); подтверждение VLM считается candidate.
+
+    temporal/прочие события без оценки upstream не «повышают» кластер: иначе правило-наблюдение A09
+    рядом с temporal-событием обходило бы гейт observation_only.
+    """
+    voters = [e for e in positives if e.source in ("rules", "vlm") or "assessment" in e.extra]
+    if not voters:
+        return "candidate" if positives else "insufficient"
     best = len(_ASSESSMENT_RANK) - 1
-    for e in positives:
+    for e in voters:
         a = "candidate" if (e.vlm is not None and e.vlm[0] == "confirm") else e.assessment
         if a in _ASSESSMENT_RANK:
             best = min(best, _ASSESSMENT_RANK.index(a))
-    return _ASSESSMENT_RANK[best] if positives else "insufficient"
+    return _ASSESSMENT_RANK[best]
 
 
 def _best_type_near(events: Sequence[NormEvent], a: float, b: float, fallback: str,
@@ -802,7 +814,11 @@ def fuse_scores(
 
     ocfg = cfg.get("output") or {}
     nd = int(_f(ocfg.get("timecode_round", 1), 1))
+    tc_policy = str((cfg.get("timecode") or {}).get("policy", "peak")).lower()
     for c in cands:
+        c.extra.setdefault("t_peak_source", round(c.t_peak, 3))
+        if tc_policy == "onset" and c.origin == "events":
+            c.t_peak = c.t_start   # момент начала (переход: отошла, вошёл, поднесла)
         c.t_peak = timecode(c.t_peak, duration, nd)
         c.t_start = timecode(min(c.t_start, c.t_peak), duration, nd)
         c.t_end = timecode(max(c.t_end, c.t_peak), duration, nd)

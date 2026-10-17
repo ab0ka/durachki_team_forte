@@ -144,7 +144,18 @@ def thumb(img: np.ndarray) -> np.ndarray:
     import cv2  # lazy
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+    return cv2.resize(gray, (96, 96), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
+def is_duplicate(a: np.ndarray, b: np.ndarray, block_thr: float, block: int = 12) -> bool:
+    """Дубль = почти идентичные кадры: максимум средней разности по блокам мал (локальные изменения — не дубль)."""
+    d = np.abs(a - b)
+    h, w = d.shape[:2]
+    hb, wb = h // block, w // block
+    if hb == 0 or wb == 0:
+        return float(d.mean()) < block_thr
+    blocks = d[: hb * block, : wb * block].reshape(hb, block, wb, block).mean(axis=(1, 3))
+    return float(blocks.max()) < block_thr
 
 
 def encode_jpeg(img: np.ndarray, max_bytes: int, qualities: Sequence[int], max_side: int = 1280) -> bytes:
@@ -325,26 +336,82 @@ class EvidenceRenderer:
 
     # ------------------------------------------------------------------ выбор моментов
     def select_times(self, t_peak: float, t_start: float, t_end: float, degraded: bool) -> list[float]:
-        """t_peak, самый резкий кадр из t_peak ± window (другой момент), контекст (начало/конец)."""
+        """Политика sharpest (фаза 1): t_peak, самый резкий кадр из t_peak ± window, контекст (начало/конец)."""
+        return [t for t, _ in self._sharpest_moments(t_peak, t_start, t_end, degraded)]
+
+    def _sharpest_moments(self, t_peak: float, t_start: float, t_end: float, degraded: bool
+                          ) -> list[tuple[float, str]]:
         max_frames = max(1, min(3, int(self.cfg.get("max_frames", 3))))
         min_sep = float(self.cfg.get("min_sep_s", 0.4))
-        out = [self.snap(t_peak)]
+        out = [(self.snap(t_peak), "key")]
         if degraded or max_frames == 1:
             return out
         window = float(self.cfg.get("window_s", 1.0))
-        idx = [i for i, t in enumerate(self.times) if abs(t - t_peak) <= window and abs(t - out[0]) >= min_sep]
+        idx = [i for i, t in enumerate(self.times) if abs(t - t_peak) <= window and abs(t - out[0][0]) >= min_sep]
         if idx:
             best = max(idx, key=lambda i: (self._sharpness_at(i), -abs(self.times[i] - t_peak)))
             if self._sharp.get(best, -1.0) >= 0:
-                out.append(self.times[best])
+                out.append((self.times[best], "sharp"))
         if self.cfg.get("context_frame", True) and len(out) < max_frames:
             gap = float(self.cfg.get("context_min_gap_s", 1.5))
             ctx = t_start if t_peak - t_start >= gap else t_end if t_end - t_peak >= gap else None
             if ctx is not None:
                 c = self.snap(ctx)
-                if all(abs(c - o) >= min_sep for o in out):
-                    out.append(c)
+                if all(abs(c - o) >= min_sep for o, _ in out):
+                    out.append((c, "before" if ctx < t_peak else "after"))
         return out[:max_frames]
+
+    def _local_best(self, target: float, radius: float) -> float:
+        """Самый резкий сэмпл в ±radius вокруг target (резкость — только локальный тай-брейк)."""
+        idx = [i for i, t in enumerate(self.times) if abs(t - target) <= radius]
+        if not idx:
+            return self.snap(target)
+        best = max(idx, key=lambda i: (self._sharpness_at(i), -abs(self.times[i] - target)))
+        return self.times[best]
+
+    def _action_moments(self, cand: Any, degraded: bool) -> list[tuple[float, str]]:
+        """Политика action: ключевой момент (t_peak) + «до» / «после» реального действия.
+
+        Источники моментов: extra.evidence_t (A09: фактические начало/пик/максимум), для V02 —
+        state_after.t_after («стол после ухода»), иначе t_start − before_s и t_end + after_s.
+        """
+        max_frames = max(1, min(3, int(self.cfg.get("max_frames", 3))))
+        min_sep = float(self.cfg.get("min_sep_s", 0.4))
+        acfg = self.cfg.get("action") or {}
+        before_s, after_s = float(acfg.get("before_s", 1.0)), float(acfg.get("after_s", 2.0))
+        local = float(acfg.get("local_s", 0.2))
+        t_peak, t_start, t_end = float(cand.t_peak), float(cand.t_start), float(cand.t_end)
+        key = self.snap(t_peak)
+        out = [(key, "key")]
+        if degraded or max_frames == 1:
+            return out
+        extra = getattr(cand, "extra", {}) or {}
+        hi = self.duration if self.duration > 0 else max(t_end + after_s, t_peak)
+        # (время, роль, точный момент от upstream?) — моменты A09/state_after уже фактические кадры, их не двигаем
+        targets: list[tuple[float, str, bool]] = []
+        state = extra.get("state_after") if isinstance(extra.get("state_after"), dict) else {}
+        if state.get("t_after") is not None:
+            targets.append((float(state["t_after"]), "after", True))
+        for t in sorted(float(x) for x in extra.get("evidence_t") or []):
+            targets.append((t, "before" if t < key else "after", True))
+        targets.append((max(0.0, t_start - before_s), "before", False))
+        targets.append((min(hi, max(t_end, t_peak) + after_s), "after", False))
+        roles_taken: set[str] = set()
+        for t, role, exact in targets:
+            if len(out) >= max_frames:
+                break
+            if role in roles_taken or not 0.0 <= t <= hi:
+                continue
+            c = self.snap(t) if exact else self._local_best(t, local)
+            if all(abs(c - o) >= min_sep for o, _ in out):
+                out.append((c, role))
+                roles_taken.add(role)
+        return [out[0]] + sorted(out[1:])
+
+    def select_moments(self, cand: Any, degraded: bool) -> list[tuple[float, str]]:
+        if str(self.cfg.get("policy", "sharpest")).lower() == "action":
+            return self._action_moments(cand, degraded)
+        return self._sharpest_moments(float(cand.t_peak), float(cand.t_start), float(cand.t_end), degraded)
 
     # ------------------------------------------------------------------ приватность
     def head_regions(self, cand: Any, img_shape: tuple[int, ...], pts: float) -> list[tuple[int, int, int, int]]:
@@ -401,7 +468,9 @@ class EvidenceRenderer:
 
     # ------------------------------------------------------------------ UI-оверлей
     def overlay(self, img: np.ndarray, cand: Any, info: dict[str, Any], pts: float, idx: int, n: int,
-                draw_boxes: bool) -> tuple[np.ndarray, list[dict[str, Any]]]:
+                draw_boxes: bool, role: str = "key", boxes: Optional[dict[str, Any]] = None
+                ) -> tuple[np.ndarray, list[dict[str, Any]]]:
+        """UI-кадр: тонкие рамки; подписи — легендой под кадром (ui_label_mode=legend), чтобы не закрывать действие."""
         import cv2  # lazy
 
         from .describe import format_time
@@ -412,8 +481,12 @@ class EvidenceRenderer:
         shapes: list[dict[str, Any]] = []
         canvas_img = img.copy()
         size = max(11, int(round(min(w, h) * 0.032)))
+        legend_mode = str(self.cfg.get("ui_label_mode", "legend")).lower() == "legend"
+        legend: list[str] = []
+        boxes = boxes if boxes is not None else (getattr(cand, "bboxes", {}) or {})
+        header_h = size + 12   # текст рисуется на итоговом холсте с полем сверху — смещаем подписи рамок
         if draw_boxes:
-            for key, box in (getattr(cand, "bboxes", {}) or {}).items():
+            for key, box in boxes.items():
                 px = to_pixels(box, w, h)
                 if not px:
                     continue
@@ -422,32 +495,42 @@ class EvidenceRenderer:
                 cv2.rectangle(canvas_img, (px[0], px[1]), (px[2], px[3]), color, th, cv2.LINE_AA)
                 label = ru_label(key)
                 lsize = max(10, size - 2)
-                tw = painter.text_width(label, lsize) + 6
-                ly = px[1] - lsize - 6 if px[1] - lsize - 6 >= 0 else px[1] + 1
-                lx = min(px[0], max(0, w - tw))
-                cv2.rectangle(canvas_img, (lx, ly), (lx + tw, ly + lsize + 5), color, -1)
-                painter.add(label, (lx + 3, ly + 1), lsize, (255, 255, 255))
+                if legend_mode:
+                    num = str(len(legend) + 1)
+                    tw = painter.text_width(num, lsize) + 6
+                    lx = px[0] if px[0] - tw < 0 else px[0] - tw   # номер — снаружи рамки, слева
+                    ly = px[1]
+                    cv2.rectangle(canvas_img, (lx, ly), (lx + tw, ly + lsize + 4), color, -1)
+                    painter.add(num, (lx + 3, ly + 1 + header_h), lsize, (255, 255, 255))
+                    legend.append(f"{num} — {label}")
+                else:
+                    tw = painter.text_width(label, lsize) + 6
+                    ly = px[1] - lsize - 6 if px[1] - lsize - 6 >= 0 else px[1] + 1
+                    lx = min(px[0], max(0, w - tw))
+                    cv2.rectangle(canvas_img, (lx, ly), (lx + tw, ly + lsize + 5), color, -1)
+                    painter.add(label, (lx + 3, ly + 1 + header_h), lsize, (255, 255, 255))
                 shapes.append({"kind": "box", "key": str(key), "label": label, "color": _hex(color),
+                               "frame_role": role,
                                "bbox": [round(px[0] / w, 4), round(px[1] / h, 4), round(px[2] / w, 4),
                                         round(px[3] / h, 4)]})
         # Поля сверху/снизу — оверлей не закрывает содержимое кадра.
-        header_h = size + 12
         type_line = f"{cand.type_id} · {info.get('name', cand.type_id)}"
         lines = painter.wrap(type_line, size, w - 12, max_lines=2)
-        footer_lines = lines + [f"скор {cand.confidence:.2f} · признаки возможного нарушения"]
+        legend_lines = painter.wrap("; ".join(legend), max(10, size - 2), w - 12, max_lines=2) if legend else []
+        footer_lines = lines + legend_lines + [f"скор {cand.confidence:.2f} · признаки возможного нарушения"]
         footer_h = (size + 6) * len(footer_lines) + 8
         sev = str(info.get("severity") or "medium").lower()
         border = SEVERITY_COLOR.get(sev, SEVERITY_COLOR["medium"])
         canvas = np.full((h + header_h + footer_h, w, 3), 24, dtype=np.uint8)
         canvas[header_h:header_h + h] = canvas_img
         cv2.rectangle(canvas, (0, header_h), (w - 1, header_h + h - 1), border, 2)
-        mark = " (пик)" if idx == 0 else ""
+        mark = {"key": " · ключевой момент", "before": " · до", "after": " · после"}.get(role, "")
         painter.add(f"кадр {idx + 1}/{n} · t = {pts:.2f} с · {format_time(pts)}{mark}", (6, 5), size,
                     (255, 255, 255))
         y = header_h + h + 4
         for i, line in enumerate(footer_lines):
-            painter.add(line, (6, y), size if i < len(lines) else max(10, size - 2),
-                        border if i < len(lines) else (210, 210, 210))
+            color = border if i < len(lines) else (210, 210, 210)
+            painter.add(line, (6, y), size if i < len(lines) else max(10, size - 2), color)
             y += size + 6
         return painter.flush(canvas), shapes
 
@@ -462,23 +545,23 @@ class EvidenceRenderer:
         max_bytes = int(self.cfg.get("max_bytes", 200_000))
         qualities = list(self.cfg.get("jpeg_quality") or [88, 80, 72, 64, 56, 48, 40, 32])
         max_side = int(self.cfg.get("max_side", 1280))
-        dup_mad = float(self.cfg.get("dup_mad", 1.5))
+        dup_block = float(self.cfg.get("dup_block", 4.0))
         min_sep = float(self.cfg.get("min_sep_s", 0.4))
-        times = self.select_times(float(cand.t_peak), float(cand.t_start), float(cand.t_end), degraded)
+        moments = self.select_moments(cand, degraded)
 
-        chosen: list[tuple[np.ndarray, float]] = []
+        chosen: list[tuple[np.ndarray, float, str]] = []
         thumbs: list[np.ndarray] = []
-        for t in times:
+        for t, role in moments:
             got = self.grab(t)
             if got is None:
                 continue
             img, pts = got
-            if any(abs(pts - p) < min_sep * 0.5 for _, p in chosen):
+            if any(abs(pts - p) < min_sep * 0.5 for _, p, _ in chosen):
                 continue
             th = thumb(img)
-            if any(float(np.mean(np.abs(th - o))) < dup_mad for o in thumbs):
+            if any(is_duplicate(th, o, dup_block) for o in thumbs):
                 continue  # визуальный дубль
-            chosen.append((img, pts))
+            chosen.append((img, pts, role))
             thumbs.append(th)
         if not chosen:
             self._warn_once(f"noframe:{cand.type_id}:{cand.t_peak}", f"no frame available for {cand.type_id} "
@@ -492,19 +575,24 @@ class EvidenceRenderer:
         n_ui = int(self.cfg.get("ui_overlay_frames", 1)) if self.cfg.get("ui_overlays", True) else 0
         box_dt = float(self.cfg.get("box_max_dt_s", 1.5))
         any_blur = False
-        for k, (img, pts) in enumerate(chosen):
+        state = (getattr(cand, "extra", {}) or {}).get("state_after")
+        after_boxes = state.get("valuables_bboxes") if isinstance(state, dict) else None
+        for k, (img, pts, role) in enumerate(chosen):
             regions = self.head_regions(cand, img.shape, pts)
             any_blur = any_blur or bool(regions)
             clean = blur_regions(img, regions) if regions else img
             jury.append(EvidenceFrame(timestamp_sec=round(float(pts), 3),
                                       image_base64=b64(encode_jpeg(clean, max_bytes, qualities, max_side))))
             if k < n_ui and not degraded:
-                draw = bool(self.cfg.get("draw_boxes", True)) and abs(pts - float(cand.t_peak)) <= box_dt
-                ov, shapes = self.overlay(clean, cand, info, pts, k, len(chosen), draw)
-                ui_frames.append({"timestamp_sec": round(float(pts), 3),
+                boxes = None
+                if role == "after" and isinstance(after_boxes, dict) and after_boxes:
+                    boxes, draw = after_boxes, bool(self.cfg.get("draw_boxes", True))  # подсветка оставленного
+                else:
+                    draw = bool(self.cfg.get("draw_boxes", True)) and abs(pts - float(cand.t_peak)) <= box_dt
+                ov, shapes = self.overlay(clean, cand, info, pts, k, len(chosen), draw, role, boxes)
+                ui_frames.append({"timestamp_sec": round(float(pts), 3), "role": role,
                                   "image_base64": b64(encode_jpeg(ov, max_bytes, qualities, max_side))})
-                if not all_shapes:
-                    all_shapes = shapes
+                all_shapes.extend(sh for sh in shapes if sh not in all_shapes)
             for r in regions:
                 h, w = img.shape[:2]
                 all_shapes.append({"kind": "blur", "timestamp_sec": round(float(pts), 3),

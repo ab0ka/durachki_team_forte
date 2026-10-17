@@ -158,8 +158,11 @@ def build_description(
 
     body = sentences[:2]
     if not any("возможн" in s.lower() for s in body):
-        why_generic = f"Это может быть признаком возможного нарушения: «{name}»."
-        body = body[:1] + [why_generic]
+        if len(body) == 1:
+            body.append(f"Это может быть признаком возможного нарушения: «{name}».")
+        else:  # не вытесняем второе предложение шаблона (например, честное «норма не подтверждена»)
+            check = _ensure_period(str(dcfg.get("check_sentence_possible")
+                                       or "Это признаки возможного нарушения — требуется проверка человеком."))
     if norm_ref and not (rx and rx.search(norm_ref)):
         last = body[-1].rstrip(".!?… ")
         body[-1] = f"{last} (норма: {norm_ref.strip().rstrip('.')})."

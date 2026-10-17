@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import yaml
 
 from ml.fusion import fuse
@@ -56,27 +58,72 @@ def test_fit_reaches_target_recall_on_train():
     assert 0.35 < thr["V01"] <= 0.5
 
 
-def test_cli_end_to_end(tmp_path, catalog, monkeypatch):
-    monkeypatch.setenv("SENTINEL_FUSION_NO_FRAMES", "1")
+def _write_preds(tmp_path, catalog, n=12, dup=False):
     preds = tmp_path / "preds_raw"
     preds.mkdir()
     rows = ["video,label,second"]
-    for i in range(12):
+    for i in range(n):
         positive = i % 2 == 0
         events = [ev(t=10.0, conf=0.55 + i * 0.02)] if positive else [ev(t=5.0, conf=0.2 + i * 0.01)]
         res = fuse(FakeClip(duration=30.0), events, [], catalog, f"job{i}")
         name = f"Х-{i}" if i % 3 == 0 else f"X-{i}"
         (preds / f"{name}.json").write_text(json.dumps({"meta": res.meta}, ensure_ascii=False), encoding="utf-8")
         rows.append(f"{name}.mov,{'нарушение' if positive else 'без нарушения'},{'10' if positive else ''}")
+    if dup:  # дубль X-0 с другим таймкодом (как Х-4≡Х-47: 57 и 68 с)
+        (preds / "X-100.json").write_text((preds / "Х-0.json").read_text(encoding="utf-8"), encoding="utf-8")
+        rows.append("X-100.mov,нарушение,25")
     labels = tmp_path / "labels.csv"
     labels.write_text("\n".join(rows) + "\n", encoding="utf-8")
-    out = tmp_path / "thr.yaml"
-    report = tmp_path / "report.json"
+    return preds, labels
+
+
+def test_cli_end_to_end_cv(tmp_path, catalog, monkeypatch):
+    monkeypatch.setenv("SENTINEL_FUSION_NO_FRAMES", "1")
+    preds, labels = _write_preds(tmp_path, catalog, dup=True)
+    out, report = tmp_path / "thr.yaml", tmp_path / "report.json"
     assert main(["--preds", str(preds), "--labels", str(labels), "--out", str(out), "--report", str(report),
                  "--cv", "3"]) == 0
     doc = yaml.safe_load(out.read_text(encoding="utf-8"))
-    assert doc["tuned"] is True and doc["tuned_on"]["mode"] == "train_split"
-    assert doc["tuned_on"]["n_holdout"] > 0 and "V01" in doc["per_type"]
+    assert doc["tuned"] is True and doc["tuned_on"]["mode"] == "cv" and doc["tuned_on"]["k"] == 3
+    assert "не независимый тест" in doc["tuned_on"]["note"]
     rep = json.loads(report.read_text(encoding="utf-8"))
-    assert rep["train"]["recall"] == 1.0 and rep["holdout"]["n"] > 0 and rep["cv"]["k"] == 3
+    assert rep["n_groups"] == 12                       # дубль X-100 ≡ Х-0 — одна группа
+    assert rep["cv"]["oof"]["recall"] == 1.0 and len(rep["cv"]["fold_thresholds"]) == 3
+    assert any("конфликт таймкодов" in w for w in rep["warnings"])
+    assert rep["cv"]["oof"]["timecode_conflicts"] == ["X-0"]
+
+
+def test_cli_holdout_mode(tmp_path, catalog, monkeypatch):
+    monkeypatch.setenv("SENTINEL_FUSION_NO_FRAMES", "1")
+    preds, labels = _write_preds(tmp_path, catalog)
+    report = tmp_path / "report.json"
+    assert main(["--preds", str(preds), "--labels", str(labels), "--mode", "holdout", "--report", str(report)]) == 0
+    rep = json.loads(report.read_text(encoding="utf-8"))
+    assert rep["mode"] == "holdout" and rep["holdout"]["n"] > 0
     assert not set(rep["train_videos"]) & set(rep["holdout_videos"])
+
+
+@pytest.mark.parametrize("dt_weight,expect_fp,expect_hit", [(0.5, 0, 0.0), (2.0, 1, 1.0)])
+def test_dt_penalty_tradeoff(dt_weight, expect_fp, expect_hit):
+    # P ловится либо V01 с верным таймкодом (0.5), либо V03 с неверным (0.8); у чистого N есть V01 0.55.
+    # Штраф Δt дешевле FP → отсекаем V01 (промах таймкода); дороже FP → берём верный таймкод ценой FP.
+    pos = [Sample("P", True, [10.0], [("V01", 0.5, 10.0, 9.5), ("V03", 0.8, 30.0, 29.0)], "p")]
+    neg = [Sample("N", False, [], [("V01", 0.55, 5.0, 5.0)], "n")]
+    thr = fit(pos + neg, {"V01": 0.45, "V03": 0.45}, 0.45, dt_weight=dt_weight)
+    m = evaluate(pos + neg, thr, 0.45)
+    assert m["fn"] == 0 and m["fp"] == expect_fp and m["timecode_hit_rate"] == expect_hit
+
+
+def test_onset_vs_peak_timecode_metric():
+    s = [Sample("P", True, [9.0], [("V01", 0.9, 10.5, 9.2)], "p")]
+    assert evaluate(s, {}, 0.0, 1.0)["timecode_hit_rate"] == 0.0
+    assert evaluate(s, {}, 0.0, 1.0, policy="onset")["timecode_hit_rate"] == 1.0
+
+
+def test_type_column_accuracy(tmp_path):
+    p = tmp_path / "labels.csv"
+    p.write_text("video,label,second,type\nX-1,нарушение,10,V02\nX-2,без нарушения,,\n", encoding="utf-8")
+    labels = read_labels(p)
+    assert labels["X-1"][0].type_id == "V02" and labels["X-2"][0].type_id is None
+    s = [Sample("X-1", True, [10.0], [("V02", 0.9, 10.0, 10.0)], "g", type_id="V02")]
+    assert evaluate(s, {}, 0.0)["type_accuracy"] == 1.0
