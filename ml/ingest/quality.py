@@ -1,7 +1,8 @@
 """Качество кадров и активность: резкость, яркость, засвет/темнота, motion_energy, gating.
 
-Метрики считаются на уменьшенном сером кадре (``quality.analysis_width``), поэтому
-абсолютные значения резкости зависят от этой ширины (пороги в config.yaml — для неё).
+Метрики считаются на уменьшенном сером кадре: КОРОТКАЯ сторона -> ``quality.analysis_short_side``
+(портрет и ландшафт в одной шкале). Абсолютные значения резкости зависят от этого размера
+(пороги в config.yaml — для него).
 
 Записи ``clip.quality[i]`` (i — индекс сэмпла, как в ``clip.times``):
     t            — фактический PTS сэмпла, сек
@@ -23,19 +24,21 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 
 
-def _gray_small(img: np.ndarray, width: int) -> np.ndarray:
+def _gray_small(img: np.ndarray, short_side: int) -> np.ndarray:
+    """Серый кадр, уменьшенный так, что короткая сторона = short_side (ориентация не важна)."""
     try:
         import cv2
 
         gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
-        if width and w > width:
-            nh = max(2, int(round(h * width / w)))
-            gray = cv2.resize(gray, (width, nh), interpolation=cv2.INTER_AREA)
+        if short_side and min(h, w) > short_side:
+            scale = short_side / float(min(h, w))
+            size = (max(2, int(round(w * scale))), max(2, int(round(h * scale))))
+            gray = cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
         return gray
     except ImportError:  # pragma: no cover - numpy-фолбэк
         gray = img if img.ndim == 2 else (img[..., 0] * 0.114 + img[..., 1] * 0.587 + img[..., 2] * 0.299)
-        step = max(1, int(round(gray.shape[1] / max(width, 1))))
+        step = max(1, int(round(min(gray.shape[:2]) / max(short_side, 1))))
         return np.ascontiguousarray(gray[::step, ::step]).astype(np.uint8)
 
 
@@ -64,7 +67,7 @@ def _blur(gray: np.ndarray, ksize: int) -> np.ndarray:
 
 def frame_metrics(img: np.ndarray, cfg: Mapping[str, Any]) -> tuple[dict[str, float], np.ndarray]:
     """Метрики одного кадра + подготовленный (уменьшенный, размытый) серый кадр для motion."""
-    gray = _gray_small(img, int(cfg.get("analysis_width", 160)))
+    gray = _gray_small(img, int(cfg.get("analysis_short_side", cfg.get("analysis_width", 160))))
     mean = float(gray.mean()) / 255.0
     metrics = {
         "sharpness": _laplacian_var(gray),

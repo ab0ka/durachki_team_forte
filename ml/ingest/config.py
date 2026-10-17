@@ -40,7 +40,7 @@ DEFAULTS: dict[str, Any] = {
                  "max_offset_s": 0.25, "gap_factor": 3.0, "min_gap_s": 0.25},
     "mock": {"allow_synthetic_uri": False},
     "quality": {
-        "analysis_width": 160,
+        "analysis_short_side": 160,
         "blur_ksize": 5,
         "diff_threshold": 18,
         "motion_norm": 0.06,

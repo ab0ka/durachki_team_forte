@@ -38,13 +38,13 @@ mock:
   allow_synthetic_uri: false  # load_video("synthetic://N") только в тестах/демо (или env SENTINEL_MOCK=1)
 
 quality:
-  analysis_width: 160      # ширина серого кадра для метрик (меньше = быстрее)
+  analysis_short_side: 160 # короткая сторона серого кадра для метрик (портрет/ландшафт в одной шкале)
   blur_ksize: 5            # гаусс перед разностью кадров (подавляет шум/JPEG)
   diff_threshold: 18       # |Δяркости| (0..255), с которого пиксель считается «изменившимся»
   motion_norm: 0.06        # доля изменившихся пикселей, соответствующая motion_energy = 1.0
   dark_level: 16           # пиксель «тёмный», если яркость <= dark_level
   bright_level: 245        # пиксель «засвеченный», если яркость >= bright_level
-  blurry_laplacian: 40.0   # var(Laplacian) ниже — кадр считаем размытым (на analysis_width)
+  blurry_laplacian: 40.0   # var(Laplacian) ниже — кадр считаем размытым (на analysis_short_side)
   dark_mean: 0.15          # средняя яркость ниже — кадр тёмный
   bright_mean: 0.88        # средняя яркость выше — кадр пересвечен
   frozen_motion: 0.0005    # motion_frac ниже — кадр «заморожен» (дубликат)
