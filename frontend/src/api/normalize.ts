@@ -142,7 +142,13 @@ export function normalizeTimeline(v: unknown): TimelinePoint[] {
 export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
   if (!isObj(raw)) throw new Error("Некорректный ответ сервера: ожидался JSON-объект");
   const violations = Array.isArray(raw.violations)
-    ? raw.violations.map(normalizeViolation).filter((v): v is Violation => v !== null)
+    ? raw.violations
+        .map((x, i) => {
+          const v = normalizeViolation(x);
+          if (v) v.index = i;
+          return v;
+        })
+        .filter((v): v is Violation => v !== null)
     : [];
   violations.sort((a, b) => a.timecode_sec - b.timecode_sec);
   const status = normalizeStatus(raw.status);
@@ -202,10 +208,53 @@ export function inferDuration(job: JobResult): number {
   return d;
 }
 
-/** Источники события: из самого нарушения или из meta.events (trace фьюжна). */
+/** A12: meta.ui.evidence_overlays[] — факты, источники (dict источник→вес), состояние VLM по нарушению. */
+export function violationOverlay(v: Violation, job: JobResult): Obj | undefined {
+  const ui = (job.meta as Obj).ui;
+  const list = isObj(ui) ? ui.evidence_overlays : undefined;
+  if (!Array.isArray(list)) return undefined;
+  const objs = list.filter(isObj);
+  if (v.index !== undefined) {
+    const byIdx = objs.find((o) => num(o.violation_index, -1) === v.index);
+    if (byIdx && (!v.type_id || !o_type(byIdx) || o_type(byIdx) === v.type_id)) return byIdx;
+  }
+  return objs.find((o) => (!v.type_id || o_type(o) === v.type_id) && Math.abs(num(o.timecode_sec, -1e9) - v.timecode_sec) < 0.6);
+}
+
+function o_type(o: Obj): string {
+  return str(o.type_id);
+}
+
+/** Список источников: массив строк или словарь {источник: вес} (по убыванию веса). */
+function sourceNames(x: unknown): string[] {
+  if (isObj(x)) {
+    return Object.entries(x)
+      .sort((a, b) => num(b[1]) - num(a[1]))
+      .map(([k]) => k);
+  }
+  return strList(x);
+}
+
+/** Состояние проверки VLM (A12: confirm | reject | reject_weak | unsure). */
+export function violationVlm(v: Violation, job: JobResult): { label: string; tone: "ok" | "warn" | "muted" } | null {
+  const o = violationOverlay(v, job);
+  const st = o ? str(o.vlm).toLowerCase() : "";
+  if (!st) return null;
+  if (st.startsWith("confirm")) return { label: "VLM подтвердила", tone: "ok" };
+  if (st.startsWith("reject")) return { label: "VLM не подтвердила", tone: "warn" };
+  if (st === "unsure") return { label: "VLM не уверена", tone: "muted" };
+  return { label: `VLM: ${st}`, tone: "muted" };
+}
+
+/** Источники события: из самого нарушения, из meta.ui.evidence_overlays (A12) или из meta.events. */
 export function violationSources(v: Violation, job: JobResult): string[] {
   const own = v.sources ?? [];
   if (own.length) return own;
+  const ov = violationOverlay(v, job);
+  if (ov) {
+    const names = sourceNames(ov.sources);
+    if (names.length) return names;
+  }
   const events = (job.meta as Obj).events;
   if (Array.isArray(events)) {
     const found = new Set<string>();
@@ -214,16 +263,21 @@ export function violationSources(v: Violation, job: JobResult): string[] {
       if (v.type_id && str(e.type_id) !== v.type_id) continue;
       const tp = num(e.t_peak ?? e.timecode_sec, Number.NaN);
       if (Number.isFinite(tp) && Math.abs(tp - v.timecode_sec) > 15) continue;
-      strList(e.source ?? e.sources).forEach((s) => found.add(s));
+      sourceNames(e.source ?? e.sources).forEach((s) => found.add(s));
     }
     return [...found];
   }
   return [];
 }
 
-/** Факты: явные facts → предложения описания. */
+/** Факты: явные facts → meta.ui.evidence_overlays (A12) → meta.events → предложения описания. */
 export function violationFacts(v: Violation, job: JobResult): string[] {
   if (v.facts && v.facts.length) return v.facts;
+  const ov = violationOverlay(v, job);
+  if (ov) {
+    const f = strList(ov.facts);
+    if (f.length) return f;
+  }
   const events = (job.meta as Obj).events;
   if (Array.isArray(events)) {
     const facts: string[] = [];

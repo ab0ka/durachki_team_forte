@@ -36,6 +36,8 @@ export interface Violation {
   facts?: string[];
   sources?: string[];
   severity?: string;
+  /** Исходный порядковый номер в ответе сервера (A12 ссылается на него в meta.ui.evidence_overlays). */
+  index?: number;
 }
 
 export type TimelinePoint = [number, number]; // (t сек, risk 0..1)

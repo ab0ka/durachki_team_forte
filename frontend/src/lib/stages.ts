@@ -13,37 +13,37 @@ export const STEPS: StepDef[] = [
     id: "upload",
     title: "Приём видео",
     hint: "Файл передан на локальный сервер, задача в очереди",
-    keys: ["upload", "queue", "queued", "pending", "accept", "start"],
+    keys: ["upload", "queue", "queued", "pending", "accept", "start", "очеред", "приём"],
   },
   {
     id: "ingest",
     title: "Декодирование",
     hint: "Чтение .mov, учёт поворота, выборка кадров",
-    keys: ["ingest", "decode", "load", "sampl", "read", "probe", "video"],
+    keys: ["ingest", "decode", "load", "sampl", "read", "probe", "video", "декодир", "загрузка видео"],
   },
   {
     id: "perception",
     title: "Люди и предметы",
     hint: "Детекция, трекинг, роли по зонам и предметам",
-    keys: ["detect", "track", "pose", "person", "object", "zone"],
+    keys: ["detect", "track", "pose", "person", "object", "zone", "поиск люд", "трекинг", "поз", "объект"],
   },
   {
     id: "scene",
     title: "Состояние сцены",
     hint: "Сейф, дверь, наличные, присутствие кассира",
-    keys: ["scene", "state", "signal"],
+    keys: ["scene", "state", "signal", "сцен"],
   },
   {
     id: "reasoning",
     title: "Анализ событий",
     hint: "Правила, временная модель, локальная VLM",
-    keys: ["rule", "temporal", "vlm", "verify", "discover", "event"],
+    keys: ["rule", "temporal", "vlm", "verify", "discover", "event", "правил", "временн"],
   },
   {
     id: "report",
     title: "Формирование отчёта",
     hint: "Кадры-доказательства, нормы РК, вердикт",
-    keys: ["fusion", "fuse", "report", "evidence", "norm", "final", "serializ", "done", "finish"],
+    keys: ["fusion", "fuse", "report", "evidence", "norm", "final", "serializ", "done", "finish", "отчёт", "отчет", "готово"],
   },
 ];
 
@@ -85,5 +85,6 @@ export function stageLabel(stage: string | undefined): string {
     ["done", "готово"],
   ];
   for (const [k, v] of map) if (s.includes(k)) return v;
-  return stage;
+  // A03 присылает готовые русские подписи («Поиск людей и объектов») — показываем как есть, со строчной.
+  return /[а-яё]/i.test(stage) ? stage.charAt(0).toLowerCase() + stage.slice(1) : stage;
 }

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { CheckCircle2, Cpu, Image as ImageIcon, Scale, Sparkles, Timer } from "lucide-react";
 import type { JobResult, Violation } from "../api/types";
-import { imageSrc, violationFacts, violationSources } from "../api/normalize";
+import { imageSrc, violationFacts, violationSources, violationVlm } from "../api/normalize";
 import { typeInfo, sourceLabel } from "../lib/catalog";
 import { formatTimecode } from "../lib/format";
 import Lightbox from "./Lightbox";
@@ -21,6 +21,7 @@ export default function ViolationCard({ v, index, job, active, onSeek }: Props) 
   const info = typeInfo(v.type_id);
   const facts = violationFacts(v, job);
   const sources = violationSources(v, job);
+  const vlm = violationVlm(v, job);
   const rules = v.rules ?? [];
 
   return (
@@ -119,6 +120,19 @@ export default function ViolationCard({ v, index, job, active, onSeek }: Props) 
             <span className="flex items-center gap-1 text-xs text-slate-500">
               <Cpu className="h-3.5 w-3.5" /> Источники:
             </span>
+            {vlm && (
+              <span
+                className={cx(
+                  "chip",
+                  vlm.tone === "ok" && "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-400/10 dark:text-emerald-300",
+                  vlm.tone === "warn" && "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-400/20 dark:bg-amber-400/10 dark:text-amber-300",
+                  vlm.tone === "muted" && "border-slate-200 text-slate-500 dark:border-white/10",
+                )}
+                title="Результат проверки эпизода локальной визуально-языковой моделью"
+              >
+                {vlm.label}
+              </span>
+            )}
             {sources.length ? (
               sources.map((s) => (
                 <span key={s} className="chip border-ink-200 bg-ink-50 text-ink-700 dark:border-white/10 dark:bg-white/5 dark:text-slate-200" title={sourceLabel(s).hint}>

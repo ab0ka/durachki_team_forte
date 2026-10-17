@@ -33,6 +33,16 @@ describe("стадии", () => {
     expect(stepIndex("vlm", 0.8)).toBe(4);
     expect(stepIndex("fusion", 0.95)).toBe(5);
   });
+  it("русские подписи стадий A03", () => {
+    expect(stepIndex("Декодирование", 0.05)).toBe(1);
+    expect(stepIndex("Поиск людей и объектов", 0.2)).toBe(2);
+    expect(stepIndex("Анализ поз", 0.35)).toBe(2);
+    expect(stepIndex("Состояние сцены", 0.5)).toBe(3);
+    expect(stepIndex("Временная модель", 0.6)).toBe(4);
+    expect(stepIndex("Проверка VLM", 0.8)).toBe(4);
+    expect(stepIndex("Формирование отчёта", 0.95)).toBe(5);
+    expect(stageLabel("Поиск людей и объектов")).toBe("поиск людей и объектов");
+  });
   it("неизвестная стадия — по реальному прогрессу", () => {
     expect(stepIndex("xyz", 0.99)).toBe(STEPS.length - 1);
     expect(stageLabel("temporal")).toBe("временная модель");

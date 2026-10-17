@@ -11,6 +11,7 @@ import {
   toJuryJson,
   violationFacts,
   violationSources,
+  violationVlm,
 } from "../src/api/normalize";
 
 // Формы ответов — как в contracts/examples (A01).
@@ -194,5 +195,37 @@ describe("поля A02", () => {
     expect(j.status).toBe("failed");
     expect(j.verdict).toBeNull();
     expect(j.partialResult?.violations).toHaveLength(1);
+  });
+});
+
+describe("A12: meta.ui.evidence_overlays", () => {
+  const raw = {
+    job_id: "o",
+    status: "done",
+    verdict: "violation",
+    violations: [
+      { type: "Б", type_id: "V02", timecode_sec: 50, description: "Описание Б.", evidence_frames: [] },
+      { type: "А", type_id: "V01", timecode_sec: 10, description: "Описание А.", evidence_frames: [] },
+    ],
+    meta: {
+      ui: {
+        evidence_overlays: [
+          { violation_index: 0, type_id: "V02", timecode_sec: 50, facts: ["факт Б"], sources: { temporal: 0.4, rules: 0.9 }, vlm: "reject_weak" },
+          { violation_index: 1, type_id: "V01", timecode_sec: 10, facts: ["факт А"], sources: { vlm: 0.7 }, vlm: "confirm" },
+        ],
+      },
+    },
+  };
+  it("сопоставляет по исходному индексу даже после сортировки по времени", () => {
+    const j = normalizeJob(raw);
+    expect(j.violations.map((v) => v.type_id)).toEqual(["V01", "V02"]);
+    expect(violationFacts(j.violations[0], j)).toEqual(["факт А"]);
+    expect(violationFacts(j.violations[1], j)).toEqual(["факт Б"]);
+  });
+  it("sources-словарь → имена по убыванию веса; состояние VLM", () => {
+    const j = normalizeJob(raw);
+    expect(violationSources(j.violations[1], j)).toEqual(["rules", "temporal"]);
+    expect(violationVlm(j.violations[0], j)?.tone).toBe("ok");
+    expect(violationVlm(j.violations[1], j)?.label).toBe("VLM не подтвердила");
   });
 });
