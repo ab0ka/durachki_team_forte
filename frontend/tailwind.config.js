@@ -27,6 +27,7 @@ export default {
           focus: "rgb(var(--ks-focus) / <alpha-value>)",
           event: "rgb(var(--ks-event) / <alpha-value>)",
           "event-text": "rgb(var(--ks-event-text) / <alpha-value>)",
+          "event-contrast": "rgb(var(--ks-event-contrast) / <alpha-value>)",
           success: "rgb(var(--ks-success) / <alpha-value>)",
           "success-text": "rgb(var(--ks-success-text) / <alpha-value>)",
           warning: "rgb(var(--ks-warning) / <alpha-value>)",

@@ -48,11 +48,11 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
       <div className="card overflow-hidden">
         <div className="relative overflow-hidden bg-ink-900 px-6 py-8 text-white sm:px-8">
           <div className="bg-grid absolute inset-0 opacity-40" />
-          <div className="absolute inset-x-0 top-0 h-24 animate-scan bg-gradient-to-b from-transparent via-brand-400/25 to-transparent" />
+          <div className="absolute inset-x-0 top-0 h-24 animate-scan bg-gradient-to-b from-transparent via-ink-300/20 to-transparent" />
           <div className="relative flex items-center gap-4">
             <div className="relative flex h-14 w-14 items-center justify-center">
-              <span className="absolute inset-0 animate-pulse-ring rounded-full bg-brand-500/40" />
-              <span className="relative flex h-12 w-12 items-center justify-center rounded-full bg-brand-600">
+              <span className="absolute inset-0 animate-pulse-ring rounded-full bg-ink-400/40" />
+              <span className="relative flex h-12 w-12 items-center justify-center rounded-full bg-ink-600">
                 <Cpu className="h-6 w-6" />
               </span>
             </div>
@@ -84,7 +84,7 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
               <ProgressBar value={p} />
             ) : (
               <div className="h-2 overflow-hidden rounded-full bg-slate-100 dark:bg-white/[.06]">
-                <div className="h-full w-full animate-pulse rounded-full bg-brand-500/30" />
+                <div className="h-full w-full animate-pulse rounded-full bg-ks-accent/25" />
               </div>
             )}
             <div className="flex justify-between text-xs text-slate-500 tnum">
@@ -105,7 +105,7 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
                     className={cx(
                       "relative z-10 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold",
                       state === "done" && "bg-emerald-500 text-white",
-                      state === "active" && "bg-brand-600 text-white ring-4 ring-brand-500/20",
+                      state === "active" && "bg-ks-accent text-ks-accent-contrast ring-4 ring-ks-accent/15",
                       state === "pending" && "bg-slate-100 text-slate-400 dark:bg-white/5",
                     )}
                   >

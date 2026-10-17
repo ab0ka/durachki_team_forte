@@ -108,7 +108,7 @@ export default function RiskTimeline({ duration, timeline, violations, hints = [
             const a = ((v.t_start ?? Math.max(0, v.timecode_sec - 1)) / d) * VB_W;
             const b = ((v.t_end ?? v.timecode_sec + 1) / d) * VB_W;
             return (
-              <rect key={`r${i}`} x={a} y={0} width={Math.max(2, b - a)} height={48} fill="none" stroke="rgb(158 44 86)" strokeWidth={2} strokeDasharray="5 3" vectorEffect="non-scaling-stroke" />
+              <rect key={`r${i}`} x={a} y={0} width={Math.max(2, b - a)} height={48} fill="none" className="stroke-ks-event" strokeWidth={2} strokeDasharray="5 3" vectorEffect="non-scaling-stroke" />
             );
           })}
           {linePath && <path d={linePath} fill="none" stroke="rgba(15,23,42,.55)" strokeWidth={1.5} vectorEffect="non-scaling-stroke" className="dark:stroke-white/70" />}
@@ -144,10 +144,10 @@ export default function RiskTimeline({ duration, timeline, violations, hints = [
             title={`Эпизод ${i + 1}: ${v.type} — ${formatTimecode(v.timecode_sec)}`}
             aria-label={`Перейти к эпизоду ${i + 1}, ${formatTimecode(v.timecode_sec)}`}
           >
-            <span className="flex h-6 w-6 items-center justify-center rounded-full bg-brand-600 text-[11px] font-bold text-white shadow-lift ring-2 ring-white transition group-hover:scale-110 dark:ring-ink-900">
+            <span className="flex h-6 w-6 items-center justify-center rounded-full bg-ks-event text-[11px] font-bold text-ks-event-contrast shadow-lift ring-2 ring-white transition group-hover:scale-110 dark:ring-ink-900">
               {i + 1}
             </span>
-            <span className="mx-auto block h-[46px] w-0.5 bg-brand-600/80" />
+            <span className="mx-auto block h-[46px] w-0.5 bg-ks-event/80" />
           </button>
         ))}
         {/* playhead */}
@@ -181,7 +181,7 @@ export default function RiskTimeline({ duration, timeline, violations, hints = [
           индекс риска по кадрам (не вероятность)
         </span>
         <span className="flex items-center gap-1.5">
-          <span className="h-2.5 w-4 rounded-sm border-2 border-dashed border-brand-600" /> интервал эпизода
+          <span className="h-2.5 w-4 rounded-sm border-2 border-dashed border-[rgb(var(--ks-event))]" /> интервал эпизода
         </span>
         {hints.length > 0 && (
           <span className="flex items-center gap-1.5">

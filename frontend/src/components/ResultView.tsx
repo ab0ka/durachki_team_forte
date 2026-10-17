@@ -270,7 +270,7 @@ export default function ResultView({
           {episodes.length > 0 ? (
             <section className="space-y-4">
               <h2 className="flex items-center gap-2 text-lg font-bold">
-                <ListChecks className="h-5 w-5 text-brand-600 dark:text-brand-300" />
+                <ListChecks className="h-5 w-5 text-ks-event" />
                 {episodesAreCandidates
                   ? "Кандидаты — не подтверждены, в вердикт не вошли"
                   : job.status === "failed"
@@ -318,7 +318,7 @@ export default function ResultView({
                 {episodes.map((v, i) => (
                   <li key={i}>
                     <button className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left hover:bg-slate-50 dark:hover:bg-white/5" onClick={() => seek(v.timecode_sec)}>
-                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-brand-600 text-[11px] font-bold text-white">{i + 1}</span>
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-ks-event text-[11px] font-bold text-ks-event-contrast">{i + 1}</span>
                       <span className="min-w-0 flex-1 truncate text-sm font-medium">{v.type}</span>
                       <span className="font-mono text-xs text-slate-500 tnum">{formatTimecode(v.timecode_sec)}</span>
                     </button>
