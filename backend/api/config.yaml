@@ -1,0 +1,59 @@
+# Kassa Sentinel API (A02) — значения по умолчанию.
+# Любой ключ переопределяется переменной окружения SENTINEL_<KEY_UPPER>,
+# например watchdog_s -> SENTINEL_WATCHDOG_S. Пути относительные к корню репо.
+
+# --- хранилище ---
+data_dir: data                  # data/jobs/<job_id>/, data/jobs.sqlite3
+job_ttl_h: 72                   # через сколько часов удалять завершённые задачи (0 = никогда)
+cleanup_interval_s: 3600
+max_upload_mb: 300
+min_free_disk_mb: 512           # меньше свободного места -> 507 на загрузку
+
+# --- очередь и время (SLA жюри: < 5 мин на пачку из 5–8 видео) ---
+workers: 1                      # потоков-воркеров (uvicorn всегда 1 процесс!)
+gpu_slots: 1                    # одновременно на GPU
+gpu_lock_scope: job             # job = весь pipeline.run под семафором; none = pipeline сам
+budget_s: 270                   # deadline_s = budget_s - ожидание в очереди
+job_cap_s: 120                  # потолок deadline_s одной задачи (чтобы одна не съела очередь)
+min_deadline_s: 15              # меньше не даём, даже если опаздываем
+fair_share: true                # делить остаток бюджета между ждущими в очереди
+watchdog_s: 285                 # от постановки в очередь: отдаём partial / failed
+deadline_grace_s: 20            # pipeline.run превысил свой deadline_s на столько -> watchdog
+max_queue: 100                  # больше задач в очереди -> 503
+max_attempts: 3                 # перезапусков после падения процесса
+max_zombie_workers: 2           # сколько «зависших» потоков терпим, подменяя их новыми
+
+# --- пайплайн ---
+pipeline: backend.pipeline      # модуль с run()/warmup(); можно module:function
+fake_pipeline: false            # SENTINEL_FAKE_PIPELINE=1 -> встроенный фейк
+fake_pipeline_s: 3.0
+require_pipeline: false         # true -> если backend.pipeline не импортируется, задачи failed, а не фейк
+warmup: true
+warmup_wait_s: 120              # воркер ждёт прогрева не дольше
+evidence_fallback: true         # нет кадров у нарушения -> вырезать кадр из видео (cv2)
+copilot_timeout_s: 60
+
+# --- безопасность ---
+ui_enabled: true
+ui_token_ttl_s: 43200           # 12 ч
+ui_allow_no_origin: false       # разрешить /ui/v1/session без Origin/Referer/Sec-Fetch-Site
+cors_origins: ""                # dev: http://localhost:5173,http://127.0.0.1:5173
+trusted_proxies: "127.0.0.1,::1"  # от кого верить CF-Connecting-IP / X-Forwarded-For
+docs: true                      # /docs и /openapi.json
+
+# rate limit "N/секунд" на IP
+rl_ui_session: "30/60"
+rl_ui_upload: "12/60"
+rl_ui_read: "600/60"
+rl_ui_ask: "20/60"
+rl_auth_fail: "300/60"          # неудачные попытки API-ключа (защита от перебора)
+
+# --- раздача фронта ---
+frontend_dir: frontend/dist
+mov_as_mp4: true                # отдавать .mov как video/mp4 (Chrome так охотнее играет H.264)
+
+# --- сервер (python -m backend.api) ---
+host: 127.0.0.1
+port: 8000
+log_level: INFO
+log_json: true
