@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .config import load_config, reports_dir, weights_dir
+from .config import feature_signature, load_config, reports_dir, stable_hash, weights_dir
 from .dataset import Sample, fit_spec, prepare_samples
 from .features import TextBank
 from .predictors import fit_predictor, has_type_labels, save_checkpoint, type_head_source
@@ -49,6 +49,7 @@ def train_all(samples: Sequence[Sample], bank: TextBank, cfg: dict, kinds: Seque
                 "reproducibility": _repro(cfg),
                 "train_groups": sorted(s.group for s in samples),
                 "pooling": pooling, "null": cal["null"],
+                "feature_signature": stable_hash(feature_signature(cfg, spec.backend), 16),
                 "type_head_source": type_head_source(samples, cfg) if model.type_trained else None,
                 "calibration": {k: cal[k] for k in ("n_inner", "n_null_blocks", "oof_auc")},
                 "prompts": {"en": bank.texts_en, "ru": bank.texts_ru, "owner": bank.owner},
