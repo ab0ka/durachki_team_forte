@@ -212,7 +212,9 @@ def test_truncated_faststart_is_not_a_silent_success(tmp_path: Path, faststart_v
     clip = load_video(str(almost))
     assert not clip.meta["complete"] and clip.meta["coverage"] < 0.98
     assert any("неполное" in w for w in clip.warnings)
-    assert clip.duration < 3.0 and len(clip) > 0
+    # duration — номинальная (3 с), недекодированный хвост виден как пробел, а не «укорачивает» ролик
+    assert clip.duration == pytest.approx(3.0, abs=1e-3) and len(clip) > 0
+    assert clip.coverage["decoded_span"] < 2.9 and clip.coverage["unknown_spans"][-1][1] == pytest.approx(3.0, abs=1e-3)
 
 
 @needs_ffmpeg

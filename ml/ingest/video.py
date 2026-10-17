@@ -808,10 +808,12 @@ class Clip:
     def coverage(self) -> dict[str, Any]:
         """Полнота декодирования — проверять до вывода «нарушений нет»."""
         m = self.meta
+        gaps = [(float(a), float(b)) for a, b in m.get("coverage_gaps", [])]
         return {"complete": bool(m.get("complete", True)), "coverage": float(m.get("coverage", 1.0)),
+                "duration": float(self.duration),
                 "decoded_span": float(m.get("decoded_span", self.duration)),
                 "declared_duration": float(m.get("declared_duration", 0.0)),
-                "gaps": list(m.get("coverage_gaps", [])),
+                "gaps": gaps, "unknown_spans": [[a, b] for a, b in gaps],
                 "source_times_complete": bool(m.get("source_times_complete", True))}
 
     def snap_time(self, t: float) -> float:
@@ -926,21 +928,25 @@ def _median_dt(times: Sequence[float], fallback: float) -> float:
 
 
 def find_gaps(source_times: Sequence[float], declared: float, dt: float, gap_factor: float = 3.0,
-              min_gap_s: float = 0.25) -> list[tuple[float, float]]:
-    """Пробелы покрытия [(a, b)]: между соседними PTS (a — последний кадр до дыры, b — первый после),
-    в начале (0, первый PTS) и в хвосте (конец декодированного, заявленная длительность)."""
+              min_gap_s: float = 0.25, edge_factor: float = 1.5) -> list[tuple[float, float]]:
+    """Пробелы покрытия [(a, b)], сек: между соседними PTS (a — последний кадр до дыры, b — первый после),
+    в начале (0, первый PTS) и в хвосте (конец декодированного, заявленная длительность).
+
+    Внутренние — от ``max(min_gap_s, gap_factor*dt)`` (не путать с дрожанием VFR); голова и хвост —
+    от ``edge_factor*dt``: там любой отсутствующий отрезок длиннее ~1.5 кадра — недекодированное содержимое."""
     if not source_times:
         return [(0.0, float(declared))] if declared > 0 else []
     thr = max(float(min_gap_s), float(gap_factor) * float(dt))
+    edge = max(float(edge_factor) * float(dt), _EPS)
     st = np.asarray(source_times, dtype=np.float64)
     gaps: list[tuple[float, float]] = []
-    if st[0] > thr:
+    if st[0] > edge:
         gaps.append((0.0, float(st[0])))
     d = np.diff(st)
     for k in np.nonzero(d > thr)[0]:
         gaps.append((float(st[k]), float(st[k + 1])))
     end = float(st[-1] + dt)
-    if declared > 0 and declared - end > thr:
+    if declared > 0 and declared - end > edge:
         gaps.append((end, float(declared)))
     return gaps
 
@@ -1043,9 +1049,11 @@ def _build_clip(
     warnings.extend(qwarn)
     fa = cfg["frame_at"]
     gaps = find_gaps(source_times, declared, dt, float(fa.get("gap_factor", 3.0)), float(fa.get("min_gap_s", 0.25)))
-    if gaps and not stats.skip_nonref:
-        total_gap = sum(b - a for a, b in gaps)
-        warnings.append(f"пробелы покрытия: {len(gaps)} шт., всего {total_gap:.2f} с (кадров нет)")
+    # при skip_nonref промежутки между опорными кадрами — норма; голова/хвост по-прежнему пробелы
+    spans = gaps if not stats.skip_nonref else [g for g in gaps if g[0] <= _EPS or (declared > 0 and g[1] >= declared - _EPS)]
+    if spans:
+        total_gap = sum(b - a for a, b in spans)
+        warnings.append(f"пробелы покрытия: {len(spans)} шт., всего {total_gap:.2f} с (кадров нет)")
 
     sample_h, sample_w = store.get(0).shape[:2] if len(store) else (0, 0)
     window = float(cfg["frame_at"].get("forward_window_s", 1.5))
@@ -1070,7 +1078,8 @@ def _build_clip(
         "declared_duration": declared,
         "decoded_span": decoded_span,
         "coverage": coverage,
-        "coverage_gaps": gaps if not stats.skip_nonref else [],
+        "coverage_gaps": spans,
+        "unknown_spans": [[a, b] for a, b in spans],  # = coverage_gaps в формате A01 ([[t0, t1], ...], сек)
         "median_frame_dt": dt,
         "complete": complete,
         "sample_size": [int(sample_w), int(sample_h)],
@@ -1080,8 +1089,10 @@ def _build_clip(
         "warnings": warnings,
         "_reader_args": reader_args,
     }
-    # длительность: заявленная контейнером, если она согласуется с декодированным таймлайном
-    duration = declared if (complete and declared > 0 and abs(declared - decoded_span) <= 2 * dt + 0.05) else decoded_span
+    # duration — НОМИНАЛЬНАЯ длительность видеопотока (контейнер), а не декодированный отрезок: недекодированный
+    # хвост остаётся внутри [0, duration] и виден потребителю (A03 сравнивает duration с times) как
+    # unknown_spans, а не исчезает. Контейнер занижает (декодировано больше) — берём декодированное.
+    duration = max(declared, decoded_span) if declared > 0 else decoded_span
     return Clip(
         path=path, duration=duration, fps=fps_src, width=stats.width, height=stats.height, times=times,
         sample_fps=float(sample_fps or 0.0) or measured_fps, quality=quality, source_times=source_times,
