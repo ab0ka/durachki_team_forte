@@ -77,18 +77,20 @@ def test_checkpoint_roundtrip(toy, cfg, tmp_path):
     assert np.allclose(a, b, atol=1e-6)
 
 
+@pytest.mark.slow
 def test_temporal_head_shapes_and_learning(toy, cfg, tmp_path):
     torch = pytest.importorskip("torch")
     samples, bank, spec = _prep(toy, cfg)
     from ml.temporal.model import build_model, loss_fn
 
-    net = build_model(spec.in_dim, cfg)
+    gru_cfg = {**cfg, "model": {**cfg["model"], "arch": "tcn_gru"}}
+    net = build_model(spec.in_dim, gru_cfg)               # вариант с BiGRU и упакованными последовательностями
     x = torch.randn(3, 50, spec.in_dim)
     mask = torch.ones(3, 50)
     mask[1, 30:] = 0
     lg, tl = net(x, mask)
     assert lg.shape == (3, 50) and tl.shape == (3, 50, 9)
-    cfg2 = {**cfg, "train": {**cfg["train"], "epochs": 25, "steps_per_epoch": 8, "mixup_prob": 0.0}}
+    cfg2 = {**cfg, "train": {**cfg["train"], "epochs": 20, "steps_per_epoch": 8, "mixup_prob": 0.0}}
     m = fit_predictor("temporal", samples, spec, cfg2, seed=0)
     auc, _ = _video_auc(m, samples, spec, cfg2)
     assert auc is not None and auc >= 0.8

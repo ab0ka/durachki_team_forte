@@ -15,6 +15,11 @@ from ml.temporal.dataset import Sample  # noqa: E402
 from ml.temporal.features import FeatureSet, TextBank  # noqa: E402
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: долгие тесты (обучение torch-головы)")
+    config.addinivalue_line("markers", "gpu: тесты, требующие CUDA")
+
+
 @pytest.fixture(autouse=True)
 def _isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_CACHE_DIR", str(tmp_path / "cache"))
@@ -74,14 +79,14 @@ def toy():
 
 
 def write_video(path: Path, seconds: float = 8.0, fps: int = 10, w: int = 116, h: int = 212,
-                event: tuple[float, float] | None = (3.0, 5.0)) -> Path:
+                event: tuple[float, float] | None = (3.0, 5.0), shade: int = 90) -> Path:
     """Синтетическое портретное видео: статичный «стол» + движущийся прямоугольник в интервале event."""
     cv2 = pytest.importorskip("cv2")
     vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h))
     n = int(seconds * fps)
     for i in range(n):
         t = i / fps
-        fr = np.full((h, w, 3), 90, np.uint8)
+        fr = np.full((h, w, 3), shade, np.uint8)
         cv2.rectangle(fr, (10, 120), (100, 190), (60, 60, 60), -1)
         if event and event[0] <= t <= event[1]:
             x = int(10 + (t - event[0]) * 30) % (w - 30)

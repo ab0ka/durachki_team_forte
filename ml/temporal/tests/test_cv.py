@@ -25,3 +25,16 @@ def test_run_with_holdout_and_selection(cfg):
     h = rep["holdout"]
     assert set(h["names"]).isdisjoint({v["name"] for v in rep["baseline"]["per_video"]})
     assert len(h["pred"]) == len(h["names"]) >= 2
+
+
+def test_nested_cv_temporal_smoke(cfg):
+    import pytest
+
+    pytest.importorskip("torch")
+    samples, bank = make_samples(n_pos=4, n_neg=4, T=60), make_bank()
+    c = {**cfg, "train": {**cfg["train"], "steps_per_epoch": 3}}
+    rep = cvmod.run(c, ["baseline", "temporal"], outer=2, inner=2, holdout=0.0, seed=0, epochs=2,
+                    samples=samples, bank=bank)
+    assert rep["selected"] in ("baseline", "temporal")
+    assert rep["temporal"]["n_folds"] == rep["baseline"]["n_folds"] == 2   # одинаковые внешние фолды
+    assert [v["name"] for v in rep["temporal"]["per_video"]] == [v["name"] for v in rep["baseline"]["per_video"]]

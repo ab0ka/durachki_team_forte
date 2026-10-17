@@ -57,7 +57,7 @@ baseline:                          # первый обучаемый резул�
   lr: 0.05
 
 model:                             # temporal head (TCN+BiGRU) — сравнение с baseline
-  arch: tcn_gru                    # tcn | gru | tcn_gru
+  arch: tcn                        # tcn | gru | tcn_gru (GRU ~5x медленнее на CPU: 156 vs 31 мс/шаг)
   input_groups: [sims, emb, dyn]   # sims — zero-shot сходства; emb — эмбеддинги; dyn — движение/смена кадра
   emb_pca: 32                      # PCA эмбеддингов на вид (подгоняется на обучающей выборке)
   hidden: 64
