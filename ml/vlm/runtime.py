@@ -80,6 +80,11 @@ def configure_registry(use: bool = True, vram_gb: float = 3.5) -> None:
     _use_registry, _registry_vram_gb = bool(use), float(vram_gb)
 
 
+def _register(reg: Any, be: VLMBackend) -> Any:
+    return reg.get_or_load(REGISTRY_NAME, lambda: (be.load(), be)[1], vram_gb=_registry_vram_gb,
+                           unload=lambda obj: obj.unload())
+
+
 def _registry() -> Optional[Any]:
     """ModelRegistry A03, только если он уже создан в этом процессе (воркер пайплайна); сами его не создаём."""
     if not _use_registry:
@@ -109,9 +114,12 @@ def ensure_loaded(be: VLMBackend, budget: Optional[Budget] = None, min_budget_s:
             reg = _registry()
             if reg is not None and be.name not in ("mock",):
                 # A03 освобождает LRU-модели под нужный объём и сможет выгрузить VLM через be.unload()
-                reg.get_or_load(REGISTRY_NAME, lambda: (be.load(), be)[1], vram_gb=_registry_vram_gb,
-                                unload=lambda obj: obj.unload())
-                if not be.loaded:  # реестр уже держал запись, но модель была выгружена
+                obj = _register(reg, be)
+                if obj is not be:  # запись держит прежний экземпляр (после unload/смены конфига): заменить,
+                    with contextlib.suppress(Exception):  # иначе новый экземпляр жил бы вне учёта VRAM A03
+                        reg.release(REGISTRY_NAME)
+                    _register(reg, be)
+                if not be.loaded:  # запись есть, но модель выгружали напрямую через be.unload()
                     be.load()
             else:
                 be.load()
@@ -141,8 +149,13 @@ def _free_cuda() -> None:
 
 
 def unload_backend() -> None:
+    """Выгрузить модель и снять её запись в ModelRegistry A03 (иначе реестр считал бы VRAM занятой)."""
     global _backend, _backend_key
     _load_failed.clear()
+    reg = _registry()
+    if reg is not None:
+        with contextlib.suppress(Exception):
+            reg.release(REGISTRY_NAME)
     with _state_lock:
         if _backend is not None:
             with contextlib.suppress(Exception):
