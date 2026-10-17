@@ -64,6 +64,22 @@ python -m ml.vlm.compare --videos data/raw --labels data/labels.csv --candidates
 - `chat`: задержка и токены;
 - `load_s`, `vram_*`.
 
+**Проверка связки с fusion.** Прогон на `ml.fusion` из `claude/integration-cloud`: синтетика, mock-VLM,
+событие правил V08, порог 0.5.
+
+| вход (rules) | без VLM | VLM `reject` | VLM `confirm` |
+|---|---|---|---|
+| 0.55 | violation (0.55) | **no_violation** (0.33, `vlm_factor` 0.6) | violation (0.776) |
+| 0.80 | violation (0.80) | **no_violation** (0.48) | violation (0.919) |
+
+Выводы:
+- Мнение VLM теперь реально меняет вердикт. Значит, ложный `reject` способен снять настоящее нарушение.
+  Поэтому решение о включении verify — только по `fn_created` из `compare`. Если `fn_created > 0`, A12 повышает
+  `vlm.reject_min_score` или убирает понижение для сильных правил, A11 — `vlm_weight`/`qa.vlm_weight`.
+- В каталоге A13 из ветки интеграции норма (`rules`) сейчас есть **только у V08**. Остальные типы fusion отсекает
+  как `no_norm` («для типа нет применимой нормы»), независимо от VLM. По FAQ 32 нормы есть у всех нарушений
+  датасета — это задача A13. Без неё compare покажет нарушения только для V08.
+
 **Правило выбора конфигурации.** Режим включается, только если на compare у него `fn_created == 0` и сумма
 `fp_fixed + fn_fixed` больше `fp_created`, а `vlm_s_p95` укладывается в бюджет A03. Выбранный режим фиксируется
 одной строкой `verify.mode` в `config.yaml` с результатом замера в коммите. Важно: все 42 строки разметки уже
