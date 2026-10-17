@@ -27,6 +27,17 @@ _spec = importlib.util.spec_from_file_location("vlm_types", Path(__file__).with_
 _vt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_vt)
 CATALOG, fnum, norm_oop, norm_type = _vt.CATALOG, _vt.fnum, _vt.norm_oop, _vt.norm_type
+_spec_p = importlib.util.spec_from_file_location("vlm_probe", Path(__file__).with_name("vlm_probe.py"))
+_vp = importlib.util.module_from_spec(_spec_p)
+_spec_p.loader.exec_module(_vp)
+ATTRS = _vp.ATTRS  # признак → (вопрос, сигнал/тип)
+
+
+def probe_types(ans: dict | None) -> list[str]:
+    """Типы-кандидаты из нейтрального опросника: признаки с ответом yes, привязанные к V0x."""
+    if not ans:
+        return []
+    return sorted({ATTRS[k][1] for k, v in ans.items() if k in ATTRS and v[0] == "yes" and ATTRS[k][1] in CATALOG})
 
 COLS = ["video_id", "t_sec", "type_id", "confidence", "what_is_visible", "actors", "objects", "onset_or_peak",
         "event_time_sec", "new_type", "alt_type_id", "source", "confirmed", "notes"]
@@ -195,6 +206,13 @@ function evState(e) {
     new_type: e.new_type, what_is_visible: e.what_is_visible, actors: e.actors, objects: e.objects, notes: '', confirmed: false};
   return S[k];
 }
+function probeBlock(ans, title) {
+  if (!ans) return null;
+  const yes = Object.entries(ans).filter(([k, v]) => v[0] === 'yes'), unc = Object.entries(ans).filter(([k, v]) => v[0] === 'unclear');
+  const chip = ([k, v]) => el('span', {class: 'chip', title: (D.attrs[k] || [k])[0], text: k + (v[1] !== null && v[1] !== undefined ? ' @' + v[1] : '')});
+  return el('div', {class: 'vlm'}, el('p', {}, el('b', {text: title + ' — да: '}), ...(yes.length ? yes.map(chip) : ['—'])),
+    unc.length ? el('p', {class: 'note'}, 'неясно: ' + unc.map(([k]) => k).join(', ')) : null);
+}
 function vlmBlock(e) {
   const c = e.confidence, lo = !(c >= D.doubt);
   return el('div', {class: 'vlm'},
@@ -214,7 +232,9 @@ function evCard(e) {
   return el('div', {class: 'card' + (st.confirmed ? ' done' : ''), id: vkey(e)},
     el('h2', {text: e.video_id + ' · t = ' + e.t_sec + ' с' + (D.conflict[e.video_id] ? ' · ⚠ тот же файл, что ' + D.conflict[e.video_id] : '')}),
     el('div', {class: 'row'},
-      el('div', {}, player(file, e.t_sec), vlmBlock(e)),
+      el('div', {}, player(file, e.t_sec), vlmBlock(e),
+        probeBlock(e.probe, 'Нейтральный опросник (t±5 с, без подсказки о нарушении)'),
+        e.probe_types && e.probe_types.length ? el('p', {}, el('b', {text: 'Кандидаты по опроснику: '}), e.probe_types.join(', ')) : null),
       el('div', {class: 'imgs'}, ...e.passes.map(p => img(p.sheet)), img(e.overview)),
       el('div', {},
         field(st, 'type_id', 'Тип нарушения', 'select', TYPES),
@@ -263,6 +283,7 @@ function cleanCard(c) {
         el('p', {}, el('b', {text: 'Деньги: '}), String(r.cash_handling || '—')),
         el('p', {}, el('b', {text: 'Дверь: '}), String(r.door_events || '—')),
         el('p', {}, el('b', {text: 'VLM подозревает нарушение: '}), String(r.suspected_violation || 'нет')),
+        ...(c.probes || []).map(p => probeBlock(p.answers, 'Опросник окна ' + p.t_center + ' с')),
         el('details', {}, el('summary', {text: 'сырой ответ'}), el('pre', {text: c.raw})))),
       el('div', {class: 'imgs'}, img(c.overview)),
       el('div', {},
@@ -320,7 +341,7 @@ render();
 
 
 def build_html(events, pairs, clean, man, conflict, doubt) -> str:
-    data = dict(catalog=CATALOG, cols=COLS, doubt=doubt, events=events, pairs=pairs, clean=clean,
+    data = dict(catalog=CATALOG, cols=COLS, doubt=doubt, events=events, pairs=pairs, clean=clean, attrs=ATTRS,
                 files={k: v["file"] for k, v in man.items()},
                 dur={k: round(float(v["duration_s"]), 1) for k, v in man.items()}, conflict=conflict)
     blob = json.dumps(data, ensure_ascii=False, default=lambda o: None, allow_nan=False).replace("</", "<\\/")
@@ -345,13 +366,37 @@ def nan_to_none(o):
 
 
 # ----------------------------------------------------------------------------- DATA_FINDINGS (черновик)
-def findings(events, conf_rows, pairs, clean, man, clean_notes, state, doubt) -> str:
+def probe_table(probes) -> list[str]:
+    pos = [p for p in probes if p["label"] == "violation"]
+    neg = [p for p in probes if p["label"] == "no_violation"]
+    if not pos or not neg:
+        return [f"⚠ Опросник не завершён (окон нарушений {len(pos)}, чистых {len(neg)}) — сравнение частот не строим. "
+                "Доопросить: `python -I -X utf8 tools/dataprep/vlm_probe.py --root .` (продолжит с места остановки).\n"]
+    out = [f"Окна t±5 с: нарушения n={len(pos)}, чистые n={len(neg)} (1/3 и 2/3 длительности). Модели НЕ говорили, "
+           "что в окне нарушение.\n", "| признак | сигнал/тип | «да» в нарушениях | «да» в чистых | разница |",
+           "|---|---|---|---|---|"]
+    rows = []
+    for k, (q, sig) in ATTRS.items():
+        py = sum(p["answers"][k][0] == "yes" for p in pos) / max(len(pos), 1)
+        ny = sum(p["answers"][k][0] == "yes" for p in neg) / max(len(neg), 1)
+        rows.append((py - ny, f"| {k} — {q} | {sig} | {py:.0%} | {ny:.0%} | {py - ny:+.0%} |"))
+    out += [r for _, r in sorted(rows, key=lambda x: -x[0])]
+    out.append("\nПризнаки с большой положительной разницей — кандидаты в сигналы правил. Признаки, которые часто "
+               "встречаются и в чистых видео, сами по себе нарушением не являются (нужен контекст или длительность).\n")
+    return out
+
+
+def findings(events, conf_rows, pairs, clean, man, clean_notes, state, doubt, probes=()) -> str:
     L = []
     w = L.append
     src = "подтверждено человеком" if conf_rows else "предложения VLM, НЕ подтверждены"
     w("# DATA_FINDINGS — ЧЕРНОВИК (локально, не в git)\n")
     w(f"> Сгенерировано `tools/dataprep/types_review.py` {dt.datetime.now():%Y-%m-%d %H:%M}. Источник типов: **{src}** "
       f"({len(conf_rows)}/{len(events)} подтверждено). Текст ниже правит и дописывает человек.\n")
+    vc = [e["confidence"] for e in events if not math.isnan(e["confidence"])]
+    if vc and len(set(vc)) <= 2:
+        w(f"> ⚠ Уверенность VLM почти константна ({sorted(set(vc))}) — как оценка качества не годится. "
+          "Секунда «события» и onset/peak от VLM якорятся на подсказанной метке. Проверять все события.\n")
     durs = {k: float(v["duration_s"]) for k, v in man.items()}
     pos = [durs[k] for k, v in man.items() if v["label"] == "violation"]
     neg = [durs[k] for k, v in man.items() if v["label"] == "no_violation"]
@@ -391,9 +436,18 @@ def findings(events, conf_rows, pairs, clean, man, clean_notes, state, doubt) ->
             w(f"- **{f['video_id']} @ {f['t_sec']:g} с** [{f['src']}, conf {f['confidence']:.2f}, "
               f"{norm_oop(f['onset_or_peak'])}, событие ≈ {f['event_time_sec']:.0f} с]{extra}: {f['what_is_visible']} "
               f"_Кто:_ {f['actors']}. _Предметы:_ {f['objects']}.")
+            py = ", ".join(k for k, v in (f.get("probe") or {}).items() if v[0] == "yes")
+            if py:
+                w(f"  - опросник «да»: {py}; кандидаты: {', '.join(f.get('probe_types') or []) or '—'}")
         w("")
     oo = [norm_oop(f["onset_or_peak"]) for f in final]
     offs = [f["event_time_sec"] - f["t_sec"] for f in final if not math.isnan(f["event_time_sec"])]
+    if probes:
+        w("## 3a. Наблюдаемые признаки: нарушения vs чистые (нейтральный опросник VLM)\n")
+        L.extend(probe_table(probes))
+        ag = [e for e in final if e.get("probe")]
+        w(f"- Тип классификации входит в кандидаты опросника: {sum(e['type_id'] in e['probe_types'] for e in ag)}"
+          f"/{len(ag)}; у {sum(not e['probe_types'] for e in ag)} событий опросник не нашёл признаков ни одного V0x.\n")
     w("## 4. Таймкод: onset vs peak\n")
     w("- В размеченную секунду: " + ", ".join(f"{k} {oo.count(k)}" for k in sorted(set(oo))) + ".")
     if offs:
@@ -479,6 +533,16 @@ def main():
     events = vlm_events(recs)
     pairs = [r for r in recs if r["kind"] == "pair"]
     clean = sorted([r for r in recs if r["kind"] == "clean"], key=lambda r: int(r["video_id"].split("-")[1]))
+    probes = load_jsonl(rdir / "vlm_probe.jsonl")
+    pidx = {(p["video_id"], p["t_center"]): p for p in probes}
+    for e in events:
+        p = pidx.get((e["video_id"], e["t_sec"]))
+        e["probe"] = p["answers"] if p else None
+        e["probe_types"] = probe_types(e["probe"])
+    for c in clean:
+        c["probes"] = sorted([dict(t_center=p["t_center"], answers=p["answers"]) for p in probes
+                              if p["video_id"] == c["video_id"]], key=lambda p: p["t_center"])
+    agree = sum(e["type_id"] in e["probe_types"] for e in events if e["probe"])
     conf_rows = read_confirmed(a.confirmed)
     state = json.loads(a.state.read_text(encoding="utf-8-sig")) if a.state and a.state.exists() else None
 
@@ -498,7 +562,11 @@ def main():
                              "event_time_sec": "" if math.isnan(e["event_time_sec"]) else f"{e['event_time_sec']:g}",
                              "source": "vlm", "confirmed": 0, "notes": ""})
     (root / "cache/DATA_FINDINGS.md").write_text(
-        findings(events, conf_rows, pairs, clean, man, a.clean_notes, state, a.doubt), encoding="utf-8")
+        findings(events, conf_rows, pairs, clean, man, a.clean_notes, state, a.doubt, probes), encoding="utf-8")
+    if probes:
+        print(f"probe windows={len(probes)}; classification type ∈ probe candidates: {agree}/"
+              f"{sum(1 for e in events if e['probe'])}; events with no probe candidate: "
+              f"{sum(1 for e in events if e['probe'] and not e['probe_types'])}")
     print(f"html: {rdir / 'index.html'} | events={len(events)} pairs={len(pairs)} clean={len(clean)}")
     print(f"labels_types.csv: {len(events)} rows, confirmed by human: {len(conf_rows)}")
     print(f"DATA_FINDINGS draft: {root / 'cache/DATA_FINDINGS.md'}")

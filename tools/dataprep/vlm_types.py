@@ -4,7 +4,7 @@
 только технический статус и агрегаты (без описаний сцен). Подтверждение — tools/dataprep/types_review.py → HTML.
 
 Проходы:
-  win  — 6 обзорных кадров ролика + кадры t-5..t+5 (шаг 1 с) вокруг размеченного таймкода;
+  win  — 4 обзорных кадра ролика + кадры t-5..t+5 (шаг 1 с) вокруг размеченного таймкода;
   wide — если confidence < --doubt или тип NEW/не распознан: t-10..t+10 (шаг 2 с);
   pair — для md5-дубликатов с разными таймкодами (Х-4≡Х-47): одно событие или два;
   clean — 6–8 чистых видео: как выглядит КОРРЕКТНАЯ процедура и что может дать ложное срабатывание.
@@ -145,17 +145,20 @@ class VLM:
             model_id, dtype=torch.bfloat16, device_map="cuda:0", quantization_config=q, **hf).eval()
 
     @torch.inference_mode()
-    def ask(self, content: list[dict], max_new=450) -> tuple[str, int, float]:
+    def ask(self, content: list[dict], max_new=450, max_time=None) -> tuple[str, int, float]:
         inp = self.proc.apply_chat_template([{"role": "user", "content": content}], tokenize=True,
                                             add_generation_prompt=True, return_dict=True,
                                             return_tensors="pt").to(self.model.device)
         t0 = time.time()
-        out = self.model.generate(**inp, max_new_tokens=max_new, do_sample=False, repetition_penalty=1.05)
+        out = self.model.generate(**inp, max_new_tokens=max_new, do_sample=False, repetition_penalty=1.05,
+                                  max_time=max_time)
         n_in = inp["input_ids"].shape[1]
         return self.proc.decode(out[0, n_in:], skip_special_tokens=True).strip(), n_in, time.time() - t0
 
-    def ask_safe(self, groups: list[tuple[str, list[Image.Image]]], prompt: str, max_new=450):
-        """groups: [(подпись, [кадры])]. При OOM — повтор с уменьшенными кадрами."""
+    def ask_safe(self, groups: list[tuple[str, list[Image.Image]]], prompt: str, max_new=450, max_time=90.0):
+        """groups: [(подпись, [кадры])]. При OOM или упоре в max_time (спилл WDDM в RAM) — повтор с уменьшенными
+        кадрами; фактический масштаб возвращается как shrink."""
+        last = ("", 0, 0.0, 0.0)
         for shrink in (1.0, 0.75, 0.55):
             content = []
             for caption, imgs in groups:
@@ -166,11 +169,15 @@ class VLM:
                     content.append({"type": "image", "image": im})
             content.append({"type": "text", "text": prompt})
             try:
-                txt, n_in, dt = self.ask(content, max_new)
-                return txt, n_in, dt, shrink
+                txt, n_in, dt = self.ask(content, max_new, max_time)
             except torch.OutOfMemoryError:
                 torch.cuda.empty_cache()
-        return "", 0, 0.0, 0.0
+                continue
+            last = (txt, n_in, dt, shrink)
+            if max_time is None or dt < max_time * 0.97:
+                return last
+            torch.cuda.empty_cache()
+        return last
 
 
 def parse_json(txt: str) -> tuple[dict, bool]:
@@ -225,6 +232,10 @@ def main():
     ap.add_argument("--doubt", type=float, default=0.6)
     ap.add_argument("--clean", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0, help="только первые N нарушений (отладка)")
+    ap.add_argument("--win-scale", type=float, default=0.6, help="масштаб кадров окна для VLM (464x848 → ×)")
+    ap.add_argument("--ov-frames", type=int, default=4, help="обзорных кадров ролика в запросе VLM")
+    ap.add_argument("--ov-scale", type=float, default=0.45)
+    ap.add_argument("--vram-margin", type=float, default=2.0, help="ГиБ VRAM вне лимита torch: рабочий стол + CUDA-контекст")
     a = ap.parse_args()
     root = Path(a.root)
     out_dir = root / "cache/types_review"
@@ -242,19 +253,31 @@ def main():
     raw_f = open(raw_path, "a", encoding="utf-8")
 
     t_start = time.time()
+    free0, total = torch.cuda.mem_get_info()
+    # потолок torch = свободная VRAM − запас: лучше OOM (→ ask_safe уменьшит кадры), чем спилл WDDM в системную RAM
+    frac = max(0.3, min(0.95, (free0 - a.vram_margin * 2**30) / total))
+    torch.cuda.set_per_process_memory_fraction(frac)
     vlm = VLM(a.model, str(root / a.hf_cache))
     torch.cuda.reset_peak_memory_stats()
-    print(f"VLM loaded: allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
+    print(f"VLM loaded: allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB, torch cap {frac * total / 2**30:.2f} GiB",
+          flush=True)
 
     def save(rec):
         done[rec["key"]] = rec
         raw_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         raw_f.flush()
+        print(f"[{len(done)}] {rec['key']} tokens={rec['n_tokens']} {rec['latency_s']}s shrink={rec['shrink']} "
+              f"parse_ok={rec['parse_ok']}", flush=True)
 
-    def overview(vid, n, scale):
-        ts = [dur[vid] * (i + 0.5) / n for i in range(n)]
-        fr = grab_frames(root / "data/raw" / man[vid]["file"], ts)
-        return [labeled(fr[t][1], fr[t][0], scale) for t in sorted(fr)]
+    def frames_for(vid, times):  # одно декодирование на все нужные моменты
+        return grab_frames(root / "data/raw" / man[vid]["file"], times)
+
+    def ov_times(vid, n):
+        return [dur[vid] * (i + 0.5) / n for i in range(n)]
+
+    def tiles(fr, times, scale, marks=()):
+        keys = sorted({round(x, 3) for x in times} & set(fr))
+        return [labeled(fr[x][1], fr[x][0], scale, mark=any(abs(x - m) < 0.01 for m in marks)) for x in keys]
 
     # --- нарушения: win (+ wide при сомнении)
     viol = [r for r in rows if r["label"] == "violation"]
@@ -262,7 +285,6 @@ def main():
         viol = viol[: a.limit]
     for r in viol:
         vid, t = r["video_id"], float(r["t_sec"])
-        path = root / "data/raw" / r["file"]
         for pss, offs in (("win", [t + d for d in range(-5, 6)]), ("wide", [t + d for d in range(-10, 11, 2)])):
             key = f"violation|{vid}|{t:g}|{pss}"
             if key in done:
@@ -272,19 +294,19 @@ def main():
                 if fnum(w.get("confidence"), 0) >= a.doubt and norm_type(w.get("type_id")) not in ("NEW", "UNK"):
                     continue
             ts = [x for x in offs if 0 <= x <= dur[vid]]
-            fr = grab_frames(path, ts)
-            win = [labeled(fr[x][1], fr[x][0], 0.75, mark=abs(x - t) < 0.01) for x in sorted(fr)]
+            o_vlm, o_sheet = ov_times(vid, a.ov_frames), ov_times(vid, 12)
+            fr = frames_for(vid, ts + o_vlm + (o_sheet if pss == "win" else []))
             sheet_name = f"{vid}_t{t:g}_{pss}.jpg"
-            sheet(win, img_dir / sheet_name)
-            ov = overview(vid, 6, 0.5)
+            sheet(tiles(fr, ts, 0.75, [t]), img_dir / sheet_name)  # для человека — крупнее
             if pss == "win":
-                sheet(overview(vid, 12, 0.5), img_dir / f"{vid}_overview.jpg")
+                sheet(tiles(fr, o_sheet, 0.5), img_dir / f"{vid}_overview.jpg")
+            win, ov = tiles(fr, ts, a.win_scale, [t]), tiles(fr, o_vlm, a.ov_scale)
             prompt = PROMPT_VIOL.format(n_ov=len(ov), n_win=len(win), t=f"{t:g}", roles=ROLE_TXT, catalog=CATALOG_TXT)
             txt, n_in, dt, shrink = vlm.ask_safe([("Обзорные кадры всего ролика:", ov),
                                                   (f"Кадры вокруг t={t:g} с (шаг {1 if pss == 'win' else 2} с):", win)],
                                                  prompt)
             parsed, ok = parse_json(txt)
-            save(dict(key=key, kind="violation", video_id=vid, t_sec=t, pass_=pss, frames=[round(x, 2) for x in sorted(fr)],
+            save(dict(key=key, kind="violation", video_id=vid, t_sec=t, pass_=pss, frames=[round(x, 2) for x in ts],
                       sheet=f"img/{sheet_name}", overview=f"img/{vid}_overview.jpg", n_tokens=n_in,
                       latency_s=round(dt, 1), shrink=shrink, raw=txt, parsed=parsed, parse_ok=ok))
 
@@ -304,11 +326,11 @@ def main():
         vid = vids[0]
         span = [x for x in range(int(ts[0]) - 5, int(ts[-1]) + 6, 2) if 0 <= x <= dur[vid]]
         span = sorted(set(span) | {int(ts[0]), int(ts[-1])})
-        fr = grab_frames(root / "data/raw" / man[vid]["file"], span)
-        tiles = [labeled(fr[x][1], fr[x][0], 0.6, mark=any(abs(x - y) < 0.01 for y in ts)) for x in sorted(fr)]
+        fr = frames_for(vid, span)
+        human = tiles(fr, span, 0.6, ts)
         sheet_name = f"{'+'.join(vids)}_pair.jpg"
-        sheet(tiles, img_dir / sheet_name, cols=6, rows=math.ceil(len(tiles) / 6))
-        txt, n_in, dt, shrink = vlm.ask_safe([(f"Кадры {span[0]}–{span[-1]} с:", tiles)],
+        sheet(human, img_dir / sheet_name, cols=6, rows=math.ceil(len(human) / 6))
+        txt, n_in, dt, shrink = vlm.ask_safe([(f"Кадры {span[0]}–{span[-1]} с:", tiles(fr, span, a.ov_scale + 0.05, ts))],
                                              PROMPT_PAIR.format(t1=f"{ts[0]:g}", t2=f"{ts[-1]:g}", roles=ROLE_TXT,
                                                                 catalog=CATALOG_TXT))
         parsed, ok = parse_json(txt)
@@ -325,8 +347,10 @@ def main():
         key = f"clean|{vid}"
         if key in done:
             continue
-        ov = overview(vid, 12, 0.6)
-        sheet(overview(vid, 12, 0.5), img_dir / f"{vid}_overview.jpg")
+        o12 = ov_times(vid, 12)
+        fr = frames_for(vid, o12)
+        ov = tiles(fr, o12, 0.5)
+        sheet(ov, img_dir / f"{vid}_overview.jpg")
         txt, n_in, dt, shrink = vlm.ask_safe([("Кадры ролика по порядку:", ov)],
                                              PROMPT_CLEAN.format(n=len(ov), roles=ROLE_TXT), max_new=600)
         parsed, ok = parse_json(txt)
