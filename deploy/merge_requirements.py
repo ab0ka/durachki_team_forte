@@ -2,18 +2,20 @@
 """Сводит requirements.txt всех модулей в deploy/requirements.in и строит lock НАСТОЯЩИМ resolver-ом.
 
 Скрипт НЕ выбирает версии сам. Он:
-  1) собирает все */requirements.txt (+ deploy/platform.in — платформенные пины torch);
-  2) ищет конфликты: несовместимые диапазоны одного пакета, взаимоисключающие дистрибутивы
-     (opencv-python vs opencv-python-headless), запрещённые лицензии (ultralytics …);
+  1) собирает все */requirements.txt (+ deploy/platform.in);
+  2) ищет конфликты: несовместимые диапазоны одного пакета, требование модуля против пина lock L1
+     (tools/dataprep/requirements-l1.lock.txt — источник истины окружения), взаимоисключающие
+     дистрибутивы (opencv-python vs opencv-python-headless), запрещённые лицензии (ultralytics …);
   3) пишет пересечение ограничений в deploy/requirements.in (без «максимальной версии»);
-  4) с --lock TARGET вызывает `uv pip compile` (resolver) → deploy/locks/TARGET.lock.txt с хэшами.
+  4) с --lock TARGET вызывает `uv pip compile -c <lock L1>` (resolver) → deploy/locks/TARGET.lock.txt:
+     пины L1 не меняются, добавляются только недостающие пакеты.
 
 Конфликт = код возврата 1 и отчёт; решение принимают люди (владелец модуля / A01 / интегратор)
 правкой requirements модуля или записью в deploy/constraints.txt (передаётся resolver-у как -c).
 
   python deploy/merge_requirements.py                       # сбор + проверка → requirements.in
   python deploy/merge_requirements.py --check               # только отчёт, файлы не пишет
-  python deploy/merge_requirements.py --lock windows-cu124  # + lock для ноутбука (нужен uv и сеть)
+  python deploy/merge_requirements.py --lock windows-cu128  # + lock для ноутбука (нужен uv и сеть)
 """
 from __future__ import annotations
 
@@ -47,9 +49,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "env", "__pycache__", "weights", "data",
              "cache", "dist", "build", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 TORCH_FAMILY = {"torch", "torchvision", "torchaudio"}
+DEFAULT_ENV_LOCK = Path("tools") / "dataprep" / "requirements-l1.lock.txt"
 
 # Цели lock-файлов. torch_backend → uv сам ходит в индекс PyTorch за torch/torchvision.
 LOCK_TARGETS: dict[str, dict[str, str]] = {
+    "windows-cu128": {"python_platform": "x86_64-pc-windows-msvc", "torch_backend": "cu128", "profile": "gpu"},
+    "linux-cu128": {"python_platform": "x86_64-manylinux_2_28", "torch_backend": "cu128", "profile": "gpu"},
+    # cu124 — только для torch <= 2.6 (lock L1: torch 2.11.0+cu128 → использовать cu128)
     "windows-cu124": {"python_platform": "x86_64-pc-windows-msvc", "torch_backend": "cu124", "profile": "gpu"},
     "windows-cpu": {"python_platform": "x86_64-pc-windows-msvc", "torch_backend": "cpu", "profile": "cpu"},
     "linux-cu124": {"python_platform": "x86_64-manylinux_2_28", "torch_backend": "cu124", "profile": "gpu"},
@@ -251,6 +257,37 @@ def _family_target(names: set[str], family: set[str], profile: str) -> str | Non
     return "onnxruntime-gpu" if profile == "gpu" else "onnxruntime"
 
 
+def load_env_lock(path: Path) -> dict[str, str]:
+    """Пины `name==version` lock-файла (комментарии/опции игнорируются)."""
+    pins: dict[str, str] = {}
+    for _, line in _logical_lines(path.read_text(encoding="utf-8-sig")):
+        if line.startswith("-"):
+            continue
+        try:
+            req = Requirement(re.sub(r"\s--hash[=\s]\S+", "", line))
+        except InvalidRequirement:
+            continue
+        specs = list(req.specifier)
+        if len(specs) == 1 and specs[0].operator in ("==", "==="):
+            pins[canonicalize_name(req.name)] = specs[0].version
+    return pins
+
+
+def check_against_lock(merged: list["Merged"], pins: dict[str, str], lock_name: str, report: Report) -> None:
+    for g in merged:
+        if g.marker or g.urls or g.name not in pins or not g.specs:
+            continue
+        try:
+            pin = Version(pins[g.name])
+        except InvalidVersion:
+            continue
+        bad = [(sp, src) for sp, src in g.specs if not SpecifierSet(sp).contains(pin, prereleases=True)]
+        if bad:
+            detail = "; ".join(f"{sp} ← {src}" for sp, src in bad)
+            report.conflicts.append(f"{g.name}: в {lock_name} {pins[g.name]}, не совместимо: {detail}")
+            g.note = "CONFLICT"
+
+
 def merge(lines: list[ReqLine], profile: str, report: Report, keep_dev: bool = False) -> list[Merged]:
     names = {ln.name for ln in lines}
     rename: dict[str, str] = {}
@@ -322,6 +359,7 @@ def print_report(report: Report, stream=sys.stderr) -> None:
 
 
 def lock(in_path: Path, target: str, out_dir: Path, constraints: list[str], uv: str | None = None) -> Path:
+    """constraints: lock L1 (-c) — его пины resolver менять не может."""
     """Настоящий resolver: uv pip compile под платформу цели. Без uv — ошибка, а не «угадывание»."""
     cfg = LOCK_TARGETS[target]
     uv = uv or shutil.which("uv")
@@ -339,8 +377,18 @@ def lock(in_path: Path, target: str, out_dir: Path, constraints: list[str], uv: 
     return out
 
 
+def resolve_env_lock(root: Path, env_lock: Path | str | None) -> Path | None:
+    if env_lock in ("none", ""):
+        return None
+    if env_lock is None:
+        cand = root / DEFAULT_ENV_LOCK
+        return cand if cand.is_file() else None
+    p = Path(env_lock)
+    return p if p.is_absolute() else root / p
+
+
 def run(root: Path, profile: str, out: Path | None, check_only: bool = False, keep_dev: bool = False,
-        allow_conflicts: bool = False) -> tuple[int, Report, str]:
+        allow_conflicts: bool = False, env_lock: Path | str | None = None) -> tuple[int, Report, str]:
     report = Report()
     files = find_requirement_files(root)
     lines: list[ReqLine] = []
@@ -348,6 +396,14 @@ def run(root: Path, profile: str, out: Path | None, check_only: bool = False, ke
         report.sources.append(f.resolve().relative_to(root.resolve()).as_posix())
         lines += parse_file(f, root, report)
     merged = merge(lines, profile, report, keep_dev=keep_dev)
+    lock_path = resolve_env_lock(root, env_lock)
+    if lock_path is not None:
+        if lock_path.is_file():
+            check_against_lock(merged, load_env_lock(lock_path), lock_path.name, report)
+            report.constraints.append(str(lock_path))
+            report.sources.append(f"{lock_path.name} (constraints: пины не меняются)")
+        else:
+            report.warnings.append(f"env-lock не найден: {lock_path}")
     text = render_in(merged, report, profile)
     code = 2 if report.banned else (1 if report.conflicts else 0)
     if out is not None and not check_only and (code == 0 or (code == 1 and allow_conflicts)):
@@ -369,12 +425,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lock", choices=sorted(LOCK_TARGETS), action="append", default=[],
                     help="построить lock через uv pip compile (можно несколько раз)")
     ap.add_argument("--locks-dir", type=Path, default=None)
+    ap.add_argument("--env-lock", default=None,
+                    help=f"lock окружения (по умолчанию {DEFAULT_ENV_LOCK.as_posix()}, если есть); 'none' — без него")
     args = ap.parse_args(argv)
 
     root = args.root.resolve()
     profile = args.profile or (LOCK_TARGETS[args.lock[0]]["profile"] if args.lock else "gpu")
     out = args.out or root / "deploy" / "requirements.in"
-    code, report, _ = run(root, profile, out, args.check, args.keep_dev, args.allow_conflicts)
+    code, report, _ = run(root, profile, out, args.check, args.keep_dev, args.allow_conflicts, args.env_lock)
     print_report(report)
     if code:
         print(f"[merge] код {code}: {'запрещённые пакеты' if code == 2 else 'конфликты'} — lock не строим",

@@ -4,8 +4,7 @@
 # источник: deploy/platform.in
 # источник: deploy/requirements.txt
 
-huggingface-hub<2,>=0.25  # deploy/requirements.txt
+huggingface-hub>=0.25  # deploy/requirements.txt
 packaging>=23  # deploy/requirements.txt
+psutil>=5.9  # deploy/requirements.txt
 pyyaml>=6.0  # deploy/requirements.txt
-torch==2.6.0  # deploy/platform.in
-torchvision==0.21.0  # deploy/platform.in
