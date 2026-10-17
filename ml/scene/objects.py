@@ -82,14 +82,24 @@ def door_traffic(tl: Timeline, zones: dict[str, Polys], cfg_door: dict[str, Any]
     if cash:
         win = float(cfg_door["traffic_cross_window_s"])
         for obs in tracks.values():
-            ms = [(i, member(b, cash, ay, of), member(b, door, ay, of, )) for i, b in obs]
-            for (i0, m0, d0), (i1, m1, d1) in zip(ms, ms[1:]):
-                if (m0 < 0.3 <= 0.7 <= m1 or m1 < 0.3 <= 0.7 <= m0) and max(d0, d1) > 0.0:
-                    tc = float(tl.times[i1])
+            # смена устойчивого состояния «вне cashier_area (m<0.3)» ↔ «внутри (m≥0.7)»,
+            # если между этими наблюдениями трек касался зоны двери
+            state: Optional[str] = None
+            door_seen = False
+            for i, b in obs:
+                m, dm = member(b, cash, ay, of), member(b, door, ay, of)
+                door_seen = door_seen or dm > 0.0
+                s_ = "in" if m >= 0.7 else ("out" if m < 0.3 else None)
+                if s_ is None:
+                    continue
+                if state is not None and s_ != state and door_seen:
+                    tc = float(tl.times[i])
                     crossings.append(tc)
                     sel = np.abs(tl.times - tc) <= win
                     p[sel] = np.maximum(p[sel], float(cfg_door["traffic_cross_p"]))
                     c[sel] = np.maximum(c[sel], 1.0)
+                state = s_
+                door_seen = dm > 0.0
     return p, c, crossings
 
 
