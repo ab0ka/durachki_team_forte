@@ -21,13 +21,15 @@ if (-not $SkipPreflight) {
     & $Py deploy\preflight.py
     if ($LASTEXITCODE -ne 0) { Write-Host "PREFLIGHT FAILED - service NOT started (runs\deploy\preflight.json)" -ForegroundColor Red; exit 1 }
 }
-$supArgs = @("deploy\supervisor.py", "run")
+# Start-Process -ArgumentList does not quote elements with spaces (PS 5.1 and 7): quote explicitly.
+function Quote-Arg([string]$a) { if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a } }
+$supArgs = @((Join-Path $Repo "deploy\supervisor.py"), "run")
 if ($Named) { $supArgs += "--named" }
 if ($NoTunnel) { $supArgs += "--no-tunnel" }
 if ($Port -gt 0) { $supArgs += @("--port", "$Port") }
 if ($App) { $supArgs += @("--app", $App) }
 New-Item -ItemType Directory -Force -Path $env:SENTINEL_LOG_DIR | Out-Null
-$p = Start-Process -FilePath $Py -ArgumentList $supArgs -WindowStyle Hidden -PassThru `
+$p = Start-Process -FilePath $Py -ArgumentList ($supArgs | ForEach-Object { Quote-Arg $_ }) -WorkingDirectory $Repo -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $env:SENTINEL_LOG_DIR "supervisor.console.log") `
     -RedirectStandardError (Join-Path $env:SENTINEL_LOG_DIR "supervisor.console.err.log")
 Start-Sleep -Seconds 3

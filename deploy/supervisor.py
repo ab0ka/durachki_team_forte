@@ -128,6 +128,50 @@ def kill_tree(pid: int, timeout: float = 15.0) -> None:
             pass
 
 
+def descendants(pid: int) -> dict[int, Optional[float]]:
+    """PID → время старта всех потомков (spawn-воркер A03 — потомок uvicorn). Без psutil — пусто."""
+    if psutil is None:
+        return {}
+    try:
+        return {c.pid: c.create_time() for c in psutil.Process(pid).children(recursive=True)}
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return {}
+
+
+def reap(pids: dict[int, Optional[float]], pgid: Optional[int] = None, timeout: float = 15.0) -> list[int]:
+    """Добить СВОИХ потомков (PID + время старта), в т.ч. осиротевших после падения родителя.
+    POSIX: дополнительно вся группа процессов (start_new_session → pgid = pid uvicorn, живёт без лидера)."""
+    if pgid and not IS_WIN:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except OSError:
+                break
+            end = time.time() + (timeout / 2 if sig == signal.SIGTERM else 2)
+            while time.time() < end and any(pid_alive(x) for x in pids):
+                time.sleep(0.1)
+    for pid, ct in pids.items():
+        if is_ours({"pid": pid, "create_time": ct}):
+            kill_tree(pid, timeout=5)
+    end = time.time() + timeout
+    while time.time() < end and any(is_ours({"pid": x, "create_time": c}) for x, c in pids.items()):
+        time.sleep(0.1)
+    return [x for x, c in pids.items() if is_ours({"pid": x, "create_time": c})]
+
+
+def gpu_pids() -> Optional[set[int]]:
+    """PID процессов с CUDA-контекстом (nvidia-smi); None — проверить нельзя."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--query-compute-apps=pid", "--format=csv,noheader,nounits"], capture_output=True,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {int(x) for x in re.findall(r"\d+", out)}
+
+
 def port_busy(host: str, port: int) -> bool:
     with socket.socket() as s:
         s.settimeout(0.5)
@@ -257,6 +301,7 @@ class Supervisor:
         self.api: Optional[subprocess.Popen] = None
         self.tunnel: Optional[subprocess.Popen] = None
         self.restarts: collections.deque[float] = collections.deque()
+        self.tree: dict[int, Optional[float]] = {}  # потомки текущего api (snapshot каждый виток)
         self.st: dict[str, Any] = {}
 
     # ---- окружение детей
@@ -320,18 +365,45 @@ class Supervisor:
                 return False
             time.sleep(0.5)
         self.api = self._popen(self.api_cmd(), "api", self.child_env())
-        self.save(api=self._rec(self.api, cmd=self.app), phase="starting", api_started=time.time())
+        self.tree = {}
+        self.save(api=self._rec(self.api, cmd=self.app), phase="starting", api_started=time.time(), api_tree=[])
         self.log(f"api pid={self.api.pid} {self.app} на {self.host}:{self.port}")
         return True
 
     def stop_proc(self, p: Optional[subprocess.Popen]) -> None:
         if p is not None and p.poll() is None:
+            if p is self.api:
+                self.snapshot_tree()
             kill_tree(p.pid)
         if p is not None:
             try:
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
+        if p is not None and p is self.api:
+            self.reap_api_tree()
+
+    def snapshot_tree(self) -> None:
+        if self.api is not None and self.api.poll() is None:
+            fresh = descendants(self.api.pid)
+            if set(fresh) - set(self.tree):
+                self.tree.update(fresh)
+                self.save(api_tree=[{"pid": k, "create_time": v} for k, v in self.tree.items()])
+
+    def reap_api_tree(self) -> None:
+        """После выхода/убийства api: добить его потомков (GPU-воркер A03) и проверить, что GPU освобождён."""
+        if self.api is None:
+            return
+        left = reap(self.tree, pgid=self.api.pid)
+        ours = set(self.tree) | {self.api.pid}
+        on_gpu = gpu_pids()
+        still = sorted((on_gpu or set()) & ours)
+        if left:
+            self.log(f"ERROR не удалось завершить потомков api: {left}")
+        if still:
+            self.log(f"ERROR GPU всё ещё держат наши процессы {still}")
+        self.save(gpu_released=None if on_gpu is None else not still, orphans_left=left, api_tree=[])
+        self.tree = {}
 
     # ---- tunnel
     def tunnel_cmd(self) -> list[str]:
@@ -444,8 +516,10 @@ class Supervisor:
                 self.log("stop requested")
                 self.store.stop_flag.unlink(missing_ok=True)
                 return 0
+            self.snapshot_tree()
             if self.api is not None and self.api.poll() is not None:
                 code = self.api.returncode
+                self.reap_api_tree()  # spawn-воркер A03 мог пережить родителя и держать VRAM
                 tail = _tail(self.logs / "api.err.log")
                 oom = OOM_RE.search(tail)
                 err = f"api завершился с кодом {code}" + (" — GPU OOM (см. deploy/RUNBOOK.md#gpu-oom)" if oom else "")
@@ -541,6 +615,9 @@ def stop(store: Store, timeout: float = 60.0) -> int:
         if is_ours(rec):
             kill_tree(rec["pid"])
             killed.append(f"{name}:{rec['pid']}")
+    tree = {int(x["pid"]): x.get("create_time") for x in (store.read().get("api_tree") or st.get("api_tree") or [])}
+    left = reap(tree) if tree else []
+    killed += [f"worker:{x}" for x in tree if x not in left]
     print("[stop] остановлено" + (f"; добиты сироты {killed}" if killed else ""))
     return 0
 
