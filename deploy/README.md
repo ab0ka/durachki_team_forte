@@ -4,6 +4,9 @@
 - Веса — офлайн, уже лежат в `weights/hf/hub`.
 - Docker (`Dockerfile.gpu`, `offline_smoke.sh`, `PLAN_B.md`) — опциональный путь. Он **не собирался** и не синхронизирован с lock L1.
 
+## Последовательность для L2
+Компактный порядок (окружение и веса → ready → 5 подряд → очередь из 2 → таймаут/перезапуск → офлайн → URL) с шаблоном фиксации замеров — **`deploy/L2_SEQUENCE.md`**.
+
 ## Команды для L2 (по порядку)
 ```powershell
 powershell -ExecutionPolicy Bypass -File deploy\windows\setup.ps1 [-InstallMissing]   # сверка venv с lock L1, adopt весов
@@ -58,32 +61,58 @@ deploy\windows\status.ps1   |   deploy\windows\stop.ps1
 5. **Логи и отчёты** — в `runs/deploy/` (в `.gitignore`), а не в `logs/`: `logs/` не игнорируется корневым `.gitignore`.
 6. **Туннель после рестарта API не перезапускается**, чтобы quick URL у жюри не сменился.
 
-## Найденные конфликты требований с lock L1 (решают владельцы, не deploy)
-`python deploy/merge_requirements.py --root <интеграционное дерево>` на ветке `claude/integration-cloud`:
+## Конфликты требований с lock L1 (решают владельцы, не deploy)
+`python deploy/merge_requirements.py --check` на `claude/integration-cloud` 2055fc4:
 
-| Пакет | lock L1 | Требование модуля | Владелец |
-|---|---|---|---|
-| transformers | 5.20.1 | `>=4.57.1,<5` | `ml/vlm/requirements.txt` (A11) |
-| pillow | 13.0.0 | `>=10.0,<13` | `ml/fusion/requirements.txt` (A12) |
-| pyyaml | 6.0.3 | `==6.0.1` | `eval/requirements.txt` (A16) |
+| Пакет | lock L1 | Требование модуля | Владелец | Статус |
+|---|---|---|---|---|
+| pillow | 13.0.0 | `>=10.0,<13` | `ml/fusion/requirements.txt` (A12) | **открыт** (и в ветке A12 `9ca9a0e`) |
+| transformers | 5.20.1 | было `<5` | `ml/vlm` (A11) | снят владельцем |
+| pyyaml | 6.0.3 | было `==6.0.1` | `eval` (A16) | снят владельцем |
 
-Свой `huggingface_hub<2` (против 2.2.0 в L1) исправлен.
+Свой `huggingface_hub<2` исправлен ранее.
+
+## Аудит 2055fc4 (claude/integration-cloud): что воспроизведено и исправлено
+Все пункты воспроизведены на временной копии интеграционного дерева с текущим `deploy/`.
+
+| Пункт | Воспроизведение | Исправление |
+|---|---|---|
+| Pillow A12 | `merge_requirements --check` → exit 1, конфликт виден (не маскировался) | Закрыты пути маскировки: маркеры (`; python_version…`) и прямые URL пропускали сверку с lock. Маркеры теперь вычисляются для Windows/py3.11, группы пакета проверяются совместно. |
+| Совместимость со всем lock L1 | — | `--resolve-check` (настоящий `uv pip compile -c lock`, сверка дрейфа). What-if с `Pillow>=10.0` во временной копии, `windows-cu128 --no-torch-index` (PyPI): ok, дрейфа пинов L1 нет, +27 пакетов вне L1. **GPU-установка этим не проверена.** |
+| `/readyz` A02 | 200 при `pipeline=fake`; успешная задача переводит `warmup_failed` в `ready`; healthcheck пропускал 404 и любые коды, кроме 503 | Ворота: только `200 + ready + state=ready + pipeline=real`; терминальные состояния — без synthetic-задачи; `gpu_hung` → рестарт API. |
+| Итоговый JSON | — | Проверки: схема ТЗ; не mock (`meta.mock` / `provenance` / стадии / `meta.api.pipeline`); `no_violation` — только с подтверждённой полнотой (`contracts.extensions.coverage_problem`, если есть). |
+| Освобождение GPU | Потомок упавшего API (как spawn-воркер A03) переживал рестарт: 6 сирот за 6 рестартов | Снимок дерева процессов, добивание сирот (POSIX — группа процессов), проверка `nvidia-smi --query-compute-apps`. |
+| SLA | Один synthetic-файл N раз → дедуп A02 по sha и кэш A03 — время ложное | Свой файл на задание (seed). Метки dedup и кэша; время от приёма с очередью. |
+| Единственный воркер / реальный прогрев | — | preflight читает действующие `workers` / `gpu_slots` / `warmup` / `fake_pipeline` / `allow_mock` A02 и `executor.mode` / `mock` A03; на конфигах 2055fc4 всё OK. |
+| Бюджеты | — | Помечены UNMEASURED до замера на GPU L2 (`service.budgets_measured_on_gpu`). |
+| Пути с пробелами | — | Тесты супервизора в каталоге с пробелами. `start.ps1`: `-WorkingDirectory` и экранирование аргументов `Start-Process`. |
 
 ## Что реально проверено (облако: Linux, без GPU, без данных)
-- `pytest deploy/tests` — **64 passed, 1 skipped** (skip — парсер PowerShell, если нет pwsh; с pwsh 7.4.6 — 65 passed). Покрыто:
-  - envcheck и merge против lock на синтетических фикстурах. Отдельно вручную прогнан `merge_requirements.py` по дереву ветки `claude/integration-cloud` с настоящим lock L1 — отсюда таблица конфликтов выше;
-  - adopt на раскладке кэша huggingface_hub (symlink и без symlink, недостающий шард, `.incomplete`, лицензия карточки, порча sha256);
-  - preflight на фейковых пробах (ключ не печатается);
-  - супервизор на реальных подпроцессах: полный цикл ready → туннель → URL → status → второй экземпляр отклонён → stop; crash-loop с OOM; чужой процесс на порту не тронут; путь без psutil;
-  - offline smoke: попытка выйти в сеть из дочернего процесса поймана; mock и неполный анализ отклонены;
-  - release (stash + detach на временном git-репо);
-  - healthcheck против `pipeline=fake`.
-- Все `.ps1` разбираются парсером PowerShell 7.4.6 (Linux); ASCII-only, чтобы Windows PowerShell 5.1 их не испортил.
-- **НЕ проверено**:
-  - на Windows `.ps1` не запускались;
-  - фаервол-правило, GPU, реальные веса и пайплайн не проверены;
-  - Cloudflare Tunnel, SLA и VRAM не проверены.
-  - Ни одной цифры скорости или памяти отсюда не приводим — их дают команды выше на ноутбуке L2.
+- `pytest deploy/tests` — **92 passed, 1 skipped** (skip — парсер PowerShell без pwsh; с pwsh 7.4.6 — 93 passed). Покрыто:
+  - merge и envcheck против lock на фикстурах, включая маскировку маркерами и URL; `resolve_check` с фейковым uv;
+  - adopt на раскладке кэша huggingface_hub;
+  - preflight (A02/A03 gates, ключ не печатается);
+  - ворота `/readyz` по всем состояниям A02; synthetic-задача не шлётся при `warmup_failed`; проверки итогового JSON (mock, полнота);
+  - супервизор на реальных подпроцессах:
+    - полный цикл, второй экземпляр отклонён, stop;
+    - crash-loop с OOM; `gpu_hung` → рестарты;
+    - сироты-потомки добиты (с psutil и без), каталоги с пробелами;
+    - чужой процесс на порту не тронут;
+  - SLA-бенч: sequential/concurrent, dedup, кэш, `--expect failed`;
+  - offline smoke, release, healthcheck.
+- На копии интеграционного дерева 2055fc4 с текущим `deploy/`:
+  - `merge_requirements --check` → exit 1 (Pillow A12);
+  - preflight → A02/A03 gates OK, budgets WARN UNMEASURED; конфиги модулей парсятся.
+- What-if (только временная копия, `Pillow>=10.0`): `--resolve-check windows-cu128 --no-torch-index` → ok, дрейф пинов L1 = 0. Это совместимость диапазонов на PyPI. **Не GPU-установка.**
+- Все `.ps1` разбираются парсером PowerShell 7.4.6; `Quote-Arg` для путей с пробелами проверен в pwsh.
+- **NOT RUN** (нет Windows / GPU / весов / сети к cu128 / данных):
+  - запуск `.ps1` на Windows; правило фаервола;
+  - установка из lock с индексом cu128; `gpu_probe`;
+  - реальный warmup A02/A03 и `/readyz`; synthetic-задача на реальном пайплайне;
+  - освобождение VRAM по `nvidia-smi`;
+  - SLA 5 подряд / очередь из 2 / 5 одновременно, таймаут и перезапуск — на GPU;
+  - VRAM; Cloudflare Tunnel.
+  - Цифр скорости и памяти нет — см. `L2_SEQUENCE.md`, шаг 8.
 
 ## Для интегратора
 - **Структура.** Ветка добавляет только `deploy/`. Канонический контракт есть в `contracts/`; deploy его не импортирует, fallback-копии нет.

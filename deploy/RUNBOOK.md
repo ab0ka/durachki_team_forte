@@ -44,6 +44,22 @@
    - крайний случай `SENTINEL_NO_VLM=1`.
 5. Перезапуск: `stop.ps1` → `run_all.ps1`. Задачи в `data\` сохраняются.
 
+## Не готов: `phase=not_ready` (ворота /readyz)
+`status.ps1 → detail` повторяет `/readyz` A02. Synthetic-задача в этих состояниях **не отправляется**: у A02 успешная задача переводит `warmup_failed` в `ready`, это скрыло бы сбой прогрева.
+
+| `/readyz` | Что делать |
+|---|---|
+| `warmup_failed` | Причина — в `detail` и `api.err.log`: нет весов, OOM при прогреве и т.п. Починить → `stop.ps1` → `run_all.ps1`. |
+| `unavailable` | `backend.pipeline` не импортируется (`api.err.log`); preflight должен был это поймать. |
+| `mock_not_allowed` / `pipeline=fake` | Убрать `SENTINEL_MOCK` / `SENTINEL_FAKE_PIPELINE`. В проде запрещены. |
+| `gpu_hung` | Супервизор сам перезапускает API (освобождает GPU), в пределах лимита crash-loop. |
+
+## GPU не освободился
+`status.ps1` → `gpu_released: False` или непустой `orphans_left`: процессы старого дерева API всё ещё держат CUDA.
+- Посмотреть: `nvidia-smi --query-compute-apps=pid,used_memory --format=csv`.
+- Если это PID из `runs\deploy\state\state.json` (`api_tree`), `stop.ps1` добивает их сам.
+- Чужие процессы не трогать — закрыть их владельцу.
+
 ## Crash-loop
 Больше `service.max_restarts` падений за `restart_window_s` → супервизор останавливается сам, туннель закрыт (`phase=crash_loop`). Чинить причину по `api.err.log`, не крутить рестарты.
 
