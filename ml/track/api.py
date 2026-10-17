@@ -290,9 +290,10 @@ def track_full(clip: Any, dets: Sequence[Any], cfg: Optional[dict] = None,
     others = [v for v in pviews if v.tid != cashier.get("primary")]
     if desk is None:
         desk, zinfo["desk"] = zones_mod.desk_fallback(cviews, others, cfg)
+    desk_ind = desk if zinfo["desk"].get("independent") else None
+    seat = np.concatenate([roles_mod.seated_mask(v, desk_ind, cfg, aspect) for v in cviews]) if cviews else None
     ca, zinfo["cashier_area"] = zones_mod.cashier_area_zone(
-        cviews, desk if zinfo["desk"].get("independent") else None, cfg, aspect,
-        float(cashier.get("conf", 0.0)), bool(cashier.get("independent")))
+        cviews, desk_ind, cfg, aspect, float(cashier.get("conf", 0.0)), bool(cashier.get("independent")), seat)
     cl, zinfo["client_area"] = zones_mod.client_area_zone(others, desk, ca, cfg, aspect,
                                                           bool(zinfo["desk"].get("independent")))
     seg_gap = max(tc["track_buffer_s"], 3.0 * frame_dt)

@@ -9,3 +9,4 @@ __pycache__/
 *.pt
 *.safetensors
 *.gguf
+_out/

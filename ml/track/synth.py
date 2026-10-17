@@ -262,3 +262,21 @@ def scene_cashier_enters_client_seated(duration: float = 40.0) -> Scene:
     client = Person("client", [(0, *CLIENT), (duration, *CLIENT)], [(0.0, duration)], color=(40, 40, 220))
     cas = Person("cashier", [(1.0, *DOOR_PT), (4.0, *SEAT), (duration, *SEAT)], [(1.0, duration)], color=(200, 80, 40))
     return Scene(duration, [client, cas], base_objects(duration))
+
+
+def scene_fidget(duration: float = 40.0) -> Scene:
+    """Кассир дважды на ~1 с отклоняется от места (взять что-то) — это НЕ уход с рабочего места."""
+    away = (SEAT[0] + 0.22, SEAT[1] + 0.06)
+    path = [(0, *SEAT), (9.6, *SEAT), (10.0, *away), (11.0, *away), (11.4, *SEAT),
+            (24.6, *SEAT), (25.0, *away), (26.0, *away), (26.4, *SEAT), (duration, *SEAT)]
+    return Scene(duration, [Person("cashier", path, [(0.0, duration)], color=(200, 80, 40))], base_objects(duration))
+
+
+def scene_v02_bounce(duration: float = 60.0) -> Scene:
+    """Кассир ушёл (15 с), на 1 с мелькнул у края рабочего места (24 с) и снова ушёл: одно событие ухода."""
+    mid = (0.18, 0.40)       # далеко от стола, по пути к двери
+    edge = (0.47, 0.72)      # на 1 с вернулась к месту
+    c = Person("cashier", [(0, *SEAT), (15, *SEAT), (17, *mid), (23.5, *mid), (24, *edge), (25, *edge), (25.5, *mid),
+                           (27, *DOOR_PT)], [(0.0, 27.0)], color=(200, 80, 40))
+    objs = base_objects(duration) + [Obj("cash", (0.44, 0.56, 0.52, 0.60), [(0.0, duration)], 0.7)]
+    return Scene(duration, [c], objs)
