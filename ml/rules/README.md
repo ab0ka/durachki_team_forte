@@ -43,6 +43,102 @@
    Факты о полном этапе (`facts_stage`, «До этого кассир наблюдался…») печатаются только после
    пройденной проверки этапа. В fallback-каталоге нет норм, и их там быть не должно (правило 5).
 
+## Фаза 2: спецификация команды → правила
+
+### Решения (записаны здесь по требованию фазы 2)
+
+1. **Каждое изменение — гипотеза за флагом, по умолчанию выключена.** Новые правила лежат в `rules.yaml`
+   с `enabled: false`, а гипотезы `H0..H9` (раздел `hypotheses`) — это наборы переопределений. Профиль
+   по умолчанию — `baseline`, он повторяет поведение фазы 1. Профиль `phase2` — все гипотезы сразу.
+   Production сам профиль не меняет: только явный аргумент, переменная `SENTINEL_RULES_PROFILE` или
+   `default_profile` в YAML. В профиль по умолчанию гипотеза попадает только после замера L2.
+2. **Две оси вместо одной.** `extra.detection` — что видно по видео: `violation_candidate` /
+   `observation` / `insufficient_context`. `extra.legal_basis` — правовая опора из каталога A13:
+   `confirmed` / `candidate` / `none` (с учётом `legal_status` A13). `extra.assessment` сохраняет
+   семантику фазы 1: `candidate_violation` — только кандидат с подтверждённой нормой. Без подтверждённой
+   нормы событие — «наблюдение для человека» без юридического вывода. На ветке A13 сейчас у всех типов
+   `legal_status: disabled` или нормы не проверены, поэтому у всех событий `legal_basis = none`.
+3. **Вердикт в replay по умолчанию — по оси обнаружения** (`--verdict detection`): жюри меряет детекцию.
+   `--verdict legal` — юридическая политика фазы 1. Какую политику взять для API, решает A12.
+4. **Совместимость с A08.** `SceneStateEx`: значение берётся, только если `known[name]` истинно (или
+   `conf ≥ known_min_conf`); `observed.*` — односторонне (`< 0.5` значит «не наблюдали», а не «нет»);
+   `quality` → `frame_quality`. В новых предикатах пороги с отступом от априорных значений A08
+   (prior `cashier_in_workplace` = 0.5): отсутствие `< 0.3`, присутствие `> 0.7`. Даже если флаги
+   `known` потеряются, prior не пройдёт порог.
+5. **Неизвестное ≠ ложь.** Неизвестная роль ≠ неуполномоченный (V01 опирается только на
+   `outsider_in_cashier_area`, который A08 оставляет неизвестным при неясной роли). Свет выключен или
+   окклюзия после ухода → `insufficient_context`, а не «чисто». Обрезанная операция не доказывает
+   несделанное действие.
+6. **Таймкод — момент начала действия.** Политика `transition` (гипотеза H0) ищет наблюдаемый переход
+   `trigger` «доказанно ложно → доказанно истинно» в окне `lookback_s` до начала сегмента: «отошла»,
+   «вошёл», «поднесла». Переход из «неизвестно» помечается `unknown→true`. Если перехода не видно
+   (с начала ролика), используется fallback `evidence`. Политику выбирает замер, не глаз.
+7. **Несколько событий в ролике сохраняются**: отдельные сегменты, NMS 5 с внутри типа. Дребезг
+   одного события склеивается (`merge_gap_s`, медиана). Пиксельные координаты, цвет и яркость не
+   используются: только сигналы A06–A08.
+8. **V09** («личные вещи на кассовом столе») — новый тип; в fallback-каталоге только имя. В каталоге
+   A13 его нет → «без пункта». Сигнал — extra `personal_items_on_desk` от A08, если появится, или
+   производный из треков (`bag` в зоне `desk`).
+
+### Спецификация → правило
+
+| Спецификация | Правило (гипотеза) | Обязательные видимые предикаты | Исключения | Момент (`trigger`) | Неизвестно → |
+|---|---|---|---|---|---|
+| Посторонний на стороне кассира / у ценностей | `V01_outsider_in_cashier_area` (baseline) | `outsider_in_cashier_area` ≥ 2 с | доказан инкассатор и людей ≤ 2 | `outsider_in_cashier_area > 0.5` | ничего; роль неясна → H3 «наблюдение» |
+| Второй посторонний во время обслуживания | `V01_second_outsider_during_service` (H5) | кассир на месте `> 0.7`, людей `≥ 3` | инкассатор в кадре | `n_persons >= 3` | ничего |
+| Вход при открытых ценностях | `V04_entry_while_valuables_open` (H4) | дверь открыта, людей стало больше (`prev_min`), кассир был в кадре до входа, сейф открыт или сумка видна | инкассатор в кадре | `door_open > 0.5` | ничего (дверь часто неизвестна) |
+| Ушла и оставила: наличные/сумка | `V02_left_cash_after_departure` (H1) | кассир вне места `< 0.3` (уход подтверждён A08) + на столе наличные или сумка; до ухода кассир наблюдался на месте | — | `cashier_in_workplace < 0.3` | стол не виден → `insufficient_context` |
+| Ушла и оставила: сейф открыт | `V03_left_safe_open_after_departure` (H1) | кассир вне места + сейф открыт; до ухода кассир на месте | — | `cashier_in_workplace < 0.3` | сейф не виден → `insufficient_context` |
+| Уход с пустым столом и закрытым сейфом | (чистый двойник H1) | — | — | — | — |
+| Работа за столом при открытом сейфе | `V03_work_with_safe_open` (H2) | кассир на месте `> 0.7` + сейф открыт ≥ 10 с | инкассатор в кадре | переход «сейф открыт при кассире на месте» | ничего |
+| Мобильный в руке кассира | `V05_phone_in_hand_at_workplace` (H6 делает его кандидатом) | `phone_in_hand` ≥ 2 с при контексте работы | — | `phone_in_hand > 0.5` | ничего; рука у лица без телефона — не сигнал |
+| Еда/питьё с ценностями | `V06_food_drink_with_valuables` (H7) | `eating_drinking > 0.6` (A08 подтверждает предметом) + кассир на месте + ценности видны | — | `eating_drinking > 0.6` | ничего |
+| Личные вещи на столе | `V09_personal_items_on_desk` (H8) | `personal_items_on_desk` ≥ 10 с | доказанная инкассаторская сумка | появление предмета | ничего |
+| Сумка оставлена / передача вне процедуры | `V07_bag_left_after_handover` (H9) | сумка видна `> 0.6` ≥ 15 с после ухода инкассатора; до этого инкассатор был с сумкой | сейф открыт (сумку убирают) | `collector_present < 0.3` | сумка не видна → `insufficient_context` |
+| Из рук в руки и сразу в сейф | (чистый двойник H9) | — | — | — | — |
+| Человек с неопределённой ролью у кассы | `V01_unknown_role_in_cashier_area` (H3), наблюдение | `observed.unknown_person_in_cashier_area` ≥ 2 с | — | появление | — |
+
+Все пороги — стартовые, без замера на реальных данных.
+
+### Одна команда замера для L2
+
+```bash
+python -m ml.rules.replay --cache cache/ --labels data/labels.csv --names out/summary.json \
+    --hypotheses all --json out/a09_ablation.json
+```
+
+- **Что сравниваем:** `baseline` (фаза 1), `baseline + Hk` для каждой гипотезы отдельно и профиль
+  `phase2` целиком. Кэш — `cache/<sha>/states.jsonl` из A03. Имена роликов — `summary.json` батча A03
+  (или `--videos data/raw`, чтобы посчитать sha256 локально).
+- **Выход:** таблица в stdout и JSON; одна строка на вариант.
+- **Метрики:** TP/FP/FN/TN (дубликаты по `group`/`md5` считаются один раз), recall;
+  `det` = 1 − (2·FN + FP) / (2·P + N); `time` — ступени 1/2/3/5 с → 1/0.75/0.5/0.25, конфликтные
+  таймкоды исключены; `joint` = (25·det + 15·time) / 40 — прокси A16; Δjoint и ΔFP к baseline;
+  hit≤1, hit≤2, медиана |Δt|; типы на TP; мс на видео. VRAM — 0: правила считаются на CPU.
+- **Правило решения:** включать гипотезу, если Δjoint > 0 и ΔFP ≤ 0. Рост recall ценой лавины FP —
+  не улучшение. Все 42 строки разметки уже использованы в разведке, поэтому подтверждать на отложенных
+  роликах или LOO (A16).
+- **Разбор по видео:** `--profile phase2 --trace --csv out/a09_phase2.csv`. Колонки: GT, событие,
+  обнаружение, норма, Δt, правило, момент (`false→true` / `unknown→true` / fallback), статус каждого
+  предиката и исключения в `t_peak`.
+
+### Правки порогов (не больше двух)
+
+Конкретных значений нет: без числовой диагностики L2 пороги не меняю. Для L2 есть команда:
+
+```bash
+python -m ml.rules.replay --cache cache/ --labels data/labels.csv --names out/summary.json \
+    [--profile phase2] --propose
+```
+
+Она жадно ищет не больше 2 однопараметрических правок (`min_duration_s` ×0.5/0.75/1.5/2, `on` для
+нечётких правил, `ffill_max_s`), которые повышают `joint` при росте FP не больше чем на 1. Печатает
+готовые `--set …` и ничего не применяет. В первую очередь стоит смотреть на два порога-догадки:
+1. `rules.V03_work_with_safe_open.min_duration_s` (10 с) — граница между короткой работой с сейфом и
+   «работой за столом при открытом сейфе»;
+2. `rules.V02_left_cash_after_departure.min_duration_s` (3 с) — сколько длится «ушла и оставила»,
+   прежде чем это событие, а не шаг в сторону.
+
 ## Публичные функции
 
 ```python
@@ -54,8 +150,11 @@ report = evaluate(states, tracks, zones, catalog)   # RulesReport: events, serie
                                                     # possible, candidates, warnings, risk_curve(), summary()
 groups = split_by_assessment(report.events)         # {"candidate_violation": [...], "review_observation": [...],
                                                     #  "insufficient_context": [...]}
-cfg = load_rules_config()                           # rules.yaml (env SENTINEL_RULES_YAML переопределяет путь)
+cfg = load_rules_config()                           # rules.yaml (env SENTINEL_RULES_YAML переопределяет путь),
+                                                    # профиль baseline (env SENTINEL_RULES_PROFILE)
+cfg = load_rules_config(profile="phase2")           # или hypotheses=["H1_left_after_departure", ...]
 cfg.rules_table()                                   # таблица enabled/disabled с причинами
+report.coverage()                                   # для meta.coverage: доля известных кадров по сигналам/правилам
 
 from ml.rules.cache_io import save_cache            # A03: сохранить states/tracks/zones для replay
 save_cache("cache/", video_id, states, tracks, zones)
@@ -71,17 +170,19 @@ save_cache("cache/", video_id, states, tracks, zones)
 |---|---|
 | `type_id` | `V01..V08` из каталога (гипотезы) |
 | `t_start`, `t_end` | фактические кадры начала/конца доказанного сегмента, с |
-| `t_peak` | фактический кадр-доказательство (политика `evidence`) |
+| `t_peak` | фактический кадр-доказательство (политика `evidence`; с H0 — наблюдаемый переход `trigger`) |
 | `confidence` | от силы и длительности, неубывающая по длительности; потолки для review/insufficient |
 | `facts` | наблюдаемые факты по-русски по шаблонам `rules.yaml` |
 | `bboxes` | боксы участников на `t_peak` из треков (`visitor#7`, `safe_open#3`, `zone:safe`) |
 | `track_ids` | id треков из `bboxes` |
-| `extra.assessment` | `candidate_violation` / `review_observation` / `insufficient_context` |
+| `extra.detection` | ось обнаружения: `violation_candidate` / `observation` / `insufficient_context` (не зависит от норм) |
+| `extra.legal_basis` | правовая опора из каталога A13: `confirmed` / `candidate` / `none` |
+| `extra.assessment` | `candidate_violation` (кандидат + подтверждённая норма) / `review_observation` / `insufficient_context` |
 | `extra.assessment_reasons` | почему не кандидат (нет проверенной нормы, правило-наблюдение, причина неполного контекста) |
-| `extra.norm_status` | `verified` / `unverified` / `absent` |
+| `extra.norm_status` | `verified` / `candidate` / `disabled` / `unverified` / `absent` |
 | `extra.evidence_t` | ≤ 3 фактических момента для кадров-доказательств |
 | `extra.rule_ids`, `extra.merged` | какие правила одного типа слились в событие |
-| `extra.trace` | «почему»: выражения, пороги, условия (`signal op threshold`, значение, ok/неизвестно), статистика сигналов по сегменту, слагаемые уверенности, отсутствующие и производные сигналы |
+| `extra.trace` | «почему»: `clauses` — применимость, обязательные предикаты и исключения со статусом true/false/unknown в `t_peak` и долями по интервалу; `interval`; `evidence` (политика, вид перехода, `trigger`); выражения, пороги, сигналы, слагаемые уверенности, отсутствующие и производные сигналы |
 | `extra.suppressed`, `extra.yielded_to` | что подавил NMS, кому уступил тип |
 
 ## `rules.yaml`
@@ -114,8 +215,8 @@ ramp step`, временные `was(x,w) held(x,w) avg(x,w) ahead(x,w) ever(x)`.
 
 ## Таблица правил (enabled/disabled и причины)
 
-Сгенерирована командой `python -m ml.rules.replay --rules-table` из `rules.yaml`.
-Описаний реальных сцен в таблице нет.
+Сгенерирована командой `python -m ml.rules.replay --rules-table` из `rules.yaml`; «Включено» — в профиле
+`baseline` (правила фазы 2 включаются гипотезами H1–H9). Описаний реальных сцен в таблице нет.
 
 | Правило | Тип | Вид | Включено | По бездействию | Причина |
 |---|---|---|---|---|---|
@@ -133,37 +234,52 @@ ramp step`, временные `was(x,w) held(x,w) avg(x,w) ahead(x,w) ever(x)`.
 | `V08_hands_hidden_with_cash` | V08 | observation | нет | — | Выключено: при потолочной камере руки часто закрыты корпусом/монитором при обычной работе; невидимые руки сами по себе не доказанное нарушение. |
 | `V08_counting_facing_away` | V08 | observation | нет | — | Выключено: «спиной к камере» зависит от ракурса (тест под другим углом) — не переносимо без калибровки. |
 | `V99_placeholder` | V99 | observation | нет | — | Выключено: V99 (иное) не задаётся правилами по сигналам — только VLM discover (A11) / fusion с конкретными видимыми фактами. |
+| `V02_left_cash_after_departure` | V02 | violation | нет | да | Фаза 2, гипотеза H1 (спецификация «ушла и оставила»): ждёт замера L2 на реальных данных. |
+| `V03_left_safe_open_after_departure` | V03 | violation | нет | да | Фаза 2, гипотеза H1 (спецификация «ушла и оставила», сейф открыт): ждёт замера L2. |
+| `V03_work_with_safe_open` | V03 | violation | нет | — | Фаза 2, гипотеза H2 («работа за столом при открытом сейфе за спиной»): порог длительности 10 с — стартовый, отличает от короткой работы с сейфом; ждёт замера L2. |
+| `V01_unknown_role_in_cashier_area` | V01 | observation | нет | — | Фаза 2, гипотеза H3: человек с неопределённой ролью в зоне кассира — наблюдение для человека/VLM (неизвестная роль ≠ неуполномоченный), не нарушение. |
+| `V04_entry_while_valuables_open` | V04 | violation | нет | — | Фаза 2, гипотеза H4 («вход при открытых ценностях»): дверь открылась и людей стало больше, пока сейф открыт или видна инкассаторская сумка; кассир был в кадре до входа. Ждёт замера L2. |
+| `V01_second_outsider_during_service` | V01 | violation | нет | — | Фаза 2, гипотеза H5 («второй посторонний во время обслуживания»): ≥ 3 человек в кадре при кассире на рабочем месте; риск FP (клиенты вдвоём) — включать только по замеру L2. |
+| `V06_food_drink_with_valuables` | V06 | violation | нет | — | Фаза 2, гипотеза H7: еда/питьё (A08 подтверждает предметом cup/bottle/food) у кассира на рабочем месте при видимых ценностях. Рука у лица без предмета — не сигнал. Ждёт замера L2. |
+| `V09_personal_items_on_desk` | V09 | violation | нет | — | Фаза 2, гипотеза H8: личные вещи (сумка, куртка) на кассовом столе ≥ 10 с. Сигнал personal_items_on_desk — extra от A08 или производный из треков (bag в зоне desk). Ждёт замера L2. |
+| `V07_bag_left_after_handover` | V07 | violation | нет | да | Фаза 2, гипотеза H9 («сумка оставлена» вместо «из рук в руки и сразу в сейф»): после ухода инкассатора сумка видна ≥ 15 с, сейф при этом не открыт. Ждёт замера L2. |
 
 ## Replay: тюнинг по кэшу без CV
 
 ```bash
-python -m ml.rules.replay --cache cache/ --labels data/labels.csv                 # прод-режим норм
-python -m ml.rules.replay --cache cache/ --labels data/labels.csv --assume-verified \
-    --set rules.V01_outsider_in_cashier_area.min_duration_s=3 \
-    --sweep global.ffill_max_s=0.5,1,2 --sweep rules.V03_safe_left_open.min_duration_s=3,5,8
-python -m ml.rules.replay --cache cache/ --labels data/labels.csv --json out.json --csv out.csv --events
+python -m ml.rules.replay --cache cache/ --labels data/labels.csv --names out/summary.json   # baseline
+python -m ml.rules.replay ... --hypotheses all --json out/a09_ablation.json                 # абляция для L2
+python -m ml.rules.replay ... --profile phase2 --trace --csv out/a09_phase2.csv              # разбор по видео
+python -m ml.rules.replay ... --hypothesis H1_left_after_departure --set rules.V02_left_cash_after_departure.min_duration_s=5
+python -m ml.rules.replay ... --sweep rules.V03_work_with_safe_open.min_duration_s=5,10,20
+python -m ml.rules.replay ... --propose                                                       # ≤ 2 правки порогов
 python -m ml.rules.replay --rules-table
 ```
 
-- Кэш (JSON, без pickle): `<cache>/<video>/states.json` (+ `tracks.json`, `zones.json`), или
-  `<cache>/<video>.states.json[l]`, или `<video>.json` с ключами `states/tracks/zones`; `.gz` тоже.
-  Состояние — `{"t", "signals": {...}}` или плоский словарь. Это `dataclasses.asdict` контракта v1.
-- Разметка CSV: столбцы ищутся по заголовку (`file/видео`, `label/нарушение`, `second/секунда`),
-  разделитель `, ; \t`, кодировка UTF-8 или cp1251. Значения — «нарушение / без нарушения», «22 секунда»,
-  «0:22». Имена нормализуются: кириллическая `Х` ≡ латинская `X`, регистр, расширение и дефисы не важны.
-- Вывод: таблица по видео (GT, вердикт, cand/review/insuff, тип, `t_peak`, Δt, попадание в `--tol`),
-  TP/FP/FN/TN, precision/recall/F1, доля попаданий таймкода ≤ 1/2/3/5 с, медиана (GT − t_peak) —
-  справочно; срабатывания каждого правила на чистых и нарушающих видео (источники FP).
-- Вердикт — наличие `candidate_violation`. `--assume-verified` (только для калибровки) считает нормы
-  всех типов проверенными, чтобы мерить детекцию отдельно от статуса норм. `--count-review` —
-  диагностика: считать нарушением и `review_observation`.
-- Дубликаты по md5 (Х-4≡Х-47 с разными секундами, Х-5≡Х-48) replay не склеивает: это разные строки
-  разметки. При калибровке их стоит учитывать как один ролик.
+- Кэш (JSON, без pickle): раскладка A03 `cache/<sha256>/states.jsonl` (+ `tracks.json`, `zones.json`,
+  `manifest.json`; `dets`/`poses`/`pose_states`/`events_*`/`risk` пропускаются). Также
+  `<cache>/<video>/states.json`, `<cache>/<video>.states.json[l]` и `<video>.json` с ключами
+  `states/tracks/zones`; `.gz` тоже. Состояние — `{"t", "signals", ["known", "conf", "observed",
+  "quality"]}` (`state_to_dict` A08 или `to_jsonable` A03) или плоский словарь.
+- sha → имя ролика: `--names` (`summary.json` батча A03 или CSV `sha256,file`) или `--videos DIR`
+  (sha256 считается локально у L2; содержимое видео никуда не уходит).
+- Разметка: схема L1 `video_id,file,label,t_sec,md5,group,t_all,conflict,raw` (колонку `raw` replay не
+  выводит) или произвольный CSV (столбцы ищутся по заголовку; «нарушение / без нарушения»,
+  «22 секунда», «0:22»; UTF-8 или cp1251). Имена нормализуются: кириллическая `Х` ≡ латинская `X`.
+  Дубликаты (`group`/`md5`) в метриках считаются один раз (`--no-dedupe` выключает). Конфликт таймкодов
+  (`conflict`) исключается из метрики времени; таймкод сравнивается с ближайшей альтернативой `t_all`.
+- Вердикт: `--verdict detection` (по умолчанию: есть `violation_candidate`) или `legal` (есть
+  `candidate_violation`, то есть ещё и подтверждённая норма). `--assume-verified` — калибровка юридической
+  политики. `--count-review` — диагностика.
+- Вывод: таблица по видео (GT и альтернативы, вердикт, тип, обнаружение, норма, `t_peak`, Δt, момент,
+  правило, предикаты в `t_peak`); TP/FP/FN/TN, precision/recall/F1, `det`/`time`/`joint`, hit ≤ 0.5/1/2/3/5 с,
+  медиана |Δt|, типы на TP, latency, срабатывания каждого правила на чистых и нарушающих видео.
+  `--trace` печатает статус каждого предиката и исключения: true/false/unknown в `t_peak`, доли по интервалу.
 
 ## Тесты
 
 ```bash
-python -m pytest ml/rules/tests -q        # 119 тестов, без GPU, весов и данных (~2 с)
+python -m pytest ml/rules/tests -q        # 199 тестов, без GPU, весов и данных (~12 с)
 ```
 
 Синтетика из `ml/rules/synth.py` (без реальных кадров и описаний сцен):
@@ -181,10 +297,20 @@ python -m pytest ml/rules/tests -q        # 119 тестов, без GPU, вес
   треков/зон, слияние состояний двух модулей, forward-fill, кривая риска, падение одного правила не
   ломает остальные.
 - `test_expr.py`: отклонение небезопасных конструкций, нечёткая и интервальная семантика, окна.
-- `test_replay.py`: раскладки кэша, CSV (`;`, cp1251, кириллическая Х), сквозной CLI, sweep, таблица правил.
+- `test_replay.py`: раскладки кэша (включая A03 `cache/<sha>/`, имена по `summary.json`), CSV (`;`, cp1251,
+  кириллическая Х, схема L1 с дубликатами и конфликтом таймкодов), сквозной CLI, обе политики вердикта,
+  абляция `--hypotheses all`, `--propose`, sweep, таблица правил.
+- `test_phase2.py` (фаза 2): на каждую гипотезу H1–H9 — **нарушение + чистый двойник + неизвестное**
+  при политиках `evidence` и `transition`; профиль `phase2` на 10 чистых сценариях без единого события;
+  несколько настоящих событий сохраняются, дребезг склеивается; уход в начале ролика не считается уходом;
+  V09 из треков.
+- `test_clauses_transition.py`: применимость (строго), предикаты, исключения (блокируют только
+  доказанные), trace по каждому пункту, переходы `false→true` / `unknown→true` / нет перехода, override.
+- `test_interop.py`: `SceneStateEx` A08 (`known`/`conf`/`observed`/`quality`, prior при `known=False` не
+  считается фактом), `legal_status` A13, независимость `detection` от норм, `coverage()`.
 
 Проверено: Python 3.13 (numpy 2.5.3) и Python 3.11 (numpy 1.26.4, PyYAML 6.0.2, pytest 8.3.3) —
-119/119; `ruff check --select E,F,W,B --line-length 120` — чисто (кроме дословной копии контракта). **Метрик на реальных роликах нет**: данных в этой среде нет, значения не выдумывались.
+199/199; `ruff check --select E,F,W,B --line-length 120` — чисто (кроме дословной копии контракта). **Метрик на реальных роликах нет**: данных в этой среде нет, значения не выдумывались.
 
 ## Зависимости, модели, лицензии
 
@@ -204,26 +330,37 @@ python -m pytest ml/rules/tests -q        # 119 тестов, без GPU, вес
 
 ## Для интегратора
 
-1. **A12 / fusion**: к вердикту `violation` допускать только события с
-   `extra["assessment"] == "candidate_violation"` (`ml.rules.split_by_assessment`). `review_observation`
-   показывать проверяющему как наблюдение без ссылки на норму как на основание. `insufficient_context`
-   показывать как «недостаточно контекста». Кадры-доказательства брать по `extra["evidence_t"]`, боксы — из
-   `bboxes`. Кривая риска правил — `evaluate(...).risk_curve()`.
+1. **A12 / fusion**: обнаружение и правовая опора разделены. Для детекции использовать
+   `extra["detection"] == "violation_candidate"`. Формулировку и ссылку брать по `extra["legal_basis"]`:
+   без `confirmed` — «наблюдение для проверки человеком», `description_template` A13, без юридического
+   вывода. Строгая юридическая политика — `extra["assessment"] == "candidate_violation"`
+   (`split_by_assessment`). `observation` — наблюдение, не нарушение. `insufficient_context` — «недостаточно
+   контекста»; это не «нарушений нет». Кадры-доказательства — по `extra["evidence_t"]`, боксы — `bboxes`,
+   кривая риска — `evaluate(...).risk_curve()`.
 2. **A03 / pipeline**: вызывать `run_rules(states, tracks, zones, catalog)`. `states` можно передать одним
    списком от `pose_signals` и `scene_states`: состояния с одинаковым `t` сливаются (`merge_policy: max`),
    разные частоты выравниваются. Для replay сохранять кэш через `ml.rules.cache_io.save_cache(...)`.
    Для UI полезен `evaluate(...).summary()` в `meta`: отсутствующие и производные сигналы, предупреждения.
+   `evaluate(...).coverage()` — для `meta.completeness`: правило с покрытием 0 ничего не могло доказать.
+   **Критично:** `cache.normalize_outputs: true` прогоняет состояния через `serde.load_state`, который
+   отбрасывает `conf/known/observed/quality` `SceneStateEx`. Тогда правила получают апостериорные значения
+   A08 (неизвестное → prior) как факты. Нужно сохранять эти поля (например, загрузчиком
+   `ml.scene.types.state_from_dict`) или передавать в правила состояния до roundtrip. Replay читает
+   `states.jsonl` напрямую и поля видит.
 3. **A07 / A08 (сигналы)**: если сигнал наблюдаем, слать его **явно, в том числе 0.0**. Отсутствие ключа
    означает «неизвестно», а не 0. Предполагается, что `outsider_in_cashier_area` исключает кассира и
    инкассатора (правила дополнительно гасят V01/V03, только если инкассатор доказан и людей ≤ 2).
 4. **A06 (треки/зоны)**: имена зон из контракта (`cashier_area`, `desk`, `safe`, `door`) используются для
    производных сигналов (только когда сигнала нет в `states`) и для подсветки. Координаты не
    захардкожены. Роли `cashier`/`visitor`/`collector` — по зоне и поведению, не по лицу.
-5. **A13 (нормы)**: статус берётся из `types.<V..>.rules[].verified` (bool `true` + непустой `url`).
-   Без этого кандидатов в нарушения не будет.
+5. **A13 (нормы)**: статус берётся из `types.<V..>.legal_status` (`confirmed`/`candidate`/`disabled`) и
+   `rules[].verified` (bool `true` + непустой `url`). Без подтверждённой нормы `legal_basis = none`.
+   V09 (личные вещи на столе) в каталоге отсутствует: «без пункта», пока A13 не найдёт настоящую норму.
 6. **A16 (eval)**: сдвиги `t_peak` и пороги подбирать только на train/calibration
    (`replay --sweep`, `--json`); `--assume-verified` — режим калибровки детекции.
-7. **Env**: `SENTINEL_RULES_YAML=/path/rules.yaml` — альтернативный конфиг.
+7. **Env**: `SENTINEL_RULES_YAML=/path/rules.yaml` — альтернативный конфиг; `SENTINEL_RULES_PROFILE=phase2`
+   — профиль (по умолчанию `baseline`; сам production профиль не меняет).
+   A08 может слать extra-сигнал `personal_items_on_desk` (V09); иначе он выводится из треков (`bag` в `desk`).
 8. **Контракт**: `ml/rules/_contract_fallback.py` — копия контракта v1. Удалить после мерджа ветки A01:
    импорт идёт через `try: from contracts.sentinel_contracts import ...`. `run_rules` принимает
    необязательный 5-й аргумент `config` — сигнатура контракта не нарушена. Предложение для A01 (не
