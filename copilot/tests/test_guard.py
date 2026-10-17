@@ -93,3 +93,16 @@ def test_refusal_is_grounded_without_citations(corpus, job_violation) -> None:
     res = normalize_result(job_violation)
     g = check_answer("По видео это установить нельзя.", [], corpus, res)
     assert g.refusal and g.grounded and g.citations == []
+
+
+def test_clause_from_corpus_but_not_in_context_removed(corpus, job_violation) -> None:
+    """п. 7 есть в корпусе, но модели передан только п. 9 — ссылка не подтверждена контекстом."""
+    res = normalize_result(job_violation)
+    refs = [NormRef(n=1, chunk=corpus.rules_for_type("V05")[0])]
+    g = check_answer("Телефон запрещён [N1]. Сейф тоже регулирует п. 7 регламента.", refs, corpus, res)
+    assert g.answer == "Телефон запрещён [1]." and "п. 7" in g.removed and not g.grounded
+
+
+def test_vague_document_name_does_not_match(corpus) -> None:
+    assert corpus.find("Регламент", "п. 9") is None
+    assert corpus.find("Тестовый регламент кассы", "п. 9") is not None

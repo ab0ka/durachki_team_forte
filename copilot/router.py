@@ -85,7 +85,7 @@ def make_router(get_job: Optional[JobProvider] = None, service: Any = None, pref
             raise
         except Exception as exc:  # сбой хранилища задач не превращаем в 500 без тела
             raise HTTPException(status_code=503, detail={"code": "job_provider_error",
-                                                         "message": f"Не удалось получить результат задачи: {type(exc).__name__}"})
+                                                         "message": f"Не удалось получить результат задачи: {type(exc).__name__}"}) from exc
         if job is None:
             raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "Задача не найдена"})
         return job

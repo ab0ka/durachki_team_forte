@@ -6,7 +6,7 @@ import types
 import pytest
 
 from copilot.config import load_config
-from copilot.llm import LLMTimeout, LlamaCppBackend, ThinkFilter, plan_gpu_layers, strip_think
+from copilot.llm import LLMTimeout, LlamaCppBackend, plan_gpu_layers, strip_think
 from copilot.report import report
 
 
@@ -18,12 +18,9 @@ def test_plan_gpu_layers() -> None:
     assert 0 < part < 36                                            # частичный offload
 
 
-def test_strip_think_and_filter() -> None:
+def test_strip_think() -> None:
     assert strip_think("<think>a</think>Ответ") == "Ответ"
     assert strip_think("Ответ<think>незакрыт") == "Ответ"
-    f = ThinkFilter()
-    out = "".join(f.feed(p) for p in ["<thi", "nk>скрыто</th", "ink>Отв", "ет <", "b"]) + f.flush()
-    assert out == "Ответ <b"
 
 
 class _FakeLlama:

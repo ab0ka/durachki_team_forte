@@ -134,7 +134,9 @@ class Corpus:
         url_k = norm_url(url)
         for c in self.chunks:
             c_doc, c_cl = c.key
-            doc_ok = bool(doc_k) and (doc_k == c_doc or doc_k in c_doc or (len(c_doc) > 8 and c_doc in doc_k))
+            # подстрока засчитывается только для длинных названий: «Правила» не должно совпадать с любым документом
+            doc_ok = bool(doc_k) and (doc_k == c_doc or (len(doc_k) >= 12 and doc_k in c_doc)
+                                      or (len(c_doc) >= 12 and c_doc in doc_k))
             url_ok = bool(url_k) and url_k == norm_url(c.url)
             if not (doc_ok or url_ok):
                 continue
@@ -142,17 +144,6 @@ class Corpus:
                 continue
             return c
         return None
-
-    def clause_exists(self, clause: str, document: Optional[str] = None) -> bool:
-        cl_k = norm_clause(clause)
-        if not cl_k:
-            return False
-        doc_k = norm_text(document)
-        for c in self.chunks:
-            c_doc, c_cl = c.key
-            if c_cl == cl_k and (not doc_k or doc_k in c_doc or c_doc in doc_k):
-                return True
-        return False
 
     def known_urls(self) -> set[str]:
         return {norm_url(c.url) for c in self.chunks if c.url}

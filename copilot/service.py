@@ -156,9 +156,12 @@ class CopilotService:
     def _clean_history(self, history: Any) -> list[dict[str, str]]:
         gcfg = self.cfg.get("guard", {})
         turns: list[dict[str, str]] = []
-        for t in history or []:
-            if isinstance(t, dict) and t.get("role") in {"user", "assistant"} and str(t.get("content") or "").strip():
-                turns.append({"role": str(t["role"]), "content": str(t["content"]).strip()})
+        for t in history if isinstance(history, list) else []:
+            if not isinstance(t, dict) or t.get("role") not in {"user", "assistant"}:
+                continue
+            content = str(t.get("content") or t.get("text") or "").strip()  # {role, text} от A15 тоже
+            if content:
+                turns.append({"role": str(t["role"]), "content": content})
         turns = turns[-int(gcfg.get("max_history_turns", 8)):]
         budget = int(gcfg.get("max_history_chars", 4000))
         out: list[dict[str, str]] = []

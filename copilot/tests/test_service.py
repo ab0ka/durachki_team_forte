@@ -186,3 +186,9 @@ def test_history_is_truncated(cfg, corpus, job_violation) -> None:
     msgs = llm.calls[0]
     assert len(msgs) == 1 + 8 + 1  # system + последние 8 реплик + вопрос
     assert msgs[1]["content"] == "реплика 12" and msgs[-2]["content"] == "реплика 19"
+
+
+def test_python_api_accepts_history_with_text(cfg, corpus, job_violation) -> None:
+    llm = ScriptedLLM(["Пользоваться телефоном запрещено [N1]."])
+    _svc(cfg, corpus, llm).answer(job_violation, "А норма?", [{"role": "user", "text": "Что с телефоном?"}])
+    assert llm.calls[0][1] == {"role": "user", "content": "Что с телефоном?"}

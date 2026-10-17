@@ -13,7 +13,6 @@ import json
 import socket
 import subprocess
 import sys
-import threading
 import time
 import types
 from pathlib import Path

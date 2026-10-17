@@ -191,13 +191,19 @@ e5 берётся из локального кэша HF (`snapshot_download(loca
 ```bash
 pip install -r copilot/requirements.txt
 python -m pytest copilot/tests -q                                    # всё, ~4 с, без GPU/весов/сети
+python -m pytest copilot -m "not gpu and not slow" -q                # как в CI A01 (module copilot)
+ruff check copilot                                                   # правила ruff из pyproject A01 (E4,E7,E9,F,B)
 python -m pytest copilot/tests/test_integration_readiness.py -q      # только готовность к интеграции
 python -m pytest copilot/tests/test_safety.py -q                     # локальность / нет облака / нет тяжёлых импортов
 ```
 
 ## 6. Что реально проверено и что требует локального GPU
 
-**Проверено в этой ветке** (Python 3.11, CPU, без весов и сети): `pytest copilot/tests` → **101 passed**.
+**Проверено в этой ветке** (Python 3.11, CPU, без весов и сети): `pytest copilot/tests` → **104 passed**.
+Повторено как в CI A01 (`.github/workflows/ci.yml`, job `module copilot`): чистый venv, зависимости
+через `scripts/ci_requirements.py copilot`, `SENTINEL_MOCK=1`, `HF_HUB_OFFLINE=1`, pytest-настройки
+A01 (`--import-mode=importlib`). Результат: 104 passed, `ruff check copilot` → All checks passed,
+`scripts/check_licenses.py` на этом дереве → OK.
 - Импорт и старт приложения с роутером без весов. Subprocess с `COPILOT_ENABLED=1` без GGUF:
   `status.available=false`, `answer.error="unavailable"`, `warmup()==False`. Тяжёлые модули не
   импортируются, сокеты не открываются.
@@ -206,9 +212,9 @@ python -m pytest copilot/tests/test_safety.py -q                     # лока�
   модель даёт `busy` за время дедлайна, а не бесконечное ожидание.
 - Нет автоскачивания: e5 только с `local_files_only=True`, иначе hashing. llama.cpp только
   `Llama(model_path=…)`, без `from_pretrained`. Сеть заблокирована в тестах.
-- Не доходят до пользователя ни в обычном ответе, ни в SSE: выдуманные `[Nk]`, «п. 999», названия
-  актов, URL, таймкоды, суммы, предложения без опоры на контекст. Нормы из `violations[].rules`,
-  которых нет в каталоге, не цитируются.
+- Не доходят до пользователя ни в обычном ответе, ни в SSE: выдуманные `[Nk]`, «п. 999», пункты из
+  корпуса, не переданные модели, названия актов, URL, таймкоды, суммы, предложения без опоры на
+  контекст. Нормы из `violations[].rules`, которых нет в каталоге, не цитируются.
 - Нехватка данных даёт «По имеющимся данным это установить нельзя…». Покрыто: момент без событий,
   нет норм, невидимое (сумма, личность), упавшая задача, пустой вывод модели.
 - Router с тестовым провайдером: dict, `AnalysisResult`, JSON-строка, async-провайдер, 404, 409,

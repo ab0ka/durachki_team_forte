@@ -54,46 +54,6 @@ def strip_think(text: str) -> str:
     return text.strip()
 
 
-class ThinkFilter:
-    """Потоковый фильтр <think>…</think> для SSE (не отдаём рассуждения пользователю)."""
-
-    def __init__(self) -> None:
-        self.buf = ""
-        self.inside = False
-
-    def feed(self, piece: str) -> str:
-        self.buf += piece
-        out = ""
-        while self.buf:
-            if self.inside:
-                end = self.buf.find("</think>")
-                if end < 0:
-                    self.buf = self.buf[-8:]  # хвост может содержать начало </think>
-                    return out
-                self.buf = self.buf[end + len("</think>"):].lstrip()
-                self.inside = False
-            else:
-                start = self.buf.find("<think>")
-                if start < 0:
-                    # не отдаём возможное начало тега
-                    keep = 0
-                    for k in range(1, min(7, len(self.buf)) + 1):
-                        if "<think>".startswith(self.buf[-k:]):
-                            keep = k
-                    out += self.buf[:len(self.buf) - keep]
-                    self.buf = self.buf[len(self.buf) - keep:]
-                    return out
-                out += self.buf[:start]
-                self.buf = self.buf[start + len("<think>"):]
-                self.inside = True
-        return out
-
-    def flush(self) -> str:
-        rest = "" if self.inside else self.buf
-        self.buf = ""
-        return rest
-
-
 # ----------------------------------------------------------------------------- VRAM
 
 def free_vram_mb() -> Optional[float]:
@@ -331,7 +291,7 @@ def check_local_url(url: str, allow_private: bool = True) -> str:
     except ValueError:
         if allow_private and "." not in host:  # имя сервиса docker-compose
             return url.rstrip("/")
-        raise ValueError(f"LLM server must be local (rule 1: no cloud APIs), got host {host!r}")
+        raise ValueError(f"LLM server must be local (rule 1: no cloud APIs), got host {host!r}") from None
     if ip.is_loopback or (allow_private and (ip.is_private or ip.is_link_local)):
         return url.rstrip("/")
     raise ValueError(f"LLM server must be local (rule 1: no cloud APIs), got {host!r}")
