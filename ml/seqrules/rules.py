@@ -398,13 +398,15 @@ def rule_safe(c: Ctx) -> tuple[list[dict], list[Event], dict]:
                {"t": r4(x), "state": "skipped", "reason": "нет доступа к кадрам"} for x in times]
         epi["safe_checks"] = res
         states = [r["state"] for r in res]
-        run_open, best = 0, 0
-        first_open = None
-        for r in res:
+        # самая длинная серия «open» без «closed» между ними (unknown/skipped серию не рвут и не продлевают)
+        run_open, run_start, best, best_start = 0, 0, 0, None
+        for i, r in enumerate(res):
             if r["state"] == "open":
+                if run_open == 0:
+                    run_start = i
                 run_open += 1
-                first_open = r["t"] if first_open is None else first_open
-                best = max(best, run_open)
+                if run_open > best:
+                    best, best_start = run_open, run_start
             elif r["state"] == "closed":
                 run_open = 0
         did = [r for r in res if r["state"] in ("open", "closed", "unknown")]
@@ -421,14 +423,16 @@ def rule_safe(c: Ctx) -> tuple[list[dict], list[Event], dict]:
         episodes.append(epi)
         if epi["status"] != "event":
             continue
-        onset = t0 if res and res[0]["state"] == "open" else float(first_open)
+        onset = t0 if best_start == 0 else float(res[best_start]["t"])
+        closed_after = [r["t"] for r in res[best_start:] if r["state"] == "closed"]
+        t_stop = float(closed_after[0]) if closed_after else t1
         cc = sc.get("confidence", {})
         conf = min(float(cc.get("max", 0.85)), float(cc.get("base", 0.6)) + float(cc.get("per_check", 0.05)) * (best - 1))
         opened = [r for r in res if r["state"] == "open"]
         facts = [f"Дверца сейфа распознана открытой на {len(opened)} проверках кадров (OWLv2, контраст «открыт / закрыт»).",
                  f"В рабочей зоне кассира людей не видно {dur:.1f} с; перед этим человек #{epi['track_id']} "
                  f"({ROLE_RU.get(epi.get('track_role', ''), 'роль не определена')}) виден выходящим из зоны."]
-        events.append(_event(sc["type_id"], onset, t1, onset, conf, facts,
+        events.append(_event(sc["type_id"], onset, t_stop, onset, conf, facts,
                              {"safe": opened[0].get("bbox"), "person": epi.get("exit_box")},
                              [epi["track_id"]] if epi.get("track_id") is not None else [],
                              {"rule": "B_safe", "episode_id": epi["id"], "assessment": "candidate_violation",
