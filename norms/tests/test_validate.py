@@ -193,3 +193,9 @@ def test_examples_schema():
     cat = _mini()
     cat["types"]["V01"]["examples"] = [cat["types"]["V01"]["examples"][1]]
     assert any("positive" in e for e in _run(cat).errors)
+
+
+def test_report_counts_synthetic_examples():
+    rep = _run(_mini())
+    assert rep.examples == {"positive": 1, "unknown": 1}
+    assert rep.to_dict()["examples"] == {"positive": 1, "unknown": 1}

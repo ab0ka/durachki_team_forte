@@ -124,6 +124,7 @@ class Report:
     warnings: list[str] = field(default_factory=list)
     quotes: list[QuoteCheck] = field(default_factory=list)
     legal_status: dict[str, str] = field(default_factory=dict)
+    examples: dict[str, int] = field(default_factory=dict)  # kind → число синтетических примеров
 
     @property
     def ok(self) -> bool:
@@ -131,7 +132,8 @@ class Report:
 
     def to_dict(self) -> dict[str, Any]:
         return {"ok": self.ok, "check": "schema+quote_integrity (not a legal verification)",
-                "legal_status": self.legal_status, "errors": self.errors, "warnings": self.warnings,
+                "legal_status": self.legal_status, "examples": self.examples,
+                "errors": self.errors, "warnings": self.warnings,
                 "quotes": [asdict(q) for q in self.quotes]}
 
 
@@ -415,6 +417,10 @@ def validate_catalog(catalog: Any, base_dir: Path = NORMS_DIR, *, strict: bool =
         _check_type(str(tid), t, sources, rep)
         if isinstance(t, dict):
             rep.legal_status[str(tid)] = str(t.get("legal_status", "?"))
+            for e in t.get("examples") or []:
+                if isinstance(e, dict):
+                    k = str(e.get("kind", "?"))
+                    rep.examples[k] = rep.examples.get(k, 0) + 1
     if strict and rep.warnings:
         rep.errors.extend(f"[strict] {w}" for w in rep.warnings)
         rep.warnings = []
@@ -456,7 +462,7 @@ def _yn(x: Any) -> str:
 
 
 def render_matrix(catalog: dict[str, Any], base_dir: Path = NORMS_DIR) -> str:
-    """Review-матрица для человека: по типу и по норме — раздельные статусы проверки."""
+    """Review-матрица: по каждой норме (или пробелу) — источник, цитата, наблюдаемое, ненаблюдаемое, статусы."""
     docs = catalog.get("documents") or {}
     by_url = {_norm_url(d.get("url", "")): (k, d) for k, d in docs.items() if isinstance(d, dict)}
     retrieval: dict[str, str] = {}
@@ -466,30 +472,35 @@ def render_matrix(catalog: dict[str, Any], base_dir: Path = NORMS_DIR) -> str:
     out = [
         "# Review-матрица норм (A13)", "",
         "АВТОГЕНЕРАЦИЯ: `python -m norms.validate --write-matrix` из `catalog.yaml` — руками не править.",
-        "Колонки «цитату сверил человек» и «применимость проверил человек» — раздельные статусы;",
-        "`validate` проверяет только дословное вхождение цитаты в сохранённый текст (не юридическую гарантию).", "",
+        "Статусы раздельно: где сохранена цитата; сверил ли цитату человек; проверил ли человек применимость.",
+        "`validate` проверяет только дословное вхождение цитаты в сохранённый текст — не юридическую гарантию.",
+        "Цепочка поисковых запросов, на которых держатся цитаты, — `evidence/search_log.md`.", "",
         "## Типы и нормы", "",
-        "| тип | название | legal_status | документ / пункт | цитата сохранена | цитату сверил человек | "
-        "применимость проверил человек | verified | условия применимости | исключения |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| тип | legal_status | источник / пункт | цитата | что наблюдаемо (условия) | что по видео не устанавливается | "
+        "цитата сохранена | цитату сверил человек | применимость проверил человек | verified | следующий шаг человеку |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for tid, t in (catalog.get("types") or {}).items():
         if not isinstance(t, dict):
             continue
-        exc = "; ".join(t.get("exclusions") or [])
         rules, checks = t.get("rules") or [], t.get("rule_checks") or []
+        head = f"{tid} {_cell(t.get('name'))}"
         if not rules:
-            out.append(f"| {tid} | {_cell(t.get('name'))} | {t.get('legal_status', '?')} | без пункта, без правового "
-                       f"вывода | — | — | — | — | — | {_cell(exc)} |")
+            nxt = "; ".join(t.get("research_candidates") or []) or "искать пункт в полном тексте (HUMAN_CHECKLIST, шаг 5)"
+            out.append(f"| {head} | {t.get('legal_status', '?')} | ПРОБЕЛ: без пункта, без правового вывода | — | "
+                       f"{_cell('; '.join(t.get('observable') or []))} | {_cell('; '.join(t.get('not_observable') or []))} | "
+                       f"— | — | — | — | {_cell(nxt)} |")
             continue
         for i, r in enumerate(rules):
             chk = checks[i] if i < len(checks) and isinstance(checks[i], dict) else {}
             doc_id = by_url.get(_norm_url(r.get("url", "")), (r.get("url"), {}))[0]
+            visible = "; ".join([str(chk.get("applicability", ""))] + list(chk.get("conditions_visible") or []))
+            hidden = "; ".join(chk.get("conditions_not_visible") or t.get("not_observable") or [])
             out.append(
-                f"| {tid} | {_cell(t.get('name'))} | {t.get('legal_status', '?')} | {_cell(doc_id)} / "
-                f"{_cell(r.get('clause') or 'пункт не установлен')} | {_cell(chk.get('quote_level', '?'))} | "
+                f"| {head} | {t.get('legal_status', '?')} | {_cell(doc_id)} / {_cell(r.get('clause') or 'пункт не установлен')} | "
+                f"«{_cell(r.get('quote'))}» | {_cell(visible)} | {_cell(hidden)} | {_cell(chk.get('quote_level', '?'))} | "
                 f"{_yn(chk.get('quote_checked_by_human'))} | {_yn(chk.get('applicability_checked_by_human'))} | "
-                f"{_yn(r.get('verified'))} | {_cell(chk.get('applicability', ''))} | {_cell(exc)} |")
+                f"{_yn(r.get('verified'))} | сверить цитату и применимость (HUMAN_CHECKLIST, шаги 3–4) |")
     out += ["", "## Документы", "", "| id | акт | URL | статус (по справочным системам) | редакция сверена | "
             "дата доступа | файл | тип текста |", "|---|---|---|---|---|---|---|---|"]
     for k, d in docs.items():
@@ -527,6 +538,8 @@ def _print_human(rep: Report, path: Path) -> None:
     n_quotes = sum(q.status != "EMPTY" for q in rep.quotes)
     print(f"\nЦитат найдено дословно: {n_ok}/{n_quotes}; норм всего: {len(rep.quotes)}; "
           f"verified=true: {sum(q.verified for q in rep.quotes)}")
+    if rep.examples:
+        print("Синтетические примеры (схема проверена): " + ", ".join(f"{k}={v}" for k, v in sorted(rep.examples.items())))
     for w in rep.warnings:
         print(f"WARN  {w}")
     for e in rep.errors:
