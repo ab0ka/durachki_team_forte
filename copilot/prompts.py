@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
@@ -79,7 +80,7 @@ def normalize_result(job_result: Any) -> dict[str, Any]:
     data = _to_dict(job_result) if job_result is not None else {}
     if not isinstance(data, dict):
         data = {}
-    out = dict(data)
+    out = {k: data[k] for k in _TOP_KEEP if k in data}
     viols: list[dict[str, Any]] = []
     raw_viols = data.get("violations")
     for v in raw_viols if isinstance(raw_viols, list) else []:
@@ -98,16 +99,144 @@ def normalize_result(job_result: Any) -> dict[str, Any]:
         vv["_n"] = len(viols) + 1
         viols.append(vv)
     out["violations"] = viols
-    meta = data.get("meta")
-    if isinstance(meta, dict):
-        meta = dict(meta)
-        for key in ("duration", "duration_s", "video_duration"):
-            if key in meta:
-                meta[key] = to_float(meta[key])
-        out["meta"] = meta
-    else:
-        out["meta"] = {}
+    out["meta"] = _compact_meta(data.get("meta"))
+    if isinstance(data.get("candidates"), list):
+        out["candidates"] = [_compact(c) for c in data["candidates"][:20] if isinstance(c, dict)]
     return out
+
+
+# что из результата вообще имеет смысл показывать ассистенту (остальное — тяжёлое или служебное)
+_TOP_KEEP = ("job_id", "status", "verdict", "analysis_complete", "verdict_state", "error", "warnings")
+_META_KEEP = ("completeness", "coverage", "partial", "complete", "analysis_complete", "degraded", "failure",
+              "warnings", "duration", "duration_s", "duration_sec", "video_duration", "version", "milestone",
+              "verdict_state", "incomplete", "violation_extra")
+_B64_RE = re.compile(r"^[A-Za-z0-9+/=\s]{200,}$")
+
+
+def _compact(x: Any, depth: int = 0) -> Any:
+    """Обрезать тяжёлое: base64/JPEG, длинные строки и списки, глубокую вложенность."""
+    if depth > 4:
+        return None
+    if isinstance(x, dict):
+        out = {}
+        for k, v in list(x.items())[:40]:
+            if any(t in str(k).lower() for t in ("image", "frame", "base64", "jpeg", "shape", "bbox", "overlay_png")):
+                continue
+            cv = _compact(v, depth + 1)
+            if cv is not None:
+                out[str(k)] = cv
+        return out
+    if isinstance(x, (list, tuple)):
+        return [c for c in (_compact(v, depth + 1) for v in list(x)[:20]) if c is not None]
+    if isinstance(x, str):
+        if _B64_RE.match(x) or x.startswith("data:"):
+            return None
+        return x[:500]
+    if isinstance(x, (bytes, bytearray)):
+        return None
+    if isinstance(x, float):
+        return x if math.isfinite(x) else None
+    return x
+
+
+def _compact_meta(meta: Any) -> dict[str, Any]:
+    if not isinstance(meta, dict):
+        return {}
+    out: dict[str, Any] = {k: _compact(meta[k]) for k in _META_KEEP if k in meta}
+    for key in ("duration", "duration_s", "duration_sec", "video_duration"):
+        if key in out:
+            out[key] = to_float(out[key])
+    ui = meta.get("ui") if isinstance(meta.get("ui"), dict) else {}
+    overlays = []
+    for o in ui.get("evidence_overlays") or []:
+        if isinstance(o, dict):  # A12: факты/источники/VLM/нормы на нарушение — без кадров и фигур
+            overlays.append(_compact({k: o.get(k) for k in ("violation_index", "type_id", "timecode_sec", "facts",
+                                                            "sources", "vlm", "norms") if k in o}))
+    hints = []
+    for h in ui.get("review_hints") or []:
+        if isinstance(h, dict):
+            hints.append(_compact({k: h.get(k) for k in ("type_id", "type", "timecode_sec", "t_start", "t_end",
+                                                         "score", "threshold", "facts", "reasons_ru") if k in h}))
+    if overlays or hints or ui.get("incomplete") is not None:
+        out["ui"] = {"evidence_overlays": overlays, "review_hints": hints, "incomplete": _compact(ui.get("incomplete"))}
+    return out
+
+
+def completeness(result: dict[str, Any]) -> dict[str, Any]:
+    """Полнота анализа: {"state": complete|incomplete|unknown|pending, "ratio": float|None, "reason": str|None}.
+
+    Неполный анализ ≠ «нарушений нет»; нет сведений ≠ «полный» (state=unknown). Источники: status,
+    analysis_complete (UI-отчёт A01), meta.completeness (A01), meta.complete/partial (A03), meta.coverage.
+    """
+    status = result.get("status")
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    reasons: list[str] = []
+    ratio: Optional[float] = None
+    if status == "processing":
+        return {"state": "pending", "ratio": None, "reason": "анализ ещё выполняется"}
+    flags: list[bool] = []
+    comp = meta.get("completeness")
+    if isinstance(comp, bool):
+        flags.append(comp)
+    elif isinstance(comp, dict):
+        ok = bool(comp.get("complete", True))
+        for st in comp.get("required_stages") or []:
+            if (comp.get("stages") or {}).get(st, "ok") in ("failed", "timeout", "skipped"):
+                ok = False
+                reasons.append(f"стадия {st}: {(comp.get('stages') or {}).get(st)}")
+        flags.append(ok)
+        if comp.get("reason"):
+            reasons.append(str(comp["reason"]))
+        a, d = to_float(comp.get("analyzed_until_sec")), to_float(comp.get("duration_sec"))
+        if a is not None and d:
+            ratio = max(0.0, min(1.0, a / d))
+    cov = meta.get("coverage")
+    if isinstance(cov, dict):
+        r = to_float(cov.get("ratio", cov.get("fraction", cov.get("value"))))
+        if r is None:
+            a, d = to_float(cov.get("analyzed_sec", cov.get("analyzed_until_sec"))), to_float(cov.get("duration_sec"))
+            r = a / d if a is not None and d else None
+        if r is not None:
+            ratio = r if ratio is None else min(ratio, r)
+        if isinstance(cov.get("complete"), bool):
+            flags.append(cov["complete"])
+    elif to_float(cov) is not None:
+        r = to_float(cov)
+        ratio = r if ratio is None else min(ratio, r)
+    if ratio is not None:
+        flags.append(ratio >= 0.999)
+    for src in (result.get("analysis_complete"), meta.get("analysis_complete"), meta.get("complete")):
+        if isinstance(src, bool):
+            flags.append(src)
+    if meta.get("partial") is True:
+        flags.append(False)
+        reasons.append("частичный результат")
+    if result.get("verdict_state") == "unknown" or meta.get("verdict_state") == "unknown":
+        flags.append(False)
+    if status == "failed":
+        flags.append(False)
+        fail = meta.get("failure") or result.get("error")
+        reasons.append(str(fail.get("reason") if isinstance(fail, dict) else fail or "анализ завершился с ошибкой"))
+    if not flags:
+        return {"state": "unknown", "ratio": ratio, "reason": None}
+    state = "complete" if all(flags) else "incomplete"
+    return {"state": state, "ratio": ratio, "reason": "; ".join(dict.fromkeys(reasons))[:300] or None}
+
+
+def completeness_text(result: dict[str, Any]) -> str:
+    c = completeness(result)
+    if c["state"] == "complete":
+        return "анализ полный"
+    if c["state"] == "pending":
+        return "анализ ещё выполняется"
+    if c["state"] == "unknown":
+        return "сведений о полноте анализа нет"
+    part = "НЕПОЛНЫЙ анализ"
+    if c["ratio"] is not None:
+        part += f" (проанализировано около {round(c['ratio'] * 100)}% видео)"
+    if c["reason"]:
+        part += f": {c['reason']}"
+    return part
 
 
 def result_times(result: dict[str, Any]) -> list[float]:
@@ -179,10 +308,16 @@ def verdict_text(result: dict[str, Any]) -> str:
     if status == "processing":
         return "анализ ещё выполняется"
     if status == "failed":
-        return "анализ завершился с ошибкой"
+        return "анализ завершился с ошибкой — вывод о нарушениях сделать нельзя"
+    state = completeness(result)["state"]
     if verdict == "violation":
-        return "обнаружены признаки возможного нарушения"
+        return "обнаружены признаки возможного нарушения" + (
+            " (анализ неполный — могли быть пропущены другие эпизоды)" if state == "incomplete" else "")
     if verdict == "no_violation":
+        if state == "incomplete":
+            return "признаков нарушения не найдено, но анализ НЕПОЛНЫЙ — это не означает, что нарушений нет"
+        if state == "unknown":
+            return "признаков нарушения не обнаружено (полнота анализа не подтверждена)"
         return "признаков нарушения не обнаружено"
     return "вердикт отсутствует"
 
@@ -202,7 +337,8 @@ def unobservable_items(result: dict[str, Any], corpus: Optional[Corpus]) -> list
 
 def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optional[Corpus] = None) -> str:
     lines = [f"РЕЗУЛЬТАТ АНАЛИЗА ВИДЕО (задача {result.get('job_id', '—')}):",
-             f"Вердикт: {result.get('verdict') or '—'} ({verdict_text(result)})"]
+             f"Вердикт: {result.get('verdict') or '—'} ({verdict_text(result)})",
+             f"Полнота анализа: {completeness_text(result)}"]
     meta = result.get("meta") or {}
     dur = meta.get("duration") or meta.get("duration_s") if isinstance(meta, dict) else None
     if dur:

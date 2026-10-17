@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 from .config import default_config
 from .corpus import Corpus, load_corpus
-from .prompts import fmt_tc, normalize_result, unobservable_items, verdict_text
+from .prompts import completeness, completeness_text, fmt_tc, normalize_result, unobservable_items, verdict_text
 
 
 def _md(s: Any) -> str:
@@ -59,7 +59,8 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
              f"> ⚠️ {disclaimer}", "",
              f"- **Задача:** `{_md(res.get('job_id') or '—')}`",
              f"- **Статус анализа:** {_md(res.get('status') or '—')}",
-             f"- **Вердикт системы:** {verdict_text(res)}"]
+             f"- **Вердикт системы:** {verdict_text(res)}",
+             f"- **Полнота анализа:** {completeness_text(res)}"]
     if isinstance(meta, dict):
         if meta.get("duration") or meta.get("duration_s"):
             lines.append(f"- **Длительность видео:** {float(meta.get('duration') or meta.get('duration_s')):.0f} с")
@@ -67,12 +68,18 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
             lines.append(f"- **Версия системы:** {_md(meta['version'])}")
     lines.append("")
 
+    comp = completeness(res)
+    if comp["state"] == "incomplete" and res.get("status") != "failed":
+        lines += ["> ⚠️ **Анализ неполный.** Отсутствие найденных нарушений в непроанализированной части "
+                  "не означает, что их нет. Просмотрите видео вручную.", ""]
     if res.get("status") in {"processing", "failed"}:
         lines += ["## Результат", "", f"Нет данных: {verdict_text(res)}.", ""]
     elif not viols:
         lines += ["## Возможные нарушения", "",
-                  "Признаков нарушения не обнаружено. Автоматический анализ может пропустить нарушение — "
-                  "рекомендуется выборочный просмотр видео.", ""]
+                  ("Нарушений в проанализированной части не найдено — анализ неполный, вывод «нарушений нет» "
+                   "сделать нельзя." if comp["state"] == "incomplete" else
+                   "Признаков нарушения не обнаружено. Автоматический анализ может пропустить нарушение — "
+                   "рекомендуется выборочный просмотр видео."), ""]
     else:
         lines += [f"## Возможные нарушения ({len(viols)})", ""]
         for v in viols:

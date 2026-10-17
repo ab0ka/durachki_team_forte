@@ -57,6 +57,17 @@ _ANSWER_VOCAB = {w[:4] for w in """признак возможного нару�
 сверить подтвердить отклонить алгоритм оценка вероятность человек определяется является случае ответ
 информация относящиеся найденные данных имеющимся""".split()}
 
+# утверждения «нарушений нет» / «нарушение есть» — сверяются с вердиктом и полнотой анализа
+_CLAIM_NONE_RE = re.compile(
+    r"нарушени\w*\s+(?:нет|не\s+(?:было|обнаружен\w*|найден\w*|выявлен\w*)|отсутству\w*)"
+    r"|(?:не\s+(?:обнаружен\w*|найден\w*|выявлен\w*)|нет|отсутству\w*)\s+(?:никаких\s+)?нарушени\w*"
+    r"|вс[её]\s+в\s+порядке|без\s+нарушений|касса\s+чист\w*",
+    re.I,
+)
+_CLAIM_SOME_RE = re.compile(r"(?:обнаружен\w*|выявлен\w*|зафиксирован\w*|есть)\s+(?:признак\w*\s+)?(?:возможного\s+)?нарушени", re.I)
+_CAVEAT_RE = re.compile(r"не\s+означает|неполн|не\s+подтвержд|полнота|в\s+проанализированной\s+части", re.I)
+
+
 REFUSAL_PATTERNS = [
     r"установить нельзя", r"нельзя установить", r"не\s+устанавлива", r"в источниках нет", r"нет информации",
     r"нет данных", r"не могу ответить", r"не выполняется", r"не определяется", r"невозможно определить",
@@ -246,6 +257,9 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
             if d and d not in context_amounts:
                 removed.append(f"сумма: {mm.group(0).strip()}")
                 bad = True
+        if not bad and _contradicts(sent, result):
+            removed.append(f"противоречит результату: {sent[:60]}")
+            bad = True
         if not bad and not is_refusal(sent):
             stems = _stems(re.sub(r"\(№\d+, [\d:]+\)|\[\d+\]", " ", sent))
             if len(stems) >= 4 and len(stems & context_stems) / len(stems) < min_support:
@@ -291,6 +305,27 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
     warnings = [f"удалены неподтверждённые фрагменты: {', '.join(dict.fromkeys(removed))}"] if removed else []
     return GuardResult(answer=answer, citations=citations, grounded=grounded, refusal=refusal,
                        removed=list(dict.fromkeys(removed)), raw_invalid=raw_invalid, warnings=warnings)
+
+
+def _contradicts(sent: str, result: dict[str, Any]) -> bool:
+    """«Нарушений нет» при вердикте violation или при неполном/упавшем анализе; «нарушение есть» при чистом."""
+    from .prompts import completeness
+
+    if _CAVEAT_RE.search(sent) or is_refusal(sent):
+        return False
+    has_viols = bool(result.get("violations")) or result.get("verdict") == "violation"
+    state = completeness(result)["state"]
+    if _CLAIM_NONE_RE.search(sent):
+        if _times_in(sent):
+            return False  # локальное утверждение о моменте — его проверяет логика таймкодов
+        scoped = re.search(r"\bдруг\w+|\bин(?:ых|ые|ой)\b|\bкроме\b|\bещ[её]\b", sent, re.I)
+        if state in {"incomplete", "pending"} or result.get("status") == "failed":
+            return True
+        if has_viols and not scoped:
+            return True
+    elif _CLAIM_SOME_RE.search(sent) and not has_viols and result.get("status") == "done":
+        return not re.search(r"\bне\s+(?:обнаружен|выявлен|зафиксирован)", sent, re.I)
+    return False
 
 
 def _result_times(result: dict[str, Any]) -> list[float]:

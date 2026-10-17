@@ -11,8 +11,8 @@ import re
 from typing import Any, Optional, Sequence
 
 from .corpus import Corpus
-from .prompts import (NormRef, REFUSAL_NO_DATA, REFUSAL_SCOPE, REFUSAL_SOURCES, REFUSAL_VIDEO, fmt_tc,
-                      to_float, unobservable_items, verdict_text)
+from .prompts import (NormRef, REFUSAL_NO_DATA, REFUSAL_SCOPE, REFUSAL_SOURCES, REFUSAL_VIDEO, completeness,
+                      completeness_text, fmt_tc, to_float, unobservable_items, verdict_text)
 
 # порядок важен: первое совпадение побеждает
 _INTENT_PATTERNS: list[tuple[str, str]] = [
@@ -180,8 +180,13 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
             return f"{REFUSAL_SOURCES}."
         return "\n".join(lines)
 
+    comp = completeness(result)
+    if not viols and comp["state"] == "incomplete":
+        return (f"{REFUSAL_NO_DATA}: {completeness_text(result)}. Нарушений в проанализированной части не найдено, "
+                "но отсутствие находок при неполном анализе не означает, что нарушений нет — нужен просмотр видео.")
     if not viols:
-        base = "Признаков нарушения по результату анализа не обнаружено."
+        base = ("Признаков нарушения по результату анализа не обнаружено."
+                + (" Полнота анализа не подтверждена." if comp["state"] == "unknown" else ""))
         if intent in {"why", "when", "evidence"}:
             return base + " Нет данных о нарушениях, поэтому таймкодов и кадров-доказательств нет."
         if intent == "checklist":
