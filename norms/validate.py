@@ -1,4 +1,8 @@
-"""Валидатор каталога норм: схема + анти-галлюцинационная проверка цитат.
+"""Валидатор каталога норм: схема + проверка ЦЕЛОСТНОСТИ цитат (анти-галлюцинация).
+
+ВАЖНО: наличие цитаты в сохранённом тексте подтверждает, что цитата не выдумана и не искажена
+относительно источника. Это НЕ юридическая верификация: действие нормы, актуальность редакции
+и применимость к ситуации на видео проверяет человек (см. legal_status и rule_checks).
 
     python -m norms.validate                 # проверить norms/catalog.yaml
     python -m norms.validate --strict        # предупреждения = ошибки (verified:false и т.п.)
@@ -14,7 +18,11 @@
      (сравнение после нормализации пробелов/кавычек/тире — не смысла!).
   5. ``verified: true`` допустим только если пункт указан и файл-источник — полный текст
      (front matter ``retrieval: fulltext``), а не поисковые фрагменты.
-  6. Встроенный fallback (norms/_fallback.py) совпадает с YAML.
+  6. legal_status: disabled → rules пуст; candidate → есть пункт с номером; confirmed → все verified.
+  7. exclusions (что само по себе НЕ нарушение) — у каждого типа; rule_checks — по одному на норму,
+     quote_level согласован с источником (fulltext / snippet / none).
+  8. Встроенный fallback (norms/_fallback.py) совпадает с YAML.
+Текст между <!-- not-quotable --> и <!-- /not-quotable --> (пересказы) в сверке цитат не участвует.
 """
 from __future__ import annotations
 
@@ -30,6 +38,11 @@ from typing import Any, Optional
 from . import CATALOG_PATH, NORMS_DIR, RULE_KEYS, SEVERITIES, TYPE_IDS
 
 RETRIEVAL_KINDS = ("fulltext", "partial", "search_snippets")
+LEGAL_STATUSES = ("confirmed", "candidate", "disabled")
+QUOTE_LEVELS = ("fulltext", "snippet", "none")
+RULE_CHECK_KEYS = ("quote_level", "currency", "applicability", "conditions_visible", "conditions_not_visible")
+_RETRIEVAL_TO_LEVEL = {"fulltext": "fulltext", "partial": "snippet", "search_snippets": "snippet"}
+_NOT_QUOTABLE_RE = re.compile(r"<!--\s*not-quotable\s*-->.*?<!--\s*/not-quotable\s*-->", re.S)
 _TYPE_ID_RE = re.compile(r"^V\d{2}$")
 _FRONT_MATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.S)
 
@@ -120,7 +133,7 @@ def _load_sources(catalog: dict[str, Any], base_dir: Path, rep: Report) -> dict[
             rep.errors.append(f"{where}.source_file: файл {doc['source_file']} не найден")
         else:
             meta, body = parse_front_matter(path.read_text(encoding="utf-8"))
-            entry["meta"], entry["body"] = meta, normalize(body)
+            entry["meta"], entry["body"] = meta, normalize(_NOT_QUOTABLE_RE.sub(" ", body))
             if not meta:
                 rep.errors.append(f"{doc['source_file']}: нет front matter (url, title, accessed, retrieval)")
             else:
@@ -198,6 +211,56 @@ def _check_rule(type_id: str, i: int, rule: Any, sources: dict[str, dict[str, An
                                  retrieval, bool(verified), status))
 
 
+def _check_rule_checks(type_id: str, t: dict[str, Any], rep: Report) -> None:
+    where = f"types.{type_id}.rule_checks"
+    checks, rules = t.get("rule_checks"), t.get("rules") or []
+    if checks is None:
+        if rules:
+            rep.warnings.append(f"{where}: нет разбора уровня проверки норм (источник/цитата/актуальность/применимость)")
+        return
+    if not isinstance(checks, list) or len(checks) != len(rules):
+        rep.errors.append(f"{where}: список той же длины, что rules ({len(rules)})")
+        return
+    for i, (chk, rule) in enumerate(zip(checks, rules)):
+        if not isinstance(chk, dict):
+            rep.errors.append(f"{where}[{i}]: должен быть словарём")
+            continue
+        missing = [k for k in RULE_CHECK_KEYS if k not in chk]
+        if missing:
+            rep.errors.append(f"{where}[{i}]: нет ключей {missing}")
+        level = chk.get("quote_level")
+        if level not in QUOTE_LEVELS:
+            rep.errors.append(f"{where}[{i}].quote_level: одно из {QUOTE_LEVELS}")
+        if isinstance(rule, dict):
+            has_quote = bool(str(rule.get("quote") or "").strip())
+            if (level == "none") == has_quote:
+                rep.errors.append(f"{where}[{i}].quote_level={level!r} не согласован с наличием цитаты")
+        for k in ("conditions_visible", "conditions_not_visible"):
+            v = chk.get(k)
+            if v is not None and (not isinstance(v, list) or not all(_is_str(x) for x in v)):
+                rep.errors.append(f"{where}[{i}].{k}: список строк")
+
+
+def _check_legal_status(type_id: str, t: dict[str, Any], rep: Report) -> None:
+    where = f"types.{type_id}"
+    status = t.get("legal_status")
+    rules = t.get("rules") if isinstance(t.get("rules"), list) else []
+    if status is None:
+        rep.warnings.append(f"{where}.legal_status: не указан (confirmed | candidate | disabled)")
+        return
+    if status not in LEGAL_STATUSES:
+        rep.errors.append(f"{where}.legal_status: одно из {LEGAL_STATUSES}")
+        return
+    if status == "disabled" and rules:
+        rep.errors.append(f"{where}: legal_status=disabled, но rules не пуст — норма не должна прикрепляться")
+    if status == "candidate" and not any(isinstance(r, dict) and r.get("clause") for r in rules):
+        rep.errors.append(f"{where}: legal_status=candidate требует хотя бы одну норму с номером пункта")
+    if status == "confirmed" and (not rules or not all(isinstance(r, dict) and r.get("verified") is True for r in rules)):
+        rep.errors.append(f"{where}: legal_status=confirmed требует, чтобы все нормы были verified: true")
+    if not _is_str(t.get("legal_note")):
+        rep.warnings.append(f"{where}.legal_note: поясните основание статуса")
+
+
 def _check_type(type_id: str, t: Any, sources: dict[str, dict[str, Any]], rep: Report) -> None:
     where = f"types.{type_id}"
     if not _TYPE_ID_RE.match(str(type_id)):
@@ -224,11 +287,19 @@ def _check_type(type_id: str, t: Any, sources: dict[str, dict[str, Any]], rep: R
             rep.errors.append(f"{where}.description_template: недопустимый плейсхолдер ({exc})")
     if t.get("severity") not in SEVERITIES:
         rep.errors.append(f"{where}.severity: одно из {SEVERITIES}")
+    exc = t.get("exclusions")
+    if not isinstance(exc, list) or not exc or not all(_is_str(x) for x in exc):
+        rep.errors.append(f"{where}.exclusions: непустой список ситуаций, которые сами по себе НЕ нарушение")
+    rc = t.get("research_candidates")
+    if rc is not None and (not isinstance(rc, list) or not all(_is_str(x) for x in rc)):
+        rep.errors.append(f"{where}.research_candidates: список строк")
+    _check_legal_status(type_id, t, rep)
+    _check_rule_checks(type_id, t, rep)
     rules = t.get("rules")
     if not isinstance(rules, list):
         rep.errors.append(f"{where}.rules: список (может быть пустым)")
         return
-    if not rules:
+    if not rules and t.get("legal_status") != "disabled":
         rep.warnings.append(f"{where}.rules: нет ни одной нормы")
     for i, r in enumerate(rules):
         _check_rule(type_id, i, r, sources, rep)
@@ -250,6 +321,9 @@ def validate_catalog(catalog: Any, base_dir: Path = NORMS_DIR, *, strict: bool =
     for tid in required_types:
         if tid not in types:
             rep.errors.append(f"types.{tid}: обязательный тип отсутствует")
+    gexc = catalog.get("exclusions")
+    if gexc is not None and (not isinstance(gexc, list) or not all(_is_str(x) for x in gexc)):
+        rep.errors.append("exclusions: список строк (общие ситуации, которые сами по себе не нарушение)")
     sources = _load_sources(catalog, Path(base_dir), rep)
     for tid, t in types.items():
         _check_type(str(tid), t, sources, rep)
@@ -289,8 +363,12 @@ def _load_yaml_strict(path: Path) -> dict[str, Any]:
         return yaml.safe_load(fh)
 
 
-def _print_human(rep: Report, path: Path) -> None:
+def _print_human(rep: Report, path: Path, catalog: Optional[dict[str, Any]] = None) -> None:
     print(f"Каталог: {path}")
+    print("Проверка: схема + ЦЕЛОСТНОСТЬ цитат относительно norms/sources (не юридическая верификация)")
+    if catalog and isinstance(catalog.get("types"), dict):
+        statuses = {tid: (t or {}).get("legal_status", "?") for tid, t in catalog["types"].items()}
+        print("legal_status: " + ", ".join(f"{k}={v}" for k, v in statuses.items()))
     print(f"{'тип':<4} {'#':<2} {'цитата':<10} {'verified':<8} {'источник':<14} документ / пункт")
     for q in rep.quotes:
         doc = (q.document[:58] + "…") if len(q.document) > 59 else q.document
@@ -304,7 +382,8 @@ def _print_human(rep: Report, path: Path) -> None:
         print(f"WARN  {w}")
     for e in rep.errors:
         print(f"ERROR {e}")
-    print("OK: каталог валиден" if rep.ok else f"FAIL: ошибок {len(rep.errors)}")
+    print("OK: схема и целостность цитат в порядке (применимость норм проверяет человек)"
+          if rep.ok else f"FAIL: ошибок {len(rep.errors)}")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -329,7 +408,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.json:
         print(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2))
     else:
-        _print_human(rep, args.catalog)
+        _print_human(rep, args.catalog, catalog)
     return 0 if rep.ok else 1
 
 

@@ -6,7 +6,9 @@
 Доп. хелперы для fusion / copilot / frontend (не обязательны):
     get_type(type_id)               -> dict типа (fallback на V99)
     type_name(type_id)              -> русское название типа
-    rule_refs(type_id)              -> list[dict] ровно с ключами RuleRef
+    rule_refs(type_id)              -> list[dict] ровно с ключами RuleRef ([] для disabled)
+    legal_status(type_id)           -> "confirmed" | "candidate" | "disabled"
+    exclusions(type_id=None)        -> что само по себе НЕ нарушение (общие + типа)
     render_description(type_id, t, facts) -> str по description_template
     catalog_source()                -> "yaml" | "fallback" (для meta.warnings)
 
@@ -30,6 +32,8 @@ __all__ = [
     "SOURCES_DIR",
     "TYPE_IDS",
     "catalog_source",
+    "exclusions",
+    "legal_status",
     "format_timecode",
     "get_type",
     "load_catalog",
@@ -133,10 +137,29 @@ def type_name(type_id: str, catalog: Optional[dict[str, Any]] = None) -> str:
     return str(get_type(type_id, catalog).get("name", type_id))
 
 
+def legal_status(type_id: str, catalog: Optional[dict[str, Any]] = None) -> str:
+    """confirmed | candidate | disabled. disabled — норма к детекции не прикрепляется (только наблюдение)."""
+    return str(get_type(type_id, catalog).get("legal_status") or "disabled")
+
+
 def rule_refs(type_id: str, catalog: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
-    """Нормы типа в форме contracts.RuleRef: ``RuleRef(**r) for r in rule_refs("V01")``."""
-    rules = get_type(type_id, catalog).get("rules") or []
-    return [{k: r.get(k) for k in RULE_KEYS} for r in rules]
+    """Нормы типа в форме contracts.RuleRef: ``RuleRef(**r) for r in rule_refs("V08")``.
+
+    Для legal_status=disabled всегда [] — неподтверждённая норма не выдаётся как основание.
+    """
+    t = get_type(type_id, catalog)
+    if str(t.get("legal_status") or "disabled") == "disabled":
+        return []
+    return [{k: r.get(k) for k in RULE_KEYS} for r in (t.get("rules") or [])]
+
+
+def exclusions(type_id: Optional[str] = None, catalog: Optional[dict[str, Any]] = None) -> list[str]:
+    """Ситуации, которые сами по себе НЕ являются нарушением: общие + специфичные для типа."""
+    cat = catalog or load_catalog()
+    out = [str(x) for x in (cat.get("exclusions") or [])]
+    if type_id is not None:
+        out += [str(x) for x in (get_type(type_id, cat).get("exclusions") or [])]
+    return out
 
 
 def format_timecode(t: Union[float, int, str]) -> str:
