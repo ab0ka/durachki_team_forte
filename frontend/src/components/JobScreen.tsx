@@ -60,7 +60,7 @@ export default function JobScreen({ jobId }: { jobId: string }) {
     };
   }, [backend, jobId, attempt, demo, setLastResult]);
 
-  if (error && !job) {
+  if (error && (!job || job.status !== "done")) {
     return (
       <StateCard
         title="Не удалось получить результат"

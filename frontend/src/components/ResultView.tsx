@@ -5,12 +5,13 @@ import {
   Ban,
   Download,
   FileJson,
+  FileText,
   ListChecks,
   Printer,
   ShieldCheck,
   Upload,
 } from "lucide-react";
-import { localVideo } from "../api/client";
+import { ApiError, localVideo } from "../api/client";
 import { inferDuration, isPartial, toJuryJson } from "../api/normalize";
 import type { JobResult } from "../api/types";
 import { useApp } from "../context";
@@ -22,7 +23,10 @@ import ViolationCard from "./ViolationCard";
 import { cx, LocalBadge } from "./ui";
 
 function download(name: string, data: unknown) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  saveBlob(name, new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+}
+
+function saveBlob(name: string, blob: Blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -43,7 +47,7 @@ export const NOT_CHECKED = [
 ];
 
 export default function ResultView({ job, raw, fileName }: { job: JobResult; raw: unknown; fileName?: string }) {
-  const { backend, demo } = useApp();
+  const { backend, demo, toast } = useApp();
   const player = useRef<PlayerHandle>(null);
   const playerBox = useRef<HTMLDivElement>(null);
   const [t, setT] = useState(0);
@@ -117,6 +121,22 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
           <button className="btn bg-white/15 text-current ring-1 ring-white/25 hover:bg-white/25" onClick={() => download(`kassa-sentinel_${job.job_id}_full.json`, raw)} title="Полный ответ: нормы, timeline, meta">
             <Download className="h-4 w-4" /> Полный отчёт JSON
           </button>
+          {backend.report && job.status === "done" && (
+            <button
+              className="btn bg-white/15 text-current ring-1 ring-white/25 hover:bg-white/25"
+              title="Текстовое заключение для проверяющего (Markdown, формирует сервер)"
+              onClick={async () => {
+                try {
+                  const md = await backend.report!(job.job_id);
+                  saveBlob(`kassa-sentinel_${job.job_id}_report.md`, new Blob([md], { type: "text/markdown;charset=utf-8" }));
+                } catch (e) {
+                  toast(e instanceof ApiError ? e.message : "Заключение недоступно", "error");
+                }
+              }}
+            >
+              <FileText className="h-4 w-4" /> Заключение .md
+            </button>
+          )}
           <button className="btn bg-white/15 text-current ring-1 ring-white/25 hover:bg-white/25" onClick={() => window.print()}>
             <Printer className="h-4 w-4" /> Печать / PDF
           </button>

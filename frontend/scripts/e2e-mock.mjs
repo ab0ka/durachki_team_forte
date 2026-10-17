@@ -229,6 +229,42 @@ try {
     await c.close();
   }
 
+  // ---------- сценарий 1в: copilot status=unavailable, report .md, истечение сессии ----------
+  {
+    const c = await browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
+    const pg = await c.newPage();
+    let jobPolls = 0;
+    await pg.route("**/ui/v1/**", (route) => {
+      const p = new URL(route.request().url()).pathname;
+      if (p.endsWith("/session")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+      if (p.endsWith("/copilot/status")) return route.fulfill({ status: 200, contentType: "application/json", body: '{"enabled":true,"available":false,"reason":"unavailable"}' });
+      if (p.endsWith("/jobs/c1/report")) return route.fulfill({ status: 200, contentType: "text/markdown; charset=utf-8", body: "# Синтетическое заключение" });
+      if (p.endsWith("/jobs/c1")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(doneJob("c1")) });
+      if (p.endsWith("/jobs/x1")) {
+        jobPolls++;
+        return jobPolls < 2
+          ? route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job_id: "x1", status: "processing", stage: "detect", progress: 0.2 }) })
+          : route.fulfill({ status: 401, contentType: "application/json", body: '{"detail":"UI session required"}' });
+      }
+      return route.fulfill({ status: 404, body: "" });
+    });
+    await pg.goto(`${url}#/job/c1`);
+    await step("copilot status available=false → панель не показана", async () => {
+      await pg.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 6000 });
+      await pg.waitForTimeout(500);
+      assert.equal(await pg.getByText("Copilot проверяющего").count(), 0);
+    });
+    await step("«Заключение .md» скачивается", async () => {
+      const [dl] = await Promise.all([pg.waitForEvent("download", { timeout: 5000 }), pg.getByRole("button", { name: "Заключение .md" }).click()]);
+      assert.ok(dl.suggestedFilename().endsWith(".md"), dl.suggestedFilename());
+    });
+    await pg.goto(`${url}#/job/x1`);
+    await step("сессия истекла во время обработки → понятная ошибка, а не вечный прогресс", async () => {
+      await pg.getByText("Не удалось получить результат").waitFor({ timeout: 8000 });
+    });
+    await c.close();
+  }
+
   // ---------- сценарий 2: failed и неполный анализ не зелёные ----------
   for (const [name, body, expectText] of [
     ["failed", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "синтетическая ошибка" }, "Анализ не завершён"],

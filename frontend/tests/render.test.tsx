@@ -21,6 +21,7 @@ function ctx(over: Partial<AppContextValue> = {}): AppContextValue {
     logout: async () => undefined,
     copilotEnabled: true,
     disableCopilot: () => undefined,
+    refreshSession: async () => undefined,
     toast: () => undefined,
     openSettings: () => undefined,
     lastResult: null,

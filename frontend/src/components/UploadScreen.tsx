@@ -22,7 +22,7 @@ import BatchList from "./BatchList";
 import { cx, LocalBadge, ProgressBar } from "./ui";
 
 export default function UploadScreen() {
-  const { backend, demo, serverOk, toast, openSettings, authenticated } = useApp();
+  const { backend, demo, serverOk, toast, openSettings, authenticated, refreshSession } = useApp();
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [drag, setDrag] = useState(false);
@@ -94,14 +94,18 @@ export default function UploadScreen() {
         toast("Загрузка отменена");
       } else {
         const msg = e instanceof ApiError ? e.message : "Не удалось загрузить файл.";
-        setError(msg);
-        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) openSettings();
+        if (e instanceof ApiError && e.status === 401) {
+          setError("Сессия истекла — войдите снова и повторите загрузку.");
+          void refreshSession();
+        } else {
+          setError(msg);
+        }
       }
       setProgress(null);
     } finally {
       handleRef.current = null;
     }
-  }, [backend, file, toast, openSettings]);
+  }, [backend, file, toast, refreshSession]);
 
   const uploading = progress !== null;
 

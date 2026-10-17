@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Bot, Send } from "lucide-react";
 import { ApiError, CopilotUnavailable } from "../api/client";
 import { useApp } from "../context";
@@ -20,6 +20,21 @@ export default function CopilotPanel({ jobId }: { jobId: string }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const [disclaimer, setDisclaimer] = useState<string | undefined>();
+
+  // A14: GET …/copilot/status — если модель недоступна, панель не показываем (не ждём 501).
+  useEffect(() => {
+    if (!copilotEnabled || !backend.copilotStatus) return;
+    let alive = true;
+    void backend.copilotStatus().then((st) => {
+      if (!alive || !st) return;
+      if (!st.available) disableCopilot();
+      else setDisclaimer(st.disclaimer);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [backend, copilotEnabled, disableCopilot]);
 
   if (!copilotEnabled) return null;
 
@@ -56,6 +71,7 @@ export default function CopilotPanel({ jobId }: { jobId: string }) {
         <div className="min-w-0 flex-1">
           <div className="text-sm font-bold">Copilot проверяющего</div>
           <div className="text-[11px] text-slate-500">локальная LLM · отвечает по этому отчёту</div>
+          {disclaimer && <div className="mt-0.5 text-[11px] text-amber-700 dark:text-amber-300">{disclaimer}</div>}
         </div>
       </div>
       <div ref={listRef} className="scrollbar-thin max-h-80 min-h-[120px] space-y-3 overflow-y-auto p-4">

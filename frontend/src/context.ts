@@ -14,6 +14,8 @@ export interface AppContextValue {
   logout: () => Promise<void>;
   copilotEnabled: boolean;
   disableCopilot: () => void;
+  /** Перечитать сессию (например, после 401 — сессия истекла). */
+  refreshSession: () => Promise<void>;
   toast: (text: string, tone?: "info" | "error" | "success") => void;
   openSettings: () => void;
   /** Последний полученный результат (для «О системе» → модели). */

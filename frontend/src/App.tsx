@@ -85,6 +85,8 @@ export default function App() {
     void initSession();
   }, [initSession]);
 
+  const disableCopilot = useCallback(() => setCopilotEnabled(false), []);
+
   const toast = useCallback((text: string, tone: Toast["tone"] = "info") => {
     const id = ++toastSeq.current;
     setToasts((t) => [...t, { id, text, tone }]);
@@ -100,7 +102,8 @@ export default function App() {
     login,
     logout,
     copilotEnabled,
-    disableCopilot: () => setCopilotEnabled(false),
+    disableCopilot,
+    refreshSession: initSession,
     toast,
     openSettings: () => setSettingsOpen(true),
     lastResult,

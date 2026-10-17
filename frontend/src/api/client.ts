@@ -12,6 +12,11 @@ export const ENDPOINTS = {
   apiJobs: "/api/v1/jobs",
   uiJob: (id: string) => `/ui/v1/jobs/${encodeURIComponent(id)}`,
   uiAsk: (id: string) => `/ui/v1/jobs/${encodeURIComponent(id)}/ask`,
+  /** A14 (через A02): статус Copilot и текстовое заключение (Markdown, работает без LLM). */
+  uiCopilotStatus: "/ui/v1/copilot/status",
+  apiCopilotStatus: "/api/v1/copilot/status",
+  uiReport: (id: string) => `/ui/v1/jobs/${encodeURIComponent(id)}/report`,
+  apiReport: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/report`,
   apiAnalyze: "/api/v1/analyze",
   apiJob: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}`,
   apiAsk: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/ask`,
@@ -113,6 +118,10 @@ export interface Backend {
   upload(file: File, onProgress: (fraction: number) => void): UploadHandle;
   getJob(id: string): Promise<{ job: JobResult; raw: unknown }>;
   listJobs?(limit?: number): Promise<HistoryItem[]>;
+  /** null — сервер не сообщает статус (тогда ориентируемся на 501 от /ask). */
+  copilotStatus?(): Promise<{ available: boolean; disclaimer?: string } | null>;
+  /** Текстовое заключение (Markdown) от A14; бросает ApiError, если недоступно. */
+  report?(id: string): Promise<string>;
   ask(id: string, question: string, history: { role: "user" | "assistant"; text: string }[]): Promise<AskResponse>;
   /** URL исходного видео для <video>. fallback — загрузка blob с X-API-Key, если cookie-маршрут не играет. */
   videoSource(id: string): { url: string; fallback?: () => Promise<string> } | null;
@@ -187,7 +196,8 @@ export class HttpBackend implements Backend {
         return { ...s, authenticated: !!settings.apiKey };
       }
       // 404/405 — UI-маршруты выключены (ui_enabled: false): работаем только через API-ключ.
-      this.uiAvailable = false;
+      // 429/5xx — временная проблема: UI-маршруты не отключаем.
+      if (res.status === 404 || res.status === 405) this.uiAvailable = false;
       return { token: null, reachable: true, authenticated: !!settings.apiKey, features: {} };
     } catch {
       return { token: null, reachable: false, authenticated: false, features: {} };
@@ -350,6 +360,25 @@ export class HttpBackend implements Backend {
     }
   }
 
+  async copilotStatus(): Promise<{ available: boolean; disclaimer?: string } | null> {
+    try {
+      const res = await this.fetchWithFallback(ENDPOINTS.uiCopilotStatus, ENDPOINTS.apiCopilotStatus);
+      if (!res.ok) return null;
+      const j = await readJson(res);
+      const available = j.available !== false && j.enabled !== false;
+      if (!available) this.features.copilot = false;
+      return { available, disclaimer: typeof j.disclaimer === "string" ? j.disclaimer : undefined };
+    } catch {
+      return null;
+    }
+  }
+
+  async report(id: string): Promise<string> {
+    const res = await this.fetchWithFallback(ENDPOINTS.uiReport(id), ENDPOINTS.apiReport(id));
+    if (!res.ok) throw new ApiError(res.status, res.status === 404 ? "Заключение недоступно на этом сервере." : messageForStatus(res.status));
+    return res.text();
+  }
+
   async getJob(id: string): Promise<{ job: JobResult; raw: unknown }> {
     let res: Response;
     try {
@@ -377,6 +406,9 @@ export class HttpBackend implements Backend {
       this.features.copilot = false;
       throw new CopilotUnavailable();
     }
+    if (res.status === 503) throw new ApiError(503, "Copilot занят (идёт анализ видео или другой запрос). Повторите чуть позже.");
+    if (res.status === 504) throw new ApiError(504, "Copilot не успел ответить (таймаут). Попробуйте задать вопрос короче.");
+    if (res.status === 409) throw new ApiError(409, "Анализ ещё не завершён — Copilot ответит после формирования отчёта.");
     if (!res.ok) throw new ApiError(res.status, messageForStatus(res.status, await errorText(res)));
     const j = (await res.json()) as Record<string, unknown>;
     const answer = j.answer ?? j.text ?? j.response ?? j.message;

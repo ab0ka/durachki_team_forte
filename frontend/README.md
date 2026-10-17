@@ -29,7 +29,7 @@ Chromium — `CHROMIUM_PATH`):
 | Скрипт | Что делает |
 |---|---|
 | `npm run screenshots` | Скриншоты **только синтетического демо** → `screenshots/*.png` (для питча) |
-| `npm run e2e:mock` | e2e реального (не демо) HTTP-пути, бэкенд подменён синтетическими ответами в формате A02 — 17 проверок |
+| `npm run e2e:mock` | e2e реального (не демо) HTTP-пути, бэкенд подменён синтетическими ответами в формате A02 — 20 проверок |
 | `npm run e2e:real` | e2e против живого сервера: `E2E_BASE_URL=… E2E_KEY=… E2E_VIDEO=… node scripts/e2e-real.mjs`. Скриншоты — только при `E2E_SHOTS=<папка>`. **С реальными видео скриншоты не коммитить и никуда не отправлять** |
 
 ## Путь пользователя
@@ -109,7 +109,9 @@ screenshots/          снимки синтетического демо и мо
 | `GET /ui/v1/jobs/{id}` | cookie | статус и результат (схема ТЗ + доп. поля; у failed — `partial`) |
 | `GET /ui/v1/jobs?limit=20` | cookie | серверная история |
 | `GET /ui/v1/jobs/{id}/video` | cookie | видео для `<video>` (Range) |
-| `POST /ui/v1/jobs/{id}/ask` | cookie + `X-CSRF-Token` | Copilot `{question, history}` → `{answer, sources?}`; 501 → панель скрыта |
+| `POST /ui/v1/jobs/{id}/ask` | cookie + `X-CSRF-Token` | Copilot (A14) `{question, history:[{role,text}]}` → `{answer, sources?}`; 501 → панель скрыта; 409/503/504 → понятные сообщения |
+| `GET /ui/v1/copilot/status` | cookie | `available:false` → панель Copilot не показывается (без ожидания 501) |
+| `GET /ui/v1/jobs/{id}/report` | cookie | «Заключение .md» (A14, работает без LLM); 404 → сообщение |
 | `/api/v1/*` | `X-API-Key` | запасной путь, если `/ui/v1` выключен (404/405): ключ из «Настроек», только в памяти вкладки |
 
 Все пути собраны в `src/api/client.ts` → `ENDPOINTS`. При 403 на POST (устарел CSRF после перезапуска сервера)
@@ -130,9 +132,10 @@ screenshots/          снимки синтетического демо и мо
 - `npm run build` — без ошибок TS, бандл ≈ 280 КБ JS (86 КБ gzip) + 51 КБ CSS + локальные шрифты.
 - `npm test` — 54 теста: форматтеры, нормализатор на формах ответов из `contracts/examples` (A01), вердикт
   (failed/partial не зелёные), стадии, валидация файла, роутинг, демо, SSR-рендер экранов, очередь пакета.
-- `npm run e2e:mock` — 17 проверок: вход (неверный и верный ключ), ключ не попадает в localStorage и URL,
+- `npm run e2e:mock` — 20 проверок: вход (неверный и верный ключ), ключ не попадает в localStorage и URL,
   CSRF на всех POST, очередь и реальный прогресс, результат, перемотка по таймкоду, лайтбокс, норма,
-  Copilot 501, серверная история, пакет из 3 файлов (1 отбракован), failed / failed+partial / partial / clean.
+  Copilot 501 и `copilot/status` available=false, скачивание «Заключение .md», истечение сессии во время обработки,
+  серверная история, пакет из 3 файлов (1 отбракован), failed / failed+partial / partial / clean.
 - `npm run e2e:real` против **ветки A02** (fake-пайплайн, синтетический ролик ffmpeg `testsrc2`): вход по cookie,
   загрузка с CSRF (200), результат за ≈ 5 с, перемотка, кадр, `/ui/v1/jobs/{id}/video` → **206** и воспроизведение,
   без ошибок JS; пакет из 3 синтетических файлов — все 3 отчёта за ≈ 14 с (fake-пайплайн по 4 с, 1 воркер).
@@ -154,9 +157,9 @@ GPU, реального пайплайна и реальных данных в �
 
 1. **Раздача.** A02 уже отдаёт `frontend/dist` на `/` (`frontend_dir: frontend/dist`). В Docker (A17) нужен
    этап `cd frontend && npm ci && npm run build` (Node ≥ 18.18); `node_modules` и `dist` в git не попадают (`.gitignore` A01).
-2. **A02.** Маршруты из таблицы выше уже совпадают с веткой A02. При запуске ветки A02 в чистом venv загрузка падала
-   с 500: `ModuleNotFoundError: python_multipart` (`uploads.py: _receive_multipart`). Нужно добавить
-   `python-multipart` в зависимости A02/A17.
+2. **A02.** Маршруты из таблицы выше совпадают с веткой A02. При первом запуске ветки A02 в чистом venv загрузка
+   падала с 500 из-за отсутствия `python-multipart`; в `backend/api/requirements.txt` (коммит A02 c33e485) он уже есть —
+   A17 нужно ставить зависимости именно из этого файла.
 3. **A03 / A12 (fusion) / A01.** Пожалуйста, отдавайте:
    - `meta.duration_sec` — для шкалы, если видео не загрузилось;
    - флаги неполноты (`meta.partial` или `meta.skipped_stages`) — для честного вердикта;
@@ -165,8 +168,8 @@ GPU, реального пайплайна и реальных данных в �
 
    Сам контракт не меняется: это доп. поля через `meta` / `extra`.
 4. **A13 (нормы).** UI показывает `rules[]` (или `rule`) как есть: `document`, `clause`, `quote`, `url`, `verified`.
-5. **A14 (Copilot).** `POST …/jobs/{id}/ask` с телом `{question, history:[{role, text}]}` → `{answer, sources?}`.
-   Ответ 501 скрывает панель.
+5. **A14 (Copilot).** Формат сверен с веткой A14 (`copilot/INTEGRATION.md`): `POST …/jobs/{id}/ask`
+   `{question, history:[{role, text}]}` → `{answer, sources}`; UI сначала спрашивает `GET …/copilot/status`.
 6. **A18 (питч).** Скриншоты синтетического демо лежат в `frontend/screenshots/`; живое демо открывается по `/?demo=1`.
 
 ## Зависимости и лицензии

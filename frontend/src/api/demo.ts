@@ -359,6 +359,24 @@ export class DemoBackend implements Backend {
   videoSource(): null {
     return null;
   }
+
+  async copilotStatus() {
+    return { available: true, disclaimer: "Синтетическое демо: ответы Copilot заготовлены заранее." };
+  }
+
+  async report(id: string): Promise<string> {
+    const r = id === "demo-clean" ? buildDemoClean(id) : buildDemoResult(id);
+    const lines = [
+      "# Заключение (СИНТЕТИЧЕСКОЕ ДЕМО)",
+      "",
+      `Вердикт: ${r.verdict === "violation" ? "обнаружены признаки возможных нарушений" : "нарушение не обнаружено"}.`,
+      "",
+      ...r.violations.map((v, i) => `${i + 1}. ${v.type} — ${v.timecode_sec.toFixed(1)} с. ${v.description}`),
+      "",
+      "Результат — подсказка для проверяющего, не юридическое заключение.",
+    ];
+    return lines.join("\n");
+  }
 }
 
 export function isDemoMode(search = typeof window !== "undefined" ? window.location.search : ""): boolean {
