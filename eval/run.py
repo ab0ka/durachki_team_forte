@@ -314,9 +314,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--log", default="reports/runs.jsonl", help="журнал итераций (агрегаты)")
     ap.add_argument("--no-log", action="store_true")
     ap.add_argument("--kind", default=None, help="exploratory | holdout_frozen (по умолчанию из config)")
+    ap.add_argument("--ablation-id", default=None)
     args = ap.parse_args(argv)
     cfg = load_config(args.config, {"dataset": {"evaluation_kind": args.kind}} if args.kind else None)
     env_applied = apply_env(cfg, args.pipeline_config, args.env)
+    if args.raw:  # до протокола: обе руки абляции фиксируют одинаковое окружение
+        raw_env = {k: str(v) for k, v in ((cfg.get("runner") or {}).get("raw_env") or {}).items()}
+        os.environ.update(raw_env)
+        env_applied.update(raw_env)
     mode = "api" if args.api else args.mode
     out_dir = Path(args.out or f"runs/eval/{_dt.datetime.now():%Y%m%d-%H%M%S}")
     subset_ids = None
@@ -379,7 +384,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.no_log:
         from .runs import append, record_from_run
 
-        append(args.log, record_from_run(mdir, args.label, args.role))
+        append(args.log, record_from_run(mdir, args.label, args.role, args.ablation_id))
     print(f"→ {mdir}/metrics.json, proxy_score.json, summary_public.json (наружу — только summary_public.json)")
     return 0
 

@@ -124,7 +124,9 @@ def _chart(runs: list[dict], series: list[tuple[str, str, str]], title: str, uni
     return f'<div class=card><h3>{html.escape(title)}</h3><div class=muted>{html.escape(unit)}</div>{legend}{"".join(out)}</div>'
 
 
-def render_html(runs: list[dict], title: str = "Kassa Sentinel — журнал итераций") -> str:
+def render_html(runs_all: list[dict], title: str = "Kassa Sentinel — журнал итераций") -> str:
+    runs = [r for r in runs_all if isinstance(r.get("metrics"), dict)]
+    verdicts = [r for r in runs_all if r.get("role") == "ablation"]
     charts = [
         _chart(runs, [("fn", "var(--s1)", "FN (пропуски)"), ("fp", "var(--s2)", "FP (ложные)")], "Ошибки по видео", "шт."),
         _chart(runs, [("hit_2", "var(--s1)", "hit@2")], "Попадание таймкода ±2 с", "доля"),
@@ -142,6 +144,16 @@ def render_html(runs: list[dict], title: str = "Kassa Sentinel — журнал 
                     f"<td>{html.escape(str(r['protocol'].get('evaluation_kind')))}</td></tr>")
     table = ("<div class=wrap><table><tr><th>#</th>" + "".join(f"<th>{c}</th>" for c in cols)
              + "<th>git</th><th>вид</th></tr>" + "".join(rows) + "</table></div>")
+    if verdicts:
+        table += ("<h2>Абляции</h2><div class=wrap><table><tr><th>гипотеза</th><th>вердикт</th><th>изменено</th>"
+                  "<th>ΔFN</th><th>ΔFP</th><th>Δhit@2</th><th>Δp90, с</th><th>исправлено/сломано</th></tr>"
+                  + "".join(f"<tr><td>{html.escape(str(v.get('ablation_id')))}</td><td><b>{html.escape(str(v.get('verdict')))}"
+                            f"</b></td><td>{html.escape(', '.join(v.get('changed_params') or []) or '—')}</td>"
+                            f"<td>{(v.get('deltas') or {}).get('fn')}</td><td>{(v.get('deltas') or {}).get('fp')}</td>"
+                            f"<td>{((v.get('deltas') or {}).get('hit') or {}).get('2')}</td>"
+                            f"<td>{(v.get('deltas') or {}).get('latency_p90_s')}</td>"
+                            f"<td>{(v.get('paired') or {}).get('fixed')}/{(v.get('paired') or {}).get('broken')}</td></tr>"
+                            for v in verdicts) + "</table></div>")
     return (f"<!doctype html><html lang=ru><head><meta charset=utf-8><meta name=viewport content='width=device-width,"
             f"initial-scale=1'><title>Журнал итераций</title><style>{_CSS}</style></head><body><h1>{html.escape(title)}</h1>"
             "<p class=muted>Только агрегаты. Все прогоны на 42 видео — разведочные (не независимый тест). Proxy-балл — "
@@ -169,6 +181,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"+ {rec['run_id']} → {args.log}")
     elif args.cmd == "list":
         for i, r in enumerate(load(args.log), 1):
+            if r.get("role") == "ablation":
+                print(f"{i:3d} АБЛЯЦИЯ {r.get('ablation_id')}: {r.get('verdict')} Δ={r.get('deltas', {}).get('fn')}FN/"
+                      f"{r.get('deltas', {}).get('fp')}FP")
+                continue
             m: dict[str, Any] = r["metrics"]
             print(f"{i:3d} {str(r.get('label'))[:40]:40s} FN={m.get('fn')} FP={m.get('fp')} hit@2={m.get('hit_2')} "
                   f"p90={m.get('latency_p90')} VRAM={m.get('vram_peak_mb')} git={r['protocol'].get('git_sha')}")
