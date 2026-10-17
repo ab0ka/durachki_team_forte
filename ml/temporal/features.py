@@ -276,7 +276,13 @@ def sims(fs: FeatureSet, bank: TextBank) -> np.ndarray:
 
 def type_scores(fs: FeatureSet, bank: TextBank) -> tuple[np.ndarray, list[str]]:
     """Zero-shot отрыв типа от «нормы»: (T, K) = max_view max_prompt(type) − max_view max_prompt(normal)."""
-    s = sims(fs, bank).max(axis=1)  # (T, P)
+    with np.errstate(all="ignore"):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            s = np.nanmax(sims(fs, bank), axis=1)  # (T, P); неизвестные виды (NaN) пропускаются
+    s = np.nan_to_num(s, nan=0.0)
     idx = bank.type_index
     normal = s[:, idx["normal"]].max(axis=1) if "normal" in idx else np.zeros(len(s), np.float32)
     keys = [k for k in TYPE_IDS if k in idx]
@@ -292,10 +298,11 @@ def _square_box(cx: float, cy: float, side_w: float, side_h: float, w: int, h: i
     return x1, y1, int(round(min(x1 + side_w, w))), int(round(min(y1 + side_h, h)))
 
 
-def _zone_box(zones: Any) -> Optional[tuple[float, float, float, float]]:
+def _zone_box(zones: Any, names: Sequence[str] = ("cashier_area", "desk", "cash_tray")
+              ) -> Optional[tuple[float, float, float, float]]:
     if not zones:
         return None
-    for name in ("cashier_area", "desk", "cash_tray"):
+    for name in names:
         for z in zones:
             zn = getattr(z, "name", None) if not isinstance(z, dict) else z.get("name")
             poly = getattr(z, "polygon", None) if not isinstance(z, dict) else z.get("polygon")
@@ -353,7 +360,10 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
     energy = np.zeros(n, np.float32)
     area = np.zeros(n, np.float32)
     pending: list[np.ndarray] = []
-    out_emb: list[np.ndarray] = []
+    pending_idx: list[tuple[int, int]] = []
+    emb_arr = np.full((n, len(views), int(backend.dim)), np.nan, np.float32)   # NaN = вид неизвестен (не «пусто»)
+    emitted = [0]
+    zone_boxes = {v: _zone_box(zones, names=(v.split(":", 1)[1],)) for v in views if v.startswith("zone:")}
     center: Optional[np.ndarray] = None
     meta: dict = {"fps": fps, "views": views, "focus_mode": "zone" if zbox else ("motion" if use_motion else "none")}
     t0 = time.monotonic()
@@ -361,16 +371,33 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
     def flush(final: bool = False) -> None:
         while len(pending) >= bs or (final and pending):
             batch = np.stack(pending[:bs])
+            where = pending_idx[:bs]
             del pending[:bs]
-            out_emb.append(backend.encode_images(batch))
+            del pending_idx[:bs]
+            e = backend.encode_images(batch)
+            for (kk, vi), row in zip(where, e):
+                emb_arr[kk, vi] = row
 
     def emit(k: int, frame: np.ndarray) -> None:
         nonlocal center
         h, w = frame.shape[:2]
-        crops = []
-        for v in views:
+        crops: list[tuple[int, np.ndarray]] = []
+        for vi, v in enumerate(views):
             if v == "full":
-                crops.append(frame)
+                crops.append((vi, frame))
+                continue
+            if v.startswith("zone:"):  # кроп по зоне A06; зоны нет -> вид неизвестен (NaN), а не «ноль»
+                zb = zone_boxes.get(v)
+                if zb is None:
+                    continue
+                x1, y1, x2, y2 = zb
+                side_min = fc.get("min_side", 0.45) * min(w, h) * 0.5
+                bw, bh = max((x2 - x1) * w, side_min), max((y2 - y1) * h, side_min)
+                side = min(max(bw, bh), min(w, h))
+                X1, Y1, X2, Y2 = _square_box((x1 + x2) / 2 * w, (y1 + y2) / 2 * h, side, side, w, h)
+                crops.append((vi, frame[Y1:Y2, X1:X2]))
+                continue
+            if v != "focus":
                 continue
             # focus
             if zbox is not None:
@@ -397,13 +424,15 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
             side = min(max(bw, bh, side_min), min(w, h))
             x1, y1, x2, y2 = _square_box(cx, cy, side, side, w, h)
             boxes[k] = (x1 / w, y1 / h, x2 / w, y2 / h)
-            crops.append(frame[y1:y2, x1:x2])
+            crops.append((vi, frame[y1:y2, x1:x2]))
         if "focus" not in views:
             boxes[k] = (0, 0, 1, 1)
-        for c in crops:
+        for vi, c in crops:
             rgb = cv2.cvtColor(cv2.resize(np.ascontiguousarray(c), (IMG, IMG), interpolation=cv2.INTER_AREA),
                                cv2.COLOR_BGR2RGB)
             pending.append(rgb)
+            pending_idx.append((k, vi))
+        emitted[0] = k + 1
         flush()
 
     for j, ci in enumerate(idxs):
@@ -431,11 +460,10 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
         k, fr = buf.popleft()
         emit(k, fr)
     flush(final=True)
-    emb = np.concatenate(out_emb, axis=0) if out_emb else np.zeros((0, backend.dim), np.float32)
+    n_done = int(emitted[0])
     # точность кэша (float16) сразу: свежий и кэшированный пути дают бит-в-бит одинаковый вход (и как на обучении)
-    emb = emb.astype(np.float16).astype(np.float32)
-    n_done = len(emb) // len(views)
-    emb = emb[: n_done * len(views)].reshape(n_done, len(views), -1)
+    emb = emb_arr[:n_done].astype(np.float16).astype(np.float32)
+    meta["zones_found"] = sorted(v for v, b in zone_boxes.items() if b is not None)
     times, boxes, energy, area = times[:n_done], boxes[:n_done], energy[:n_done], area[:n_done]
     delta = np.zeros((n_done, len(views)), np.float32)
     if n_done > 1:
