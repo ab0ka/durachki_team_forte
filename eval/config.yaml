@@ -84,8 +84,11 @@ robustness:
 # --- Имитация жюри ---
 jury_sim:
   n_videos: 6
+  min_sequential: 5          # приёмка: 5+ видео ПОСЛЕДОВАТЕЛЬНО, затем ограниченная пачка
   poll_s: 2.0
-  total_limit_s: 300.0
+  total_limit_s: 300.0       # от приёма каждого job, включая очередь
+  grace_s: 60                # сколько ждать сверх лимита, чтобы отличить «медленно» от «не завершено»
+  cloudflare_timeout_s: 100  # таймаут запроса Cloudflare Tunnel: загрузка дольше — FAIL, ≥60% — WARN
   big_file_mb: 150
   request_timeout_s: 120
 
