@@ -8,6 +8,7 @@
     python -m norms.validate --strict        # предупреждения = ошибки (verified:false и т.п.)
     python -m norms.validate --json          # машиночитаемый отчёт
     python -m norms.validate --write-fallback  # пересобрать norms/_fallback.py из YAML
+    python -m norms.validate --write-matrix    # пересобрать norms/REVIEW_MATRIX.md из YAML
 
 Что проверяется:
   1. Схема: version, все типы V01..V08 и V99, поля name / observable / not_observable /
@@ -443,6 +444,68 @@ def write_fallback(catalog: dict[str, Any], path: Path = NORMS_DIR / "_fallback.
     )
 
 
+MATRIX_PATH = NORMS_DIR / "REVIEW_MATRIX.md"
+
+
+def _cell(x: Any) -> str:
+    return str(x).replace("|", "/").replace("\n", " ").strip() or "—"
+
+
+def _yn(x: Any) -> str:
+    return "да" if x is True else "нет"
+
+
+def render_matrix(catalog: dict[str, Any], base_dir: Path = NORMS_DIR) -> str:
+    """Review-матрица для человека: по типу и по норме — раздельные статусы проверки."""
+    docs = catalog.get("documents") or {}
+    by_url = {_norm_url(d.get("url", "")): (k, d) for k, d in docs.items() if isinstance(d, dict)}
+    retrieval: dict[str, str] = {}
+    for k, d in docs.items():
+        f = base_dir / str(d.get("source_file", ""))
+        retrieval[k] = parse_front_matter(f.read_text(encoding="utf-8"))[0].get("retrieval", "?") if f.is_file() else "нет файла"
+    out = [
+        "# Review-матрица норм (A13)", "",
+        "АВТОГЕНЕРАЦИЯ: `python -m norms.validate --write-matrix` из `catalog.yaml` — руками не править.",
+        "Колонки «цитату сверил человек» и «применимость проверил человек» — раздельные статусы;",
+        "`validate` проверяет только дословное вхождение цитаты в сохранённый текст (не юридическую гарантию).", "",
+        "## Типы и нормы", "",
+        "| тип | название | legal_status | документ / пункт | цитата сохранена | цитату сверил человек | "
+        "применимость проверил человек | verified | условия применимости | исключения |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for tid, t in (catalog.get("types") or {}).items():
+        if not isinstance(t, dict):
+            continue
+        exc = "; ".join(t.get("exclusions") or [])
+        rules, checks = t.get("rules") or [], t.get("rule_checks") or []
+        if not rules:
+            out.append(f"| {tid} | {_cell(t.get('name'))} | {t.get('legal_status', '?')} | без пункта, без правового "
+                       f"вывода | — | — | — | — | — | {_cell(exc)} |")
+            continue
+        for i, r in enumerate(rules):
+            chk = checks[i] if i < len(checks) and isinstance(checks[i], dict) else {}
+            doc_id = by_url.get(_norm_url(r.get("url", "")), (r.get("url"), {}))[0]
+            out.append(
+                f"| {tid} | {_cell(t.get('name'))} | {t.get('legal_status', '?')} | {_cell(doc_id)} / "
+                f"{_cell(r.get('clause') or 'пункт не установлен')} | {_cell(chk.get('quote_level', '?'))} | "
+                f"{_yn(chk.get('quote_checked_by_human'))} | {_yn(chk.get('applicability_checked_by_human'))} | "
+                f"{_yn(r.get('verified'))} | {_cell(chk.get('applicability', ''))} | {_cell(exc)} |")
+    out += ["", "## Документы", "", "| id | акт | URL | статус (по справочным системам) | редакция сверена | "
+            "дата доступа | файл | тип текста |", "|---|---|---|---|---|---|---|---|"]
+    for k, d in docs.items():
+        if isinstance(d, dict):
+            out.append(f"| {k} | {_cell(d.get('act', d.get('title', '')))} | {_cell(d.get('url'))} | "
+                       f"{_cell(d.get('in_force', '?'))} | {_yn(d.get('revision_checked'))} | {_cell(d.get('accessed', '?'))} | "
+                       f"{_cell(d.get('source_file'))} | {retrieval.get(k, '?')} |")
+    return "\n".join(out) + "\n"
+
+
+def check_matrix(catalog: dict[str, Any], rep: Report, path: Path = MATRIX_PATH) -> None:
+    if not path.is_file() or path.read_text(encoding="utf-8") != render_matrix(catalog):
+        rep.errors.append("norms/REVIEW_MATRIX.md устарел или отсутствует — "
+                          "запустите `python -m norms.validate --write-matrix`")
+
+
 def _load_yaml_strict(path: Path) -> dict[str, Any]:
     import yaml
 
@@ -482,15 +545,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--json", action="store_true", help="вывести отчёт в JSON")
     ap.add_argument("--no-fallback-check", action="store_true")
     ap.add_argument("--write-fallback", action="store_true", help="пересобрать norms/_fallback.py")
+    ap.add_argument("--write-matrix", action="store_true", help="пересобрать norms/REVIEW_MATRIX.md")
     args = ap.parse_args(argv)
 
     catalog = _load_yaml_strict(args.catalog)
     if args.write_fallback:
         write_fallback(catalog)
         print("norms/_fallback.py обновлён")
+    if args.write_matrix:
+        MATRIX_PATH.write_text(render_matrix(catalog), encoding="utf-8")
+        print("norms/REVIEW_MATRIX.md обновлён")
     rep = validate_catalog(catalog, args.base_dir or args.catalog.parent, strict=args.strict)
     if not args.no_fallback_check and args.catalog.resolve() == CATALOG_PATH.resolve():
         check_fallback(catalog, rep)
+        check_matrix(catalog, rep)
     if args.json:
         print(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2))
     else:

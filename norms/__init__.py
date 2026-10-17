@@ -10,6 +10,7 @@
     legal_status(type_id)           -> "confirmed" | "candidate" | "disabled"
     exclusions(type_id=None)        -> что само по себе НЕ нарушение (общие + типа)
     legal_basis(type_id)            -> блок для UI/fusion: статус, пояснение, нормы, уровни проверки
+    examples(type_id=None)          -> синтетические примеры positive/negative/unknown (для тестов A09/A12)
     render_description(type_id, t, facts) -> str по description_template
     catalog_source()                -> "yaml" | "fallback" (для meta.warnings)
 
@@ -33,6 +34,7 @@ __all__ = [
     "SOURCES_DIR",
     "TYPE_IDS",
     "catalog_source",
+    "examples",
     "exclusions",
     "legal_basis",
     "legal_status",
@@ -209,3 +211,13 @@ def legal_basis(type_id: str, catalog: Optional[dict[str, Any]] = None) -> dict[
         "exclusions": exclusions(type_id, cat),
         "disclaimer": str(cat.get("disclaimer") or "").strip(),
     }
+
+
+def examples(type_id: Optional[str] = None, catalog: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+    """Синтетические примеры спецификации (не реальные сцены): kind, facts, signals (null = неизвестно), expected.
+
+    Для одного типа — его примеры; без аргумента — все, с полем ``type_id``.
+    """
+    cat = catalog or load_catalog()
+    items = [(type_id, get_type(type_id, cat))] if type_id else list(cat["types"].items())
+    return [{"type_id": tid, **e} for tid, t in items for e in (t.get("examples") or [])]
