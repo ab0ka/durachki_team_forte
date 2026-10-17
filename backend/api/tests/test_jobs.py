@@ -120,8 +120,46 @@ def test_timeout_is_failed_partial_only_for_ui(client_factory):
         assert cancelled.wait(3), "progress() должен оборвать run() после таймаута"
 
 
-def test_hung_pipeline_does_not_block_queue(client_factory):
-    """Зависший run() (без вызовов progress): watchdog -> failed, очередь идёт дальше."""
+def test_hung_pipeline_single_gpu_owner(client_factory):
+    """Зависший run() (без progress): watchdog -> failed; GPU НЕ отдаётся второй задаче (один владелец
+    вместе с A03), та честно получает failed по таймауту, /readyz = 503 gpu_hung. Как только run()
+    вернулся — очередь работает дальше."""
+    hang = threading.Event()
+    calls = []
+
+    def run(video_path, job_id, progress, deadline_s=240):
+        calls.append(job_id)
+        if len(calls) == 1:
+            hang.wait(10)
+        return make_result(job_id)
+
+    kw = dict(watchdog_s=0.8, budget_s=0.7, job_cap_s=0.3, min_deadline_s=0.1, deadline_grace_s=0.1,
+              hung_gpu_s=0.2)
+    try:
+        with client_factory(spec(run), **kw) as c:
+            j1 = upload(c, FTYP_ONLY).json()["job_id"]
+            time.sleep(0.1)
+            j2 = upload(c, FTYP_ONLY).json()["job_id"]
+            assert wait_job(c, j1)["status"] == "failed"
+            d2 = wait_job(c, j2)
+            assert d2["status"] == "failed" and "timeout" in d2["error"]
+            assert len(calls) == 1  # второй run() не стартовал параллельно зависшему
+            end = time.time() + 3
+            while time.time() < end and c.get("/readyz").json()["state"] != "gpu_hung":
+                time.sleep(0.05)
+            r = c.get("/readyz")
+            assert r.status_code == 503 and r.json()["state"] == "gpu_hung"
+            hang.set()
+            end = time.time() + 3
+            while time.time() < end and c.get("/readyz").status_code != 200:
+                time.sleep(0.05)
+            assert c.get("/readyz").status_code == 200
+            assert wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])["status"] == "done"
+    finally:
+        hang.set()
+
+
+def test_hung_pipeline_release_gpu_opt_in(client_factory):
     hang = threading.Event()
     calls = []
 
@@ -131,16 +169,15 @@ def test_hung_pipeline_does_not_block_queue(client_factory):
             hang.wait(5)
         return make_result(job_id)
 
-    kw = dict(watchdog_s=0.8, budget_s=0.7, job_cap_s=0.3, min_deadline_s=0.1, deadline_grace_s=0.1)
+    kw = dict(watchdog_s=0.8, budget_s=0.7, job_cap_s=0.3, min_deadline_s=0.1, deadline_grace_s=0.1,
+              zombie_release_gpu=True)
     try:
         with client_factory(spec(run), **kw) as c:
             j1 = upload(c, FTYP_ONLY).json()["job_id"]
             time.sleep(0.1)
             j2 = upload(c, FTYP_ONLY).json()["job_id"]
             assert wait_job(c, j1)["status"] == "failed"
-            d2 = wait_job(c, j2)
-            assert d2["status"] == "done", d2
-            assert c.get("/readyz").json()["queue"]["zombies"] >= 0
+            assert wait_job(c, j2)["status"] == "done"
     finally:
         hang.set()
 

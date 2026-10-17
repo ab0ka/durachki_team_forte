@@ -62,7 +62,8 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
     def make(**kw: Any) -> Settings:
         base: dict[str, Any] = dict(data_dir=tmp_path / "data", api_keys=[KEY],
                                     frontend_dir=tmp_path / "no-frontend", video_validation="off",
-                                    log_json=True, job_ttl_h=0, rl_auth_fail="10000/60")
+                                    log_json=True, job_ttl_h=0, rl_auth_fail="10000/60",
+                                    dedup=False)  # тесты грузят одни и те же байты; dedup — свой тест
         base.update(kw)
         return Settings.from_env(env={}, **base)
     return make

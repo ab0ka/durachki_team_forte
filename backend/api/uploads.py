@@ -178,10 +178,10 @@ def _probe_cv2(path: Path) -> Optional[dict[str, Any]]:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         n = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
         h, w = frame.shape[:2]
-        info: dict[str, Any] = {"decoder": "cv2", "fps": round(fps, 3), "frames": int(n),
+        info: dict[str, Any] = {"decoder": "cv2", "fps_nominal": round(fps, 3), "frames": int(n),
                                 "decoded_width": int(w), "decoded_height": int(h)}
-        if fps > 0 and n > 0:
-            info["duration"] = round(n / fps, 3)
+        if fps > 0 and n > 0:  # при переменном fps — только оценка; длительность берём из контейнера
+            info["duration_est"] = round(n / fps, 3)
         return info
     finally:
         cap.release()
@@ -199,9 +199,9 @@ def _probe_av(path: Path) -> Optional[dict[str, Any]]:
                 raise UploadError(415, "file has no video stream")
             for fr in c.decode(vs):
                 info = {"decoder": "pyav", "decoded_width": fr.width, "decoded_height": fr.height,
-                        "fps": float(vs.average_rate or 0)}
+                        "fps_nominal": float(vs.average_rate or 0)}
                 if c.duration:
-                    info["duration"] = round(c.duration / 1_000_000, 3)
+                    info["duration_est"] = round(c.duration / 1_000_000, 3)
                 return info
     except UploadError:
         raise
@@ -215,8 +215,9 @@ def _probe_ffprobe(path: Path) -> Optional[dict[str, Any]]:
     if not exe:
         return None
     try:
-        r = subprocess.run([exe, "-v", "error", "-select_streams", "v:0", "-count_packets",
-                            "-show_entries", "stream=width,height,avg_frame_rate,nb_read_packets",
+        # один пакет, а не -count_packets: POST должен ответить сразу после записи файла
+        r = subprocess.run([exe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+                            "-show_entries", "stream=width,height:packet=pts_time",
                             "-show_entries", "format=duration", "-of", "json", str(path)],
                            capture_output=True, timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired):
@@ -226,13 +227,13 @@ def _probe_ffprobe(path: Path) -> Optional[dict[str, Any]]:
     except ValueError:
         data = {}
     streams = data.get("streams") or []
-    if r.returncode != 0 or not streams or not int(streams[0].get("nb_read_packets") or 0):
+    if r.returncode != 0 or not streams or not (data.get("packets") or []):
         raise UploadError(415, "file is not a decodable video (ffprobe found no video packets)")
     st = streams[0]
     info: dict[str, Any] = {"decoder": "ffprobe", "decoded_width": st.get("width"),
                             "decoded_height": st.get("height")}
     try:
-        info["duration"] = round(float(data.get("format", {}).get("duration")), 3)
+        info["duration_est"] = round(float(data.get("format", {}).get("duration")), 3)
     except (TypeError, ValueError):
         pass
     return info
@@ -253,6 +254,8 @@ def validate_video(path: Path, mode: str = "required",
         r = probe(path)
         if r is not None:
             info.update({k: v for k, v in r.items() if v is not None})
+            if "duration" not in info and "duration_est" in info:  # нет mvhd — хотя бы оценка
+                info["duration"] = info["duration_est"]
             info["validated"] = True
             return info
     if mode == "required":

@@ -33,15 +33,25 @@ class Settings:
     max_queue: int = 12
     max_attempts: int = 3
     max_zombie_workers: int = 2
+    zombie_release_gpu: bool = False
+    hung_gpu_s: float = 60.0
+    restart_fresh_budget: bool = False
+    pass_deadline_at: bool = True
 
     pipeline: str = "backend.pipeline"
     fake_pipeline: bool = False
     fake_pipeline_s: float = 3.0
+    allow_mock: bool = False
     warmup: bool = True
     warmup_wait_s: float = 120.0
     evidence_fallback: bool = True
     video_validation: str = "required"
     copilot_timeout_s: float = 60.0
+    min_coverage: float = 0.95
+    partial_accept: bool = False
+    jury_profile: str = "extended"
+    max_response_mb: float = 3.0
+    dedup: bool = True
 
     api_keys: list[str] = field(default_factory=list)
     api_keys_file: Path | None = None
@@ -81,6 +91,10 @@ class Settings:
     def max_upload_bytes(self) -> int:
         return int(self.max_upload_mb * 1024 * 1024)
 
+    @property
+    def max_response_bytes(self) -> int:
+        return int(self.max_response_mb * 1024 * 1024)
+
     @classmethod
     def from_env(cls, config_path: Path | str | None = None, env: dict[str, str] | None = None,
                  **overrides: Any) -> "Settings":
@@ -116,6 +130,8 @@ class Settings:
             s.gpu_lock_scope = "job"
         if s.video_validation not in ("required", "best_effort", "off"):
             s.video_validation = "required"
+        if s.jury_profile not in ("extended", "strict"):
+            s.jury_profile = "extended"
         return s
 
 

@@ -31,15 +31,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     deadline_s   REAL,
     client       TEXT,
     warnings     TEXT,                   -- JSON list
-    video_meta   TEXT                    -- JSON: длительность/fps/размер от декодера
+    video_meta   TEXT,                   -- JSON: длительность/fps/размер от декодера
+    dedup_key    TEXT                    -- sha256:версия пайплайна (идемпотентность)
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
 """
+_MIGRATIONS = {"video_meta": "TEXT", "dedup_key": "TEXT"}  # колонки, добавленные после v1
 
 _COLUMNS = ("id", "status", "stage", "progress", "created_at", "queued_at", "started_at",
             "finished_at", "error", "result_path", "video_path", "filename", "size_bytes",
-            "sha256", "attempts", "deadline_s", "client", "warnings", "video_meta")
+            "sha256", "attempts", "deadline_s", "client", "warnings", "video_meta", "dedup_key")
 
 
 class JobStore:
@@ -54,6 +56,11 @@ class JobStore:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.executescript(_SCHEMA)
+            have = {r[1] for r in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            for col, typ in _MIGRATIONS.items():
+                if col not in have:  # БД от прошлой версии API
+                    self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS jobs_dedup ON jobs(dedup_key)")
 
     # ---- базовые операции: execute И fetch под одним локом (коннект общий для потоков) ----
     def _run(self, sql: str, args: Iterable[Any] = ()) -> int:
@@ -89,14 +96,14 @@ class JobStore:
 
     def create(self, job_id: str, *, video_path: str, filename: str, size_bytes: int,
                sha256: str, client: str = "", video_meta: Optional[dict[str, Any]] = None,
-               now: Optional[float] = None) -> dict[str, Any]:
+               dedup_key: Optional[str] = None, now: Optional[float] = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         self._run(
             "INSERT INTO jobs (id, status, stage, progress, created_at, queued_at, video_path, "
-            "filename, size_bytes, sha256, client, warnings, video_meta) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "filename, size_bytes, sha256, client, warnings, video_meta, dedup_key) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (job_id, "queued", "queued", 0.0, now, now, video_path, filename, size_bytes, sha256,
-             client, "[]", json.dumps(video_meta or {}, ensure_ascii=False)))
+             client, "[]", json.dumps(video_meta or {}, ensure_ascii=False), dedup_key))
         return self.get(job_id) or {}
 
     def get(self, job_id: str) -> Optional[dict[str, Any]]:
@@ -153,6 +160,12 @@ class JobStore:
         rows = self._all("SELECT * FROM jobs WHERE status IN ('done','failed') AND "
                          "COALESCE(finished_at, created_at) < ?", (ts,))
         return [self._row(r) for r in rows if r is not None]  # type: ignore[misc]
+
+    def find_by_dedup(self, key: str) -> Optional[dict[str, Any]]:
+        """Последняя не упавшая задача с тем же файлом и версией пайплайна."""
+        r = self._one("SELECT * FROM jobs WHERE dedup_key=? AND status IN ('queued','running','done') "
+                      "ORDER BY created_at DESC LIMIT 1", (key,))
+        return self._row(r)
 
     def find_done_by_sha(self, sha256: str) -> Optional[dict[str, Any]]:
         r = self._one("SELECT * FROM jobs WHERE sha256=? AND status='done' "

@@ -1,16 +1,20 @@
 """Очередь задач: FIFO, воркеры-потоки, GPU-семафор, бюджет времени, watchdog, рестарт.
 
-Честность результата: done — только когда pipeline.run вернул результат. Нет пайплайна,
-исключение, таймаут -> failed (partial.json сохраняется как подробности для UI)."""
+Честность результата: done — только когда pipeline.run вернул результат и он прошёл политику исхода
+(results.normalize). Нет пайплайна, mock в проде, исключение, таймаут -> failed с причиной.
+partial.json становится done только при partial_accept=true И достаточной полноте (meta.coverage /
+meta.completeness); иначе он — лишь подробности для UI."""
 from __future__ import annotations
 
 import base64
 import importlib
+import inspect
 import json
 import logging
 import math
 import os
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -20,13 +24,15 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .config import Settings
-from .results import fill_missing_evidence, iter_frames, normalize, to_api_dict
+from .results import (analysis_complete, coverage_ratio, enforce_size, fill_missing_evidence,
+                      iter_frames, json_size, normalize, to_api_dict)
 from .store import JobStore
 
 log = logging.getLogger("sentinel.api.worker")
 
 ProgressFn = Callable[[str, float], None]
-RunFn = Callable[[str, str, ProgressFn, float], Any]
+RunFn = Callable[..., Any]
+_TRUE = {"1", "true", "yes", "on", "y"}
 
 
 class JobCancelled(BaseException):
@@ -41,13 +47,24 @@ class PipelineSpec:
     mode: str = "real"            # real | fake | unavailable
     error: str = ""
     manages_gpu: bool = False     # pipeline сам держит GPU-лок -> API не оборачивает run()
+    accepts_deadline_at: bool = False
+    version: str = ""
+
+
+def _accepts_kw(fn: Callable[..., Any], name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
 
 
 def resolve_pipeline(settings: Settings) -> PipelineSpec:
     """Ленивый импорт backend.pipeline. Фейк — только при явном SENTINEL_FAKE_PIPELINE=1."""
     if settings.fake_pipeline:
         from .fake_pipeline import make_fake_runner
-        return PipelineSpec(run=make_fake_runner(settings.fake_pipeline_s), mode="fake")
+        return PipelineSpec(run=make_fake_runner(settings.fake_pipeline_s), mode="fake",
+                            version="fake")
     mod_name, _, fn = settings.pipeline.partition(":")
     try:
         mod = importlib.import_module(mod_name)
@@ -58,12 +75,38 @@ def resolve_pipeline(settings: Settings) -> PipelineSpec:
         return PipelineSpec(mode="unavailable", error=f"{type(e).__name__}: {e}"[:400])
     warm = getattr(mod, "warmup", None) if not fn else None
     manages = any(hasattr(mod, a) for a in ("GPU_LOCK", "GPU_SEMAPHORE", "gpu_lock"))
+    version = str(getattr(mod, "PIPELINE_VERSION", None) or getattr(mod, "__version__", None) or "")
     return PipelineSpec(run=run, warmup=warm if callable(warm) else None, mode="real",
-                        manages_gpu=manages)
+                        manages_gpu=manages, accepts_deadline_at=_accepts_kw(run, "deadline_at"),
+                        version=version)
+
+
+def mock_env_active() -> bool:
+    return os.environ.get("SENTINEL_MOCK", "").strip().lower() in _TRUE
+
+
+def result_is_mock(meta: Any) -> bool:
+    """Признаки mock-результата (A03 meta.mock, A01 meta.provenance.mock, origin стадий/моделей)."""
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("mock") is True or meta.get("fake_pipeline") is True:
+        return True
+    prov = meta.get("provenance")
+    if isinstance(prov, dict) and prov.get("mock") is True:
+        return True
+    for key in ("stages", "models"):
+        block = meta.get(key)
+        items = block.values() if isinstance(block, dict) else (block if isinstance(block, list) else [])
+        for it in items:
+            if isinstance(it, dict) and ("mock" in str(it.get("origin", "")).lower()
+                                         or it.get("status") == "mock"):
+                return True
+    return False
 
 
 class GpuGate:
-    """Семафор с владельцами: watchdog может освободить слот зависшей задачи."""
+    """Семафор с владельцами. Один владелец GPU: слот зависшей задачи не отдаётся другой
+    (zombie_release_gpu=false), пока её run() не вернётся."""
 
     def __init__(self, slots: int):
         self.slots = max(1, int(slots))
@@ -87,6 +130,10 @@ class GpuGate:
                 self._holders.discard(owner)
                 self._cv.notify_all()
 
+    def holds(self, owner: str) -> bool:
+        with self._cv:
+            return owner in self._holders
+
     @property
     def busy(self) -> int:
         with self._cv:
@@ -100,6 +147,37 @@ def write_json(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
+def gpu_memory() -> Optional[dict[str, float]]:
+    """VRAM процесса API — только если torch уже загружен пайплайном (сами torch не импортируем)."""
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    try:
+        if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+            return None
+        mb = 1024 * 1024
+        out = {"allocated_mb": round(torch.cuda.memory_allocated() / mb, 1),
+               "reserved_mb": round(torch.cuda.memory_reserved() / mb, 1),
+               "max_allocated_mb": round(torch.cuda.max_memory_allocated() / mb, 1)}
+        try:
+            free, total = torch.cuda.mem_get_info()
+            out.update(free_mb=round(free / mb, 1), total_mb=round(total / mb, 1))
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return None
+
+
+def _reset_gpu_peak() -> None:
+    torch = sys.modules.get("torch")
+    try:
+        if torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
 class JobManager:
     def __init__(self, settings: Settings, store: JobStore,
                  pipeline: Optional[PipelineSpec | Callable[[], PipelineSpec]] = None):
@@ -107,7 +185,8 @@ class JobManager:
         self.store = store
         self._pipeline_src = pipeline
         self.pipeline: Optional[PipelineSpec] = None
-        self.state = "loading"            # loading | warming | ready | unavailable | warmup_failed
+        # loading | warming | ready | unavailable | warmup_failed | mock_not_allowed
+        self.state = "loading"
         self.state_detail = ""
         self._resolved = threading.Event()
         self._warm = threading.Event()
@@ -119,7 +198,7 @@ class JobManager:
         self._live: dict[str, dict[str, Any]] = {}
         self._running: dict[str, dict[str, Any]] = {}
         self._workers: set[threading.Thread] = set()
-        self._zombies: set[threading.Thread] = set()
+        self._zombies: dict[threading.Thread, dict[str, Any]] = {}
         self._threads: list[threading.Thread] = []
         self._seq = 0
         self.gpu = GpuGate(settings.gpu_slots)
@@ -176,6 +255,13 @@ class JobManager:
             return
         if spec.mode == "fake":
             log.warning("FAKE PIPELINE ENABLED (SENTINEL_FAKE_PIPELINE=1): results are synthetic")
+        elif mock_env_active() and not self.s.allow_mock:
+            self.state = "mock_not_allowed"
+            self.state_detail = ("SENTINEL_MOCK=1 in production: mock models would produce synthetic "
+                                 "results; set SENTINEL_ALLOW_MOCK=1 only for dev/tests")
+            log.error("mock mode refused", extra={"error": self.state_detail})
+            self._warm.set()
+            return
         if spec.warmup and self.s.warmup:
             self.state = "warming"
             t0 = time.monotonic()
@@ -192,7 +278,26 @@ class JobManager:
 
     @property
     def ready(self) -> bool:
-        return self.state == "ready"
+        return self.state == "ready" and not self.gpu_hung()
+
+    def gpu_hung(self, now: Optional[float] = None) -> Optional[float]:
+        """Секунды, сколько зависший run() держит GPU сверх hung_gpu_s (None — не держит)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            worst = None
+            for z in self._zombies.values():
+                if self.gpu.holds(z["job_id"]):
+                    held = now - z["since"]
+                    if held > self.s.hung_gpu_s:
+                        worst = max(worst or 0.0, held)
+            return worst
+
+    def pipeline_tag(self) -> str:
+        """Ключ идемпотентности: та же версия пайплайна -> тот же результат."""
+        spec = self.pipeline
+        if spec is None:
+            return "loading"
+        return f"{spec.mode}:{spec.version or 'unversioned'}"
 
     # ------------------------------------------------------------ queue
     def submit(self, job_id: str, queued_at: Optional[float] = None) -> None:
@@ -227,10 +332,14 @@ class JobManager:
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
-            return {"queued": self.queue_len(), "running": len(self._running),
-                    "workers": len(self._workers - self._zombies), "zombies": len(self._zombies),
-                    "gpu_busy": self.gpu.busy, "gpu_slots": self.gpu.slots,
-                    "completed": self.completed}
+            out: dict[str, Any] = {
+                "queued": self.queue_len(), "running": len(self._running),
+                "workers": len(self._workers - set(self._zombies)), "zombies": len(self._zombies),
+                "gpu_busy": self.gpu.busy, "gpu_slots": self.gpu.slots, "completed": self.completed}
+        gm = gpu_memory()
+        if gm:
+            out["gpu_memory"] = gm
+        return out
 
     # ------------------------------------------------------------ worker
     def _worker_loop(self) -> None:
@@ -243,16 +352,22 @@ class JobManager:
                 try:
                     self._process(job_id)
                 except Exception:
+                    if self._stop.is_set():  # остановка сервера: хранилище уже закрыто
+                        return
                     log.exception("worker crashed on job", extra={"job_id": job_id})
+                    try:
+                        self._fail(job_id, "worker crashed (see server log)", "worker_crash")
+                    except Exception:
+                        log.exception("could not mark crashed job failed", extra={"job_id": job_id})
                 with self._lock:
                     if me in self._zombies:
-                        self._zombies.discard(me)
-                        if len(self._workers - self._zombies) > self.s.workers:
+                        self._zombies.pop(me, None)
+                        if len(self._workers - set(self._zombies)) > self.s.workers:
                             return
         finally:
             with self._lock:
                 self._workers.discard(me)
-                self._zombies.discard(me)
+                self._zombies.pop(me, None)
 
     def job_dir(self, job_id: str) -> Path:
         return self.s.jobs_dir / job_id
@@ -285,6 +400,9 @@ class JobManager:
             err = spec.error if spec else "pipeline not initialised (warmup timeout)"
             self._fail(job_id, f"analysis pipeline unavailable: {err}", "pipeline_unavailable")
             return
+        if self.state == "mock_not_allowed":
+            self._fail(job_id, self.state_detail, "mock_not_allowed")
+            return
 
         gated = self.s.gpu_lock_scope == "job" and not spec.manages_gpu
         if gated:
@@ -302,12 +420,16 @@ class JobManager:
             with self._lock:
                 self._running[job_id] = {"thread": threading.current_thread(),
                                          "started": started, "deadline": deadline}
-            video = row["video_path"]
+            kwargs: dict[str, Any] = {}
+            if self.s.pass_deadline_at and spec.accepts_deadline_at:
+                kwargs["deadline_at"] = t0 + self.s.budget_s  # бюджет от приёма файла (A03)
+            _reset_gpu_peak()
             try:
-                result = spec.run(video, job_id, self._progress_cb(job_id), deadline)
+                result = spec.run(row["video_path"], job_id, self._progress_cb(job_id), deadline,
+                                  **kwargs)
             except JobCancelled:
                 return
-            except Exception as e:
+            except BaseException as e:  # noqa: BLE001 — в т.ч. SystemExit из библиотек в потоке
                 log.error("pipeline.run raised", extra={"job_id": job_id, "error": repr(e)[:300],
                                                          "trace": traceback.format_exc(limit=8)})
                 self._fail(job_id, f"analysis error: {type(e).__name__}: {e}"[:500], "pipeline_error")
@@ -322,7 +444,7 @@ class JobManager:
 
     def _deadline_for(self, t0: float) -> float:
         """deadline_s = budget − ожидание (очередь включена), не больше job_cap_s и честной доли
-        для тех, кто ждёт за нами: иначе 6-е видео из пачки жюри не уложится в 5 минут."""
+        для тех, кто ждёт за нами (оценка, а не обещание: пропускную способность меряет L2)."""
         s, now = self.s, time.time()
         d = min(s.budget_s - (now - t0), s.job_cap_s)
         if s.fair_share:
@@ -369,13 +491,21 @@ class JobManager:
             self._fail(job_id, f"pipeline returned unusable result: {type(e).__name__}: {e}"[:500],
                        "bad_result")
             return
-        if api.get("status") == "failed":
-            meta = api.get("meta") if isinstance(api.get("meta"), dict) else {}
-            self._fail(job_id, str(meta.get("error") or "pipeline reported status=failed")[:500],
-                       "pipeline_failed")
+        if spec.mode != "fake" and not self.s.allow_mock and result_is_mock(api.get("meta")):
+            self._fail(job_id, "pipeline returned a MOCK result (meta.mock) — refused in production",
+                       "mock_result", details=api)
             return
-        api, w = normalize(api, job_id)
+        api, w = normalize(api, job_id, min_coverage=self.s.min_coverage)
         warns += w
+        if api["status"] == "failed":
+            self._fail(job_id, str(api.get("error") or "analysis failed"), "pipeline_failed",
+                       details=api)
+            return
+        self._store_done(job_id, api, warns, spec, t0=t0, started=started, deadline=deadline)
+
+    def _store_done(self, job_id: str, api: dict[str, Any], warns: list[str], spec: PipelineSpec,
+                    *, t0: float, started: Optional[float], deadline: Optional[float],
+                    partial: bool = False) -> bool:
         row = self.store.get(job_id) or {}
         if self.s.evidence_fallback and row.get("video_path"):
             warns += fill_missing_evidence(api, Path(row["video_path"]))
@@ -385,21 +515,33 @@ class JobManager:
         meta["warnings"] = (list(mw) if isinstance(mw, list) else ([str(mw)] if mw else [])) + warns
         if spec.mode == "fake":
             meta["fake_pipeline"] = True
-        frames = [{"i": i, "violation": vi, "timestamp_sec": f.get("timestamp_sec"),
-                   "path": f"frames/{i}.jpg"} for i, vi, f in iter_frames(api)]
-        meta["api"] = {
-            "pipeline": spec.mode, "queue_wait_s": round(started - t0, 2),
-            "processing_s": round(now - started, 2), "total_s": round(now - t0, 2),
-            "deadline_s": deadline, "filename": row.get("filename"),
-            "video": row.get("video_meta") or {}, "frames": frames, "api_version": "1",
+        if partial:
+            meta["partial"] = True
+        frames_meta = {
+            "pipeline": spec.mode, "pipeline_version": spec.version or None,
+            "queue_wait_s": round((started or now) - t0, 2),
+            "processing_s": round(now - started, 2) if started else None,
+            "total_s": round(now - t0, 2), "deadline_s": deadline,
+            "deadline_at_passed": bool(self.s.pass_deadline_at and spec.accepts_deadline_at),
+            "filename": row.get("filename"), "video": row.get("video_meta") or {},
+            "coverage": coverage_ratio(meta), "analysis_complete": analysis_complete(
+                meta, self.s.min_coverage), "partial": partial, "api_version": "2",
         }
+        gm = gpu_memory()
+        if gm:
+            frames_meta["gpu_peak_mb"] = gm.get("max_allocated_mb")
+        meta["api"] = frames_meta
+        meta["warnings"] += enforce_size(api, self.s.max_response_bytes)
+        frames_meta["frames"] = [{"i": i, "violation": vi, "timestamp_sec": f.get("timestamp_sec"),
+                                  "path": f"frames/{i}.jpg"} for i, vi, f in iter_frames(api)]
+        frames_meta["response_bytes"] = json_size(api)
         jd = self.job_dir(job_id)
         path = jd / f"result-{int(now * 1000)}-{threading.get_ident()}.json"
         try:
             write_json(path, api)
         except (OSError, ValueError) as e:
             self._fail(job_id, f"could not store result: {type(e).__name__}", "store_error")
-            return
+            return False
         if self.store.finalize(job_id, "done", result_path=str(path), warnings=meta["warnings"]):
             with self._lock:
                 self.completed += 1
@@ -408,12 +550,13 @@ class JobManager:
             self._dump_frames(jd, api)
             log.info("job done", extra={"job_id": job_id, "verdict": api.get("verdict"),
                                          "violations": len(api.get("violations") or []),
-                                         "total_s": meta["api"]["total_s"]})
-        else:  # watchdog успел раньше: результат поздний, наружу не меняем
-            try:
-                os.replace(path, jd / "late_result.json")
-            except OSError:
-                pass
+                                         "total_s": frames_meta["total_s"], "partial": partial})
+            return True
+        try:  # watchdog успел раньше: результат поздний, наружу не меняем
+            os.replace(path, jd / "late_result.json")
+        except OSError:
+            pass
+        return False
 
     def _dump_frames(self, jd: Path, api: dict[str, Any]) -> None:
         try:
@@ -434,21 +577,64 @@ class JobManager:
             return None
         return data if isinstance(data, dict) else None
 
-    def _fail(self, job_id: str, error: str, code: str) -> bool:
-        """failed — наружу без вердикта. partial.json (если pipeline успел) — подробности для UI."""
+    def _try_partial(self, job_id: str, partial: dict[str, Any]) -> tuple[bool, str]:
+        """partial.json -> done, только если включено и полнота достаточна. (принят?, причина)."""
+        meta = partial.get("meta") if isinstance(partial.get("meta"), dict) else {}
+        cov = coverage_ratio(meta)
+        complete = analysis_complete(meta, self.s.min_coverage)
+        why = (f"coverage={cov:.2f}" if cov is not None else "coverage not reported") + \
+              f", complete={complete}"
+        if not self.s.partial_accept:
+            return False, f"partial result not accepted (partial_accept=false; {why})"
+        if complete is not True:
+            return False, f"partial result incomplete ({why}; need >= {self.s.min_coverage})"
+        if not self.s.allow_mock and result_is_mock(meta):
+            return False, "partial result is MOCK — refused"
+        cand = dict(partial)
+        cand.pop("status", None)  # A03 пишет processing
+        api, warns = normalize(cand, job_id, min_coverage=self.s.min_coverage)
+        if api["status"] != "done":
+            return False, f"partial result rejected by outcome policy: {api.get('error')}"
+        row = self.store.get(job_id) or {}
+        spec = self.pipeline or PipelineSpec(mode="unknown")
+        warns.append(f"PARTIAL: pipeline did not finish; result accepted by coverage ({why})")
+        info = self._running_info(job_id)
+        ok = self._store_done(job_id, api, warns, spec, t0=row.get("queued_at") or time.time(),
+                              started=info.get("started") if info else row.get("started_at"),
+                              deadline=info.get("deadline") if info else row.get("deadline_s"),
+                              partial=True)
+        return ok, why
+
+    def _running_info(self, job_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            info = self._running.get(job_id)
+            return dict(info) if info else None
+
+    def _fail(self, job_id: str, error: str, code: str,
+              details: Optional[dict[str, Any]] = None) -> bool:
+        """failed — наружу без вердикта, с причиной. partial.json и отвергнутый результат —
+        подробности только для UI (ui-маршрут, поле partial)."""
         partial = self._read_partial(job_id)
+        if partial is not None and code in ("timeout", "pipeline_error", "worker_crash"):
+            accepted, why = self._try_partial(job_id, partial)
+            if accepted:
+                return False  # задача завершена как done (partial) — это не failure
+            error = f"{error}; {why}"
         result_path = None
-        if partial is not None:
-            details = {"job_id": job_id, "complete": False, "code": code, "partial": partial}
+        if partial is not None or details is not None:
+            body = {"job_id": job_id, "complete": False, "code": code}
+            if partial is not None:
+                body["partial"] = partial
+            if details is not None:
+                body["rejected_result"] = details
             p = self.job_dir(job_id) / "failed_details.json"
             try:
-                write_json(p, details)
+                write_json(p, body)
                 result_path = str(p)
             except (OSError, ValueError):
                 result_path = None
         ok = self.store.finalize(job_id, "failed", error=f"{code}: {error}"[:600],
-                                 result_path=result_path,
-                                 warnings=[f"{code}: {error}"[:300]])
+                                 result_path=result_path, warnings=[f"{code}: {error}"[:300]])
         if ok:
             log.warning("job failed", extra={"job_id": job_id, "code": code, "error": error[:300],
                                               "has_partial": partial is not None})
@@ -466,19 +652,37 @@ class JobManager:
         now = time.time() if now is None else now
         for row in self.store.active():
             jid = row["id"]
-            with self._lock:
-                info = self._running.get(jid)
+            info = self._running_info(jid)
+            if info and not info["thread"].is_alive():  # поток умер мимо finally
+                self._fail(jid, "worker thread died during analysis", "worker_crash")
+                with self._lock:
+                    self._running.pop(jid, None)
+                self.gpu.release(jid)
+                continue
             limit = row["queued_at"] + self.s.watchdog_s
             if info:
                 limit = min(limit, info["started"] + info["deadline"] + self.s.deadline_grace_s)
             if now < limit:
                 continue
             waited = now - row["queued_at"]
-            if self._fail(jid, f"analysis did not finish in time ({waited:.0f}s since upload)",
-                          "timeout"):
-                self._abandon(jid, info)
+            closed = self._fail(jid, f"analysis did not finish in time ({waited:.0f}s since upload)",
+                                "timeout")
+            if closed or self._is_final(jid):
+                self._abandon(jid, info, now)
+        self._ensure_workers()
 
-    def _abandon(self, job_id: str, info: Optional[dict[str, Any]]) -> None:
+    def _ensure_workers(self) -> None:
+        with self._lock:
+            alive = {t for t in self._workers if t.is_alive()}
+            self._workers = alive
+            missing = self.s.workers - len(alive - set(self._zombies))
+        for _ in range(max(0, missing)):
+            if len(self._zombies) > self.s.max_zombie_workers:
+                break
+            log.warning("respawning worker thread")
+            self._spawn_worker()
+
+    def _abandon(self, job_id: str, info: Optional[dict[str, Any]], now: float) -> None:
         with self._cv:
             if job_id in self._q:
                 self._q.remove(job_id)
@@ -489,29 +693,36 @@ class JobManager:
             self._running.pop(job_id, None)
             th = info.get("thread")
             if th is not None and th.is_alive():
-                self._zombies.add(th)
-            spawn = (len(self._workers - self._zombies) < self.s.workers
-                     and len(self._zombies) <= self.s.max_zombie_workers)
-        self.gpu.release(job_id)
-        if spawn:
-            log.warning("worker stuck in pipeline.run; spawning replacement",
+                self._zombies[th] = {"job_id": job_id, "since": now}
+        if self.s.zombie_release_gpu:
+            self.gpu.release(job_id)
+        else:
+            log.warning("pipeline.run still running after timeout; GPU stays with it (single owner)",
                         extra={"job_id": job_id})
-            self._spawn_worker()
 
     # ------------------------------------------------------------ restart / cleanup
     def _recover(self) -> None:
+        """Незавершённые задачи после рестарта: дедлайн по-прежнему от приёма файла (300 с),
+        опоздавшие -> failed с причиной, остальные — в очередь с остатком бюджета."""
         now = time.time()
         for row in self.store.active():
             jid = row["id"]
+            elapsed = now - row["created_at"]
             if row["attempts"] >= self.s.max_attempts:
                 self.store.finalize(jid, "failed", error="crashed: server restarted during "
                                     f"processing {row['attempts']} times")
             elif not row.get("video_path") or not Path(row["video_path"]).is_file():
                 self.store.finalize(jid, "failed", error="video file missing after restart")
+            elif not self.s.restart_fresh_budget and \
+                    elapsed > self.s.watchdog_s - self.s.min_deadline_s:
+                self.store.finalize(jid, "failed", error=f"timeout: server restarted, deadline passed "
+                                    f"({elapsed:.0f}s since upload)")
             else:
-                self.store.requeue(jid, now)
-                self.submit(jid, now)
-                log.info("requeued after restart", extra={"job_id": jid})
+                base = now if self.s.restart_fresh_budget else row["created_at"]
+                self.store.requeue(jid, base)
+                self.submit(jid, base)
+                log.info("requeued after restart", extra={"job_id": jid,
+                                                           "elapsed_s": round(elapsed, 1)})
 
     def _cleanup_loop(self) -> None:
         while not self._stop.is_set():
