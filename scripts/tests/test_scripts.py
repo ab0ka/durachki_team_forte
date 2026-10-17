@@ -21,7 +21,7 @@ from ownership import agent_from_title, forbidden_reason, is_shared, owner_of  #
     ("backend/api/main.py", "A02"), ("backend/pipeline/run.py", "A03"), ("ml/detect/x.py", "A05"),
     ("ml/fusion/fuse.py", "A12"), ("norms/catalog.yaml", "A13"), ("frontend/src/App.tsx", "A15"),
     ("docs/arch.md", "A18"), ("pitch/deck.md", "A18"), ("./testkit/fixtures.py", "A01"),
-    ("random/file.py", None), ("ml/other/x.py", None),
+    ("random/file.py", None), ("ml/other/x.py", None), (".pre-commit-config.yaml", "A01"), ("any.toml", "A01"),
 ])
 def test_owner_of(path, owner):
     assert owner_of(path) == owner

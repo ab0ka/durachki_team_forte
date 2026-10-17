@@ -49,6 +49,8 @@ def owner_of(path: str) -> Optional[str]:
     path = path.replace("\\", "/")
     if path.startswith("./"):
         path = path[2:]
+    if "/" not in path:  # «Корень репо — только A01»: любой файл в корне
+        return "A01"
     best: tuple[int, Optional[str]] = (0, None)
     for agent, prefixes in OWNERS.items():
         for p in prefixes:
