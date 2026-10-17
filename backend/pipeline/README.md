@@ -4,6 +4,51 @@
 [partial.json] → vlm.verify → vlm.discover → fusion. Каждая стадия — ленивый импорт модуля из контракта;
 весь вызов моделей идёт **последовательно в одном процессе-воркере** (один владелец GPU).
 
+## Фаза 2: решения и флаги (кратко)
+
+| Что | Флаг | По умолчанию | Почему так |
+|---|---|---|---|
+| Полнота: `meta.coverage` = `compute_coverage` A01 (`ratio` ядра, `unknown_spans`, `gaps` с хвостом, `stages`, `required`, `complete`) + `by_stage` + гейт | `coverage.gate`, `coverage.min_required` | **вкл**, 0.98 (= порог A01) | требование: неполный анализ ≠ «нарушений нет»; сериализатор A01 без `meta.coverage` отдаёт `failed` |
+| `meta.provenance` / `duration_sec` / `completeness` (совместимость) | — | всегда | формат `contracts/extensions.py` |
+| Время только из PTS (запасной декодер, кадры-доказательства) | — | всегда | переменный fps: индекс×fps врёт |
+| Отмена `cancel(job_id)`, `release_gpu()` | — | API | отмена/рестарт останавливают воркер → модели выгружены |
+| Дедлайн для всех служебных RPC воркера | `reserve_s.respawn_s` | всегда | регрессия A01: 6-с ролик отвечал 110 с при дедлайне 40 с |
+| **H1** coarse→fine: обзор `overview_fps` → окна у кандидатов → плотные `fps` → уточнение начала | `refine.enabled` | **выкл** | гипотеза; включать только после замера L2 |
+| **H2** таймкод = начало нарушения | `timecode.policy` (`module`/`onset`/`onset_offset`) | `module` | «политика t_peak подбирается замером, не на глаз» |
+| Бюджеты стадий | `budgets_s` | плейсхолдеры | реальные — из `compare --emit-budgets` на L2 |
+
+Ядро покрытия = пересечение интервалов кадров ingest и состояний scene (и temporal, если она обязательна);
+кадр в t представляет [t, t + шаг), начало/хвост короче ~1.5 шага — артефакт сетки, не пропуск.
+Проверено в интеграции (`claude/integration-cloud`, реальные модули в mock-режиме): `run --mock` → `done/no_violation`,
+`ratio=1.0`, сериализатор A01 принимает; `compare --mock` проходит оба режима через процесс-воркер.
+
+Инварианты (покрыты тестами): кандидаты не отсеиваются по движению/риску (статичное нарушение при нулевом
+движении и нулевом риске доходит до VLM и отчёта); не подтверждённый окном кандидат не удаляется
+(`extra.refine="not_confirmed"`); неизвестное покрытие — `null`, не 0 и не 1; инференс не читает разметку;
+production никогда сам не переходит в mock (mock — только `--mock`/`SENTINEL_MOCK=1`, помечается `meta.mock`).
+
+### Замер для L2 (одна команда на гипотезу; GPU один — режимы идут последовательно)
+
+```bash
+# 0) профиль: холодный и тёплый прогон, время и VRAM по стадиям, очередь, токены VLM
+python -m backend.pipeline profile data/videos/X-1.mov --repeat 2 --json > reports/profile_X-1.json
+# 1) H1: baseline vs coarse→fine (+ бюджеты стадий из реального прогона)
+python -m backend.pipeline compare data/videos --labels data/labels.csv --modes baseline,refine \
+       --out reports/h1 --emit-budgets reports/h1/budgets.l2.yaml
+# 2) H2 (отдельно, одно изменение за раз): таймкод модуля vs начало нарушения
+python -m backend.pipeline compare data/videos --labels data/labels.csv --modes baseline,onset --out reports/h2
+```
+Выход: `reports/h*/compare.md` (таблица режимов), `compare.json`, `<режим>/preds/*.json`, `<режим>/rows.jsonl`.
+Метрики: TP/FP/TN/FN и `failed` отдельно (failed на нарушении = пропуск), |Δ| таймкода `t_peak` и onset,
+hit@1/2/5 с (при конфликте дубликатов — ближайшая из `t_all`), распределение типов (GT-типов нет),
+время p50/p90/max и по стадиям, VRAM-пик по стадиям, неполные анализы и минимум покрытия.
+Кэш в `compare` выключен (честное время). Это разведочная оценка на тех же 42 строках — не независимый тест.
+
+**Правило включения режима:** FN + failed_on_violation не растёт, FP не растёт, hit@2 с не хуже, p90
+укладывается в SLA (≤ 60 с на 145-с видео, 5 видео ≤ 300 с), VRAM-пик ≤ свободных ~5.3 ГБ. Иначе режим
+остаётся выключенным. **Откат** — профиль `baseline` / флаг в `config.yaml` (`refine.enabled: false`,
+`timecode.policy: module`); бюджеты — убрать `SENTINEL_PIPELINE_CONFIG`.
+
 ## Публичные функции
 
 ```python
@@ -70,9 +115,11 @@ warmup()                                                              # при �
 ## partial.json
 
 `data/jobs/<job_id>/partial.json` (`SENTINEL_DATA_DIR`) пишется после ядра (rules+temporal), после
-VLM-проверки и перед каждой поздней стадией, если до дедлайна < `partial.margin_s`. Формат — API-схема
-(`contracts.serialize.result_to_api`, если есть), но **`status: "processing"`, `meta.partial=true`,
-`meta.complete=false`, `verdict` только `"violation"` или `null` — никогда `no_violation`**.
+VLM-проверки и перед каждой поздней стадией, если до дедлайна < `partial.margin_s`. Формат — сериализатор
+A01 (`contracts.serialize.result_to_api`), но **`status: "processing"`, `verdict: null` всегда**,
+`meta.partial=true`, `meta.completeness.complete=false`; найденное к этому моменту — в
+`partial_verdict` (`"violation"`/`null`) и `partial_violations`. Промежуточный результат не выдаётся ни за
+`done`, ни за `no_violation` (A02 показывает его только как подробности `failed`).
 
 ## Кэш
 
@@ -128,7 +175,7 @@ poisoned), `vram_events`, `required_stages`, `partial_written`. Мета из `m
 
 ## Тесты
 
-`python -m pytest backend/pipeline/tests -q` — 39 тестов, без GPU и без весов (~10 с): фейковые модули
+`python -m pytest backend/pipeline/tests -q` — 66 тестов, без GPU и без весов (~25 с): фейковые модули
 через `sys.modules` (inline) и файлами на диске (реальный процесс-воркер), синтетическое видео через
 `cv2.VideoWriter`. Покрыто: обязательные/дополнительные стадии и вердикты, отсутствие модуля, нарушение
 контракта модулем, таймаут (inline и kill воркера с перезапуском), краш воркера, дедлайн и
@@ -152,7 +199,9 @@ fold, fps, каталогу; `from_cache`), CLI run/batch/profile, нормал�
 
 ## Для интегратора
 
-* **A02 (API):** вызывать `run(path, job_id, progress, deadline_s, deadline_at=t_upload + SLA)` из
+* **A02 (API):** отмена задачи — `backend.pipeline.cancel(job_id)` (воркер останавливается, модели выгружены, результат
+  `failed` + `meta.cancelled`); между задачами при нехватке VRAM — `backend.pipeline.release_gpu()`.
+  Вызывать `run(path, job_id, progress, deadline_s, deadline_at=t_upload + SLA)` из
   ОДНОГО фонового потока очереди (воркер всё равно один). `warmup()` — в startup. Watchdog: если
   задача не завершилась к дедлайну — читать `data/jobs/<id>/partial.json`: при `verdict == "violation"`
   можно отдать как `done` с `meta.partial=true`; при `verdict == null` — `failed` (таймаут), **не**

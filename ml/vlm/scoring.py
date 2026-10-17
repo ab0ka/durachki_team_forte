@@ -63,3 +63,25 @@ def update_confidence(p_prior: float, visible: bool, conf: float, candidate_type
     p = min(p, p0 + max_raise)
     agr = agreement(pv, thr)
     return p, {"p_prior": round(p0, 4), "p_vlm": round(pv, 4), "p_post": round(p, 4), "agreement": agr}
+
+
+# Мнение VLM в конвенции ml.fusion (A12): extra.vlm = {"verdict": confirm|reject|unsure, "score": 0..1}.
+_AGREEMENT_TO_VERDICT = {"supports": "confirm", "contradicts": "reject", "uncertain": "unsure",
+                         "type_mismatch": "unsure"}
+
+
+def fusion_opinion(agreement: str, pv: Optional[float]) -> dict[str, Any]:
+    """{"verdict", "score"} для fusion; для not_checked — {} (fusion не видит мнения и ничего не меняет).
+
+    score — уверенность VLM в СВОЁМ вердикте: confirm -> p_vlm, reject -> 1 - p_vlm, unsure -> 0.5.
+    """
+    verdict = _AGREEMENT_TO_VERDICT.get(agreement)
+    if verdict is None:
+        return {}
+    if verdict == "confirm" and pv is not None:
+        score = pv
+    elif verdict == "reject" and pv is not None:
+        score = 1.0 - pv
+    else:
+        score = 0.5
+    return {"verdict": verdict, "score": round(float(score), 4)}

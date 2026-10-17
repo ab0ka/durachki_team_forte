@@ -18,7 +18,7 @@ from typing import Optional, Sequence
 from .config import load_config, reports_dir, weights_dir
 from .dataset import Sample, fit_spec, prepare_samples
 from .features import TextBank
-from .predictors import fit_predictor, has_type_labels, save_checkpoint
+from .predictors import fit_predictor, has_type_labels, save_checkpoint, type_head_source
 
 log = logging.getLogger("sentinel.temporal")
 
@@ -26,22 +26,30 @@ log = logging.getLogger("sentinel.temporal")
 def train_all(samples: Sequence[Sample], bank: TextBank, cfg: dict, kinds: Sequence[str], out_dir: Path,
               select: str = "auto", threshold: str = "auto", cv_report: Optional[dict] = None,
               epochs: Optional[int] = None) -> dict:
+    from .cv import calibrate
+
     t0 = time.monotonic()
     deadline = t0 + 60.0 * float(cfg["train"].get("max_minutes", 8.0))
-    spec = fit_spec([fs for s in samples for fs in s.versions], bank, cfg)
-    prepare_samples(list(samples), bank, spec)
+    seed = int(cfg["train"]["seed"])
     info: dict = {"kinds": {}, "n_samples": len(samples), "n_pos": sum(s.label for s in samples),
                   "type_labels": has_type_labels(samples)}
+    inf = cfg["infer"]
+    pooling = {k: inf.get(k) for k in ("pooling", "pool_k", "null_tau_s", "risk_step_s", "smooth_s")}
     for kind in kinds:
-        model = fit_predictor(kind, samples, spec, cfg, seed=int(cfg["train"]["seed"]), epochs=epochs,
-                              deadline=deadline)
-        thr, src = float(cfg["infer"]["event_threshold"]), "config.infer.event_threshold"
+        # калибровка (null-CDF чистых роликов + порог) — внутренним grouped CV по обучающим данным;
+        # затем финальная модель на всех данных (calibrate перезаписывает s.X, поэтому spec — после неё)
+        cal = calibrate(kind, samples, bank, cfg, seed=seed, epochs=epochs)
+        spec = fit_spec([fs for s in samples for fs in s.versions], bank, cfg)
+        prepare_samples(list(samples), bank, spec)
+        model = fit_predictor(kind, samples, spec, cfg, seed=seed, epochs=epochs, deadline=deadline)
+        thr, src = cal["threshold"], f"inner grouped CV ({cal['n_inner']} фолдов) по обучающим данным, OOF"
         if threshold not in ("auto", "", None):
             thr, src = float(threshold), "cli"
-        elif cv_report and kind in cv_report:
-            thr, src = float(cv_report[kind]["deploy_threshold"]), "cv_report.deploy_threshold (по всем OOF)"
         meta = {"threshold": thr, "threshold_source": src, "n_train": len(samples),
                 "train_groups": sorted(s.group for s in samples),
+                "pooling": pooling, "null": cal["null"],
+                "type_head_source": type_head_source(samples, cfg) if model.type_trained else None,
+                "calibration": {k: cal[k] for k in ("n_inner", "n_null_blocks", "oof_auc")},
                 "prompts": {"en": bank.texts_en, "ru": bank.texts_ru, "owner": bank.owner},
                 "cv": ({k: cv_report[kind][k] for k in ("threshold_free", "nested", "protocol", "outer", "inner")}
                        if cv_report and kind in cv_report else None)}

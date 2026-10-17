@@ -25,7 +25,7 @@ from fastapi.security import APIKeyHeader
 from .config import API_DIR, Settings, parse_rate
 from .logging_utils import RequestContextMiddleware, setup_logging
 from .media import range_response
-from .results import iter_frames
+from .results import iter_frames, jury_view, status_view
 from .security import (ApiKeyAuth, RateLimiter, UiTokenSigner, check_secret, client_ip,
                        cross_site, fingerprint, ip_in, load_api_keys, load_ui_secret)
 from .store import JobStore
@@ -37,7 +37,7 @@ try:
 except ImportError:  # пока ветка A01 не смерджена
     from contracts.sentinel_contracts import AnalysisResult  # noqa: F401
 
-API_VERSION = "1.0.0"
+API_VERSION = "2.0.0"
 SESSION_COOKIE = "ks_session"
 _JOB_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 log = logging.getLogger("sentinel.api")
@@ -61,6 +61,7 @@ class Ctx:
     cache: "OrderedDict[str, bytes]" = field(default_factory=OrderedDict)
     copilot: Any = None
     copilot_checked: bool = False
+    dedup_lock: Any = None  # asyncio.Lock: поиск дубликата + создание задачи атомарны
 
 
 def _ctx(request: Request) -> Ctx:
@@ -145,45 +146,69 @@ def _job_row(ctx: Ctx, job_id: str) -> dict[str, Any]:
     return row
 
 
-def _result_bytes(ctx: Ctx, row: dict[str, Any]) -> bytes:
-    key = f"{row['id']}:{row['result_path']}"
+def _result_bytes(ctx: Ctx, row: dict[str, Any], view: str = "raw") -> bytes:
+    """Сериализованный ответ из result.json (кэш LRU по задаче и представлению)."""
+    key = f"{row['id']}:{row['result_path']}:{view}"
     data = ctx.cache.get(key)
     if data is None:
-        data = Path(row["result_path"]).read_bytes()
+        raw = Path(row["result_path"]).read_bytes()
+        if view == "raw":
+            data = raw
+        else:
+            obj = json.loads(raw)
+            data = json.dumps(jury_view(obj, view), ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8")
         ctx.cache[key] = data
-        while len(ctx.cache) > 32:
+        while len(ctx.cache) > 64:
             ctx.cache.popitem(last=False)
     else:
         ctx.cache.move_to_end(key)
     return data
 
 
-def _job_payload(ctx: Ctx, row: dict[str, Any], ui: bool) -> Response:
+def _profile(ctx: Ctx, request: Request, ui: bool) -> str:
+    if ui:
+        return "ui"
+    q = request.query_params.get("profile", "")
+    return q if q in ("extended", "strict") else ctx.s.jury_profile
+
+
+def _job_payload(ctx: Ctx, row: dict[str, Any], profile: str) -> Response:
+    """profile: extended|strict — для жюри (/api/v1), ui — полный отчёт (/ui/v1)."""
     jid, st = row["id"], row["status"]
+    jprof = "extended" if profile == "ui" else profile
     if st in ("queued", "running"):
         live = ctx.manager.live(jid) or {}
-        body = {"job_id": jid, "status": "processing",
-                "stage": live.get("stage") or row.get("stage") or "queued",
-                "progress": round(float(live.get("progress", row.get("progress") or 0.0)), 3),
-                "queue_position": ctx.manager.queue_position(jid),
-                "elapsed_s": round(time.time() - row["created_at"], 1)}
+        body = status_view(jid, "processing", jprof,
+                           stage=live.get("stage") or row.get("stage") or "queued",
+                           progress=round(float(live.get("progress", row.get("progress") or 0.0)), 3),
+                           queue_position=ctx.manager.queue_position(jid),
+                           elapsed_s=round(time.time() - row["created_at"], 1))
         return JSONResponse(body, headers={"Cache-Control": "no-store", "Retry-After": "2"})
     if st == "done" and row.get("result_path"):
         try:
-            return Response(_result_bytes(ctx, row), media_type="application/json",
-                            headers={"Cache-Control": "no-store"})
-        except OSError:
+            data = _result_bytes(ctx, row, "raw" if profile == "ui" else jprof)
+            return Response(data, media_type="application/json", headers={"Cache-Control": "no-store"})
+        except (OSError, ValueError):
             log.error("result file missing", extra={"job_id": jid})
-            return JSONResponse({"job_id": jid, "status": "failed", "verdict": None,
-                                 "violations": [], "error": "result file missing"})
-    body: dict[str, Any] = {"job_id": jid, "status": "failed", "verdict": None, "violations": [],
-                            "error": row.get("error") or "analysis failed"}
-    if ui and row.get("result_path"):  # неполный анализ: только подробности для UI
+            return JSONResponse(status_view(jid, "failed", jprof, error="result file missing"))
+    body = status_view(jid, "failed", jprof, error=row.get("error") or "analysis failed")
+    if profile == "ui" and row.get("result_path"):  # неполный/отвергнутый анализ — только для UI
         try:
-            body["partial"] = json.loads(Path(row["result_path"]).read_text(encoding="utf-8"))
+            details = json.loads(Path(row["result_path"]).read_text(encoding="utf-8"))
+            body["partial"] = _strip_frames(details)
         except (OSError, ValueError):
             pass
     return JSONResponse(body, headers={"Cache-Control": "no-store"})
+
+
+def _strip_frames(d: Any) -> Any:
+    """Подробности для UI без base64-кадров: ответ остаётся маленьким (лимит 3 МБ)."""
+    if isinstance(d, dict):
+        return {k: ("<jpeg omitted>" if k == "image_base64" else _strip_frames(v)) for k, v in d.items()}
+    if isinstance(d, list):
+        return [_strip_frames(v) for v in d]
+    return d
 
 
 async def _analyze(request: Request, principal: str) -> Response:
@@ -222,10 +247,21 @@ async def _analyze(request: Request, principal: str) -> Response:
         raise
     vmeta.update(filename_normalized=normalize_filename(up.filename), size_bytes=up.size,
                  upload_s=round(time.time() - t_req, 2))
-    row = ctx.store.create(job_id, video_path=str(up.path), filename=up.filename,
-                           size_bytes=up.size, sha256=up.sha256, client=principal,
-                           video_meta=vmeta, now=t_req)  # бюджет считаем с начала запроса
-    ctx.manager.submit(job_id, queued_at=row.get("queued_at", t_req))
+    force = request.query_params.get("force", "").lower() in ("1", "true", "yes")
+    await anyio.to_thread.run_sync(ctx.manager._resolved.wait, 5.0)
+    dkey = f"{up.sha256}:{ctx.manager.pipeline_tag()}"
+    async with ctx.dedup_lock:
+        if s.dedup and not force:
+            prev = ctx.store.find_by_dedup(dkey)
+            if prev is not None:  # тот же файл и та же версия пайплайна -> тот же результат
+                shutil.rmtree(jd, ignore_errors=True)
+                log.info("duplicate upload -> existing job", extra={"job_id": prev["id"]})
+                st = "processing" if prev["status"] in ("queued", "running") else prev["status"]
+                return JSONResponse({"job_id": prev["id"], "status": st, "deduplicated": True})
+        row = ctx.store.create(job_id, video_path=str(up.path), filename=up.filename,
+                               size_bytes=up.size, sha256=up.sha256, client=principal,
+                               video_meta=vmeta, dedup_key=dkey, now=t_req)  # бюджет — от приёма
+        ctx.manager.submit(job_id, queued_at=row.get("queued_at", t_req))
     log.info("job queued", extra={"job_id": job_id, "size": up.size, "principal": principal,
                                    "duration": vmeta.get("duration")})
     return JSONResponse({"job_id": job_id, "status": "processing"})
@@ -287,7 +323,7 @@ def build_jobs_router(auth: Callable[[str], Callable[..., Any]], ui: bool) -> AP
     @r.get("/jobs/{job_id}", tags=tag, summary="Статус/результат задачи (схема ТЗ)")
     async def get_job(job_id: str, request: Request, _: str = Depends(auth("read"))) -> Response:
         ctx = _ctx(request)
-        return _job_payload(ctx, _job_row(ctx, job_id), ui)
+        return _job_payload(ctx, _job_row(ctx, job_id), _profile(ctx, request, ui))
 
     @r.api_route("/jobs/{job_id}/video", methods=["GET", "HEAD"], tags=tag,
                  summary="Исходное видео с поддержкой HTTP Range")
@@ -429,8 +465,10 @@ def create_app(settings: Optional[Settings] = None,
             log.warning(note)
         store = JobStore(s.db_path)
         manager = JobManager(s, store, pipeline)
+        import asyncio
         ctx = Ctx(s=s, store=store, manager=manager, keys=ApiKeyAuth(keys),
-                  signer=UiTokenSigner(load_ui_secret(s.ui_secret, s.data_dir), s.ui_token_ttl_s))
+                  signer=UiTokenSigner(load_ui_secret(s.ui_secret, s.data_dir), s.ui_token_ttl_s),
+                  dedup_lock=asyncio.Lock())
         app.state.ctx = ctx
         manager.start()
         log.info("api started", extra={"workers": s.workers, "gpu_slots": s.gpu_slots,
@@ -530,9 +568,16 @@ def create_app(settings: Optional[Settings] = None,
         m = ctx.manager
         body = {"ready": m.ready, "state": m.state,
                 "pipeline": m.pipeline.mode if m.pipeline else "loading",
-                "queue": m.stats(), "version": API_VERSION}
+                "pipeline_version": (m.pipeline.version or None) if m.pipeline else None,
+                "queue": m.stats(), "version": API_VERSION,
+                "jury_profile": s.jury_profile, "partial_accept": s.partial_accept}
         if m.state_detail:
             body["detail"] = m.state_detail
+        hung = m.gpu_hung()
+        if hung is not None:
+            body["state"] = "gpu_hung"
+            body["detail"] = (f"pipeline.run has held the GPU {hung:.0f}s after its job timed out; "
+                              "restart the service")
         return JSONResponse(body, status_code=200 if m.ready else 503)
 
     # ---------------- фронт: frontend/dist со SPA-fallback, иначе встроенная страница

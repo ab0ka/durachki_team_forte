@@ -39,7 +39,15 @@ VARIANTS: dict[str, str] = {
     "blur": "gblur=sigma=2.5",
     "h264_crf32": "null",
     "fps25": "fps=25",
+    # «другой угол» может оказаться горизонтальным: пиксельный поворот на 90° и letterbox 16:9
+    "landscape_rot90": "transpose=1",
+    "landscape_pad": "pad=trunc(ih*16/9/2)*2:ih:(ow-iw)/2:0:black",
+    # поворот только в метаданных (displaymatrix), пиксели не трогаем — проверка учёта rotation
+    "rotmeta90": "@display_rotation=90",
+    # переменный fps: выбрасываем кадры неравномерно, PTS сохраняются → время ДОЛЖНО совпасть с оригиналом
+    "vfr_drop": "@vfr",
 }
+SIZE_CHANGING = {"landscape_rot90", "landscape_pad", "rotmeta90"}
 
 
 def make_variant(src: str | Path, dst: str | Path, name: str, crf: int = 20) -> Path:
@@ -63,11 +71,22 @@ def make_variant(src: str | Path, dst: str | Path, name: str, crf: int = 20) -> 
         raise RuntimeError("нет ffmpeg")
     info = ffprobe_info(src)
     w, h = int(info.get("width") or 0) or 464, int(info.get("height") or 0) or 848
-    vf = VARIANTS[name].format(W=w, H=h)
+    spec = VARIANTS[name]
     q = 32 if name == "h264_crf32" else crf
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-an", "-vf", f"{vf},format=yuv420p",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", str(q), str(dst)]
+    enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(q)]
+    if spec == "@display_rotation=90":   # только метаданные: копия потока + displaymatrix
+        cmd = ["ffmpeg", "-y", "-v", "error", "-display_rotation:v:0", "90", "-i", str(src), "-an", "-c", "copy", str(dst)]
+    elif spec == "@vfr":
+        sel = "select='lt(mod(n\\,3)\\,1)+between(t\\,1\\,2)'"   # 1/3 кадров, кроме 1–2 с — все
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-an", "-vf", f"{sel},format=yuv420p",
+               "-fps_mode", "vfr"] + enc + [str(dst)]
+    else:
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-an", "-vf", f"{spec.format(W=w, H=h)},format=yuv420p"] \
+            + enc + [str(dst)]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+    if r.returncode != 0 and spec == "@display_rotation=90":  # старый ffmpeg: устаревший тег rotate
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-an", "-c", "copy", "-metadata:s:v:0", "rotate=90", str(dst)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
     if r.returncode != 0 or not dst.exists():
         raise RuntimeError(f"ffmpeg {name}: {r.stderr[-400:]}")
     return dst
@@ -122,7 +141,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     from .run import run_folder, select_videos
 
     ap = argparse.ArgumentParser(description="Устойчивость к синтетическим возмущениям ракурса/качества")
-    ap.add_argument("--videos", default="data/videos")
+    ap.add_argument("--videos", default="data/raw", help="папка видео (L1: data/raw)")
     ap.add_argument("--labels", default="data/labels.csv")
     ap.add_argument("--out", default="runs/robustness")
     ap.add_argument("--variants", default=None, help="через запятую; по умолчанию config robustness.default_set")

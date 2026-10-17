@@ -65,10 +65,12 @@ def test_noisy_states_stay_in_range():
 @pytest.mark.parametrize("scenario", scenario_names())
 def test_analysis_result_is_jury_valid(scenario):
     r = make_analysis_result(scenario, duration=10, with_images=scenario in ("V01", "clean"))
-    body = result_to_jury_api(r)
+    body = result_to_jury_api(r, allow_mock=True)
     assert jury_response_errors(body, duration=10) == []
     assert body["verdict"] == ("violation" if scenario.startswith("V") else "no_violation")
-    assert result_to_ui_report(r)["analysis_complete"] is True
+    assert result_to_ui_report(r, allow_mock=True)["analysis_complete"] is True
+    # без явного mock-режима результат фикстуры не выдаётся за настоящий
+    assert result_to_jury_api(r, allow_mock=False)["status"] == "failed"
 
 
 def test_stub_catalog_has_no_norms():

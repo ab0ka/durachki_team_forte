@@ -10,8 +10,8 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from ._contract import PoseFrameX, Track
-from .backends import get_backend
-from .config import is_mock_mode, load_config
+from .backends import WeightsNotFound, get_backend
+from .config import deep_merge, enabled_mode, is_mock_mode, load_config
 from .filters import smooth_keypoint_track
 from .status import set_status
 
@@ -44,10 +44,35 @@ class BoxLookup:
         return None
 
 
-def _select(lookups: dict[int, BoxLookup], tracks: dict[int, Track], t: float, sel: dict[str, Any]) -> list[tuple[int, np.ndarray]]:
+_BACKEND_CFG_KEY = {"mediapipe": "mediapipe", "rtmpose-onnx": "rtmpose", "mock": "mock"}
+
+
+def backend_selection(cfg: dict[str, Any], backend_name: str) -> dict[str, Any]:
+    """selection.* ⊕ backend.<имя>.selection (например, MediaPipe — только кассир, 1 кроп на кадр)."""
+    base = cfg.get("selection", {}) or {}
+    key = _BACKEND_CFG_KEY.get(backend_name, backend_name)
+    over = ((cfg.get("backend", {}) or {}).get(key, {}) or {}).get("selection", {}) or {}
+    return deep_merge(base, over) if over else dict(base)
+
+
+def allowed_tracks(tracks: dict[int, Track], sel: dict[str, Any]) -> Optional[set[int]]:
+    """Фильтр по ролям (selection.roles); None — без фильтра. roles_fallback=top1: ролей нет ни у кого → все."""
+    roles = sel.get("roles")
+    if not roles:
+        return None
+    ids = {tid for tid, tr in tracks.items() if tr.role in set(roles)}
+    if not ids and str(sel.get("roles_fallback", "top1")) == "top1":
+        return None
+    return ids
+
+
+def _select(lookups: dict[int, BoxLookup], tracks: dict[int, Track], t: float, sel: dict[str, Any],
+            allowed: Optional[set[int]] = None) -> list[tuple[int, np.ndarray]]:
     pri_map = sel.get("role_priority", {}) or {}
     cands = []
     for tid, lk in lookups.items():
+        if allowed is not None and tid not in allowed:
+            continue
         b = lk.at(t)
         if b is None:
             continue
@@ -68,15 +93,27 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
     t_start = time.perf_counter()
     persons = {int(t.track_id): t for t in tracks or [] if t.label == "person" and t.boxes}
     times = [float(t) for t in (getattr(clip, "times", None) or [])]
-    if not persons or not times:
-        set_status(state="no_persons", n_crops=0, elapsed_s=0.0)
+    mode = enabled_mode(cfg)
+    if mode == "false":
+        set_status(state="disabled", stage_status="skipped", reason="ml/pose отключена (enabled: false)",
+                   coverage=_coverage(times, {}, 0, 1, persons))
         return []
-    backend, errors = get_backend(cfg, mock=is_mock_mode())
+    if not persons or not times:
+        set_status(state="no_persons", stage_status="ok", n_crops=0, elapsed_s=0.0,
+                   coverage=_coverage(times, {}, 0, 1, persons))
+        return []
+    exc_list: list[BaseException] = []
+    backend, errors = get_backend(cfg, mock=is_mock_mode(), errors_out=exc_list)
     if backend is None:
+        only_missing = bool(exc_list) and all(isinstance(e, WeightsNotFound) for e in exc_list)
         msg = "pose backend unavailable: " + "; ".join(errors)
         log.warning("%s — позы пропущены, сигналы позы будут unknown", msg)
-        set_status(state="failed", error=msg, warnings=[msg], n_crops=0, elapsed_s=time.perf_counter() - t_start)
+        stage = "skipped" if (mode == "auto" and only_missing) else "failed"
+        set_status(state="failed", stage_status=stage, error=msg, warnings=[msg], n_crops=0,
+                   elapsed_s=time.perf_counter() - t_start, coverage=_coverage(times, {}, 0, 1, persons))
         return []
+    sel = backend_selection(cfg, backend.name)
+    allowed = allowed_tracks(persons, sel)
     tol = float(sel.get("box_time_tolerance_s", 0.25))
     lookups = {tid: BoxLookup(tr, tol, float(sel.get("max_interp_gap_s", 1.0))) for tid, tr in persons.items()}
     budget = float(sel.get("budget_s", 10.0))
@@ -123,7 +160,7 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
     i = 0
     while i < len(times):
         t = times[i]
-        chosen = _select(lookups, persons, t, sel)
+        chosen = _select(lookups, persons, t, sel, allowed)
         if chosen:
             if n_crops + len(chosen) > max_total:
                 warnings.append(f"max_crops_total={max_total} достигнут на t={t:.2f}s")
@@ -173,20 +210,52 @@ def estimate_impl(clip: Any, tracks: Sequence[Track], cfg: Optional[dict[str, An
             poses.append(PoseFrameX(t=float(t), track_id=tid,
                                     keypoints=[(float(x), float(y), float(s)) for x, y, s in kps[j]], extra=extra))
     poses.sort(key=lambda p: (p.t, p.track_id if p.track_id is not None else -1))
-    if stride > 1 and state == "ok":
+    capped = any("max_crops_total" in w for w in warnings)
+    if (stride > 1 or capped) and state == "ok":
         state = "partial"
-    set_status(state=state, backend=backend.name, error=error, warnings=warnings + errors, n_crops=n_crops,
-               n_frames=n_frames, stride=stride, elapsed_s=round(time.perf_counter() - t_start, 3),
-               providers=list(getattr(backend, "providers", []) or []))
+    stage = {"ok": "ok", "partial": "ok", "mock": "mock"}.get(state, "failed")
+    set_status(state=state, stage_status=stage, backend=backend.name, error=error, warnings=warnings + errors,
+               n_crops=n_crops, n_frames=n_frames, stride=stride, elapsed_s=round(time.perf_counter() - t_start, 3),
+               providers=list(getattr(backend, "providers", []) or []),
+               coverage=_coverage(times, results, n_frames, stride, persons, capped=capped,
+                                  stopped_early=error is not None))
     return poses
+
+
+def _coverage(times: Sequence[float], results: dict[int, list], n_frames: int, stride: int,
+              persons: dict[int, Track], capped: bool = False, stopped_early: bool = False) -> dict[str, Any]:
+    """Полнота стадии позы — для meta.completeness у A03 (частичный анализ ≠ «нарушений нет»)."""
+    cashier_ids = [tid for tid, tr in persons.items() if tr.role == "cashier"]
+    cashier_frames = len({round(x[0], 3) for tid in cashier_ids for x in results.get(tid, [])})
+    posed_frames = len({round(x[0], 3) for items in results.values() for x in items})
+    analyzed_until = max((x[0] for items in results.values() for x in items), default=None)
+    return {
+        "frames_total": len(times),
+        "frames_with_persons_processed": int(n_frames),
+        "frames_posed": posed_frames,
+        "stride": int(stride),
+        "persons_tracked": len(persons),
+        "persons_posed": len(results),
+        "cashier_frames_posed": cashier_frames,
+        "crops_capped": bool(capped),
+        "stopped_early": bool(stopped_early),
+        "analyzed_until_sec": None if analyzed_until is None else round(float(analyzed_until), 3),
+    }
 
 
 def warmup_impl(cfg: Optional[dict[str, Any]] = None) -> bool:
     """Загрузить бэкенд и прогнать пустой кроп (держим модель тёплой). False — бэкенд недоступен."""
     cfg = cfg or load_config()
-    backend, errors = get_backend(cfg, mock=is_mock_mode())
+    mode = enabled_mode(cfg)
+    if mode == "false":
+        set_status(state="disabled", stage_status="skipped", reason="ml/pose отключена (enabled: false)")
+        return False
+    exc_list: list[BaseException] = []
+    backend, errors = get_backend(cfg, mock=is_mock_mode(), errors_out=exc_list)
     if backend is None:
-        set_status(state="failed", error="; ".join(errors), warnings=errors)
+        only_missing = bool(exc_list) and all(isinstance(e, WeightsNotFound) for e in exc_list)
+        set_status(state="failed", stage_status="skipped" if (mode == "auto" and only_missing) else "failed",
+                   error="; ".join(errors), warnings=errors)
         return False
     try:
         backend.infer([(np.zeros((256, 192, 3), dtype=np.uint8), np.array([0, 0, 192, 256], dtype=np.float32))],

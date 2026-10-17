@@ -67,22 +67,29 @@ class InprocRunner:
                 print(f"warmup: {e}", file=sys.stderr)
 
     def run_one(self, path: Path, video_id: str) -> tuple[dict, dict]:
+        from .protocol import VramSampler, torch_peak_mb
+
         job_id = f"eval-{video_id}-{uuid.uuid4().hex[:6]}"
-        t0 = time.perf_counter()
         info: dict[str, Any] = {"video_id": video_id, "file": str(path), "mode": "inproc"}
+        torch_peak_mb(reset=True)
+        sampler = VramSampler()
+        t0 = time.perf_counter()
         try:
-            res = self.pipeline.run(str(path), job_id, lambda stage, p: None,
-                                    deadline_s=float((self.cfg.get("runner") or {}).get("deadline_s", 240)))
+            with sampler:
+                res = self.pipeline.run(str(path), job_id, lambda stage, p: None,
+                                        deadline_s=float((self.cfg.get("runner") or {}).get("deadline_s", 240)))
             api = result_to_api(res)
             meta = _full_meta(res)
             if meta and isinstance(api, dict):
                 api.setdefault("meta", {})
                 for k, v in meta.items():
                     api["meta"].setdefault(k, v)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 — явная ошибка, не «нарушений нет»
             api = {"job_id": job_id, "status": "failed", "verdict": None, "violations": [], "error": repr(e)[:500]}
             info["error"] = repr(e)[:500]
         info["latency_s"] = round(time.perf_counter() - t0, 3)
+        info["vram_peak_mb"] = sampler.peak_mb            # вся карта (nvidia-smi); None без nvidia-smi
+        info["vram_torch_peak_mb"] = torch_peak_mb()       # только этот процесс (torch уже импортирован пайплайном)
         return api, info
 
 
@@ -111,6 +118,10 @@ class ApiRunner:
         t_acc = time.perf_counter()
         info["upload_s"] = round(t_acc - t_up, 3)
         api: dict = {}
+        from .protocol import VramSampler
+
+        sampler = VramSampler()       # имеет смысл, если сервис на этой же машине (L2)
+        sampler.__enter__()
         while time.perf_counter() - t_acc < self.timeout_s:
             try:
                 g = self.s.get(f"{self.url}/api/v1/jobs/{job_id}", headers={"X-API-Key": self.key}, params=params,
@@ -125,6 +136,8 @@ class ApiRunner:
             info["timeout"] = True
             info["error"] = f"timeout {self.timeout_s:.0f} s (status={api.get('status')})"
         info["latency_s"] = round(time.perf_counter() - t_acc, 3)  # от приёма, включая очередь
+        sampler.__exit__()
+        info["vram_peak_mb"] = sampler.peak_mb
         return api, info
 
 
@@ -143,7 +156,7 @@ def run_cli_batch(videos: list[tuple[str, Path]], out_dir: Path, cfg: dict, raw:
         cmd = [str(c).format(python=sys.executable, videos=str(tmp_in), out=str(tmp_out)) for c in rcfg.get("cli_cmd", [])]
         if raw and rcfg.get("cli_raw_flag"):
             cmd.append(rcfg["cli_raw_flag"])
-        env = dict(os.environ)
+        env = dict(os.environ)  # SENTINEL_* и конфиг пайплайна уже выставлены в os.environ (apply_env)
         if raw:
             env.update({k: str(v) for k, v in (rcfg.get("raw_env") or {}).items()})
         t0 = time.perf_counter()
@@ -188,6 +201,21 @@ def select_videos(videos_dir: str | Path, labels_csv: Optional[str | Path], cfg:
             continue
         out.append((vid, p))
     return out[:limit] if limit else out
+
+
+def apply_env(cfg: dict, pipeline_config: Optional[str] = None, env_pairs: Optional[list[str]] = None) -> dict:
+    """--pipeline-config и --env K=V → os.environ ДО импорта пайплайна. Возвращает применённые пары."""
+    applied: dict[str, str] = {}
+    if pipeline_config:
+        name = str((cfg.get("runner") or {}).get("pipeline_config_env") or "SENTINEL_PIPELINE_CONFIG")
+        applied[name] = str(Path(pipeline_config).resolve())
+    for pair in env_pairs or []:
+        k, sep, v = pair.partition("=")
+        if not sep or not k.strip():
+            raise ValueError(f"--env ждёт K=V, получено {pair!r}")
+        applied[k.strip()] = v
+    os.environ.update(applied)
+    return applied
 
 
 def _extract_raw(api: dict) -> Any:
@@ -260,7 +288,7 @@ def write_scores_raw(out_dir: Path, labels_csv: Optional[str | Path]) -> Optiona
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Прогон папки через пайплайн + метрики")
-    ap.add_argument("--videos", default="data/videos")
+    ap.add_argument("--videos", default="data/raw", help="папка видео (L1: data/raw)")
     ap.add_argument("--labels", default="data/labels.csv")
     ap.add_argument("--types", default="data/labels_types.csv")
     ap.add_argument("--out", default=None, help="по умолчанию runs/eval/<дата-время>")
@@ -279,8 +307,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--config", default=None)
     ap.add_argument("--robustness", default=None)
     ap.add_argument("--jury-sim", default=None)
+    ap.add_argument("--pipeline-config", default=None, help="конфиг пайплайна → env runner.pipeline_config_env")
+    ap.add_argument("--env", action="append", default=[], help="K=V флаг пайплайна (повторяемый)")
+    ap.add_argument("--label", default=None, help="гипотеза/название прогона для журнала")
+    ap.add_argument("--role", default="single", help="baseline | candidate | single")
+    ap.add_argument("--log", default="reports/runs.jsonl", help="журнал итераций (агрегаты)")
+    ap.add_argument("--no-log", action="store_true")
+    ap.add_argument("--kind", default=None, help="exploratory | holdout_frozen (по умолчанию из config)")
+    ap.add_argument("--ablation-id", default=None)
     args = ap.parse_args(argv)
-    cfg = load_config(args.config)
+    if args.kind == "holdout_frozen":  # только замороженный hold-out (eval.extra freeze), открытый с --final
+        man_p = Path(args.splits).with_name(Path(args.splits).stem + "_manifest.json")
+        frozen = man_p.exists() and bool(read_json(man_p).get("frozen"))
+        if not (frozen and args.subset == "holdout" and args.final):
+            print("ВНИМАНИЕ: --kind holdout_frozen допустим только для --subset holdout --final по split'у из "
+                  "eval.extra freeze; помечаю как exploratory.")
+            args.kind = "exploratory"
+    cfg = load_config(args.config, {"dataset": {"evaluation_kind": args.kind}} if args.kind else None)
+    env_applied = apply_env(cfg, args.pipeline_config, args.env)
+    if args.raw:  # до протокола: обе руки абляции фиксируют одинаковое окружение
+        raw_env = {k: str(v) for k, v in ((cfg.get("runner") or {}).get("raw_env") or {}).items()}
+        os.environ.update(raw_env)
+        env_applied.update(raw_env)
     mode = "api" if args.api else args.mode
     out_dir = Path(args.out or f"runs/eval/{_dt.datetime.now():%Y%m%d-%H%M%S}")
     subset_ids = None
@@ -309,6 +357,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("нет видео для прогона")
             return 1
         print(f"{len(vids)} видео → {out_dir} (mode={mode})")
+        from .protocol import build_protocol
+
+        prot = build_protocol(label=args.label or out_dir.name, cfg=cfg, videos=vids, labels_csv=args.labels, mode=mode,
+                              subset=args.subset, pipeline_config=args.pipeline_config, env_overrides=env_applied,
+                              run_id=out_dir.name)
+        write_json(out_dir / "protocol.json", prot)
         run_folder(vids, out_dir, cfg, mode, args.api or "", args.key, args.raw, args.skip_existing)
         preds_dir = out_dir / "preds"
         if args.raw:
@@ -320,8 +374,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     from .metrics import evaluate_dirs, format_scorecard, format_summary, public_summary
     from .score_like_jury import format_score, score
 
+    prot_path = preds_dir.parent / "protocol.json"
+    pc_sha = read_json(prot_path).get("pipeline_config_sha") if prot_path.exists() else None
     res = evaluate_dirs(args.labels, preds_dir, args.types, cfg, subset_ids,
-                        {"subset": args.subset or "all", "mode": mode})
+                        {"subset": args.subset or "all", "mode": mode, "pipeline_config_sha": pc_sha})
     mdir = preds_dir.parent
     write_json(mdir / "metrics.json", res)
     rob = read_json(args.robustness) if args.robustness else None
@@ -332,6 +388,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(format_scorecard(res["scorecard"]))
     print(format_summary(res["summary"]))
     print(format_score(sc).split("\n", 1)[-1] if res.get("scorecard") else format_score(sc))
+    if not args.no_log:
+        from .runs import append, record_from_run
+
+        append(args.log, record_from_run(mdir, args.label, args.role, args.ablation_id))
     print(f"→ {mdir}/metrics.json, proxy_score.json, summary_public.json (наружу — только summary_public.json)")
     return 0
 

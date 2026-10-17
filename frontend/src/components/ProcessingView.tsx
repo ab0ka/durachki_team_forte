@@ -6,13 +6,14 @@ import { stageLabel, STEPS, stepIndex } from "../lib/stages";
 import { cx, ProgressBar } from "./ui";
 
 /**
- * Экран обработки. Прогресс и ETA — только из реального источника (поле progress сервера);
- * без него — неопределённый индикатор, без выдуманных процентов.
+ * Экран обработки. Прогресс — только из реального источника (поле progress сервера); без него —
+ * неопределённый индикатор. Оставшееся время НЕ прогнозируется: показываем только фактическое время —
+ * сколько прошло и сколько длились уже пройденные стадии (по наблюдаемым сменам stage).
  */
 export default function ProcessingView({ job, fileName }: { job: JobResult; fileName?: string }) {
   const [now, setNow] = useState(() => Date.now());
   const watchStart = useRef(Date.now());
-  const firstObs = useRef<{ t: number; p: number } | null>(null);
+  const stageLog = useRef<{ stage: string; at: number; end?: number }[]>([]);
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 500);
@@ -21,15 +22,14 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
 
   const hasProgress = typeof job.progress === "number" && job.status === "processing";
   const p = hasProgress ? job.progress! : 0;
-  if (hasProgress && firstObs.current === null) firstObs.current = { t: Date.now(), p };
 
-  // ETA по скорости роста реального прогресса между наблюдениями
-  let eta: number | null = null;
-  const fo = firstObs.current;
-  if (hasProgress && fo) {
-    const dt = (now - fo.t) / 1000;
-    const dp = p - fo.p;
-    if (dt >= 3 && dp > 0.02 && p < 1) eta = ((1 - p) * dt) / dp;
+  // Журнал смен стадий (реальные наблюдения при опросе, точность ≈ интервал опроса).
+  const cur = job.stage ?? "";
+  const log = stageLog.current;
+  if (cur && (log.length === 0 || log[log.length - 1].stage !== cur)) {
+    const t = Date.now();
+    if (log.length) log[log.length - 1].end = t;
+    log.push({ stage: cur, at: t });
   }
 
   const idx = job.status === "queued" ? 0 : stepIndex(job.stage, hasProgress ? p : undefined);
@@ -89,7 +89,7 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
             )}
             <div className="flex justify-between text-xs text-slate-500 tnum">
               <span>прошло {formatDuration(elapsed)}</span>
-              <span>{eta !== null ? `осталось ≈ ${formatDuration(eta)} (по скорости прогресса)` : ""}</span>
+              <span>{hasProgress ? "доля работы по стадиям; оставшееся время не прогнозируется" : ""}</span>
             </div>
           </div>
 
@@ -119,6 +119,21 @@ export default function ProcessingView({ job, fileName }: { job: JobResult; file
               );
             })}
           </ol>
+          {log.filter((x) => x.end).length > 0 && (
+            <div className="mt-5">
+              <div className="label mb-1.5">Пройденные стадии (наблюдение)</div>
+              <ul className="space-y-1 text-xs text-slate-600 dark:text-slate-300">
+                {log
+                  .filter((x) => x.end)
+                  .map((x, i) => (
+                    <li key={`${x.stage}-${i}`} className="flex justify-between gap-3">
+                      <span className="truncate">{stageLabel(x.stage)}</span>
+                      <span className="font-mono tnum text-slate-500">≈ {formatDuration((x.end! - x.at) / 1000)}</span>
+                    </li>
+                  ))}
+              </ul>
+            </div>
+          )}
           <p className="mt-6 rounded-xl bg-slate-50 p-3 text-xs leading-relaxed text-slate-500 dark:bg-white/5">
             Видео обрабатывается на локальном сервере. Страницу можно закрыть — задача сохранится в «Недавних проверках».
           </p>

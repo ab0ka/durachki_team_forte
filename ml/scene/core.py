@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 
 from . import roi as R
+from . import tri
 from ._contract import SIGNALS
 from .appearance import analyze_roi, extract_u8
 from .config import is_mock, load_config
@@ -192,6 +193,7 @@ def scene_states_with_trace(
     have = np.zeros(n, dtype=bool)
     q_own = np.zeros(n)
     mot = np.zeros(n)
+    bright = np.full(n, np.nan)
     shifts_have: dict[int, tuple[float, float]] = {}
     stores: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {k: {} for k, v in roi_of.items() if v is not None}
     cash_pf: dict[int, tuple[float, float]] = {}
@@ -219,6 +221,7 @@ def scene_states_with_trace(
             g = R.resize_w(R.to_gray(fr), aw)
             have[i] = True
             q_own[i] = R.frame_quality(g)["quality"]
+            bright[i] = float(np.median(g))
             if prev_small is not None and prev_small.shape == g.shape:
                 mot[i] = float(np.mean(np.abs(g - prev_small)))
             prev_small = g
@@ -237,6 +240,7 @@ def scene_states_with_trace(
                 green_pf[i] = green_frac_frame(fr, green_region, bc)
     if not have.any():
         trace["warnings"].append("frames unavailable: ROI/colour cues disabled, detections only")
+    shifts_list = [shifts_have.get(i, (0.0, 0.0)) for i in range(n)]
     quality = q_clip if q_clip is not None else _fill_nearest(q_own, have, 1.0 if not have.any() else 0.5)
     trace["info"]["quality_source"] = "clip.quality" if q_clip is not None else ("frames" if have.any() else "default")
     det_ran = np.full(n, bool(dets))
@@ -259,7 +263,17 @@ def scene_states_with_trace(
         roi_box = roi_of[name]
         det_lo, det_c = det_evidence(tl, roi_box, open_lbl, closed_lbl, ocfg, quality)
         if roi_box is not None and stores.get(name):
-            res = analyze_roi(stores[name], [i for i in idxs if have[i]], n, times, roi_box, person_boxes, quality, det_lo, det_c, rc, ocfg, use_shape_prior=(name == "safe_open"))
+            nm = None
+            backend = str((ocfg.get("namer") or {}).get("backend", "none"))
+            if backend != "none":
+                from .namer import get_namer
+
+                nm = get_namer(cfg.get("namer", {}), backend)
+                if nm is None:
+                    trace["warnings"].append(f"{name}: namer '{backend}' unavailable — naming by detections/shape only")
+            res = analyze_roi(stores[name], [i for i in idxs if have[i]], n, times, roi_box, person_boxes, quality, det_lo, det_c, rc, ocfg,
+                              use_shape_prior=(name == "safe_open"), naive_reference=bool(cfg.get("ablation", {}).get("naive")),
+                              frame_fn=frames if nm is not None else None, shifts=shifts_list, namer=nm, obj=_zone)
             p, c, v = res.p_open, res.conf, res.visibility
             prov = list(dict.fromkeys(res.provenance))
             trace["info"][name] = {"p_a_open": res.p_a_open, "label_conf": res.label_conf, "two_states": res.has_two_states, **{k: v2 for k, v2 in res.info.items() if k not in ("ref_idx", "features")}}
@@ -353,11 +367,37 @@ def scene_states_with_trace(
             out_c[name] = sig.c
             continue
         spec = _smooth_spec(name, cfg)
+        if cfg.get("ablation", {}).get("smoothing"):
+            spec = dict(cfg["ablation"]["smoothing"])  # только для абляции (ml.scene.ablation)
         out_p[name] = smooth(sig.p, times, spec, conf=None if name in weighted else sig.c)
         out_c[name] = hold_conf(sig.c, times, tau) if spec.get("method") == "hmm" else sig.c
+        if cfg.get("ablation", {}).get("naive"):
+            # АБЛЯЦИЯ «наивный режим»: неизвестное считается наблюдённым (как будто «не увидели» = «нет»)
+            out_p[name] = smooth(np.where(sig.c > 0, sig.p, 0.0), times, spec)
+            out_c[name] = np.ones(n)
 
     # --- составной: оставленные без присмотра наличные (трёхзначная логика) ---
     _unattended(out_p, out_c, pres_extra, raw, times, cfg, trace)
+
+    # --- фаза 2: явные статусы, свет, предикаты, интервалы ---
+    bright_f = _fill_nearest(np.nan_to_num(bright, nan=0.0), have, np.nan) if have.any() else None
+    if bright_f is not None:
+        bright_f = np.where(np.isfinite(bright_f), bright_f, np.nan)
+    pctx_lights = _lights(times, bright_f, cfg)
+    if cfg["lights"].get("freeze", False):
+        _freeze_dark(out_p, pctx_lights, trace)
+    sig_tri, why_sig = _statuses(out_p, out_c, vis, quality, pctx_lights, pres_extra, raw, cfg, workplace, bool(dets), have, trace)
+    pred_res = None
+    if cfg["predicates"].get("enabled", True):
+        from .predicates import PredContext, compute as compute_predicates
+
+        pctx = PredContext(
+            times=times, tl=tl, zones=zb, workplace=workplace, sig_tri=sig_tri,
+            sig_vis={k: np.asarray(v) for k, v in vis.items()}, quality=np.asarray(quality), brightness=bright_f,
+            det_ran=det_ran, pres_extra=pres_extra, safe_roi=roi_of.get("safe_open"), desk_box=desk_box, cfg=cfg,
+        )
+        pred_res = compute_predicates(pctx)
+        trace["events"] = pred_res.events
 
     # --- сборка ---
     states: list[SceneStateEx] = []
@@ -388,13 +428,97 @@ def scene_states_with_trace(
                     "safe_unattended": float(trace["raw"].get("safe_unattended", np.zeros(n))[i]),
                 },
                 quality=float(quality[i]),
+                status={name: tri.NAMES[int(sig_tri[name][i])] for name in SIGNALS},
+                why={name: why_sig[name][i] for name in SIGNALS},
+                pred={k: float(v[i] == tri.T) for k, v in pred_res.tri.items()} if pred_res else {},
+                pred_status={k: tri.NAMES[int(v[i])] for k, v in pred_res.tri.items()} if pred_res else {},
+                pred_why={k: pred_res.why[k][i] for k in pred_res.tri} if pred_res else {},
             )
         )
+    if pred_res is not None:
+        from .intervals import intervals as _intervals
+
+        trace["intervals"] = _intervals(states, kind="pred", policy=str(cfg["predicates"].get("timecode", "onset")))
     trace["info"]["timings_s"] = round(time.perf_counter() - t0, 3)
     trace["info"]["stride"] = stride
     trace["info"]["mock"] = is_mock()
     trace["times"] = times
     return states, trace
+
+
+def _lights(times: np.ndarray, bright: Optional[np.ndarray], cfg: dict[str, Any]) -> np.ndarray:
+    """tri «свет выключен» (используется и статусами, и предикатами)."""
+    from .predicates import PredContext, lights_off
+
+    n = len(times)
+    ctx = PredContext(times=times, tl=None, zones={}, workplace=None, sig_tri={}, sig_vis={}, quality=np.ones(n), brightness=bright,
+                      det_ran=np.ones(n, bool), pres_extra={}, safe_roi=None, desk_box=None, cfg=cfg)
+    return lights_off(ctx)[0]
+
+
+def _freeze_dark(out_p: dict[str, np.ndarray], lights: np.ndarray, trace: dict[str, Any]) -> None:
+    """[H3, флаг lights.freeze] В темноте legacy-сигналы держат последнее значение до темноты (не дрейфуют к априору)."""
+    dark = lights == tri.T
+    if not dark.any():
+        return
+    for name, arr in out_p.items():
+        if name in ("motion_energy", "n_persons"):
+            continue
+        a = arr.copy()
+        for i0, i1 in tri.runs(dark):
+            if i0 > 0:
+                a[i0 : i1 + 1] = a[i0 - 1]
+        out_p[name] = a
+    trace["info"]["lights_freeze"] = True
+
+
+_PRESENCE = ("cashier_present", "cashier_in_workplace", "outsider_in_cashier_area", "collector_present", "n_persons")
+_ROI_SIG = ("safe_open", "door_open", "cash_visible")
+
+
+def _statuses(out_p: dict[str, np.ndarray], out_c: dict[str, np.ndarray], vis: dict[str, np.ndarray], quality: np.ndarray, lights: np.ndarray,
+              pres_extra: dict[str, np.ndarray], raw: dict[str, Any], cfg: dict[str, Any], workplace: Any, has_dets: bool, have: np.ndarray,
+              trace: dict[str, Any]) -> tuple[dict[str, np.ndarray], dict[str, list[str]]]:
+    """true / false / unknown / occluded + причина для каждого сигнала (не увидели ≠ нет)."""
+    sc = cfg["status"]
+    n = len(quality)
+    sig_tri: dict[str, np.ndarray] = {}
+    whys: dict[str, list[str]] = {}
+    lost = pres_extra.get("workplace_lost", np.zeros(n))
+    unk_person = pres_extra.get("unknown_person_in_cashier_area", np.zeros(n))
+    for name in SIGNALS:
+        p = out_p.get(name, np.zeros(n))
+        c = out_c.get(name, np.zeros(n))
+        v = vis.get(name)
+        x = tri.from_prob(p, c, vis=v, vis_thr=float(sc["vis_thr"]))
+        prov = trace["provenance"].get(name, "none")
+        w = []
+        for i in range(n):
+            if x[i] in (tri.T, tri.F):
+                w.append("")
+            elif lights[i] == tri.T:
+                w.append("dark")
+            elif x[i] == tri.O:
+                w.append("occluded")
+            elif name in _ROI_SIG and not have.any():
+                w.append("frames_unavailable")
+            elif quality[i] < float(sc["min_quality"]):
+                w.append("low_quality")
+            elif name in _PRESENCE and not workplace and name != "n_persons":
+                w.append("no_zone")
+            elif name in _PRESENCE and lost[i] > 0:
+                w.append("track_lost")
+            elif name == "outsider_in_cashier_area" and unk_person[i] > 0:
+                w.append("role_unknown")
+            elif name in POSE_KEYS_DEFAULT and "pose" not in prov:
+                w.append("no_pose")
+            elif not has_dets and name not in ("motion_energy",):
+                w.append("no_detector")
+            else:
+                w.append("no_evidence")
+        sig_tri[name] = x
+        whys[name] = w
+    return sig_tri, whys
 
 
 def _apply_learned(name: str, p: np.ndarray, c: np.ndarray, feats: dict[str, np.ndarray], vis: np.ndarray, quality: np.ndarray, model: Optional[dict[str, Any]], cfg: dict[str, Any], prov: list[str]) -> tuple[np.ndarray, np.ndarray]:

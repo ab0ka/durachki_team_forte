@@ -21,9 +21,10 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // Только маршруты API: префикс "/ui" перехватил бы и статический /ui-config.json.
     proxy: {
-      "/api": { target, changeOrigin: true },
-      "/ui": { target, changeOrigin: true },
+      "/api/": { target, changeOrigin: true },
+      "/ui/v1/": { target, changeOrigin: true },
     },
   },
   test: {

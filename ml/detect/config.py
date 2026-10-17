@@ -58,7 +58,7 @@ def env_flag(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
-EXTRAS = ("tta", "tiles", "open_vocab", "finetuned")
+EXTRAS = ("tta", "tiles", "open_vocab", "finetuned", "rare_open_vocab")
 
 
 def apply_env_extras(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -79,6 +79,8 @@ def apply_env_extras(cfg: dict[str, Any]) -> dict[str, Any]:
         cfg["tiling"]["enabled"] = True
     if "open_vocab" in flags:
         cfg["open_vocab"]["enabled"] = True
+    if "rare_open_vocab" in flags:
+        cfg["inventory"]["mode"] = "rare_open_vocab"
     if "finetuned" in flags and "onnx_finetuned" not in cfg["closed_set"]["backends"]:
         cfg["closed_set"]["backends"] = ["onnx_finetuned", *cfg["closed_set"]["backends"]]
     return cfg

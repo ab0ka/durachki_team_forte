@@ -39,8 +39,21 @@ def moving_average(X: np.ndarray, win: int) -> np.ndarray:
     return ((c[win:] - c[:-win]) / win).astype(np.float32)
 
 
-def has_type_labels(samples: Sequence[Sample]) -> bool:
-    return any(s.label and s.type_id for s in samples)
+def has_type_labels(samples: Sequence[Sample], cfg: Optional[dict] = None) -> bool:
+    if cfg is None:
+        return any(s.label and s.type_id for s in samples)
+    from .dataset import train_type_id
+
+    return any(s.label and train_type_id(s, cfg) for s in samples)
+
+
+def type_head_source(samples: Sequence[Sample], cfg: dict) -> Optional[str]:
+    """confirmed — только подтверждённые метки; pseudo — есть предварительные (VLM); None — головы нет."""
+    if not has_type_labels(samples, cfg):
+        return None
+    from .dataset import train_type_id
+
+    return "pseudo" if any(s.label and not s.type_id and train_type_id(s, cfg) for s in samples) else "confirmed"
 
 
 # ----------------------------------------------------------------------------- baseline (numpy)
@@ -62,24 +75,48 @@ class BaselineLR:
         return np.concatenate([X, moving_average(X, win)], axis=1)
 
     def fit(self, samples: Sequence[Sample], cfg: dict, seed: int = 0) -> "BaselineLR":
+        X, y, wt, tt, _ = self.gather(samples, cfg)
+        return self._fit_arrays(X, y, wt, tt, samples, cfg, seed)
+
+    def gather(self, samples: Sequence[Sample], cfg: dict) -> tuple:
+        """Кадры обучения: X (+контекст), мягкие цели y, веса wt (сумма 1), type idx, индекс группы."""
+        from .dataset import train_type_id
+
         tr = cfg["train"]
-        Xs, ys, ws, ts = [], [], [], []
-        for s in samples:
+        group_mode = str(tr.get("weighting", "group")) == "group"
+        n_pos = max(1, sum(1 for s in samples if s.label))
+        n_neg = max(1, sum(1 for s in samples if not s.label))
+        Xs, ys, ws, ts, gs = [], [], [], [], []
+        for gi, s in enumerate(samples):
+            nv = max(1, len(s.X))
             for X, g in zip(s.X, s.grid):
                 fps = 1.0 / max(float(g[1] - g[0]), 1e-6) if len(g) > 1 else 4.0
                 y, w = frame_targets(g, s.label, s.times, tr["sigma_s"], tr["far_radius_s"], tr["far_weight"])
+                if group_mode:  # группа весит 0.5/n_класса независимо от длины ролика и числа версий
+                    tot = float(w.sum())
+                    if tot <= 0:
+                        continue
+                    w = w / tot / nv * (0.5 / (n_pos if s.label else n_neg))
                 Xs.append(self._ctx(X, fps)); ys.append(y); ws.append(w)
-                ts.append(np.full(len(y), _type_idx(s.type_id), np.int64))
+                ts.append(np.full(len(y), _type_idx(train_type_id(s, cfg)), np.int64))
+                gs.append(np.full(len(y), gi, np.int64))
         X = np.concatenate(Xs).astype(np.float32)
         y = np.concatenate(ys).astype(np.float32)
         w = np.concatenate(ws).astype(np.float32)
         keep = w > 0
-        X, y, w, tt = X[keep], y[keep], w[keep], np.concatenate(ts)[keep]
-        pos = float((w * y).sum())
-        neg = float((w * (1 - y)).sum())
-        pw = float(np.clip(neg / max(pos, 1e-6), 1.0, tr.get("pos_weight_max", 20.0))) if pos > 0 else 1.0
-        wt = w * (1 + (pw - 1) * y)
+        X, y, w, tt, gg = X[keep], y[keep], w[keep], np.concatenate(ts)[keep], np.concatenate(gs)[keep]
+        if group_mode:
+            wt = w
+        else:  # старый режим: каждый кадр = 1, баланс классов по массе кадров
+            pos = float((w * y).sum())
+            neg = float((w * (1 - y)).sum())
+            pw = float(np.clip(neg / max(pos, 1e-6), 1.0, tr.get("pos_weight_max", 20.0))) if pos > 0 else 1.0
+            wt = w * (1 + (pw - 1) * y)
         wt = wt / max(wt.sum(), 1e-6)
+        return X, y, wt, tt, gg
+
+    def _fit_arrays(self, X: np.ndarray, y: np.ndarray, wt: np.ndarray, tt: np.ndarray, samples: Sequence[Sample],
+                    cfg: dict, seed: int) -> "BaselineLR":
         F = X.shape[1]
         rng = np.random.default_rng(seed)
         theta = np.concatenate([rng.normal(0, 0.01, F), [0.0]]).astype(np.float64)
@@ -95,7 +132,7 @@ class BaselineLR:
             theta -= self.lr * (m / (1 - 0.9 ** it)) / (np.sqrt(v / (1 - 0.999 ** it)) + 1e-8)
         self.w, self.b = theta[:-1].astype(np.float32), float(theta[-1])
         sel = (tt >= 0) & (y > 0.5)
-        if has_type_labels(samples) and sel.sum() >= 2:
+        if has_type_labels(samples, cfg) and sel.sum() >= 2:
             self.type_W = _fit_softmax(X[sel], tt[sel], n=int(cfg["model"].get("n_types", 9)), l2=self.l2)
         return self
 
@@ -173,7 +210,7 @@ class TemporalHead:
         self.device = ("cuda" if torch.cuda.is_available() else "cpu") if dev == "auto" else dev
         torch.manual_seed(seed)
         rng = np.random.default_rng(seed)
-        self.type_trained = has_type_labels(samples) and float(tr.get("type_weight", 0)) > 0
+        self.type_trained = has_type_labels(samples, cfg) and float(tr.get("type_weight", 0)) > 0
         cfg_loss = cfg if self.type_trained else {**cfg, "train": {**tr, "type_weight": 0.0}}
         net = self.net.to(self.device).train()
         opt = torch.optim.AdamW(net.parameters(), lr=float(tr["lr"]), weight_decay=float(tr["weight_decay"]))

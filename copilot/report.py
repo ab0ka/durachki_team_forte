@@ -9,7 +9,8 @@ from typing import Any, Optional
 
 from .config import default_config
 from .corpus import Corpus, load_corpus
-from .prompts import fmt_tc, normalize_result, unobservable_items, verdict_text
+from .prompts import (completeness, completeness_text, explain_for, explain_lines, fmt_tc, normalize_result,
+                      review_hints, unobservable_items, verdict_text)
 
 
 def _md(s: Any) -> str:
@@ -30,14 +31,15 @@ def _verified_rules(v: dict[str, Any], corpus: Optional[Corpus]) -> tuple[list[d
             continue
         if hit.key not in seen:
             seen.add(hit.key)
+            # статус берём из каталога (корпуса), а не со слов результата
             out.append({"document": hit.document, "clause": hit.clause, "url": hit.url,
-                        "quote": r.get("quote") or hit.text, "verified": bool(r.get("verified", hit.verified))})
+                        "quote": hit.text, "verified": hit.verified, "status": hit.status, "note": hit.note})
     if not out and corpus is not None and v.get("type_id"):
         for c in corpus.rules_for_type(str(v["type_id"])):
             if c.key not in seen:
                 seen.add(c.key)
                 out.append({"document": c.document, "clause": c.clause, "url": c.url, "quote": c.text,
-                            "verified": c.verified})
+                            "verified": c.verified, "status": c.status, "note": c.note})
     return out, dropped
 
 
@@ -58,7 +60,8 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
              f"> ⚠️ {disclaimer}", "",
              f"- **Задача:** `{_md(res.get('job_id') or '—')}`",
              f"- **Статус анализа:** {_md(res.get('status') or '—')}",
-             f"- **Вердикт системы:** {verdict_text(res)}"]
+             f"- **Вердикт системы:** {verdict_text(res)}",
+             f"- **Полнота анализа:** {completeness_text(res)}"]
     if isinstance(meta, dict):
         if meta.get("duration") or meta.get("duration_s"):
             lines.append(f"- **Длительность видео:** {float(meta.get('duration') or meta.get('duration_s')):.0f} с")
@@ -66,12 +69,18 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
             lines.append(f"- **Версия системы:** {_md(meta['version'])}")
     lines.append("")
 
+    comp = completeness(res)
+    if comp["state"] == "incomplete" and res.get("status") != "failed":
+        lines += ["> ⚠️ **Анализ неполный.** Отсутствие найденных нарушений в непроанализированной части "
+                  "не означает, что их нет. Просмотрите видео вручную.", ""]
     if res.get("status") in {"processing", "failed"}:
         lines += ["## Результат", "", f"Нет данных: {verdict_text(res)}.", ""]
     elif not viols:
         lines += ["## Возможные нарушения", "",
-                  "Признаков нарушения не обнаружено. Автоматический анализ может пропустить нарушение — "
-                  "рекомендуется выборочный просмотр видео.", ""]
+                  ("Нарушений в проанализированной части не найдено — анализ неполный, вывод «нарушений нет» "
+                   "сделать нельзя." if comp["state"] == "incomplete" else
+                   "Признаков нарушения не обнаружено. Автоматический анализ может пропустить нарушение — "
+                   "рекомендуется выборочный просмотр видео."), ""]
     else:
         lines += [f"## Возможные нарушения ({len(viols)})", ""]
         for v in viols:
@@ -86,6 +95,10 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
             if v.get("confidence") not in (None, ""):
                 lines.append(f"- **Уверенность алгоритма:** {float(v['confidence']):.2f} (не вероятность нарушения)")
             lines.append(f"- **Что видно:** {_md(v.get('description')) or 'нет описания'}")
+            why = explain_lines(explain_for(res, v))
+            if why:
+                lines.append("- **Почему отмечено (данные системы):**")
+                lines.extend(f"  - {_md(x)}" for x in why)
             frames = [fmt_tc(f.get("timestamp_sec")) for f in v.get("evidence_frames") or []]
             lines.append(f"- **Кадры-доказательства:** {', '.join(frames) if frames else 'нет'}")
             rules, dropped = _verified_rules(v, corpus)
@@ -94,14 +107,33 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
                 for r in rules:
                     ref = f"{_md(r['document'])}" + (f", {_md(r['clause'])}" if r.get("clause") else "")
                     link = f"[{ref}]({r['url']})" if r.get("url") else ref
-                    mark = "" if r.get("verified") else " _(цитата требует сверки с первоисточником)_"
+                    tags = []
+                    if r.get("status") == "candidate":
+                        tags.append("норма-кандидат")
+                    if not r.get("verified"):
+                        tags.append("цитата требует сверки с первоисточником")
+                    mark = f" _({'; '.join(tags)})_" if tags else ""
                     quote = f" — «{_md(r['quote'])}»" if r.get("quote") else ""
                     lines.append(f"  - {link}{quote}{mark}")
             else:
-                lines.append("- **Нормы:** в источниках нет подтверждённой нормы для этого случая")
+                lines.append("- **Норма:** без пункта — в каталоге нет подтверждённого пункта для этого типа")
+            info = corpus.type_info(tid) if corpus is not None and tid else {}
+            if info.get("legal_note"):
+                lines.append(f"- **Пояснение каталога (не текст нормы):** {_md(info['legal_note'])}")
+            excl = [str(x) for x in info.get("exclusions") or [] if str(x).strip()]
+            if excl:
+                lines.append("- **Когда это не нарушение (каталог):** " + "; ".join(_md(x) for x in excl))
             if dropped:
                 lines.append(f"- _Отброшено ссылок, не найденных в каталоге норм: {dropped}_")
             lines.append("")
+
+    hints = review_hints(res)
+    if hints:
+        lines += ["## Спорные места (не вошли в вердикт)", ""]
+        for h in hints:
+            reasons = ", ".join(_md(x) for x in h.get("reasons_ru") or []) or "ниже порога"
+            lines.append(f"- {_md(h.get('type') or h.get('type_id') or 'кандидат')} — {fmt_tc(h.get('timecode_sec'))}: {reasons}")
+        lines.append("")
 
     lines += ["## Что проверить вручную", ""]
     for v in viols:

@@ -78,6 +78,12 @@ def _state_signals(state: Any) -> Mapping[str, Any]:
     return sig or {}
 
 
+def _state_get(state: Any, name: str) -> Any:
+    if isinstance(state, Mapping):
+        return state.get(name)
+    return getattr(state, name, None)
+
+
 def _to_float(v: Any) -> float:
     if isinstance(v, bool):
         return 1.0 if v else 0.0
@@ -96,12 +102,21 @@ def build_series(
     ffill_max_s: float = 1.5,
     merge_policy: str = "max",
     time_round: float = 1e-3,
+    known_min_conf: float = 0.5,
+    observed_one_sided: bool = True,
 ) -> SignalSeries:
     """Свести список состояний в выровненные ряды.
 
     Отсутствие сигнала ≠ отрицание: кадры без значения (и пропуски длиннее ``ffill_max_s``)
     остаются ``NaN`` = «неизвестно». ``defaults`` — только явные, задокументированные
     исключения (например, модуль, который по договорённости не шлёт нулевой сигнал).
+
+    Совместимость с ``SceneStateEx`` (A08) и его JSON (``state_to_dict``): если у состояния есть
+    ``known[name]`` — значение берётся только при ``True``; иначе при наличии ``conf`` — только при
+    ``conf[name] ≥ known_min_conf``; у расширенного состояния сигнал без сведений о подтверждении —
+    неизвестен. ``observed`` (признаки вне SIGNALS) добавляются как сигналы; при
+    ``observed_one_sided`` значение < 0.5 считается «не наблюдалось» (= неизвестно), а не «нет».
+    ``quality`` → сигнал ``frame_quality``.
     """
     defaults = dict(defaults or {})
     buckets: dict[float, dict[str, float]] = {}
@@ -111,11 +126,35 @@ def build_series(
             continue
         key = round(round(t / time_round) * time_round, 6)
         dst = buckets.setdefault(key, {})
+        known = _state_get(st, "known")
+        conf = _state_get(st, "conf")
+        known = known if isinstance(known, Mapping) else None
+        conf = conf if isinstance(conf, Mapping) else None
+        values: list[tuple[str, float]] = []
         for name, raw in _state_signals(st).items():
-            v = _to_float(raw)
+            name = str(name)
+            if known is not None and name in known:
+                if not bool(known[name]):
+                    continue  # не подтверждено наблюдением → неизвестно
+            elif conf is not None and name in conf:
+                if _to_float(conf[name]) < known_min_conf:
+                    continue
+            elif known is not None or conf is not None:
+                continue  # расширенное состояние без сведений о подтверждении → неизвестно
+            values.append((name, _to_float(raw)))
+        observed = _state_get(st, "observed")
+        if isinstance(observed, Mapping):
+            for name, raw in observed.items():
+                v = _to_float(raw)
+                if observed_one_sided and not name.endswith("_conf") and v < 0.5:
+                    continue  # «не наблюдали» ≠ «нет»
+                values.append((str(name), v))
+        quality = _state_get(st, "quality")
+        if quality is not None and not isinstance(quality, (Mapping, list, tuple)):
+            values.append(("frame_quality", _to_float(quality)))
+        for name, v in values:
             if not math.isfinite(v):
                 continue
-            name = str(name)
             if name in dst and merge_policy == "max":
                 dst[name] = max(dst[name], v)
             elif name in dst and merge_policy == "min":
@@ -265,6 +304,7 @@ def derive_from_tracks(
     collector = np.zeros(n)
     outsider = np.zeros(n)
     obj_presence: dict[str, np.ndarray] = {}
+    desk_bag = np.zeros(n) if "desk" in zone_polys else None  # личная сумка (label bag) на столе — V09
     has_person = False
     workplace_zone = "desk" if "desk" in zone_polys else ("cashier_area" if "cashier_area" in zone_polys else None)
     for tr in tracks:
@@ -279,7 +319,10 @@ def derive_from_tracks(
         idx_prev = np.clip(idx - 1, 0, len(bt) - 1)
         use_prev = np.abs(bt[idx_prev] - times) < np.abs(bt[idx] - times)
         nearest = np.where(use_prev, idx_prev, idx)
-        present = np.abs(bt[nearest] - times) <= presence_tol_s
+        # присутствие — только в пределах жизни трека (без растягивания до первого/после последнего
+        # бокса: иначе начало действия «съезжает» раньше на presence_tol_s); внутри — разрывы ≤ tol
+        alive = (times >= bt[0] - 1e-6) & (times <= bt[-1] + 1e-6)
+        present = alive & (np.abs(bt[nearest] - times) <= presence_tol_s)
         if label == "person":
             has_person = True
             n_persons += present
@@ -299,6 +342,10 @@ def derive_from_tracks(
         else:
             arr = obj_presence.setdefault(label, np.zeros(n))
             np.maximum(arr, present.astype(float), out=arr)
+            if label == "bag" and desk_bag is not None:
+                for i in np.nonzero(present)[0]:
+                    if in_zone(boxes[int(nearest[i])][1], "desk", desk_margin):
+                        desk_bag[i] = 1.0
     if has_person:
         out["n_persons"] = n_persons
         out["cashier_present"] = cashier
@@ -312,4 +359,6 @@ def derive_from_tracks(
     for label, sig in label_to_signal.items():
         if label in obj_presence:
             out[sig] = obj_presence[label]
+    if desk_bag is not None:
+        out["personal_items_on_desk"] = desk_bag
     return out

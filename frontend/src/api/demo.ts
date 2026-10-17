@@ -139,6 +139,19 @@ function demoTimeline(): TimelinePoint[] {
   return pts;
 }
 
+// Синтетические записи стадий (формат meta.stages A03) — для панели «Полнота анализа» в демо.
+const DEMO_STAGES_META = {
+  ingest: { status: "ok", seconds: 3.1, required: true },
+  detect: { status: "ok", seconds: 11.4, required: true },
+  track: { status: "ok", seconds: 1.2 },
+  pose: { status: "ok", seconds: 4.6 },
+  scene: { status: "ok", seconds: 0.8 },
+  rules: { status: "ok", seconds: 0.1, required: true },
+  temporal: { status: "ok", seconds: 2.9 },
+  vlm_verify: { status: "ok", seconds: 9.7 },
+  fusion: { status: "ok", seconds: 0.6, required: true },
+};
+
 // Нормы в демо — заглушки: реальные ссылки приходят только из norms/catalog.yaml (A13).
 const DEMO_RULE_NOTE =
   "[ДЕМО] Здесь показывается дословная цитата пункта нормы из norms/catalog.yaml (A13). В демо-режиме текст нормы не подставляется, чтобы не выдумывать пункты.";
@@ -154,17 +167,18 @@ export function buildDemoResult(jobId = "demo"): JobResult {
     description:
       "На 00:18.0 дверца сейфа открыта. С 00:21.6 кассир выходит из зоны рабочего места, сейф остаётся открытым, рядом людей нет. На столе видны пачки банкнот. Это может указывать на нарушение порядка хранения ценностей — требуется проверка.",
     evidence_frames: [
-      { timestamp_sec: 18.4, image_base64: demoFrameBase64(18.4, { highlight: "safe", label: "сейф открыт" }) },
-      { timestamp_sec: 24.6, image_base64: demoFrameBase64(24.6, { highlight: "safe", label: "сейф без присмотра" }) },
-      { timestamp_sec: 29.0, image_base64: demoFrameBase64(29.0, { highlight: "desk" }) },
+      // Как у A12: в evidence_frames — чистые кадры; рамки подсветки — в meta.ui.evidence_overlays.shapes.
+      { timestamp_sec: 24.6, image_base64: demoFrameBase64(24.6) },
+      { timestamp_sec: 24.2, image_base64: demoFrameBase64(24.2) },
+      { timestamp_sec: 29.0, image_base64: demoFrameBase64(29.0) },
     ],
     rules: [
       {
         document: "[ДЕМО] Нормативный документ из каталога норм",
-        clause: "п. — (из norms/catalog.yaml)",
+        clause: null,
         url: "https://adilet.zan.kz/rus",
         quote: DEMO_RULE_NOTE,
-        verified: true,
+        verified: false,
       },
     ],
     facts: [
@@ -185,8 +199,8 @@ export function buildDemoResult(jobId = "demo"): JobResult {
     description:
       "На 00:44.9 открывается дверь кассового помещения, в зону кассира входит второй человек без инкассаторской сумки и находится у стола с наличными до 00:53.5. Наличие допуска по видео установить нельзя — требуется проверка.",
     evidence_frames: [
-      { timestamp_sec: 45.4, image_base64: demoFrameBase64(45.4, { highlight: "person2", label: "вход" }) },
-      { timestamp_sec: 47.8, image_base64: demoFrameBase64(47.8, { highlight: "person2", label: "посторонний" }) },
+      { timestamp_sec: 47.8, image_base64: demoFrameBase64(47.8) },
+      { timestamp_sec: 45.4, image_base64: demoFrameBase64(45.4) },
     ],
     rules: [
       {
@@ -225,7 +239,34 @@ export function buildDemoResult(jobId = "demo"): JobResult {
       ],
       warnings: ["Демо-режим: результат сгенерирован в браузере, сервер не используется."],
       device: "demo",
+      complete: true,
+      coverage: 1,
+      required_stages: ["ingest", "detect", "rules", "fusion"],
+      stages: DEMO_STAGES_META,
       ui: {
+        evidence_overlays: [
+          {
+            violation_index: 0,
+            type_id: "V03",
+            timecode_sec: 24.6,
+            facts: v1.facts,
+            sources: { rules: 0.82, vlm: 0.74 },
+            vlm: "confirm",
+            shapes: [
+              { kind: "box", key: "safe_open", label: "сейф открыт", color: "#e5484d", bbox: [0.06, 0.68, 0.43, 0.86] },
+              { kind: "box", key: "cash", label: "наличные", color: "#f5a524", bbox: [0.4, 0.54, 0.56, 0.6] },
+            ],
+          },
+          {
+            violation_index: 1,
+            type_id: "V01",
+            timecode_sec: 47.8,
+            facts: v2.facts,
+            sources: { rules: 0.66, temporal: 0.58 },
+            vlm: "unsure",
+            shapes: [{ kind: "box", key: "person", label: "второй человек", color: "#e5484d", bbox: [0.6, 0.5, 0.83, 0.64] }],
+          },
+        ],
         review_hints: [
           {
             type_id: "V01",
@@ -256,6 +297,10 @@ export function buildDemoClean(jobId = "demo-clean"): JobResult {
       duration: DEMO_DURATION,
       file_name: "demo_clean.mov",
       timings: { total: 28.2 },
+      complete: true,
+      coverage: 1,
+      required_stages: ["ingest", "detect", "rules", "fusion"],
+      stages: DEMO_STAGES_META,
       ui: {
         review_hints: [
           {

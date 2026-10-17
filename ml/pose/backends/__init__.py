@@ -5,7 +5,7 @@ import logging
 import threading
 from typing import Any, Optional
 
-from .base import PoseBackend, PoseBackendError
+from .base import PoseBackend, PoseBackendError, WeightsNotFound
 
 log = logging.getLogger("ml.pose")
 _CACHE: dict[str, PoseBackend] = {}
@@ -25,9 +25,24 @@ def _make(name: str, cfg: dict[str, Any]) -> PoseBackend:
     raise PoseBackendError(f"неизвестный бэкенд позы: {name}")
 
 
-def get_backend(cfg: dict[str, Any], mock: bool = False) -> tuple[Optional[PoseBackend], list[str]]:
-    """Тёплый (закэшированный) бэкенд + список ошибок попыток. None — ни один не поднялся."""
-    order = ["mock"] if mock else list(cfg.get("backend", {}).get("order", ["rtmpose_onnx"]))
+def backend_order(cfg: dict[str, Any], mock: bool = False) -> list[str]:
+    from ..config import backend_override
+
+    if mock:
+        return ["mock"]
+    override = backend_override()
+    if override:
+        return [override]
+    return list(cfg.get("backend", {}).get("order", ["rtmpose_onnx"]))
+
+
+def get_backend(cfg: dict[str, Any], mock: bool = False, errors_out: Optional[list[BaseException]] = None
+                ) -> tuple[Optional[PoseBackend], list[str]]:
+    """Тёплый (закэшированный) бэкенд + список ошибок попыток. None — ни один не поднялся.
+
+    errors_out (если передан) получает сами исключения — чтобы отличить «нет весов» от сбоя.
+    """
+    order = backend_order(cfg, mock)
     errors: list[str] = []
     with _LOCK:
         for name in order:
@@ -39,6 +54,8 @@ def get_backend(cfg: dict[str, Any], mock: bool = False) -> tuple[Optional[PoseB
                 msg = f"{name}: {type(exc).__name__}: {exc}"
                 log.warning("pose backend unavailable — %s", msg)
                 errors.append(msg)
+                if errors_out is not None:
+                    errors_out.append(exc)
                 continue
             _CACHE[name] = be
             return be, errors

@@ -14,6 +14,8 @@ from typing import Any, Iterable, Optional, Sequence
 
 from ._types import AnalysisResult, BBox, Violation
 from .catalog import known_type, resolve_catalog, rule_refs, type_info
+from .completeness import coverage_info
+from .policies import apply_policies
 from .config import load_config, load_thresholds, threshold_for
 from .describe import build_description, clean_facts, format_time
 from .serialize import event_to_dict, to_jsonable
@@ -56,6 +58,8 @@ class NormEvent:
     vlm: Optional[tuple[str, float]] = None   # ("confirm"|"reject"|"unsure", score)
     positive: bool = True        # False — только мнение VLM (отказ), без положительного вклада
     orig_type_id: Optional[str] = None
+    assessment: str = "candidate"   # candidate | norm_review | observation | insufficient (оценка A09)
+    conf_in: float = 0.0            # уверенность как пришла (до восстановления срезанной A09)
 
 
 @dataclass
@@ -86,6 +90,7 @@ class Candidate:
     reported: bool = False
     suppressed_by: Optional[str] = None
     gate: list[str] = field(default_factory=list)        # почему НЕ нарушение (пусто — гейт пройден)
+    assessment: str = "candidate"                        # сводная оценка upstream (см. NormEvent)
 
     @property
     def key(self) -> str:
@@ -113,6 +118,7 @@ class Candidate:
                 "reported": self.reported,
                 "suppressed_by": self.suppressed_by,
                 "gate": self.gate,
+                "assessment": self.assessment,
                 "n_obs_facts": len(self.obs_facts),
             },
             4,
@@ -236,6 +242,54 @@ def _norm_bbox(box: Any) -> Optional[BBox]:
     return (x1, y1, x2, y2)
 
 
+_ASSESSMENT_RANK = ("candidate", "norm_review", "observation", "insufficient")
+
+
+def _a09_uncapped(conf: float, extra: dict[str, Any]) -> float:
+    """Уверенность правила до потолка review_observation: extra.confidence_raw или trace.confidence_terms A09."""
+    for key in ("confidence_raw", "confidence_uncapped", "raw_confidence"):
+        if key in extra:
+            v = _f(extra[key], -1.0)
+            if v >= 0:
+                return _clamp(max(conf, v), 0.0, 1.0)
+    trace = extra.get("trace")
+    terms = trace.get("confidence_terms") if isinstance(trace, dict) else None
+    if not isinstance(terms, dict):
+        return conf
+    if "expr" in terms:
+        raw = _f(terms.get("expr"), float("nan"))
+    elif all(k in terms for k in ("base", "strength", "duration")):
+        raw = _f(terms["base"], 0.0) + _f(terms["strength"], 0.0) + _f(terms["duration"], 0.0)
+    else:
+        return conf
+    if math.isnan(raw):
+        return conf
+    value = min(_f(terms.get("cap", 1.0), 1.0), raw * _f(terms.get("factor", 1.0), 1.0))
+    value *= _f(terms.get("derived_factor", 1.0), 1.0)
+    return _clamp(max(conf, value), 0.0, 1.0)
+
+
+def upstream_assessment(conf: float, extra: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, float]:
+    """Оценка события правил A09 → (candidate|norm_review|observation|insufficient, уверенность для слияния)."""
+    gcfg = cfg.get("report_gate") or {}
+    if not gcfg.get("upstream_assessment", True):
+        return "candidate", conf
+    a = str(extra.get("assessment") or "").strip().lower()
+    if not a or a in {"candidate_violation", "candidate", "violation"}:
+        return "candidate", conf
+    if a in {"insufficient_context", "insufficient"}:
+        return "insufficient", conf
+    if a in {"review_observation", "review", "observation"}:
+        reasons = " ".join(str(r) for r in extra.get("assessment_reasons") or []).lower()
+        if "наблюдени" in reasons or "observation" in reasons:
+            return "observation", conf
+        if "норм" in reasons or "norm" in reasons or str(extra.get("norm_status", "")).lower() in {"unverified",
+                                                                                                 "absent"}:
+            return "norm_review", (_a09_uncapped(conf, extra) if gcfg.get("uncap_norm_review", True) else conf)
+        return "observation", conf
+    return "candidate", conf
+
+
 def normalize_events(
     events: Optional[Iterable[Any]],
     duration: float,
@@ -285,6 +339,8 @@ def normalize_events(
                     track_ids.append(int(tid))
                 except (TypeError, ValueError):
                     continue
+            conf_in = conf
+            assessment, conf = upstream_assessment(conf, extra, cfg)
             opinion = vlm_opinion(source, conf, extra)
             positive = not (source == "vlm" and opinion is not None and opinion[0] != "confirm")
             if positive and source == "vlm" and conf <= 0.0:
@@ -305,6 +361,8 @@ def normalize_events(
                     vlm=opinion,
                     positive=positive,
                     orig_type_id=orig_type,
+                    assessment=assessment,
+                    conf_in=conf_in,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — одно битое событие не должно ронять слияние
@@ -405,13 +463,24 @@ def _source_weight(cfg: dict[str, Any], source: str) -> float:
     return _f(weights.get(source, weights.get("other", 0.6)), 0.6)
 
 
+def temporal_mode(cfg: dict[str, Any]) -> str:
+    """off (по умолчанию) | bonus | score — влияние temporal/риск-кривой на скор кластера."""
+    raw = cfg.get("temporal_mode", "off")
+    mode = "off" if raw is False or raw is None else str(raw).strip().lower()   # YAML: голое off → False
+    return mode if mode in {"off", "bonus", "score"} else "off"
+
+
 def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]) -> Candidate:
     """Объединение уверенностей источников в одном кластере."""
     positives = [e for e in group if e.positive]
     pool = positives or list(group)
     type_id = group[0].type_id
-    t_start = min(e.t_start for e in pool)
-    t_end = max(e.t_end for e in pool)
+    tmode = temporal_mode(cfg)
+    # temporal_mode=off|bonus: при наличии фактических источников границы и пик берём по ним
+    factual = [e for e in pool if e.source != "temporal"] if tmode != "score" else []
+    span = factual or pool
+    t_start = min(e.t_start for e in span)
+    t_end = max(e.t_end for e in span)
 
     conf_by_source: dict[str, float] = {}
     for e in positives:
@@ -429,18 +498,27 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
     if positives and "temporal" not in weighted and risk_support >= _f(rcfg.get("support_min", 0.5), 0.5):
         weighted["risk_curve"] = _clamp(_f(rcfg.get("support_weight", 0.6), 0.6) * risk_support, 0.0, 1.0)
 
-    if not weighted:
+    # Какие вклады задают базовый скор. temporal_mode=score — как в фазе 1; bonus — temporal/кривая только
+    # в бонусе согласия; off — temporal/кривая не влияют на скор кластера с фактическими источниками.
+    temporal_keys = {"temporal", "risk_curve"}
+    has_factual = any(k not in temporal_keys for k in weighted)
+    base_parts = {k: v for k, v in weighted.items()
+                  if tmode == "score" or k not in temporal_keys or not has_factual}
+    agree_parts = {k: v for k, v in weighted.items()
+                   if tmode != "off" or k not in temporal_keys or not has_factual}
+
+    if not base_parts:
         base = 0.0
     elif str(cfg.get("combine", "noisy_or")).lower() == "max":
-        base = max(weighted.values())
+        base = max(base_parts.values())
     else:
         prod = 1.0
-        for v in weighted.values():
+        for v in base_parts.values():
             prod *= 1.0 - v
         base = 1.0 - prod
 
     acfg = cfg.get("agreement") or {}
-    n_agree = sum(1 for v in weighted.values() if v >= _f(acfg.get("min_conf", 0.3), 0.3))
+    n_agree = sum(1 for v in agree_parts.values() if v >= _f(acfg.get("min_conf", 0.3), 0.3))
     bonus = 0.0
     if n_agree >= 2:
         bonus = min(_f(acfg.get("max_bonus", 0.15), 0.15),
@@ -469,7 +547,7 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
         prio = SOURCE_PRIORITY.index(e.source) if e.source in SOURCE_PRIORITY else len(SOURCE_PRIORITY)
         return (round(w * e.confidence, 6), -prio)
 
-    peak_ev = max(pool, key=peak_key)
+    peak_ev = max(span, key=peak_key)
 
     # Факты: rules → vlm → temporal → прочие; боксы — с пикового события, затем близкие по времени.
     ordered = sorted(pool, key=lambda e: (SOURCE_PRIORITY.index(e.source) if e.source in SOURCE_PRIORITY
@@ -496,9 +574,13 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
     extra: dict[str, Any] = {}
     for e in [peak_ev] + ordered:
         for k in ("keypoints", "poses", "head_boxes", "person_bboxes", "persons", "roles", "type_probs",
-                  "type_scores"):
+                  "type_scores", "state_after"):
             if k in e.extra and k not in extra:
                 extra[k] = e.extra[k]
+    ev_t = sorted({round(_f(t), 3) for e in span for t in (e.extra.get("evidence_t") or [])
+                   if not math.isnan(_f(t, float("nan")))})
+    if ev_t:
+        extra["evidence_t"] = ev_t[:6]
     orig_types = sorted({e.orig_type_id for e in group if e.orig_type_id})
     if orig_types:
         extra["orig_type_ids"] = orig_types
@@ -524,7 +606,25 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
         track_ids=track_ids,
         extra=extra,
         peak_source=peak_ev.source,
+        assessment=_cluster_assessment(positives),
     )
+
+
+def _cluster_assessment(positives: Sequence[NormEvent]) -> str:
+    """Лучшая оценка среди фактических источников (rules/VLM); подтверждение VLM считается candidate.
+
+    temporal/прочие события без оценки upstream не «повышают» кластер: иначе правило-наблюдение A09
+    рядом с temporal-событием обходило бы гейт observation_only.
+    """
+    voters = [e for e in positives if e.source in ("rules", "vlm") or "assessment" in e.extra]
+    if not voters:
+        return "candidate" if positives else "insufficient"
+    best = len(_ASSESSMENT_RANK) - 1
+    for e in voters:
+        a = "candidate" if (e.vlm is not None and e.vlm[0] == "confirm") else e.assessment
+        if a in _ASSESSMENT_RANK:
+            best = min(best, _ASSESSMENT_RANK.index(a))
+    return _ASSESSMENT_RANK[best]
 
 
 def _best_type_near(events: Sequence[NormEvent], a: float, b: float, fallback: str,
@@ -635,12 +735,21 @@ def gate_reasons(c: Candidate, types: dict[str, dict[str, Any]], cfg: dict[str, 
         reasons.append("no_observable_fact")
     if not gcfg.get("temporal_only_types", False) and set(c.conf_by_source) <= {"temporal"}:
         reasons.append("temporal_only")
-    if gcfg.get("require_norm", True):
+    req = gcfg.get("require_norm_types")
+    if req is None:  # совместимость со старым ключом require_norm: true|false
+        req = ["*"] if gcfg.get("require_norm", False) else []
+    if "*" in req or c.type_id in req:
         if catalog_ok:
             if not rule_refs(types, c.type_id):
                 reasons.append("no_norm")
         elif str(gcfg.get("norm_missing_if_no_catalog", "report")).lower() == "hint":
             reasons.append("norms_catalog_unavailable")
+    reasons.extend(str(r) for r in c.extra.get("policy_gate") or [] if str(r) not in reasons)
+    if gcfg.get("upstream_assessment", True):
+        if c.assessment == "observation" and str(gcfg.get("observation_policy", "hint")) == "hint":
+            reasons.append("observation_only")
+        elif c.assessment == "insufficient" and str(gcfg.get("insufficient_policy", "hint")) == "hint":
+            reasons.append("insufficient_context")
     return reasons
 
 
@@ -694,14 +803,22 @@ def fuse_scores(
     norm, warnings = normalize_events(events, duration, types, cfg)
     curve = RiskCurve(risk)
     gap = _f((cfg.get("grouping") or {}).get("merge_gap_s", 3.0), 3.0)
-    cands = [score_group(g, curve, cfg) for g in group_events(norm, gap)]
+    cands = []
+    for g in group_events(norm, gap):
+        cand = score_group(g, curve, cfg)
+        apply_policies(cand, g, cfg)
+        cands.append(cand)
     cands = [c for c in cands if c.confidence > 0 or c.n_events > 0]
     cands += risk_only_candidates(curve, cands, norm, types, cfg)
     cross_type_nms(cands, cfg)
 
     ocfg = cfg.get("output") or {}
     nd = int(_f(ocfg.get("timecode_round", 1), 1))
+    tc_policy = str((cfg.get("timecode") or {}).get("policy", "peak")).lower()
     for c in cands:
+        c.extra.setdefault("t_peak_source", round(c.t_peak, 3))
+        if tc_policy == "onset" and c.origin == "events":
+            c.t_peak = c.t_start   # момент начала (переход: отошла, вошёл, поднесла)
         c.t_peak = timecode(c.t_peak, duration, nd)
         c.t_start = timecode(min(c.t_start, c.t_peak), duration, nd)
         c.t_end = timecode(max(c.t_end, c.t_peak), duration, nd)
@@ -774,6 +891,10 @@ _GATE_RU = {
     "no_observable_fact": "нет конкретного наблюдаемого факта от правил/VLM",
     "temporal_only": "сигнал только временной модели",
     "no_norm": "для типа нет применимой нормы в каталоге",
+    "observation_only": "наблюдение (телефон, еда, дверь, второй человек) само по себе не нарушение",
+    "valuables_removed": "после ухода кассира наличные и сумка убраны, сейф закрыт — норма",
+    "client_side": "человек на клиентской стороне напротив кассира — норма",
+    "insufficient_context": "этап не наблюдался полностью — неизвестно, а не «нет» и не «да»",
     "norms_catalog_unavailable": "каталог норм недоступен",
     "below_threshold": "скор ниже порога",
     "suppressed": "перекрыт более сильным нарушением другого типа",
@@ -802,6 +923,9 @@ def _hint(c: Candidate, types: dict[str, dict[str, Any]], cfg: dict[str, Any]) -
         "reasons_ru": [_GATE_RU.get(r, r) for r in reasons],
         "suppressed_by": c.suppressed_by,
         "origin": c.origin,
+        "assessment": c.assessment,
+        "policies": c.extra.get("policies", []),
+        "counter_facts": c.extra.get("counter_facts", []),
     }
 
 
@@ -861,6 +985,7 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
         cand.t_peak = timecode(cand.t_peak, duration, nd)
     if not catalog_ok:
         warnings.append("norms: в каталоге нет ни одной нормы — нарушения выдаются без ссылок на нормы")
+    coverage = coverage_info(clip, duration, cfg)
     t_scores = time.perf_counter() - t0
 
     renderer = None
@@ -943,6 +1068,28 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
         "warnings": warnings,
         "disclaimer": "Результат — подсказка для проверяющего, а не юридическое заключение.",
     }
+    meta["coverage"] = coverage
+    ccfg = cfg.get("completeness") or {}
+    unknown_fails = str(ccfg.get("unknown_coverage", "failed")).lower() == "failed"
+    incomplete = coverage["complete"] is False or (coverage["complete"] is None and unknown_fails)
+    if coverage["complete"] is None:
+        warnings.append("coverage: нет данных о покрытии видео (clip.meta / clip.times)")
+    if ccfg.get("coverage_gate", True) and incomplete:
+        reason_list = coverage["reasons"] or ["покрытие видео анализом неизвестно"]
+        if outcome.verdict == "violation":
+            warnings.append("анализ видео неполный (" + "; ".join(reason_list) + "): найденные нарушения "
+                            "показаны, но другие могли быть пропущены")
+            meta["analysis_complete"] = False
+        else:
+            msg = ("Анализ видео неполный: " + "; ".join(reason_list) +
+                   ". Отсутствие нарушений не подтверждено — вердикт не выносится.")
+            meta["analysis_complete"] = False
+            meta["failure"] = {"reason": "partial_coverage" if coverage["complete"] is False else "unknown_coverage",
+                               "details": reason_list, "message_ru": msg}
+            meta["ui"]["incomplete"] = {"failed_stages": [], "details": {"coverage": reason_list}, "message_ru": msg}
+            warnings.append(msg)
+            return AnalysisResult(job_id=str(job_id), status="failed", verdict=None, violations=[],
+                                  timeline=outcome.timeline, meta=meta)
     return AnalysisResult(
         job_id=str(job_id),
         status="done",

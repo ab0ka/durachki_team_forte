@@ -142,7 +142,12 @@ def build_persons(
         for tr in person_tracks:
             ts, bb = _track_arrays(tr)
             vis: list[tuple[int, BBox]] = []
+            # hold заполняет только разрывы ВНУТРИ трека: за последним боксом трек не «продлевается»
+            # (иначе уход/вход сдвигаются на hold_s и портят таймкод)
+            edge = dt * 0.5 + 1e-6
             for i, t in enumerate(tl.times):
+                if t < ts[0] - edge or t > ts[-1] + edge:
+                    continue
                 j = _nearest_idx(ts, float(t))
                 if abs(ts[j] - t) <= hold_s:
                     vis.append((i, tuple(bb[j])))

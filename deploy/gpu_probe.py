@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Проба GPU на КОНКРЕТНОЙ машине до запуска: драйвер, VRAM, torch CUDA, fp16-matmul, ORT providers.
 
-  python deploy/gpu_probe.py                    # ожидаем CUDA 12.4 и >= 7.5 GiB VRAM
+  python deploy/gpu_probe.py                    # ожидаем CUDA 12.8 (lock L1) и >= 7.5 GiB VRAM
   python deploy/gpu_probe.py --allow-cpu        # CPU-режим (План Б без GPU)
 Отчёт: logs/gpu_probe.json. Никаких «должно работать» — только то, что вернула машина.
 """
@@ -93,7 +93,7 @@ def evaluate(rep: dict, min_vram_gib: float, expect_cuda: str, allow_cpu: bool) 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--min-vram-gib", type=float, default=7.5)
-    ap.add_argument("--expect-cuda", default="12.4")
+    ap.add_argument("--expect-cuda", default="12.8")
     ap.add_argument("--allow-cpu", action="store_true")
     ap.add_argument("--out", type=Path, default=None)
     a = ap.parse_args(argv)

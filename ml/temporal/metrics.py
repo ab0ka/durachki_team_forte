@@ -76,3 +76,26 @@ def recommend_threshold(labels: Sequence[int], scores: Sequence[float], margin: 
     if not np.isfinite(thr):
         thr = 0.5
     return float(np.clip(thr + margin, 0.05, 0.95))
+
+
+def spearman(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    """Ранговая корреляция Спирмена (ничьи — средний ранг). None, если < 3 точек или константа."""
+    x = np.asarray(a, dtype=float)
+    y = np.asarray(b, dtype=float)
+    if len(x) < 3 or len(x) != len(y):
+        return None
+
+    def rank(v: np.ndarray) -> np.ndarray:
+        order = np.argsort(v, kind="stable")
+        r = np.empty(len(v), float)
+        r[order] = np.arange(len(v), dtype=float)
+        for val in np.unique(v):  # средний ранг для ничьих
+            m = v == val
+            if m.sum() > 1:
+                r[m] = r[m].mean()
+        return r
+
+    rx, ry = rank(x), rank(y)
+    if rx.std() == 0 or ry.std() == 0:
+        return None
+    return float(np.corrcoef(rx, ry)[0, 1])

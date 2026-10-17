@@ -1,7 +1,7 @@
 // Пакетная проверка: несколько файлов загружаются по очереди, статусы опрашиваются в фоне.
 // Состояние — в модуле (переживает переходы между экранами), React читает его через useSyncExternalStore.
 import { ApiError, rememberLocalVideo, saveHistoryItem, type Backend } from "../api/client";
-import { isPartial } from "../api/normalize";
+import { analyzeCompleteness, type Completeness } from "./completeness";
 import type { Verdict } from "../api/types";
 import { validateVideoFile } from "./validate";
 
@@ -19,6 +19,11 @@ export interface BatchItem {
   /** Прогресс анализа от сервера, если он его присылает. */
   progress?: number;
   verdict?: Verdict | null;
+  /** Полнота анализа: complete | partial | unknown (зелёный — только complete). */
+  completeness?: Completeness;
+  /** Результат mock/fake-пайплайна. */
+  mock?: boolean;
+  /** @deprecated совместимость: completeness === "partial". */
   partial?: boolean;
   violations?: { type: string; timecode_sec: number }[];
   error?: string;
@@ -80,7 +85,8 @@ export class BatchStore {
       job_id: it.jobId ?? null,
       status: it.state,
       verdict: it.verdict ?? null,
-      partial: it.partial ?? false,
+      completeness: it.completeness ?? null,
+      mock: it.mock ?? false,
       violations: it.violations ?? [],
       error: it.error ?? null,
     }));
@@ -133,11 +139,13 @@ export class BatchStore {
       try {
         const { job } = await backend.getJob(it.jobId!);
         if (job.status === "done" || job.status === "failed") {
-          const partial = job.status === "done" && isPartial(job);
+          const rep = analyzeCompleteness(job);
           this.set(it.key, {
             state: job.status,
             verdict: job.status === "done" ? job.verdict : null,
-            partial,
+            completeness: rep.state,
+            mock: rep.mock,
+            partial: rep.state === "partial",
             violations: job.violations.map((v) => ({ type: v.type, timecode_sec: v.timecode_sec })),
             error: job.error,
           });

@@ -1,6 +1,7 @@
-"""jury_sim против локального фейкового API (http.server) — проверяет код симулятора, не сервис."""
+"""jury_sim против локального фейкового API (http.server) — проверяет код симулятора, не сервис и не модели."""
 from __future__ import annotations
 
+import base64
 import json
 import re
 import threading
@@ -12,13 +13,37 @@ from pathlib import Path
 import pytest
 
 from eval.common import load_config
+from eval.jury_sim import inspect_result, jpeg_size
 
-from .conftest import make_pred, make_violation
+from .conftest import make_pred, make_violation, write_synthetic_video
 
 KEY = "test-key"
 
 
-def _server(enforce_auth: bool = True, max_bytes: int = 1 << 20):
+def _jpeg(w: int, h: int) -> str:
+    import cv2
+    import numpy as np
+
+    ok, buf = cv2.imencode(".jpg", np.full((h, w, 3), 100, np.uint8))
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+def _result(jid: str, behaviour: str) -> dict:
+    v = make_violation(0.5, frames=[0.5])
+    v["evidence_frames"][0]["image_base64"] = _jpeg(16, 24)        # портрет, как видео 64×96
+    meta = {"models": ["PekingU/rtdetr_v2_r18vd", "Qwen/Qwen3-VL-4B-Instruct"], "mock": False, "coverage": 1.0}
+    if behaviour == "mock":
+        meta = {"models": ["mock-detector"], "mock": True, "coverage": 1.0}
+    if behaviour == "partial":
+        return make_pred(jid, [], meta={**meta, "coverage": 0.3}) | {"job_id": jid}
+    if behaviour == "failed_silent":
+        return {"job_id": jid, "status": "failed", "verdict": None, "violations": []}
+    if behaviour == "late_tc":
+        v["timecode_sec"] = 99.0
+    return make_pred(jid, [v], meta=meta) | {"job_id": jid}
+
+
+def _server(enforce_auth: bool = True, max_bytes: int = 1 << 20, behaviour: str = "good"):
     jobs: dict[str, float] = {}
 
     class H(BaseHTTPRequestHandler):
@@ -57,9 +82,9 @@ def _server(enforce_auth: bool = True, max_bytes: int = 1 << 20):
             jid = self.path.rstrip("/").split("/")[-1]
             if jid not in jobs:
                 return self._send(404, {"detail": "nf"})
-            if time.time() - jobs[jid] < 0.2:
+            if behaviour == "hang" or time.time() - jobs[jid] < 0.15:
                 return self._send(200, {"job_id": jid, "status": "processing"})
-            self._send(200, make_pred(jid, [make_violation(3.0)]) | {"job_id": jid})
+            self._send(200, _result(jid, behaviour))
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -68,16 +93,14 @@ def _server(enforce_auth: bool = True, max_bytes: int = 1 << 20):
 
 @pytest.fixture
 def videos(tmp_path: Path) -> list[Path]:
-    out = []
-    for i in range(3):
-        p = tmp_path / f"X-{i + 1}.mov"
-        p.write_bytes(b"\x00" * 1000)
-        out.append(p)
-    return out
+    pytest.importorskip("cv2")
+    return [write_synthetic_video(tmp_path / f"X-{i + 1}.mov", seconds=1.0, fps=10, size=(64, 96)) for i in range(5)]
 
 
-def _cfg():
-    return load_config(overrides={"jury_sim": {"poll_s": 0.05, "total_limit_s": 5, "big_file_mb": 2}})
+def _cfg(**over):
+    js = {"poll_s": 0.05, "total_limit_s": 3, "grace_s": 0.5, "big_file_mb": 2}
+    js.update(over)
+    return load_config(overrides={"jury_sim": js})
 
 
 def _session():
@@ -88,33 +111,65 @@ def _session():
     return s
 
 
-def test_good_server_all_pass(videos):
+def _sim(videos, **kw):
     pytest.importorskip("requests")
-    from eval.jury_sim import format_table, run_jury_sim
+    from eval.jury_sim import run_jury_sim
 
-    srv = _server()
+    behaviour = kw.pop("behaviour", "good")
+    auth = kw.pop("enforce_auth", True)
+    cfg = kw.pop("cfg", _cfg())
+    srv = _server(enforce_auth=auth, behaviour=behaviour)
     try:
-        res = run_jury_sim(f"http://127.0.0.1:{srv.server_port}", KEY, videos, _cfg(), concurrency=2,
-                           session=_session())
+        return run_jury_sim(f"http://127.0.0.1:{srv.server_port}", KEY, videos, cfg, session=_session(), **kw)
     finally:
         srv.shutdown()
-    st = {c["name"]: c["status"] for c in res["checks"]}
-    assert res["summary"]["n_fail"] == 0, format_table(res)
-    assert any(n.startswith("sequential") for n in st) and any(n.startswith("bounded stress") for n in st)
-    seq = next(c for c in res["checks"] if c["name"].startswith("sequential"))
-    assert all(j["status"] == "done" and j["accept_to_done_s"] < 5 for j in seq["data"]["jobs"])
+
+
+def _st(res: dict, needle: str) -> list[str]:
+    return [c["status"] for c in res["checks"] if needle in c["name"]]
+
+
+def test_jpeg_size_and_inspect():
+    raw = base64.b64decode(_jpeg(16, 24))
+    assert jpeg_size(raw) == (16, 24) and jpeg_size(b"nope") is None
+    r = _result("j", "good")
+    assert inspect_result(r, {"duration": 1.0, "width": 64, "height": 96})["jpeg_issues"] == []
+    land = inspect_result(r, {"duration": 1.0, "width": 96, "height": 64})       # горизонтальное видео
+    assert any("ориентация" in x for x in land["jpeg_issues"])
+    assert inspect_result(_result("j", "late_tc"), {"duration": 1.0, "width": 64, "height": 96})["pts_issues"]
+    assert inspect_result(_result("j", "partial"), {})["partial_as_clean"] is True
+    assert inspect_result(_result("j", "mock"), {})["mock"] is True
+
+
+def test_good_server_pass(videos):
+    from eval.jury_sim import format_table
+
+    res = _sim(videos, concurrency=2)
+    assert res["summary"]["overall"] == "PASS", format_table(res)
+    assert _st(res, "sequential: ≥ 5") == ["PASS"]
+    assert any(c["name"].startswith("batch") for c in res["checks"])
     assert "image_base64" not in json.dumps(res)            # в отчёте только статусы и тайминги
 
 
 def test_broken_auth_detected(videos):
-    pytest.importorskip("requests")
-    from eval.jury_sim import run_jury_sim
+    res = _sim(videos[:1], enforce_auth=False, skip_stress=True, big_mb=0)
+    assert any("401" in c["name"] for c in res["checks"] if c["status"] == "FAIL")
+    assert res["summary"]["overall"] == "FAIL"
 
-    srv = _server(enforce_auth=False)
-    try:
-        res = run_jury_sim(f"http://127.0.0.1:{srv.server_port}", KEY, videos[:1], _cfg(), skip_stress=True, big_mb=0,
-                           session=_session())
-    finally:
-        srv.shutdown()
-    fails = [c["name"] for c in res["checks"] if c["status"] == "FAIL"]
-    assert any("401" in n for n in fails)
+
+@pytest.mark.parametrize("behaviour,needle", [
+    ("mock", "настоящие модели"),
+    ("partial", "неполный анализ"),
+    ("failed_silent", "явной причиной"),
+    ("late_tc", "PTS"),
+])
+def test_acceptance_failures(videos, behaviour, needle):
+    res = _sim(videos[:5], behaviour=behaviour, skip_stress=True, big_mb=0)
+    assert "FAIL" in _st(res, needle), [(c["name"], c["status"]) for c in res["checks"]]
+    assert res["summary"]["overall"] == "FAIL"
+
+
+def test_unfinished_and_too_few(videos):
+    res = _sim(videos[:2], behaviour="hang", skip_stress=True, big_mb=0, cfg=_cfg(total_limit_s=0.3, grace_s=0.2))
+    assert "FAIL" in _st(res, "завершены") and "NOT RUN" in _st(res, "≥ 5")
+    assert res["summary"]["overall"] == "FAIL"

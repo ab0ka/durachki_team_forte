@@ -14,10 +14,13 @@ from backend.pipeline.serde import result_to_dict
 
 
 def _strip(res) -> str:
+    """Содержательный результат (без метаданных исполнения: статусы ok/cached, тайминги, кэш-хиты)."""
     d = result_to_dict(res)
-    meta = d.pop("meta")
-    return json.dumps({**d, "stages_status": {k: v["status"] for k, v in meta["stages"].items()}},
-                      sort_keys=True, ensure_ascii=False)
+    cov = res.meta.get("coverage") or {}
+    keep = {k: d.get(k) for k in ("status", "verdict", "violations", "timeline")}
+    keep["coverage"] = {k: cov.get(k) for k in ("ratio", "complete", "unknown_spans", "duration_sec")}
+    keep["stages_status"] = {k: v["status"] for k, v in res.meta["stages"].items()}
+    return json.dumps(keep, sort_keys=True, ensure_ascii=False)
 
 
 def _slow_detect(clip, every_n=1):

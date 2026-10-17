@@ -72,14 +72,25 @@ class VideoLabel:
     files: list[str] = field(default_factory=list)  # исходные пути/имена
     group: str = ""                # id группы дубликатов (для LOO)
     md5: str = ""
+    pseudo_type_id: str = ""       # предварительный тип (VLM/авто), в обучение — только по флагу use_pseudo_types
     sources: list[dict] = field(default_factory=list)  # исходные метки файлов группы (не теряются при слиянии)
     conflict: bool = False         # в группе дубликатов метки «нарушение»/«без» расходятся
+    time_conflict: bool = False    # в группе дубликатов разные таймкоды (> 1.5 с) — решает человек
 
 
 _NAME_KEYS = ("file", "name", "video", "filename", "файл", "имя", "видео", "ролик", "id")
 _LABEL_KEYS = ("label", "violation", "verdict", "class", "target", "наруш", "вердикт", "класс", "метка")
-_TIME_KEYS = ("time", "sec", "second", "timecode", "ts", "секунд", "время", "таймкод", "момент")
+_TIME_KEYS = ("t_all", "t_sec", "time", "sec", "second", "timecode", "ts", "секунд", "время", "таймкод",
+              "момент")
 _TYPE_KEYS = ("type_id", "type", "тип")
+_TYPE_STATUS_KEYS = ("type_status", "type_source", "статус типа", "статус_типа")
+_PSEUDO_WORDS = ("pseudo", "vlm", "auto", "предвар", "псевдо", "draft", "unverified", "непровер")
+
+
+def is_pseudo_status(v: str) -> bool:
+    """Статус метки типа: подтверждённая (человек) или предварительная (VLM/авто). Пусто — подтверждённая."""
+    s = str(v or "").strip().lower()
+    return any(w in s for w in _PSEUDO_WORDS)
 
 
 def _pick(header: list[str], keys: Iterable[str], exclude: set[int]) -> Optional[int]:
@@ -117,11 +128,15 @@ def read_labels(path: str | Path, time_offset_s: float = 0.0) -> dict[str, Video
     used: set[int] = set()
     i_name = _pick(header, _NAME_KEYS, used)
     has_header = i_name is not None
+    i_status = None
     if not has_header:  # без заголовка: имя, метка, время[, тип]
         i_name, i_label, i_time, i_type = 0, 1, 2, 3
         body = rows
     else:
         used.add(i_name)
+        i_status = _pick(header, _TYPE_STATUS_KEYS, used)
+        if i_status is not None:
+            used.add(i_status)
         i_type = _pick(header, _TYPE_KEYS, used)
         if i_type is not None:
             used.add(i_type)
@@ -149,15 +164,19 @@ def read_labels(path: str | Path, time_offset_s: float = 0.0) -> dict[str, Video
             lab = 1 if times else 0
         typ = cell(i_type).upper().translate(_HOMOGLYPHS)
         typ = typ if re.fullmatch(r"V\d{2}", typ) else ""
+        pseudo = ""
+        if typ and is_pseudo_status(cell(i_status)):  # предварительный тип не выдаём за подтверждённый
+            typ, pseudo = "", typ
         if name in out:  # повтор строки — объединяем
             prev = out[name]
             prev.label = max(prev.label, lab)
             prev.times = sorted(set(prev.times + times))
             prev.type_id = prev.type_id or typ
+            prev.pseudo_type_id = prev.pseudo_type_id or pseudo
             prev.files.append(raw_name)
         else:
             out[name] = VideoLabel(name=name, label=lab, times=times if lab else [], type_id=typ,
-                                   files=[raw_name])
+                                   files=[raw_name], pseudo_type_id=pseudo)
     return out
 
 
@@ -210,7 +229,8 @@ def assign_groups(labels: dict[str, VideoLabel], md5s: dict[str, str] | None = N
     return groups
 
 
-def merge_duplicates(labels: dict[str, VideoLabel], conflict_policy: str = "positive") -> dict[str, VideoLabel]:
+def merge_duplicates(labels: dict[str, VideoLabel], conflict_policy: str = "positive",
+                     time_conflict_policy: str = "both") -> dict[str, VideoLabel]:
     """Свернуть группу дубликатов в одну обучающую запись, НЕ выбирая метку произвольно:
     все исходные метки остаются в ``sources``; таймкоды позитивных файлов объединяются
     (Х-4≡Х-47 -> якоря [57, 68]); расхождение «нарушение/без» помечается ``conflict`` и решается
@@ -225,12 +245,19 @@ def merge_duplicates(labels: dict[str, VideoLabel], conflict_policy: str = "posi
         conflict = len({it.label for it in items}) > 1
         if conflict and conflict_policy == "exclude":
             continue
+        pos_times = [sorted(it.times) for it in items if it.label and it.times]
+        time_conflict = any(min(abs(a - b) for b in other) > 1.5 for ts in pos_times for other in pos_times
+                            for a in ts if other is not ts and other)
         label = max(it.label for it in items)
         times = sorted({t for it in items if it.label for t in it.times}) if label else []
         types = {it.type_id for it in items if it.label and it.type_id}
+        ptypes = {it.pseudo_type_id for it in items if it.label and it.pseudo_type_id}
         out[g] = VideoLabel(name=g, label=label, times=times, type_id=types.pop() if len(types) == 1 else "",
+                            pseudo_type_id=ptypes.pop() if len(ptypes) == 1 else "",
                             files=[f for it in items for f in it.files], group=g, md5=items[0].md5,
-                            sources=sources, conflict=conflict)
+                            sources=sources, conflict=conflict, time_conflict=time_conflict)
+        if time_conflict and time_conflict_policy == "video_only":
+            out[g].times = []  # кадровый надзор снят, остаётся метка уровня видео (MIL); таймкод решает человек
     return out
 
 

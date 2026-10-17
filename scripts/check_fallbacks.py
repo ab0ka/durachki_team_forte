@@ -45,6 +45,27 @@ def find_fallbacks(root: Path) -> list[Path]:
                   if not any(part in SKIP for part in p.relative_to(root).parts))
 
 
+def unguarded_imports(root: Path) -> dict[str, list[str]]:
+    """Прямые (вне try/except) импорты ``_contract_fallback``: {каталог модуля: [файл:строка]}."""
+    out: dict[str, list[str]] = {}
+    for p in root.rglob("*.py"):
+        rel = p.relative_to(root)
+        if any(part in SKIP for part in rel.parts) or p.name == "_contract_fallback.py":
+            continue
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8", errors="ignore"))
+        except SyntaxError:
+            continue
+        guarded = {id(m) for n in ast.walk(tree) if isinstance(n, ast.Try) for h in n.handlers for m in ast.walk(h)}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom) and n.module and "_contract_fallback" in n.module \
+                    and id(n) not in guarded:
+                target = n.module.replace(".", "/").rsplit("/_contract_fallback", 1)[0] if n.level == 0 \
+                    else rel.parent.as_posix() if n.level == 1 else rel.parent.parent.as_posix()
+                out.setdefault(target, []).append(f"{rel.as_posix()}:{n.lineno}")
+    return out
+
+
 def compare(path: Path, canon_src: str) -> tuple[str, str]:
     src = path.read_text(encoding="utf-8")
     if src.replace("\r\n", "\n") == canon_src.replace("\r\n", "\n"):
@@ -72,12 +93,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     canon = canon_path.read_text(encoding="utf-8")
     rc = 0
+    blockers = unguarded_imports(root)
     for p in find_fallbacks(root):
         status, why = compare(p, canon)
         rel = p.relative_to(root).as_posix()
         print(f"{status:15} {rel}" + (f" — {why}" if why else ""))
+        module_dir = p.parent.relative_to(root).as_posix()
+        if blockers.get(module_dir):
+            print(f"{'':15} прямой импорт без try/except: {', '.join(blockers[module_dir])}")
         if status == "DIVERGED":
             rc = 1
+        elif args.drop and blockers.get(module_dir):
+            print(f"{'':15} НЕ удалён: сначала исправить прямые импорты (иначе тесты модуля сломаются)")
         elif args.drop:
             p.unlink()
             print(f"{'':15} удалён {rel}")

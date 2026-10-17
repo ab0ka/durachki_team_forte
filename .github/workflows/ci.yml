@@ -54,6 +54,8 @@ jobs:
         run: python scripts/check_licenses.py
       - name: Fallback-копии контракта совпадают с каноном
         run: python scripts/check_fallbacks.py
+      - name: Медиа, веса и файлы > 5 МБ не попали в git
+        run: python scripts/guard_media.py --all
 
   modules:
     name: module ${{ matrix.module }}

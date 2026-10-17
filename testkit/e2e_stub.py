@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from contracts.extensions import Completeness, Provenance
+from contracts.extensions import Provenance, compute_coverage
 from contracts.sentinel_contracts import AnalysisResult, Event, EvidenceFrame, Violation
 from contracts.serialize import result_to_jury_api
 from contracts.validate import jury_response_errors
@@ -103,9 +103,10 @@ def fallback_fuse(clip: Any, events: list[Event], risk: list, catalog: dict, job
                                     "Признаки возможного нарушения — требуется проверка человеком.",
                                     evidence_frames=frames, type_id=e.type_id, confidence=e.confidence,
                                     t_start=e.t_start, t_end=e.t_end, rules=[]))
-    meta = {"duration_sec": clip.duration,
-            "completeness": Completeness(complete=True, analyzed_until_sec=clip.duration,
-                                         duration_sec=clip.duration).to_dict(),
+    # Явная пометка: результат mock-прогона тест-кита (production такой результат без SENTINEL_MOCK=1 не отдаст).
+    meta = {"duration_sec": clip.duration, "mock": True,
+            "coverage": compute_coverage(clip.duration, clip.duration, stages={"fusion": "mock"},
+                                         required=["fusion"], source="testkit-e2e-stub"),
             "provenance": Provenance(pipeline_version="testkit-e2e-stub", mock=True, sources=["fusion"]).to_dict()}
     return AnalysisResult(job_id=job_id, status="done", verdict="violation" if violations else "no_violation",
                           violations=violations, timeline=[(float(t), float(r)) for t, r in risk], meta=meta)
@@ -216,7 +217,7 @@ def run_scenario(scenario: str, out_dir: Path, *, duration: float = 8.0, fps: fl
         rec["seconds"] = round(time.perf_counter() - t0, 2)
         return rec
     rec["seconds"] = round(time.perf_counter() - t0, 2)
-    body = result_to_jury_api(result)
+    body = result_to_jury_api(result, allow_mock=True)  # e2e-заглушка — явно mock-прогон
     rec["response"] = {k: body[k] for k in ("job_id", "status", "verdict")}
     rec["violations"] = [{"type": v["type"], "timecode_sec": v["timecode_sec"]} for v in body["violations"]]
     rec["errors"] += jury_response_errors(body, duration)

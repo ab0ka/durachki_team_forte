@@ -106,3 +106,10 @@ def test_clause_from_corpus_but_not_in_context_removed(corpus, job_violation) ->
 def test_vague_document_name_does_not_match(corpus) -> None:
     assert corpus.find("Регламент", "п. 9") is None
     assert corpus.find("Тестовый регламент кассы", "п. 9") is not None
+
+
+def test_insinuation_with_caveat_word_is_still_checked(corpus, job_violation) -> None:
+    """«Не означает» не даёт иммунитета: предложение без опоры на контекст всё равно вырезается."""
+    res = normalize_result(job_violation)
+    g = check_answer("Это не означает, что кассир тайно украл деньги и скрылся через чёрный ход.", [], corpus, res)
+    assert "украл" not in g.answer

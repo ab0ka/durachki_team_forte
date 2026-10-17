@@ -152,3 +152,35 @@ def test_validate_report_exposes_statuses():
     rep = v.validate_catalog(yaml.safe_load(norms.CATALOG_PATH.read_text(encoding="utf-8")))
     d = rep.to_dict()
     assert d["legal_status"]["V08"] == "candidate" and "not a legal verification" in d["check"]
+
+
+def test_phase2_types_and_examples():
+    cat = norms.load_catalog()
+    assert "клиент" in " ".join(cat["types"]["V01"]["exclusions"])  # клиент напротив — норма
+    assert cat["types"]["V01"]["name"].startswith("Посторонний на стороне кассира")
+    v09 = cat["types"]["V09"]
+    assert v09["legal_status"] == "candidate" and v09["rules"][0]["clause"] == "п. 12"
+    for tid, t in cat["types"].items():
+        kinds = {e["kind"] for e in t["examples"]}
+        assert "positive" in kinds and kinds & {"negative", "unknown"}, tid
+        for chk in t.get("rule_checks", []):
+            assert chk["quote_checked_by_human"] is False and chk["applicability_checked_by_human"] is False
+
+
+def test_review_matrix_in_sync_and_separates_statuses():
+    yaml = pytest.importorskip("yaml")
+    cat = yaml.safe_load(norms.CATALOG_PATH.read_text(encoding="utf-8"))
+    rep = v.Report()
+    v.check_matrix(cat, rep)
+    assert rep.ok, rep.errors
+    text = v.render_matrix(cat)
+    assert "цитату сверил человек" in text and "применимость проверил человек" in text
+    assert "V09" in text and "без пункта, без правового вывода" in text
+
+
+def test_examples_helper():
+    all_ex = norms.examples()
+    assert {e["type_id"] for e in all_ex} >= set(norms.TYPE_IDS)
+    assert all(e["expected"] in ("candidate", "no_violation", "unknown") for e in all_ex)
+    unk = [e for e in norms.examples("V02") if e["kind"] == "unknown"][0]
+    assert any(val is None for val in unk["signals"].values())  # unknown ≠ false

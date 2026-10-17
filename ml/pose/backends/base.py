@@ -10,6 +10,10 @@ class PoseBackendError(RuntimeError):
     """Бэкенд не может быть инициализирован (нет весов / библиотеки / провайдера)."""
 
 
+class WeightsNotFound(PoseBackendError):
+    """Веса бэкенда не найдены локально (не сбой: в режиме enabled=auto стадия просто пропускается)."""
+
+
 class PoseBackend(Protocol):
     name: str
     batch_size: int

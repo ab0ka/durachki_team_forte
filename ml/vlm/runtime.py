@@ -23,18 +23,19 @@ _backend: Optional[VLMBackend] = None
 _backend_key: Optional[tuple[Any, ...]] = None
 _backend_reason = ""
 _injected: Optional[VLMBackend] = None
-_gpu_lock: Any = threading.RLock()
-
-
 def set_gpu_lock(lock: Optional[Any]) -> None:
-    """A03 передаёт общий lock/семафор GPU (любой context manager). None — вернуть внутренний."""
-    global _gpu_lock
-    _gpu_lock = lock if lock is not None else threading.RLock()
+    """A03 передаёт общий lock/семафор GPU (любой context manager). None — без внешнего lock.
+    Внутри процесса VLM дополнительно арбитрирует анализ и чат приоритетным lock (ml.vlm.gpu)."""
+    from . import gpu
+
+    gpu.set_external_lock(lock)
 
 
 def gpu_guard() -> ContextManager[Any]:
-    lk = _gpu_lock
-    return lk if hasattr(lk, "__enter__") else contextlib.nullcontext()
+    """GPU для анализа (приоритет выше чата копилота)."""
+    from . import gpu
+
+    return gpu.guard(gpu.PRIO_ANALYSIS)
 
 
 def set_backend(backend: Optional[VLMBackend]) -> None:
@@ -53,6 +54,8 @@ def get_backend(cfg: dict[str, Any]) -> tuple[Optional[VLMBackend], str]:
     global _backend, _backend_key, _backend_reason
     if _injected is not None:
         return _injected, ""
+    rc = cfg.get("runtime") or {}
+    configure_registry(bool(rc.get("use_registry", True)), float(rc.get("registry_vram_gb", 3.5)))
     k = _key(cfg)
     with _state_lock:
         if _backend_key != k:
@@ -67,6 +70,26 @@ def get_backend(cfg: dict[str, Any]) -> tuple[Optional[VLMBackend], str]:
 
 
 _load_failed: dict[int, tuple[float, str]] = {}  # id(backend) -> (monotonic time, причина)
+REGISTRY_NAME = "ml.vlm:qwen"
+_registry_vram_gb = 3.5   # оценка резерва: 2.7 ГБ после загрузки (замер L1) + активации <=6 кадров по 448 px
+_use_registry = True
+
+
+def configure_registry(use: bool = True, vram_gb: float = 3.5) -> None:
+    global _use_registry, _registry_vram_gb
+    _use_registry, _registry_vram_gb = bool(use), float(vram_gb)
+
+
+def _registry() -> Optional[Any]:
+    """ModelRegistry A03, только если он уже создан в этом процессе (воркер пайплайна); сами его не создаём."""
+    if not _use_registry:
+        return None
+    try:
+        from backend.pipeline.registry import ModelRegistry  # type: ignore
+
+        return ModelRegistry.peek()
+    except Exception:  # noqa: BLE001 — нет A03 (CLI, тесты) — грузим сами
+        return None
 
 
 def ensure_loaded(be: VLMBackend, budget: Optional[Budget] = None, min_budget_s: float = 0.0,
@@ -83,7 +106,15 @@ def ensure_loaded(be: VLMBackend, budget: Optional[Budget] = None, min_budget_s:
         return False, f"model not warm and budget {budget.remaining():.1f}s < lazy_load_min_budget_s {min_budget_s}"
     try:
         with gpu_guard():
-            be.load()
+            reg = _registry()
+            if reg is not None and be.name not in ("mock",):
+                # A03 освобождает LRU-модели под нужный объём и сможет выгрузить VLM через be.unload()
+                reg.get_or_load(REGISTRY_NAME, lambda: (be.load(), be)[1], vram_gb=_registry_vram_gb,
+                                unload=lambda obj: obj.unload())
+                if not be.loaded:  # реестр уже держал запись, но модель была выгружена
+                    be.load()
+            else:
+                be.load()
         _load_failed.pop(id(be), None)
         return True, ""
     except BackendUnavailable as e:
@@ -138,6 +169,8 @@ class CallOutcome:
     latency_s: float = 0.0
     repaired: bool = False
     error: str = ""
+    finish_reason: str = ""        # последнего вызова: eos | length | time | stop | ""
+    truncated: bool = False        # ответ обрезан по длине/времени (complete=False)
     raw: list[str] = field(default_factory=list)  # только для локального дампа (CLI), не для логов
 
 
@@ -216,6 +249,7 @@ def call_json(be: VLMBackend, images: list[Any], system: str, prompt: str, budge
             break
         out.attempts += 1
         out.latency_s += res.latency_s
+        out.finish_reason, out.truncated = res.finish_reason, bool(res.truncated)
         budget.record(res.latency_s, vis, res.completion_tokens, mnt, retry)
         out.raw.append(res.text)
         if not res.text.strip():

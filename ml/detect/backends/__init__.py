@@ -144,10 +144,62 @@ def get_backends(cfg: dict[str, Any]) -> Backends:
         return be
 
 
+# mock: группа запросов inventory → цвета палитры (mock.palette + mock.extra_palette)
+MOCK_GROUP_COLORS = {"cash": ["cash"], "cash_bag": ["cash_bag"], "generic_bag": ["bag"], "personal_item": ["jacket"],
+                     "phone": ["cell_phone"], "landline": ["landline"], "cup": ["cup", "bottle"], "food": ["food"],
+                     "safe_open": ["safe_open"], "safe_closed": ["safe"]}
+
+_SCORERS: dict[tuple, Any] = {}
+
+
+def inventory_texts(cfg: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for qs in cfg["inventory"]["rare_open_vocab"].get("queries", {}).values():
+        for q in qs:
+            if q not in out:
+                out.append(q)
+    return out
+
+
+def get_inventory_scorer(cfg: dict[str, Any], warnings: list[str]) -> Any:
+    """Сырой open-vocab скорер для inventory (mode=rare_open_vocab). Нет весов → None + warning (не исключение:
+    closed-set часть inventory работает, OWL-виды остаются unknown)."""
+    texts = inventory_texts(cfg)
+    ov, rt = cfg["open_vocab"], cfg["runtime"]
+    key = (is_mock(), tuple(texts), ov["hf_model_id"], rt.get("device"), rt.get("fp16"), ov.get("input_size"))
+    with _LOCK:
+        if key in _SCORERS:
+            return _SCORERS[key]
+        if is_mock():
+            from .mock import MockOpenVocabScorer
+
+            m = cfg["mock"]
+            pal = {**m["palette"], **m.get("extra_palette", {})}
+            groups = cfg["inventory"]["rare_open_vocab"].get("queries", {})
+            tc = {q: [pal[c] for c in MOCK_GROUP_COLORS.get(g, []) if c in pal] for g, qs in groups.items() for q in qs}
+            sc: Any = MockOpenVocabScorer(texts, tc, tolerance=m["tolerance"], min_area_px=m["min_area_px"])
+        else:
+            if not is_cached(ov["hf_model_id"]):
+                warnings.append(f"inventory: open-vocab weights {ov['hf_model_id']} not found locally — "
+                                "rare_open_vocab недоступен, работаю как baseline")
+                return None
+            try:
+                from .owlv2 import OwlV2Backend
+
+                sc = OwlV2Backend(ov["hf_model_id"], [{"text": q} for q in texts], device=rt["device"], fp16=rt["fp16"],
+                                  input_size=ov["input_size"], name="owlv2")
+            except Exception as e:  # noqa: BLE001
+                warnings.append(f"inventory: open-vocab not loaded: {type(e).__name__}: {e} — работаю как baseline")
+                return None
+        _SCORERS[key] = sc
+        return sc
+
+
 def clear_cache() -> None:
     with _LOCK:
         _CACHE.clear()
+        _SCORERS.clear()
 
 
-__all__ = ["Backends", "CLOSED_SET_LABELS", "DetectorUnavailable", "get_backends", "clear_cache", "is_mock",
-           "resolve_device"]
+__all__ = ["Backends", "CLOSED_SET_LABELS", "DetectorUnavailable", "get_backends", "get_inventory_scorer",
+           "clear_cache", "is_mock", "resolve_device"]

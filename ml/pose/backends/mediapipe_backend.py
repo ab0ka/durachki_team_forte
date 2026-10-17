@@ -1,14 +1,34 @@
-"""MediaPipe Pose (Apache-2.0) — opt-in бэкенд. Выход ЯВНО перекладывается из 33 landmark-ов
-MediaPipe BlazePose в порядок COCO-17 (MP33_TO_COCO17); прочие 16 точек MediaPipe отбрасываются.
-visibility MediaPipe — не то же, что score RTMPose: умножается на mediapipe.visibility_scale.
+"""MediaPipe Pose Landmarker (Tasks API, Apache-2.0) — переключаемый вариант бэкенда, по умолчанию выключен.
+
+Включение: SENTINEL_POSE_BACKEND=mediapipe или backend.order: [mediapipe]. Работает по кропу человека
+(по умолчанию только кассира, см. backend.mediapipe.selection) с апскейлом: короткая сторона кропа
+доводится до upscale_min_side px — детектор BlazePose плохо видит мелких людей.
+
+Выход ЯВНО перекладывается из 33 landmark-ов BlazePose в порядок COCO-17 (MP33_TO_COCO17); остальные
+16 точек отбрасываются. score = visibility (× presence) — шкала не та же, что у RTMPose
+(visibility_scale в config). Поза не найдена → нулевые score (unknown), а не выдуманные точки.
+Модель (.task, офлайн): backend.mediapipe.task_path | $SENTINEL_POSE_MP_TASK |
+$SENTINEL_WEIGHTS_DIR/{pose,}/**/pose_landmarker_<variant>.task | ./weights/pose/.
 """
 from __future__ import annotations
 
-from typing import Any, Sequence
+import atexit
+import glob
+import os
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from .base import PoseBackendError
+from .base import PoseBackendError, WeightsNotFound
+
+MP33_NAMES: tuple[str, ...] = (
+    "nose", "left_eye_inner", "left_eye", "left_eye_outer", "right_eye_inner", "right_eye",
+    "right_eye_outer", "left_ear", "right_ear", "mouth_left", "mouth_right", "left_shoulder",
+    "right_shoulder", "left_elbow", "right_elbow", "left_wrist", "right_wrist", "left_pinky",
+    "right_pinky", "left_index", "right_index", "left_thumb", "right_thumb", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle", "left_heel", "right_heel",
+    "left_foot_index", "right_foot_index",
+)
 
 # COCO-17 индекс → индекс landmark-а MediaPipe Pose (33 точки, BlazePose topology)
 MP33_TO_COCO17: tuple[int, ...] = (
@@ -33,7 +53,7 @@ MP33_TO_COCO17: tuple[int, ...] = (
 
 
 def mp33_to_coco17(landmarks_xyv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(33, 3) [x, y, visibility] → (17, 2) xy, (17,) score — в порядке COCO-17."""
+    """(33, 3) [x, y, score] → (17, 2) xy, (17,) score — в порядке COCO-17."""
     lm = np.asarray(landmarks_xyv, dtype=np.float32)
     if lm.shape != (33, 3):
         raise ValueError(f"ожидались 33 landmark-а MediaPipe, получено {lm.shape}")
@@ -41,42 +61,152 @@ def mp33_to_coco17(landmarks_xyv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return lm[idx, :2].copy(), np.clip(lm[idx, 2], 0.0, 1.0)
 
 
+def find_task(cfg: dict[str, Any]) -> Optional[str]:
+    mc = cfg.get("backend", {}).get("mediapipe", {}) or {}
+    explicit = mc.get("task_path") or os.environ.get("SENTINEL_POSE_MP_TASK")
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    name = f"pose_landmarker_{mc.get('variant', 'full')}.task"
+    dirs: list[str] = []
+    wd = os.environ.get("SENTINEL_WEIGHTS_DIR")
+    if wd:
+        dirs += [os.path.join(wd, "pose"), wd]
+    dirs.append(os.path.join(os.getcwd(), "weights", "pose"))
+    for d in dirs:
+        hits = sorted(glob.glob(os.path.join(os.path.expanduser(d), "**", name), recursive=True))
+        if hits:
+            return hits[0]
+    return None
+
+
+def crop_upscale(frame: np.ndarray, box_px: Sequence[float], padding: float, min_side: float,
+                 max_scale: float) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Кроп bbox×padding (за краем кадра — чёрное поле) с апскейлом только вверх.
+
+    Возвращает (изображение, (x0, y0, w, h) кропа в пикселях кадра) — для обратного маппинга точек.
+    """
+    import cv2
+
+    x1, y1, x2, y2 = (float(v) for v in box_px)
+    w = max((x2 - x1) * padding, 2.0)
+    h = max((y2 - y1) * padding, 2.0)
+    x0 = (x1 + x2) / 2.0 - w / 2.0
+    y0 = (y1 + y2) / 2.0 - h / 2.0
+    s = float(min(max(min_side / min(w, h), 1.0), max(max_scale, 1.0)))
+    out_w, out_h = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    mat = np.array([[s, 0.0, -x0 * s], [0.0, s, -y0 * s]], dtype=np.float32)
+    img = cv2.warpAffine(frame, mat, (out_w, out_h), flags=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    return img, (x0, y0, out_w / s, out_h / s)
+
+
+def to_frame(xy_norm: np.ndarray, geom: tuple[float, float, float, float]) -> np.ndarray:
+    """Нормированные координаты кропа (0..1) → пиксели кадра."""
+    x0, y0, cw, ch = geom
+    return np.stack([x0 + xy_norm[:, 0] * cw, y0 + xy_norm[:, 1] * ch], axis=1).astype(np.float32)
+
+
+def pick_pose(cands: Sequence[tuple[np.ndarray, np.ndarray]], box_px: Sequence[float], min_score: float = 0.3) -> int:
+    """Из нескольких поз в кропе — та, чьи видимые точки больше лежат в bbox трека (×1.1), с учётом score."""
+    x1, y1, x2, y2 = (float(v) for v in box_px)
+    mx, my = 0.05 * (x2 - x1), 0.05 * (y2 - y1)
+    best, best_v = -1, -1.0
+    for i, (xy, sc) in enumerate(cands):
+        vis = sc >= min_score
+        if not vis.any():
+            v = 0.0
+        else:
+            inside = ((xy[:, 0] >= x1 - mx) & (xy[:, 0] <= x2 + mx) & (xy[:, 1] >= y1 - my) & (xy[:, 1] <= y2 + my))
+            v = float((inside & vis).sum()) / float(vis.sum()) * float(sc[vis].mean())
+        if v > best_v:
+            best, best_v = i, v
+    return best
+
+
 class MediaPipePose:
     name = "mediapipe"
 
-    def __init__(self, cfg: dict[str, Any]) -> None:
-        try:
-            import mediapipe as mp  # noqa: F401
-            self._mp_pose = mp.solutions.pose
-        except Exception as exc:  # noqa: BLE001
-            raise PoseBackendError(f"mediapipe недоступен: {exc}") from exc
-        mc = cfg.get("backend", {}).get("mediapipe", {})
-        self.pose = self._mp_pose.Pose(static_image_mode=True,
-                                       model_complexity=int(mc.get("model_complexity", 1)),
-                                       min_detection_confidence=float(mc.get("min_detection_confidence", 0.3)))
-        self.pad = float(cfg.get("backend", {}).get("rtmpose", {}).get("padding", 1.25))
+    def __init__(self, cfg: dict[str, Any], landmarker: Any = None) -> None:
+        mc = cfg.get("backend", {}).get("mediapipe", {}) or {}
+        self.pad = float(mc.get("crop_padding", 1.4))
+        self.min_side = float(mc.get("upscale_min_side", 384))
+        self.max_scale = float(mc.get("upscale_max", 3.0))
         self.vis_scale = float(mc.get("visibility_scale", 1.0))
+        self.use_presence = bool(mc.get("use_presence", True))
+        self.min_score = float(cfg.get("signals", {}).get("kp_min_score", 0.3))
         self.batch_size = 1
+        self._mp = None
+        if landmarker is not None:  # тесты: внедрённый фейковый landmarker (без mediapipe и модели)
+            self.landmarker = landmarker
+            self.providers = ["injected"]
+            return
+        path = find_task(cfg)
+        if not path:
+            raise WeightsNotFound(f"модель MediaPipe pose_landmarker_{mc.get('variant', 'full')}.task не найдена")
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+        except Exception as exc:  # noqa: BLE001
+            raise PoseBackendError(f"mediapipe недоступен: {type(exc).__name__}: {exc}") from exc
+        delegate = str(mc.get("delegate", "cpu")).lower()
+        base = mp_python.BaseOptions(
+            model_asset_path=path,
+            delegate=(mp_python.BaseOptions.Delegate.GPU if delegate == "gpu" else mp_python.BaseOptions.Delegate.CPU))
+        opts = vision.PoseLandmarkerOptions(
+            base_options=base, running_mode=vision.RunningMode.IMAGE, num_poses=int(mc.get("num_poses", 2)),
+            min_pose_detection_confidence=float(mc.get("min_pose_detection_confidence", 0.3)),
+            min_pose_presence_confidence=float(mc.get("min_pose_presence_confidence", 0.3)),
+            min_tracking_confidence=float(mc.get("min_tracking_confidence", 0.3)),
+            output_segmentation_masks=False)
+        try:
+            self.landmarker = vision.PoseLandmarker.create_from_options(opts)
+        except Exception as exc:  # noqa: BLE001 — например, нет libGLESv2 в контейнере
+            raise PoseBackendError(f"PoseLandmarker не создан: {type(exc).__name__}: {exc}") from exc
+        self._mp = mp
+        self.path = path
+        self.providers = [f"mediapipe-{delegate}"]
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        lm, self.landmarker = getattr(self, "landmarker", None), None
+        if lm is not None and hasattr(lm, "close"):
+            try:
+                lm.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _detect(self, rgb: np.ndarray) -> list[np.ndarray]:
+        """→ список (33, 3) [x, y, score] нормированных к входному изображению."""
+        if self._mp is not None:
+            image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+            res = self.landmarker.detect(image)
+        else:
+            res = self.landmarker.detect(rgb)
+        out = []
+        for pose in getattr(res, "pose_landmarks", None) or []:
+            rows = []
+            for p in pose:
+                vis = getattr(p, "visibility", None)
+                pres = getattr(p, "presence", None)
+                score = vis if vis is not None else (pres if pres is not None else 0.0)
+                if self.use_presence and vis is not None and pres is not None:
+                    score = min(vis, pres)
+                rows.append((float(p.x), float(p.y), float(score)))
+            if len(rows) == 33:
+                out.append(np.array(rows, dtype=np.float32))
+        return out
 
     def infer(self, items: Sequence[tuple[np.ndarray, np.ndarray]], meta: Any = None) -> list[tuple[np.ndarray, np.ndarray]]:
-        import cv2
-
         out = []
         for frame, box in items:
-            h, w = frame.shape[:2]
-            x1, y1, x2, y2 = (float(v) for v in box)
-            cx, cy, bw, bh = (x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1) * self.pad, (y2 - y1) * self.pad
-            ox, oy = int(max(0, cx - bw / 2)), int(max(0, cy - bh / 2))
-            ex, ey = int(min(w, cx + bw / 2)), int(min(h, cy + bh / 2))
-            crop = frame[oy:ey, ox:ex]
-            kp = np.zeros((17, 2), np.float32)
-            sc = np.zeros(17, np.float32)
-            if crop.size:
-                res = self.pose.process(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-                if res.pose_landmarks:
-                    lm = np.array([[p.x, p.y, p.visibility] for p in res.pose_landmarks.landmark], np.float32)
-                    xy, sc = mp33_to_coco17(lm)
-                    kp = np.stack([ox + xy[:, 0] * crop.shape[1], oy + xy[:, 1] * crop.shape[0]], axis=1)
-                    sc = np.clip(sc * self.vis_scale, 0.0, 1.0)
-            out.append((kp.astype(np.float32), sc.astype(np.float32)))
+            img, geom = crop_upscale(frame, box, self.pad, self.min_side, self.max_scale)
+            cands = []
+            for lm in self._detect(img[..., ::-1]):
+                xy, sc = mp33_to_coco17(lm)
+                cands.append((to_frame(xy, geom), np.clip(sc * self.vis_scale, 0.0, 1.0).astype(np.float32)))
+            if not cands:
+                out.append((np.zeros((17, 2), np.float32), np.zeros(17, np.float32)))  # не найдено → unknown
+                continue
+            out.append(cands[pick_pose(cands, box, self.min_score)])
         return out

@@ -17,12 +17,12 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from .autolabel import is_verified
+from .autolabel import label_status
 from .boxes import iou_matrix
 
 IOU_THRS = np.round(np.arange(0.5, 0.951, 0.05), 2)
-UNVERIFIED_WARNING = ("GT не проверена человеком (info.verified != true): результат = согласие с псевдоразметкой, "
-                      "НЕ метрика качества.")
+UNVERIFIED_WARNING = ("GT не подтверждена как человеческая разметка (нет mark-verified и не указан --annotator): "
+                      "результат = согласие с псевдоразметкой, НЕ метрика качества.")
 
 
 def _xywh_to_xyxy(b: Sequence[float]) -> list[float]:
@@ -50,7 +50,8 @@ def average_precision(tp: np.ndarray, scores: np.ndarray, n_gt: int) -> float:
     return float(q.mean())
 
 
-def evaluate(gt: dict[str, Any], preds: Sequence[dict[str, Any]], iou_thrs: Sequence[float] = IOU_THRS) -> dict[str, Any]:
+def evaluate(gt: dict[str, Any], preds: Sequence[dict[str, Any]], iou_thrs: Sequence[float] = IOU_THRS,
+             annotator: Optional[str] = None) -> dict[str, Any]:
     cats = {c["id"]: c["name"] for c in gt.get("categories", [])}
     gt_by = defaultdict(list)  # (img, cat) -> boxes
     for a in gt.get("annotations", []):
@@ -89,9 +90,11 @@ def evaluate(gt: dict[str, Any], preds: Sequence[dict[str, Any]], iou_thrs: Sequ
         per_class[name] = {"n_gt": n_gt, "n_pred": n_pred, "AP50": aps[0] if aps else float("nan"),
                            "AP": float(np.nanmean(aps)) if n_gt else float("nan")}
     valid = [v for v in per_class.values() if v["n_gt"] > 0]
-    verified = is_verified(gt)
+    status = label_status(gt, annotator)
+    verified = status in ("verified", "manual")
     rep = {
         "quality_claim": verified,
+        "gt_status": status,
         "gt_kind": (gt.get("info") or {}).get("kind", "unknown"),
         "n_images": len(gt.get("images", [])),
         "mAP50": float(np.mean([v["AP50"] for v in valid])) if valid else float("nan"),
@@ -140,13 +143,14 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--frames", default="")
     ap.add_argument("--out", default="")
+    ap.add_argument("--annotator", default=None, help="автор ручной разметки (иначе GT считается непроверенной)")
     a = ap.parse_args(argv)
     gt = json.loads(Path(a.gt).read_text(encoding="utf-8"))
     if a.run:
         preds = run_predictions(gt, a.frames)
     else:
         preds = json.loads(Path(a.pred).read_text(encoding="utf-8"))
-    rep = evaluate(gt, preds)
+    rep = evaluate(gt, preds, annotator=a.annotator)
     txt = json.dumps(rep, ensure_ascii=False, indent=2)
     print(txt)
     if not rep["quality_claim"]:

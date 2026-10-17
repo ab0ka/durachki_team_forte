@@ -36,20 +36,23 @@ class SimpleClip:
             pass
         self.fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
         frames, times = [], []
-        step = max(1, int(round(self.fps / sample_fps)))
-        i = 0
+        period = 1.0 / max(sample_fps, 1e-6)
+        next_t = 0.0
+        last_t = 0.0
         while True:
             ok, fr = cap.read()
             if not ok:
                 break
-            if i % step == 0:
+            t = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0  # время только из PTS (переменный fps)
+            last_t = max(last_t, t)
+            if t + 1e-6 >= next_t:
                 frames.append(fr)
-                times.append(round(i / self.fps, 4))
-            i += 1
+                times.append(round(t, 4))
+                next_t = t + period
         cap.release()
         self._frames = frames
         self.times = times
-        self.duration = i / self.fps if self.fps else 0.0
+        self.duration = last_t
         self.height, self.width = (frames[0].shape[:2] if frames else (0, 0))
 
     def frame(self, i: int) -> Any:

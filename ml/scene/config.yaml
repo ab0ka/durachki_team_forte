@@ -62,6 +62,8 @@ safe:
   geom_scale: 0.15
   geom_c: 0.6
   ref_open_det_thr: 0.5       # если в эталонных кадрах детектор видит safe_open — эталон «открыт», ROI-признак инвертируется
+  cluster_mode: ref_first     # ref_first | kmeans2 — [H1, выкл до замера L2] два кластера вида по всему ролику
+  namer: {backend: none, k: 3, weight: 1.5, single_state_weight: 1.0, cap: 3.0}   # none | siglip2 — [H2, выкл]
   smoothing: {method: hmm, switch_per_s: 0.05, prior: 0.1, gain: 1.0}
 
 door:
@@ -85,6 +87,8 @@ door:
   traffic_cross_p: 0.92       # трек пересёк границу cashier_area рядом с дверью
   traffic_cross_window_s: 1.0
   ref_open_det_thr: 0.5
+  cluster_mode: ref_first     # [H1]
+  namer: {backend: none, k: 3, weight: 1.5, single_state_weight: 1.0, cap: 3.0}   # [H2]
   smoothing: {method: hmm, switch_per_s: 0.08, prior: 0.15, gain: 1.0}
 
 cash:
@@ -93,7 +97,7 @@ cash:
   w_det: 1.0
   w_color: 0.6
   det_absent_p: 0.3
-  det_absent_c: 0.3
+  det_absent_c: 0.4           # «нет» известно, только если молчат и детектор, и цветовой признак: 0.4 + 0.6·0.25 ≥ 0.5
   color: true                 # запасной цвет/текстура-классификатор купюр на ROI стола
   color_sat_lo: 25            # HSV S (0..255): купюры тенге — пастельные, не белые и не кислотные
   color_sat_hi: 170
@@ -149,3 +153,62 @@ learned:
   enabled: true               # использовать обученную модель (train_signals.py), если файл есть
   path: weights/scene/scene_signals.json   # относительно корня репо; env SENTINEL_SCENE_MODEL
   weight: 0.5                 # 1.0 — заменить ручную фузию, 0.5 — смешать в логит-пространстве
+
+# ---------------------------------------------------------------- фаза 2 ----------------------------
+# Правило: новый режим, меняющий существующие SIGNALS, по умолчанию ВЫКЛЮЧЕН, пока L2 не измерит выигрыш
+# (python -m ml.scene.l2_bench). Предикаты — аддитивный слой (новые поля), legacy-сигналы не меняют.
+
+status:
+  vis_thr: 0.35               # неизвестно и видимость ROI ниже — статус occluded (а не unknown)
+  min_quality: 0.35           # ниже — причина low_quality
+
+lights:
+  abs_dark: 28                # медианная яркость кадра (0..255) ниже — темно
+  rel_dark: 0.4               # ...или ниже 0.4 × типичной для ролика (75-й перцентиль)
+  min_s: 1.0                  # темнота короче — не «выключили свет»
+  max_gap_s: 0.4
+  freeze: false               # [гипотеза H3, выкл] в темноте legacy-SIGNALS держат последнее известное значение
+
+predicates:
+  enabled: true               # аддитивные поля pred/pred_status/pred_why
+  min_quality: 0.35
+  max_gap_s: 0.6              # дребезг одного события склеивается
+  vis_thr: 0.35
+  vis_thr_safe_free: 0.6      # сейф «без людей рядом»: видимость ROI сейфа ≥
+  near_safe_pad: 0.15         # опорная точка у сейфа (ROI + pad) — тоже «сторона кассы»
+  dominant_min_s: 5.0         # доминирующий работник со стороны кассы (кассир по поведению) — от стольких секунд
+  client_history_s: 1.0       # был со стороны клиента до входа на сторону кассы ≥ — посторонний (если не доминирующий)
+  outsider_min_s: 1.0
+  second_person_min_s: 2.0
+  entry_before_s: 2.0
+  entry_after_s: 0.6
+  entry_mark_s: 2.0
+  leave_min_s: 1.0
+  leave_onset: exit           # exit — вышла из зоны кассы | left_desk — отошла от стола [H5, подбирается замером]
+  desk_near_pad: 0.12         # «у стола»: опорная точка в bbox стола + pad
+  after_leave_window_s: 5.0   # решение «оставил ценности» — по окну [t_ухода, t_ухода + 5 с]
+  k_true: 2                   # ≥ k_true сэмплов «видно» в окне → true
+  k_false: 3                  # ≥ k_false сэмплов «видно, что нет» и ни одного «да» → false
+  bag_min_score: 0.3
+  reach: 0.06                 # «в руках/рядом»: зазор между боксами сумки и человека (норм.)
+  static_radius: 0.04         # неподвижный предмет (стационарный телефон): радиус кластера центров
+  static_frac: 0.6            # ...присутствует в ≥ 60% сэмплов ролика (стационарный телефон стоит всё время)
+  object_min_score: 0.3
+  object_window_s: 0.5        # предмет рядом с кассиром ±0.5 с от позы
+  object_min_s: 1.0
+  phone_det_only: false       # [гипотеза H4, выкл] мобильный по детекции в боксе кассира без позы
+  personal_labels: [bag, backpack, handbag, jacket, coat]
+  personal_min_s: 2.0
+  bag_alone_min_s: 3.0
+  safe_working_min_s: 3.0
+  timecode: onset             # onset | mid | max — t_peak интервала (подбирается замером L2)
+
+namer:                        # общие настройки open-vocab именователя (используется, только если backend != none)
+  model: google/siglip2-base-patch16-224
+  cache_dir: weights/hf/hub   # офлайн HF-кэш (L1); env SENTINEL_HF_CACHE переопределяет
+  device: auto                # auto | cuda | cpu
+
+ablation:                     # только для python -m ml.scene.ablation; в проде пусто
+  smoothing: null             # переопределить сглаживание всех сигналов: {method: hmm|hysteresis|ema|none, ...}
+  naive: false                # наивный режим для сравнения (НЕ включать в проде): «не увидели = нет», пропавший трек = ушёл,
+                              # первые кадры = закрытый сейф, «не кассир» = посторонний, сторона — по перекрытию бокса

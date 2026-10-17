@@ -4,7 +4,8 @@
 |---|---|
 | `sentinel_contracts.py` | **Замороженный контракт v1** (байт в байт с ТЗ). sha256 `3b870961e62dac86e9457029009a37a753c0fdc73543639690b0493d8e134cac` — проверяется тестом. |
 | `__init__.py` | Реэкспорт dataclass-ов, `LABELS`, `SIGNALS`, `CONTRACT_VERSION`. |
-| `extensions.py` | Совместимые дополнения v1.1 (только через `meta`/`extra`, со значениями по умолчанию): `completeness`, `provenance`, `verdict_state`/unknown. |
+| `extensions.py` | Совместимые дополнения v1.1 (только через `meta`/`signals`, со значениями по умолчанию): `meta.coverage` и `compute_coverage`, защита от mock, «неизвестно ≠ нет» (`signal_value`), реестр типов с V09. |
+| `config.yaml` | Флаги: гипотезы по умолчанию выключены (`jury.embed_rule_in_description: false`); порог полноты `coverage.min_ratio_for_no_violation`. |
 | `serialize.py` | Два сериализатора: `result_to_jury_api` (строго ТЗ) и `result_to_ui_report` (расширенный). `result_to_api` — прежнее имя = UI-report (`profile="jury"` — ответ жюри). Также `api_to_result`, `resolve_outcome`. |
 | `api_schema.json` | JSON Schema (draft 2020-12) ответа `GET /api/v1/jobs/{id}`; `$defs/AnalyzeResponse` — ответ `POST /analyze`. |
 | `validate.py` | Валидатор: обычный, строгий для жюри (`jury_response_errors`), смысловые проверки; CLI `python -m contracts.validate`. |
@@ -49,7 +50,9 @@ report = result_to_ui_report(result)           # + type_id, confidence, rules, r
 ### Пайплайн / fusion (A03, A12)
 
 * Ставьте `verdict` явно. Сериализатор **не придумывает** `no_violation`. Если вердикта нет и нет нарушений, ответ будет `failed`.
-* Сообщайте полноту анализа: `meta["completeness"] = Completeness(complete=..., stages=..., required_stages=[...]).to_dict()`. При неполном анализе `no_violation` не отдаётся (будет `failed`). Нарушения с доказательствами отдаются.
+* **`no_violation` отдаётся только при подтверждённой полноте:** `meta["coverage"] = compute_coverage(...)` (`contracts.extensions`). Без неё ответ — `failed` с причиной.
+* Mock-результат помечайте `meta["mock"] = True`. Без явного `SENTINEL_MOCK=1` он отдаётся как `failed`.
+* Неизвестно ≠ нет: не наблюдали сигнал — не кладите его в `signals`; `0.0` означает «видели, что нет».
 * Кладите `meta["duration_sec"]`: по нему таймкоды проверяются и обрезаются по длительности.
 * Происхождение результата — `meta["provenance"] = Provenance(...).to_dict()`. Сведения по нарушению — `meta["violation_extra"][i]` (попадают только в UI-report).
 * Кадры — JPEG в base64 без префикса `data:`. Невалидные кадры отбрасываются с предупреждением.

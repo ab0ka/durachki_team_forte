@@ -132,7 +132,7 @@ def test_partial_never_done_or_no_violation(fake_ml, synth_video, tmp_path):
     assert res.meta["partial_written"] == ["after_core"]
     p = Path(tmp_path / "data" / "jobs" / "job_partial_1" / "partial.json")
     data = json.loads(p.read_text(encoding="utf-8"))
-    assert data["status"] == "processing" and data["verdict"] is None
+    assert data["status"] == "processing" and data["verdict"] is None and data["partial_verdict"] is None
     assert data["meta"]["partial"] is True and data["meta"]["complete"] is False
 
 
@@ -140,7 +140,8 @@ def test_partial_with_violation(fake_ml, synth_video, tmp_path):
     fake_ml({"ml.temporal.score": _temporal_with_event})
     run(synth_video, "jp2", None, 60)
     data = json.loads((tmp_path / "data" / "jobs" / "jp2" / "partial.json").read_text(encoding="utf-8"))
-    assert data["status"] == "processing" and data["verdict"] == "violation"
+    assert data["status"] == "processing" and data["verdict"] is None      # промежуточный — без вердикта
+    assert data["partial_verdict"] == "violation" and data["partial_violations"]
 
 
 def test_progress_monotonic_russian(fake_ml, synth_video):
@@ -198,3 +199,30 @@ def test_run_with_context_outputs(fake_ml, synth_video, tmp_path):
     names = {Path(f).name for f in files}
     assert {"dets.jsonl", "tracks.json", "zones.json", "states.jsonl", "events_rules.json", "risk.json",
             "events_all.json", "stages.json"} <= names
+
+
+def test_cold_flag_queue_wait_and_vlm_usage(fake_ml, synth_video):
+    def verify(clip, events, budget_s):
+        out = []
+        for e in events:
+            out.append(Event(e.type_id, e.t_start, e.t_end, e.t_peak, e.confidence, "vlm", [], {}, [],
+                             {"vlm": {"status": "checked", "budget": {"calls": 1, "output_tokens": 37}}}))
+        return out
+
+    fake_ml({"ml.vlm.verify": verify})
+    r1 = run(synth_video, "job-cold-1", None, 60, overrides={"cache": {"mode": "off"}})
+    r2 = run(synth_video, "job-cold-2", None, 60, overrides={"cache": {"mode": "off"}})
+    assert r1.meta["stages"]["detect"].get("cold") is True          # первый вызов — с загрузкой модели
+    assert not r2.meta["stages"]["detect"].get("cold")              # модель уже тёплая
+    assert r1.meta["queue_wait_s"] >= 0
+    assert r1.meta["vlm"]["vlm_verify"]["budget"]["output_tokens"] == 37
+    assert r1.meta["vlm"]["vlm_verify"]["statuses"] == {"checked": 1}
+
+
+def test_mock_config_does_not_leak_into_process_env(fake_ml, synth_video):
+    """mock одной задачи не должен переключать процесс API (и следующие задачи) в mock."""
+    import os
+
+    fake_ml()
+    run(synth_video, "job-mock-cfg", None, 60, overrides={"mock": True})
+    assert "SENTINEL_MOCK" not in os.environ

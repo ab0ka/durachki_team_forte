@@ -145,3 +145,50 @@ def test_nan_confidence_is_neutral_prior(clip, cfg, clock):
     be = MockBackend(mode="neutral", clock=clock)
     out = verify_events(clip, [_ev(conf=float("nan"))], 30.0, cfg=cfg, backend=be, clock=clock)[0]
     assert out.confidence == 0.5
+
+
+def test_fusion_compatible_opinion(clip, cfg, clock):
+    """ml.fusion (A12) читает extra.vlm.verdict/score; 'status' не должен выглядеть как вердикт."""
+    sup = verify_events(clip, [_ev(conf=0.5)], 30.0, cfg=cfg,
+                        backend=MockBackend(responses=[_ans(True, "V05", 0.9, [])], clock=clock), clock=clock)[0]
+    assert sup.extra["vlm"]["verdict"] == "confirm" and sup.extra["vlm"]["score"] == pytest.approx(0.9)
+    rej = verify_events(clip, [_ev(conf=0.9)], 30.0, cfg=cfg,
+                        backend=MockBackend(responses=[_ans(False, "V05", 0.8, [])], clock=clock), clock=clock)[0]
+    assert rej.extra["vlm"]["verdict"] == "reject" and rej.extra["vlm"]["score"] == pytest.approx(0.8)
+    assert "vlm_verdict" not in rej.extra  # A03-fallback не выбрасывает событие без явного флага
+    unk = verify_events(clip, [_ev(conf=0.6)], 30.0, cfg=cfg, backend=MockBackend(mode="neutral", clock=clock),
+                        clock=clock)[0]
+    assert unk.extra["vlm"]["verdict"] == "unsure"
+    cfg["backend"] = "off"
+    off = verify_events(clip, [_ev(conf=0.6)], 30.0, cfg=cfg)[0]
+    assert "verdict" not in off.extra["vlm"] and off.extra["vlm"]["coverage"]["complete"] is False
+
+
+def test_coverage_summary(clip, cfg, clock):
+    evs = [_ev("V05", t, 0.5) for t in (2.0, 5.0, 8.0)]
+    out = verify_events(clip, evs, 100.0, cfg=cfg, backend=MockBackend(mode="confirm", clock=clock), clock=clock,
+                        limits={"max_calls": 2})
+    cov = out[0].extra["vlm"]["coverage"]
+    assert cov == {"checked": 2, "total": 3, "complete": False, "statuses": {"ok": 2, "skipped_budget": 1}}
+
+
+def test_emit_rejected_flag(clip, cfg, clock):
+    cfg["verify"]["emit_vlm_verdict_rejected"] = True
+    rej = verify_events(clip, [_ev(conf=0.9)], 30.0, cfg=cfg,
+                        backend=MockBackend(responses=[_ans(False, "V05", 0.8, [])], clock=clock), clock=clock)[0]
+    assert rej.extra["vlm_verdict"] == "rejected"
+
+
+def test_truncated_answer_marked_incomplete(clip, cfg, clock):
+    from ml.vlm.backends.base import GenResult
+
+    class Trunc(MockBackend):
+        def generate(self, images, system, prompt, **kw):
+            self.calls.append({"prompt": prompt})
+            return GenResult(text='{"visible": true, "type_id": "V05", "confidence": 0.8, "observed_facts": ["Кас',
+                             latency_s=1.0, completion_tokens=180, finish_reason="length")
+
+    out = verify_events(clip, [_ev(conf=0.5)], 30.0, cfg=cfg, backend=Trunc(clock=clock), clock=clock)[0]
+    v = out.extra["vlm"]
+    assert v["status"] == "ok" and v["finish_reason"] == "length" and v["complete"] is False
+    assert v["repaired_json"] is True

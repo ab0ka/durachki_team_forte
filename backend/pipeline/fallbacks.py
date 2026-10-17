@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping, Optional
 from .config import cfg_get
 from .contract import (AnalysisResult, Detection, Event, EvidenceFrame, RuleRef, SceneState, Track,
                        Violation)
-from .media import blur_regions, encode_jpeg_b64
+from .media import blur_regions, encode_jpeg_b64, read_frame_at_pts
 
 # Только названия (не нормы!) — на случай пустого каталога.
 FALLBACK_NAMES = {
@@ -41,25 +41,10 @@ class EvidenceClip:
         return self.frame_at(self.times[i])
 
     def frame_at(self, t: float) -> Any:
-        try:
-            import cv2  # noqa: WPS433
-        except Exception:  # noqa: BLE001
-            return None
+        """Кадр с PTS, ближайшим к t (переменный fps — время только из PTS)."""
         with self._lock:
-            cap = cv2.VideoCapture(self.path)
-            try:
-                if not cap.isOpened():
-                    return None
-                fps = float(cap.get(cv2.CAP_PROP_FPS) or self.fps or 30.0)
-                n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                idx = int(round(max(0.0, float(t)) * fps))
-                if n > 0:
-                    idx = min(idx, n - 1)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, frame = cap.read()
-                return frame if ok else None
-            finally:
-                cap.release()
+            frame, _pts = read_frame_at_pts(self.path, t)
+        return frame
 
 
 def states_from_detections(times: Iterable[float], dets: list[Detection],

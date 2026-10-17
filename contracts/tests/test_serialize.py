@@ -26,6 +26,7 @@ EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 TZ_EXAMPLE = json.loads((EXAMPLES / "job_done_tz.json").read_text(encoding="utf-8"))
 JPEG_B64 = TZ_EXAMPLE["violations"][0]["evidence_frames"][0]["image_base64"]
 NAN = float("nan")
+COVERED = {"coverage": {"ratio": 1.0, "complete": True}}
 
 
 def _rule(i: int = 0) -> RuleRef:
@@ -74,15 +75,15 @@ def test_result_to_api_keeps_contract_behaviour():
         result_to_api(r, profile="xml")
 
 
-def test_jury_embeds_first_rule_into_description_once():
-    v = result_to_jury_api(_result())["violations"][0]
+def test_jury_embeds_first_rule_into_description_only_when_flag_on():
+    plain = result_to_jury_api(_result())  # флаг-гипотеза jury.embed_rule_in_description по умолчанию выключен
+    assert "Норма" not in plain["violations"][0]["description"]
+    v = result_to_jury_api(_result(), embed_rule_in_description=True)["violations"][0]
     assert v["description"].count("https://example.invalid/0") == 1
     assert "ТЕСТ-ДОКУМЕНТ-0, п. TEST" in v["description"]
     already = _result(violations=[_violation(description="Описание. https://example.invalid/0")])
-    assert result_to_jury_api(already)["violations"][0]["description"] == "Описание. https://example.invalid/0"
-    plain = result_to_jury_api(_result(), embed_rule_in_description=False)
-    assert "Норма" not in plain["violations"][0]["description"]
-
+    assert result_to_jury_api(already, embed_rule_in_description=True)["violations"][0]["description"] == \
+        "Описание. https://example.invalid/0"
 
 def test_jury_caps_frames_at_three():
     frames = [EvidenceFrame(20.0 + i, JPEG_B64) for i in range(5)]
@@ -129,7 +130,7 @@ def test_unknown_status_becomes_failed():
 
 
 def test_done_without_verdict_and_without_violations_is_not_no_violation():
-    out = result_to_jury_api(_result(verdict=None, violations=[]))
+    out = result_to_jury_api(_result(verdict=None, violations=[], meta=COVERED))
     assert out["status"] == "failed" and out["verdict"] is None
     assert result_to_ui_report(_result(verdict=None, violations=[]))["verdict_state"] == "unknown"
 
@@ -145,30 +146,49 @@ def test_violation_verdict_without_valid_violation_fails():
     assert result_to_jury_api(_result(violations=[nan_v]))["status"] == "failed"
 
 
-def test_no_violation_requires_complete_analysis():
-    ok = _result(verdict="no_violation", violations=[], meta={"completeness": {"complete": True}})
+def test_no_violation_requires_confirmed_coverage():
+    ok = _result(verdict="no_violation", violations=[], meta=COVERED)
     assert result_to_jury_api(ok)["verdict"] == "no_violation"
-    legacy = _result(verdict="no_violation", violations=[], meta={})  # модуль без completeness — совместимость
-    assert result_to_jury_api(legacy)["verdict"] == "no_violation"
-    partial = _result(verdict="no_violation", violations=[],
-                      meta={"completeness": {"complete": False, "reason": "timeout"}})
-    out = result_to_jury_api(partial)
-    assert out["status"] == "failed" and out["verdict"] is None
-    req_failed = _result(verdict="no_violation", violations=[],
-                         meta={"completeness": {"stages": {"detect": "failed"}, "required_stages": ["detect"]}})
-    assert result_to_jury_api(req_failed)["status"] == "failed"
-    vlm_skipped = _result(verdict="no_violation", violations=[],
-                          meta={"completeness": {"stages": {"vlm": "skipped"}, "required_stages": ["detect"]}})
-    assert result_to_jury_api(vlm_skipped)["verdict"] == "no_violation"
+    for meta, why in [({}, "нет meta.coverage"),
+                      ({"coverage": {"ratio": 0.6, "complete": True}}, "60%"),
+                      ({"coverage": {"ratio": 1.0, "complete": False}}, "complete=false"),
+                      ({"coverage": 1.0, "complete": False}, "meta.complete=false"),
+                      ({"coverage": {"ratio": 1.0, "required": ["detect"], "stages": {"detect": "error"}}}, "detect"),
+                      ({"coverage": {"ratio": 1.0}, "required_stages": ["scene"],
+                        "stages": {"scene": {"status": "missing"}}}, "scene")]:
+        r = _result(verdict="no_violation", violations=[], meta=meta)
+        out = result_to_jury_api(r)
+        assert out["status"] == "failed" and out["verdict"] is None, meta
+        assert why in result_to_ui_report(r)["error"], (why, result_to_ui_report(r)["error"])
+    assert result_to_jury_api(_result(verdict="no_violation", violations=[], meta={"coverage": 0.99}))["verdict"] \
+        == "no_violation"
+    vlm_off = {"coverage": {"ratio": 1.0, "required": ["detect"], "stages": {"detect": "ok", "vlm": "disabled"}}}
+    assert result_to_jury_api(_result(verdict="no_violation", violations=[], meta=vlm_off))["verdict"] == "no_violation"
 
+
+def test_mock_result_never_passes_as_production():
+    for meta in ({**COVERED, "mock": True}, {**COVERED, "provenance": {"mock": True}},
+                 {"coverage": {"ratio": 1.0, "required": ["detect"], "stages": {"detect": "mock"}}}):
+        for verdict, viol in (("no_violation", []), ("violation", [_violation()])):
+            r = _result(verdict=verdict, violations=viol, meta=meta)
+            assert result_to_jury_api(r, allow_mock=False)["status"] == "failed"
+            assert result_to_jury_api(r, allow_mock=True)["verdict"] == verdict
+
+
+def test_mock_allowed_only_by_explicit_env(monkeypatch):
+    r = _result(verdict="no_violation", violations=[], meta={**COVERED, "mock": True})
+    monkeypatch.delenv("SENTINEL_MOCK", raising=False)
+    assert result_to_jury_api(r)["status"] == "failed"
+    monkeypatch.setenv("SENTINEL_MOCK", "1")
+    assert result_to_jury_api(r)["verdict"] == "no_violation"
 
 def test_incomplete_analysis_still_reports_evidenced_violation():
-    r = _result(meta={"completeness": {"complete": False}})
+    r = _result(meta={"coverage": {"ratio": 0.3, "complete": False}})
     assert result_to_jury_api(r)["verdict"] == "violation"
 
 
 def test_no_violation_hides_candidates_from_jury():
-    r = _result(verdict="no_violation")
+    r = _result(verdict="no_violation", meta=COVERED)
     jury = result_to_jury_api(r)
     assert jury["verdict"] == "no_violation" and jury["violations"] == []
     ui = result_to_ui_report(r)
@@ -178,13 +198,12 @@ def test_no_violation_hides_candidates_from_jury():
 
 # ----------------------------------------------------------------------------- таймкоды и кадры
 
-def test_nan_timecode_falls_back_to_frame_then_t_start():
-    v = _violation(timecode_sec=NAN)
+def test_nan_timecode_falls_back_to_t_start_then_frame():
+    v = _violation(timecode_sec=NAN)  # t_start=21.25 — начало действия
     oc = resolve_outcome(_result(violations=[v]))
-    assert oc.violations[0]["timecode_sec"] == 22.0  # первый валидный кадр
-    v2 = _violation(timecode_sec=float("inf"), evidence_frames=[], t_start=5.04)
-    assert resolve_outcome(_result(violations=[v2])).violations[0]["timecode_sec"] == 5.0
-
+    assert oc.violations[0]["timecode_sec"] == 21.2
+    v2 = _violation(timecode_sec=float("inf"), t_start=NAN)
+    assert resolve_outcome(_result(violations=[v2])).violations[0]["timecode_sec"] == 22.0  # первый кадр
 
 def test_timecode_clamped_to_duration():
     r = _result(meta={"duration_sec": 20.0})
@@ -240,7 +259,8 @@ def test_ui_report_fields_and_rules():
     v = out["violations"][0]
     assert tuple(v)[:4] == API_REQUIRED_VIOLATION
     assert v["rule"] == v["rules"][0] and v["rules"][1]["clause"] is None
-    assert out["verdict_state"] == "violation" and out["analysis_complete"] is None
+    assert out["verdict_state"] == "violation" and out["analysis_complete"] is False
+    assert "meta.coverage" in out["coverage_problem"]
     assert job_response_errors(out) == [] and job_response_errors(out, strict=True) != []
     no_rules = result_to_ui_report(_result(violations=[_violation(rules=[])]))
     assert no_rules["violations"][0]["rule"] is None

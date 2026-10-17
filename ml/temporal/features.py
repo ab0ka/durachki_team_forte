@@ -19,6 +19,7 @@ from .config import TYPE_IDS, cache_dir, feature_signature, is_mock, load_prompt
 
 log = logging.getLogger("sentinel.temporal")
 IMG = 224
+FEATURE_VERSION = 3  # поднимать при любом изменении извлечения: старый кэш перестанет совпадать по ключу
 
 
 # ----------------------------------------------------------------------------- backends
@@ -55,9 +56,11 @@ class SiglipBackend:
 
     name = "siglip2"
 
-    def __init__(self, model_id: str, device: str = "auto", fp16: bool = True) -> None:
+    def __init__(self, model_id: str, device: str = "auto", fp16: bool = True, cache_dir: Optional[str] = None) -> None:
         import torch
         from transformers import AutoModel, AutoProcessor
+
+        kw = {"cache_dir": cache_dir} if cache_dir else {}
 
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,17 +68,22 @@ class SiglipBackend:
         self.dtype = torch.float16 if (fp16 and device.startswith("cuda")) else torch.float32
         self.model_id = model_id
         try:
-            self.processor = AutoProcessor.from_pretrained(model_id)
+            self.processor = AutoProcessor.from_pretrained(model_id, **kw)
             ip = getattr(self.processor, "image_processor", None)
         except Exception:  # нет токенизатора рядом с весами — картинки всё равно считаем
             self.processor = None
             try:
                 from transformers import AutoImageProcessor
 
-                ip = AutoImageProcessor.from_pretrained(model_id)
+                ip = AutoImageProcessor.from_pretrained(model_id, **kw)
             except Exception:
                 ip = None
-        self.model = AutoModel.from_pretrained(model_id, torch_dtype=self.dtype).to(device).eval()
+        try:  # transformers 5.x: dtype=; 4.x: torch_dtype=
+            model = AutoModel.from_pretrained(model_id, dtype=self.dtype, **kw)
+        except TypeError:
+            model = AutoModel.from_pretrained(model_id, torch_dtype=self.dtype, **kw)
+        self.model = model.to(device).eval()
+        self._kw = kw
         self.mean = np.asarray(getattr(ip, "image_mean", None) or [0.5, 0.5, 0.5], dtype=np.float32)
         self.std = np.asarray(getattr(ip, "image_std", None) or [0.5, 0.5, 0.5], dtype=np.float32)
         self.logit_scale = float(self.model.logit_scale.exp().item()) if hasattr(self.model, "logit_scale") else 1.0
@@ -113,8 +121,9 @@ class SiglipBackend:
         else:
             from transformers import AutoTokenizer
 
-            inp = AutoTokenizer.from_pretrained(self.model_id)(list(texts), padding="max_length", max_length=64,
-                                                               truncation=True, return_tensors="pt")
+            inp = AutoTokenizer.from_pretrained(self.model_id, **self._kw)(list(texts), padding="max_length",
+                                                                           max_length=64, truncation=True,
+                                                                           return_tensors="pt")
         inp = {k: v.to(self.device) for k, v in inp.items() if k in ("input_ids", "attention_mask")}
         with torch.no_grad():
             try:
@@ -143,8 +152,21 @@ def get_backend(cfg: dict, force: Optional[str] = None) -> Any:
                     os.environ.setdefault("HF_HUB_OFFLINE", "1")
                     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
                 _BACKENDS[key] = SiglipBackend(f["model_id"], str(f.get("device", "auto")),
-                                               bool(f.get("fp16", True)))
+                                               bool(f.get("fp16", True)), hf_cache_dir(cfg))
         return _BACKENDS[key]
+
+
+def hf_cache_dir(cfg: dict) -> Optional[str]:
+    """Каталог офлайн-весов HF: env HF_HUB_CACHE/HF_HOME имеют приоритет, иначе features.hf_cache (если есть)."""
+    if os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME"):
+        return None  # transformers сам возьмёт из env
+    p = cfg["features"].get("hf_cache")
+    if not p:
+        return None
+    from .config import REPO_ROOT
+
+    path = Path(p) if Path(p).is_absolute() else REPO_ROOT / p
+    return str(path) if path.is_dir() else None
 
 
 def _l2(x: np.ndarray) -> np.ndarray:
@@ -254,7 +276,13 @@ def sims(fs: FeatureSet, bank: TextBank) -> np.ndarray:
 
 def type_scores(fs: FeatureSet, bank: TextBank) -> tuple[np.ndarray, list[str]]:
     """Zero-shot отрыв типа от «нормы»: (T, K) = max_view max_prompt(type) − max_view max_prompt(normal)."""
-    s = sims(fs, bank).max(axis=1)  # (T, P)
+    with np.errstate(all="ignore"):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            s = np.nanmax(sims(fs, bank), axis=1)  # (T, P); неизвестные виды (NaN) пропускаются
+    s = np.nan_to_num(s, nan=0.0)
     idx = bank.type_index
     normal = s[:, idx["normal"]].max(axis=1) if "normal" in idx else np.zeros(len(s), np.float32)
     keys = [k for k in TYPE_IDS if k in idx]
@@ -270,10 +298,11 @@ def _square_box(cx: float, cy: float, side_w: float, side_h: float, w: int, h: i
     return x1, y1, int(round(min(x1 + side_w, w))), int(round(min(y1 + side_h, h)))
 
 
-def _zone_box(zones: Any) -> Optional[tuple[float, float, float, float]]:
+def _zone_box(zones: Any, names: Sequence[str] = ("cashier_area", "desk", "cash_tray")
+              ) -> Optional[tuple[float, float, float, float]]:
     if not zones:
         return None
-    for name in ("cashier_area", "desk", "cash_tray"):
+    for name in names:
         for z in zones:
             zn = getattr(z, "name", None) if not isinstance(z, dict) else z.get("name")
             poly = getattr(z, "polygon", None) if not isinstance(z, dict) else z.get("polygon")
@@ -331,7 +360,10 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
     energy = np.zeros(n, np.float32)
     area = np.zeros(n, np.float32)
     pending: list[np.ndarray] = []
-    out_emb: list[np.ndarray] = []
+    pending_idx: list[tuple[int, int]] = []
+    emb_arr = np.full((n, len(views), int(backend.dim)), np.nan, np.float32)   # NaN = вид неизвестен (не «пусто»)
+    emitted = [0]
+    zone_boxes = {v: _zone_box(zones, names=(v.split(":", 1)[1],)) for v in views if v.startswith("zone:")}
     center: Optional[np.ndarray] = None
     meta: dict = {"fps": fps, "views": views, "focus_mode": "zone" if zbox else ("motion" if use_motion else "none")}
     t0 = time.monotonic()
@@ -339,16 +371,33 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
     def flush(final: bool = False) -> None:
         while len(pending) >= bs or (final and pending):
             batch = np.stack(pending[:bs])
+            where = pending_idx[:bs]
             del pending[:bs]
-            out_emb.append(backend.encode_images(batch))
+            del pending_idx[:bs]
+            e = backend.encode_images(batch)
+            for (kk, vi), row in zip(where, e):
+                emb_arr[kk, vi] = row
 
     def emit(k: int, frame: np.ndarray) -> None:
         nonlocal center
         h, w = frame.shape[:2]
-        crops = []
-        for v in views:
+        crops: list[tuple[int, np.ndarray]] = []
+        for vi, v in enumerate(views):
             if v == "full":
-                crops.append(frame)
+                crops.append((vi, frame))
+                continue
+            if v.startswith("zone:"):  # кроп по зоне A06; зоны нет -> вид неизвестен (NaN), а не «ноль»
+                zb = zone_boxes.get(v)
+                if zb is None:
+                    continue
+                x1, y1, x2, y2 = zb
+                side_min = fc.get("min_side", 0.45) * min(w, h) * 0.5
+                bw, bh = max((x2 - x1) * w, side_min), max((y2 - y1) * h, side_min)
+                side = min(max(bw, bh), min(w, h))
+                X1, Y1, X2, Y2 = _square_box((x1 + x2) / 2 * w, (y1 + y2) / 2 * h, side, side, w, h)
+                crops.append((vi, frame[Y1:Y2, X1:X2]))
+                continue
+            if v != "focus":
                 continue
             # focus
             if zbox is not None:
@@ -375,13 +424,15 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
             side = min(max(bw, bh, side_min), min(w, h))
             x1, y1, x2, y2 = _square_box(cx, cy, side, side, w, h)
             boxes[k] = (x1 / w, y1 / h, x2 / w, y2 / h)
-            crops.append(frame[y1:y2, x1:x2])
+            crops.append((vi, frame[y1:y2, x1:x2]))
         if "focus" not in views:
             boxes[k] = (0, 0, 1, 1)
-        for c in crops:
+        for vi, c in crops:
             rgb = cv2.cvtColor(cv2.resize(np.ascontiguousarray(c), (IMG, IMG), interpolation=cv2.INTER_AREA),
                                cv2.COLOR_BGR2RGB)
             pending.append(rgb)
+            pending_idx.append((k, vi))
+        emitted[0] = k + 1
         flush()
 
     for j, ci in enumerate(idxs):
@@ -409,9 +460,10 @@ def extract_clip(clip: Any, backend: Any, cfg: dict, zones: Any = None,
         k, fr = buf.popleft()
         emit(k, fr)
     flush(final=True)
-    emb = np.concatenate(out_emb, axis=0) if out_emb else np.zeros((0, backend.dim), np.float32)
-    n_done = len(emb) // len(views)
-    emb = emb[: n_done * len(views)].reshape(n_done, len(views), -1)
+    n_done = int(emitted[0])
+    # точность кэша (float16) сразу: свежий и кэшированный пути дают бит-в-бит одинаковый вход (и как на обучении)
+    emb = emb_arr[:n_done].astype(np.float16).astype(np.float32)
+    meta["zones_found"] = sorted(v for v, b in zone_boxes.items() if b is not None)
     times, boxes, energy, area = times[:n_done], boxes[:n_done], energy[:n_done], area[:n_done]
     delta = np.zeros((n_done, len(views)), np.float32)
     if n_done > 1:

@@ -75,8 +75,10 @@ def test_make_llm_picks_llama_cpp_when_gguf_exists(fake_llama_cpp, tmp_path, mon
     gguf = tmp_path / "model.gguf"
     gguf.write_bytes(b"\0")
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "llama_cpp" else None)
-    be = make_llm(load_config({"llm": {"backend": "auto", "model_candidates": [str(gguf)]}}))
+    be = make_llm(load_config({"llm": {"backend": "llama_cpp", "model_candidates": [str(gguf)]}}))
     assert isinstance(be, LlamaCppBackend) and be._llm is None
+    # auto больше не грузит отдельную модель: на 8 ГБ рядом с VLM она не помещается
+    assert make_llm(load_config({"llm": {"backend": "auto", "model_candidates": [str(gguf)]}})) is None
 
 
 def test_report_contents(cfg, corpus, job_violation) -> None:

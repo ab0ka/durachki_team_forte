@@ -93,18 +93,20 @@ class SyntheticClip:
         if frames is not None:
             self._frames = [np.ascontiguousarray(f) for f in frames]
             self.height, self.width = self._frames[0].shape[:2]
-            self.times = [round(i / sample_fps, 6) for i in range(len(self._frames))]
+            self.times = [i / sample_fps for i in range(len(self._frames))]
             self.duration = len(self._frames) / sample_fps
         else:
             self.width, self.height = int(size[0]), int(size[1])
             self.duration = float(duration_s)
             n = max(1, int(math.floor(duration_s * sample_fps + 1e-9)))
             src = [int(round(i * fps / sample_fps)) for i in range(n)]
-            self.times = [round(k / fps, 6) for k in src]
+            self.times = [k / fps for k in src]
             self._frames = [render_scene(k, k / fps, (self.width, self.height)) for k in src]
         self.source_times = list(self.times)
         self.quality = [{"t": t, "motion_energy": 0.0, "sharpness": 100.0, "brightness": 0.3} for t in self.times]
-        self.meta: dict[str, Any] = {"backend": "synthetic", "warnings": [], "complete": True}
+        # МОК: явная пометка, чтобы его нельзя было принять за анализ реального видео
+        self.meta: dict[str, Any] = {"backend": "synthetic", "mock": True, "warnings": ["MOCK: синтетический клип"],
+                                     "complete": True, "coverage": 1.0, "coverage_gaps": []}
 
     def __len__(self) -> int:
         return len(self.times)
@@ -135,3 +137,49 @@ def synthetic_clip_from_uri(uri: str, sample_fps: float = 5.0) -> SyntheticClip:
     m = re.match(r"synthetic://([0-9.]+)?", uri)
     duration = float(m.group(1)) if m and m.group(1) else 10.0
     return SyntheticClip(duration_s=duration, sample_fps=sample_fps if sample_fps and sample_fps > 0 else 5.0)
+
+
+# ----------------------------------------------------------------------------- «съёмка с миганием»
+
+
+def write_blink_recording(path: str, scene_lengths: Sequence[float], *, blink_s: float = 1.0, preamble_s: float = 2.0,
+                          size: tuple[int, int] = (240, 432), fps: float = 30.0,
+                          scenario_dark: Optional[dict[int, tuple[float, float]]] = None,
+                          flicker_scene: Optional[int] = None) -> list[dict[str, float]]:
+    """Синтетическая запись для split_blinks: подготовка, затем для каждой сцены — «мигание»
+    (свет выключен blink_s) и сама сцена. ``scenario_dark={k: (offset, length)}`` — длинное
+    выключение света внутри сцены k (НЕ метка); ``flicker_scene`` — метка этой сцены «двойная»
+    (короткое мерцание внутри провала). Возвращает ожидаемые off_t/on_t/end_t по сценам."""
+    import cv2
+
+    w, h = size
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (int(w), int(h)))
+    if not writer.isOpened():
+        raise RuntimeError(f"cv2.VideoWriter не открылся: {path}")
+    rng = np.random.default_rng(0)
+    plan: list[tuple[str, float, int]] = [("bright", preamble_s, -1)]
+    for k, length in enumerate(scene_lengths):
+        plan += [("blink", blink_s, k), ("scene", float(length), k)]
+    expected: list[dict[str, float]] = []
+    n = 0
+    for kind, length, k in plan:
+        frames = int(round(length * fps))
+        if kind == "blink":
+            expected.append({"off_t": n / fps, "on_t": (n + frames) / fps})
+        for j in range(frames):
+            img = render_scene(n, n / fps, (w, h), code=False)
+            dark = kind == "blink"
+            if kind == "blink" and flicker_scene == k and frames // 2 - 2 <= j < frames // 2 + 1:
+                dark = False  # мерцание: на 0.1 с свет «моргнул» внутри метки
+            if kind == "scene" and scenario_dark and k in scenario_dark:
+                off, ln = scenario_dark[k]
+                dark = off <= j / fps < off + ln
+            if dark:
+                gain = 0.12 + 0.15 * min(1.0, j / max(frames, 1))  # автоэкспозиция «вытягивает» темноту
+                img = np.clip(img.astype(np.float32) * gain + rng.normal(0, 2, img.shape), 0, 255).astype(np.uint8)
+            writer.write(img)
+            n += 1
+        if kind == "scene":
+            expected[-1]["end_t"] = n / fps
+    writer.release()
+    return expected

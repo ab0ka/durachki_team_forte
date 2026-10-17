@@ -2,7 +2,7 @@
 
     detect(clip, every_n: int = 1) -> list[Detection]
 
-Доп. функции: warmup(), last_stats(), available(). Тяжёлые зависимости (torch/transformers/onnxruntime/cv2)
+Доп. функции: warmup(), last_stats(), available(), desk_inventory(clip, t, zones), safe_door_state(clip, t, zones). Тяжёлые зависимости (torch/transformers/onnxruntime/cv2)
 импортируются лениво — импорт пакета без побочных эффектов и без сети.
 Нет локальных весов → detect() бросает DetectorUnavailable (mock — только явный SENTINEL_MOCK=1).
 """
@@ -27,6 +27,20 @@ def last_stats() -> dict:
     from .pipeline import last_stats as _last_stats
 
     return _last_stats()
+
+
+def desk_inventory(clip: Any, t: float, zones: Any, **kw: Any) -> Any:
+    """Предметы на кассовом столе в окне вокруг t: present / unknown (см. inventory.py)."""
+    from .inventory import desk_inventory as _f
+
+    return _f(clip, t, zones, **kw)
+
+
+def safe_door_state(clip: Any, t: float, zones: Any, **kw: Any) -> Any:
+    """Дверца сейфа в окне вокруг t: open / closed / unknown (см. inventory.py)."""
+    from .inventory import safe_door_state as _f
+
+    return _f(clip, t, zones, **kw)
 
 
 def available() -> dict:
@@ -54,4 +68,4 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(name)
 
 
-__all__ = ["detect", "warmup", "last_stats", "available", "DetectorUnavailable"]
+__all__ = ["detect", "warmup", "last_stats", "available", "desk_inventory", "safe_door_state", "DetectorUnavailable"]

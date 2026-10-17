@@ -30,6 +30,26 @@ on_required_failure: violation_only   # violation_only | fail  (fail — все�
 
 detect_every_n: 1            # аргумент every_n для ml.detect.detect
 
+# H1 (по умолчанию ВЫКЛ до замера L2): coarse→fine. Обзор всей длительности с overview_fps →
+# кандидаты → окна [t_start − pre_s, t_end + post_s] с плотной выборкой fps → detect/track/scene/rules
+# на окне → уточнённое начало события. Кандидаты не отбрасываются; окна не зависят от движения/риска.
+refine:
+  enabled: false
+  overview_fps: 2.0
+  fps: 8.0
+  pre_s: 4.0
+  post_s: 3.0
+  merge_gap_s: 2.0
+  max_windows: 4
+  max_frames: 96
+  reuse_overview_zones: true
+
+# H2 (по умолчанию как отдал модуль): какой момент события отдавать как timecode_sec.
+# module — t_peak модуля; onset — начало нарушения (t_start); onset_offset — t_start + offset_s.
+timecode:
+  policy: module
+  offset_s: 0.0
+
 executor:
   mode: process              # process (прод: один процесс-воркер владеет GPU, kill по таймауту)
                              # | inline (тесты/отладка: в текущем процессе, таймаут не останавливает CUDA)
@@ -54,8 +74,12 @@ sampling:
   reference_deadline_s: 240  # если дедлайн жёстче — fps снижается пропорционально
   min_deadline_scale: 0.4
 
-# Мягкие бюджеты стадий (сек) для эталонного видео: 145 с при 5 fps на RTX 4060 (цель ≤ 60 с).
-# Масштабируются по числу кадров; используются для решения «запускать ли необязательную стадию».
+# Мягкие бюджеты стадий (сек) для эталонного видео: 145 с при 5 fps (цель ≤ 60 с на RTX 4060).
+# ВНИМАНИЕ: ПЛЕЙСХОЛДЕРЫ, НЕ ИЗМЕРЕНИЯ. Заменить выходом замера L2:
+#   python -m backend.pipeline compare … --emit-budgets budgets.l2.yaml  →  SENTINEL_PIPELINE_CONFIG=budgets.l2.yaml
+# (p90 сек/кадр по стадии × reference_frames × 1.5; время включает загрузку моделей — см. meta.stages.*.cold,
+# очередь — meta.queue_wait_s, токены VLM — meta.vlm.*.budget). Масштабируются по числу кадров;
+# решают только «запускать ли необязательную стадию»; жёсткий предел — дедлайн задачи.
 budgets_s:
   ingest: 6
   detect: 14
@@ -64,6 +88,7 @@ budgets_s:
   scene: 3
   rules: 1
   temporal: 15
+  refine: 10
   vlm_verify: 25
   vlm_discover: 20
   fusion: 4
@@ -79,9 +104,19 @@ reserve_s:
   fusion_min: 3              # обязательные стадии оставляют слиянию только минимум
   vlm_min_budget: 6          # если на VLM остаётся меньше — стадия пропускается
   essential_min: 1.5         # обязательная стадия стартует, только если осталось больше
+  respawn_s: 8               # воркер убит и до дедлайна меньше — слияние без его перезапуска (в процессе API)
 
-optional_stages: [pose, temporal, vlm_verify, vlm_discover]  # пропускаются по бюджету (с warning)
+optional_stages: [pose, temporal, refine, vlm_verify, vlm_discover]  # пропускаются по бюджету (с warning)
 min_start_fraction: 0.6      # необязательная стадия стартует, если влезает ≥ 60% её (масштабированного) бюджета
+
+# Полнота: meta.coverage — формат contracts.extensions.compute_coverage (A01): ratio ядра (пересечение
+# кадров ingest и состояний scene), unknown_spans, stages, required, complete; + by_stage — доли по
+# стадиям (неизвестно → null). Гейт: ratio < min_required → анализ неполный → никогда не no_violation.
+coverage:
+  gate: true
+  min_required: 0.98           # = contracts/config.yaml coverage.min_ratio_for_no_violation (A01); подбирает L2
+  max_gap_s: 2.0               # разрыв между кадрами/состояниями больше этого — непокрытое время
+  container_tolerance: 0.15    # контейнер длиннее декодированного на >15% → декодер не дошёл до конца
 
 partial:
   enabled: true

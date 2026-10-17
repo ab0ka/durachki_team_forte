@@ -15,16 +15,21 @@ from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
-__all__ = ["verify", "discover", "warmup", "unload", "status", "set_gpu_lock", "set_catalog", "set_backend"]
+__version__ = "2.0.0"
+
+__all__ = ["verify", "discover", "warmup", "unload", "status", "set_gpu_lock", "set_catalog", "set_backend",
+           "model_info", "__version__"]
 
 
-def verify(clip: Any, events: list[Any], budget_s: float, *, limits: Optional[dict[str, Any]] = None) -> list[Any]:
+def verify(clip: Any, events: list[Any], budget_s: float, *, limits: Optional[dict[str, Any]] = None,
+           zones: Optional[list[Any]] = None) -> list[Any]:
     """Проверка событий-кандидатов. Возвращает те же события (1:1, тот же порядок) с обновлёнными
-    confidence/facts и extra.vlm (agreement: supports|contradicts|uncertain|type_mismatch|not_checked)."""
+    confidence/facts и extra.vlm: verdict/score (для ml.fusion), agreement, coverage, …
+    zones — зоны A06 (для кропа стола/сейфа в режиме qa); можно и в event.extra["zones"]."""
     from .verifier import _copy_event, verify_events
 
     try:
-        return verify_events(clip, list(events or []), float(budget_s), limits=limits)
+        return verify_events(clip, list(events or []), float(budget_s), limits=limits, zones=zones)
     except Exception as e:  # noqa: BLE001 — стадия не должна ронять пайплайн
         log.warning("ml.vlm.verify failed: %s", type(e).__name__)
         out = [_copy_event(ev) for ev in (events or [])]
@@ -93,3 +98,37 @@ def set_backend(backend: Any) -> None:
     from .runtime import set_backend as _set
 
     _set(backend)
+
+
+def model_info() -> dict[str, Any]:
+    """Хук A03 для ключа кэша: чекпойнт, ревизия снапшота, версия промптов (+ хэш .md-промптов, qa_spec.yaml и
+    config.yaml — A03 сам хэширует только .py/.yaml/.json/.txt/.jinja, а промпты здесь в .md)."""
+    import hashlib
+    from pathlib import Path
+
+    from .config import load_config, preset_cfg
+
+    cfg = load_config()
+    here = Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    for p in sorted(list((here / "prompts").glob("*.md")) + [here / "qa_spec.yaml", here / "config.yaml"]):
+        if p.exists():
+            h.update(p.name.encode())
+            h.update(p.read_bytes())
+    model = preset_cfg(cfg, "transformers").get("model")
+    revision = None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        from .backends.transformers_backend import resolve_cache_dir
+
+        r = try_to_load_from_cache(str(model), "config.json",
+                                   cache_dir=resolve_cache_dir((cfg.get("transformers") or {}).get("cache_dir")))
+        if isinstance(r, str):
+            revision = Path(r).parent.name  # имя каталога снапшота = commit hash
+    except Exception:  # noqa: BLE001
+        pass
+    return {"checkpoint": model, "revision": revision,
+            "prompt_version": f"{cfg.get('prompt_version', 'v1')}+{h.hexdigest()[:12]}",
+            "verify_mode": (cfg.get("verify") or {}).get("mode", "json"), "backend": cfg.get("backend"),
+            "version": __version__}

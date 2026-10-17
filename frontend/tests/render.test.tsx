@@ -39,8 +39,9 @@ describe("ResultView", () => {
     expect(html).toContain("Обнаружены признаки возможных нарушений");
     expect(html).toContain("00:24.6");
     expect(html).toContain("00:47.8");
-    expect(html).toContain("цитата проверена");
     expect(html).toContain("цитата не сверена");
+    expect(html).toContain("без пункта");
+    expect(html).not.toContain("цитата сверена"); // в демо нет сверенных норм — бейдж не показывается
     expect(html).toContain("Что система не проверяет");
     expect(html).toContain("Как система пришла к выводу");
   });
@@ -62,6 +63,25 @@ describe("ResultView", () => {
     const html = wrap(<ResultView job={job} raw={{}} />);
     expect(html).toContain("Анализ не завершён");
     expect(html).toContain("Найдено до сбоя анализа");
+    expect(html).not.toContain("Нарушение не обнаружено");
+  });
+  it("A01 failed с кандидатами: жёлтый «Анализ не завершён», кандидаты помечены, зелёного нет", () => {
+    const job = normalizeJob({
+      job_id: "u",
+      status: "failed",
+      verdict: null,
+      violations: [],
+      verdict_state: "unknown",
+      analysis_complete: false,
+      coverage_problem: "meta.coverage.ratio не задан",
+      error: "«нет нарушения» не подтверждено: meta.coverage.ratio не задан",
+      candidates: [{ type: "Кандидат", type_id: "V05", timecode_sec: 7, description: "Описание.", evidence_frames: [] }],
+      meta: { stages: { ingest: { status: "ok", required: true } } },
+    });
+    const html = wrap(<ResultView job={job} raw={{}} />);
+    expect(html).toContain("Анализ не завершён");
+    expect(html).toContain("Кандидаты — не подтверждены, в вердикт не вошли");
+    expect(html).toContain("не вошло в вердикт");
     expect(html).not.toContain("Нарушение не обнаружено");
   });
   it("ответ сервера в формате A01 рендерится", () => {

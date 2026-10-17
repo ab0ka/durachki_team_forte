@@ -23,6 +23,13 @@ sources:
 # (не предполагает независимости); noisy_or предполагает независимость и завышает скор — не рекомендуется.
 combine: max          # max | noisy_or
 
+# Влияние temporal (события source=temporal и риск-кривая) на скор кластера, где есть rules/VLM:
+#   off   — не влияет (по умолчанию): разведочный замер L1 — SigLIP2 по кадру + max по кадрам дал AUC 0.30–0.34,
+#           такой скор не может отсеивать видео; temporal остаётся в подсказках и на timeline;
+#   bonus — участвует только в бонусе согласия; score — как в фазе 1 (может задать базовый скор).
+# Кластер ТОЛЬКО из temporal всегда остаётся подсказкой (report_gate.temporal_only_types: false).
+temporal_mode: "off"   # в кавычках: голое off YAML читает как false
+
 agreement:            # небольшой ограниченный бонус за согласие источников (не «перемножение вероятностей»)
   min_conf: 0.3       # источник «согласен», если его взвешенный вклад ≥ min_conf
   bonus_per_source: 0.05
@@ -49,10 +56,41 @@ risk:                     # риск-кривая temporal
 report_gate:
   require_fact: true            # ≥1 конкретный наблюдаемый факт от rules/VLM (не «модель заметила аномалию»)
   fact_sources: [rules, vlm]    # чьи факты считаются наблюдаемыми
-  require_norm: false           # L2: пока у большинства типов нет подтверждённого пункта, нарушение всё равно
-                                # выдаётся (с пометкой «норма не установлена»); FAQ 31 допускает ссылку без пункта
+  # Норма в каталоге обязательна только для этих типов. Остальные при наличии фактов выдаются
+  # честно «без пункта» (rules: [], в описании — «нормативное основание не подтверждено»):
+  # по FAQ 32 у нарушений датасета есть открытая норма РК, но не найденный пункт не выдумываем.
+  require_norm_types: [V99]     # V99 (catch-all) без нормы — только подсказка, без юридического обвинения
   norm_missing_if_no_catalog: report   # каталог norms недоступен целиком: report (с warning) | hint
   temporal_only_types: false    # событие ТОЛЬКО от temporal (без фактов) — нарушение? (false → подсказка)
+  # Оценка правил A09 (Event.extra.assessment):
+  #   candidate_violation                       → может стать нарушением;
+  #   review_observation из-за непроверенной нормы (правило вида violation) → может, «без пункта»;
+  #   review_observation «правило-наблюдение» (телефон/еда/дверь/второй человек сами по себе) → observation_policy;
+  #   insufficient_context (этап не наблюдался полностью; неизвестно ≠ нет и ≠ да) → insufficient_policy.
+  upstream_assessment: true
+  observation_policy: hint      # hint | report
+  insufficient_policy: hint     # hint | report
+  # A09 срезает уверенность review_observation до 0.45 из-за отсутствия проверенной нормы. Для правил вида
+  # violation восстанавливаем исходную уверенность: extra.confidence_raw → иначе из extra.trace.confidence_terms.
+  uncap_norm_review: true
+
+# Поведенческие политики (спецификация команды). ВСЕ ВЫКЛЮЧЕНЫ, пока L2 не измерил выигрыш (python -m ml.fusion.ab).
+policies:
+  v02_after_window:          # «ушла и оставила»: решение по столу/сейфу в окне после ухода (extra.state_after / trace)
+    enabled: false
+    remain_min: 0.5          # наличные/сумка/открытый сейф ≥ — ценности остались → кандидат
+    removed_max: 0.2         # все три известны и ≤ — убрано, сейф закрыт → норма (подсказка)
+    removed_factor: 0.35
+  v01_client_side:           # клиент напротив со своей стороны — норма (extra.person_side / zone)
+    enabled: false
+  negative_evidence:         # extra.negative: {сейф закрыт: 0.9, стол пуст: 0.8} снижает скор
+    enabled: false
+    weight: 0.5
+
+# Таймкод нарушения: peak — t_peak самого весомого события (A09: фактический кадр доказательства);
+# onset — начало слитого кластера (переход). Политика выбирается ЗАМЕРОМ (python -m ml.fusion.ab), не на глаз.
+timecode:
+  policy: peak            # peak | onset
 
 output:
   max_violations: 10
@@ -66,10 +104,21 @@ evidence:
   # Кадры с оверлеями (боксы, подписи, штамп времени) — отдельно в meta.ui.evidence_overlays для UI.
   ui_overlays: true       # рендерить JPEG с оверлеями для UI
   ui_overlay_frames: 1    # сколько кадров каждого нарушения рендерить с оверлеем (экономия размера)
+  # Выбор моментов: sharpest (фаза 1: t_peak + самый резкий в ±window + контекст) | action (гипотеза фазы 2:
+  # ключевой момент + «до»/«после» реального действия из extra.evidence_t A09 / state_after.t_after; резкость —
+  # только локальный тай-брейк в ±action.local_s). Включать после просмотра L2 (python -m ml.fusion.ab --frames).
+  policy: sharpest
+  action:
+    before_s: 1.0         # «до»: t_start − before_s
+    after_s: 2.0          # «после»: t_end + after_s (для V02 — state_after.t_after, стол после ухода)
+    local_s: 0.2
+  ui_label_mode: legend   # legend: номера у рамок + подписи под кадром (не закрывают действие) | tags
   max_frames: 3           # 1..3 кадра на нарушение
   window_s: 1.0           # поиск самого резкого кадра в t_peak ± window_s
   min_sep_s: 0.4          # кадры одного нарушения — разные моменты
-  dup_mad: 1.5            # средняя абс. разность (0..255) ниже — кадры считаются дублями
+  dup_block: 4.0          # дубль, если МАКСИМУМ средней абс. разности по блокам 12×12 миниатюры 96×96 ниже
+                          # (0..255). Максимум по блокам, а не среднее по кадру: локальное изменение (ушёл
+                          # человек, осталась пачка) не считается дублем; одинаковые кадры/JPEG — дубль
   context_frame: true     # 3-й кадр: начало/конец длинного события
   context_min_gap_s: 1.5
   box_max_dt_s: 1.5       # боксы t_peak рисуем на кадрах не дальше этого от t_peak
@@ -91,6 +140,8 @@ description:
   max_facts: 3
   max_chars: 420
   check_sentence: "Требуется проверка человеком."
+  # если ни шаблон, ни факты не содержат «возможного нарушения» — финальное предложение с этой формулировкой
+  check_sentence_possible: "Это признаки возможного нарушения — требуется проверка человеком."
   # Слова-домыслы (regex по основам, без учёта регистра). Предложения/факты с ними вычищаются.
   forbidden:
     - "укра[лд]\\w*"
@@ -117,6 +168,16 @@ description:
     - "присвоил\\w*"
     - "присвоени\\w*"
     - "нарушил\\w*"
+    # сумма, подлинность, допуск, умысел — по видео не устанавливаются (дисклеймеры «нельзя установить допуск» не режутся)
+    - "\\d[\\d\\s.,]*\\s*(?:тенге|тг\\b|₸|руб\\w*|долл\\w*|евро|usd|kzt)"
+    - "сумм(?:а|ы|у|ой|е)\\b"
+    - "подлинн\\w*"
+    - "без\\s+допуска"
+    - "не\\s+име\\w+\\s+(?:допуска|права)"
+    - "неуполномоч\\w*"
+    - "не\\s+допущ\\w*"
+    - "с\\s+умыслом"
+    - "намерен\\w*"
 
 # Полнота анализа (согласовано с A03): apply_completeness(result, stages) после fuse().
 # Если обязательная стадия упала/не выполнена и нарушений не найдено — status=failed, verdict=None
@@ -124,4 +185,10 @@ description:
 completeness:
   required: [ingest, detect, rules]       # без них «нарушений нет» не доказано
   optional: [track, pose, scene, temporal, vlm]  # падение → вердикт остаётся, но meta.degraded
-  ok_values: [ok, done, success, true, skipped_by_config]
+  ok_values: [ok, done, success, "true", skipped_by_config]
+  # meta.coverage внутри fuse(): неполное покрытие видео + нет нарушений → status=failed, verdict=None.
+  coverage_gate: true
+  min_decoded: 0.98       # clip.meta["coverage"] от A04 (декодированная доля длительности) ниже → неполно
+  min_sampled: 0.9        # доля длительности, покрытая сэмплами clip.times
+  max_gap_s: 2.0          # разрыв между соседними сэмплами больше → «дыра» в анализе
+  unknown_coverage: failed  # нет ни clip.meta, ни clip.times: failed | done (с предупреждением)

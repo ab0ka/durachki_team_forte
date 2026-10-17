@@ -1,4 +1,5 @@
-"""Кэш весов: SENTINEL_WEIGHTS (по умолчанию <repo>/weights).
+"""Кэш весов: SENTINEL_WEIGHTS (по умолчанию <repo>/weights); HF-кэш — weights/hf/hub (как у L1 и deploy/weights.py),
+также HF_HUB_CACHE / HF_HOME и старая раскладка weights/hf.
 
 Скачивание — ТОЛЬКО на этапе setup (с интернетом):  python -m ml.detect.weights --download
 Импорт и инференс никогда не ходят в сеть (from_pretrained(..., local_files_only=True)); HF_HUB_OFFLINE=1
@@ -24,12 +25,34 @@ def weights_dir() -> Path:
 
 
 def hf_cache_dir() -> Path:
-    # HF_HUB_CACHE (как у deploy/weights.py) → стандартная раскладка weights/hf/hub → старая weights/hf.
+    """Куда скачивать на setup: HF_HUB_CACHE, иначе <SENTINEL_WEIGHTS>/hf/hub (раскладка L1 / deploy/weights.py)."""
     env = os.environ.get("HF_HUB_CACHE")
-    if env and Path(env).expanduser().is_dir():
-        return Path(env).expanduser()
-    hub = weights_dir() / "hf" / "hub"
-    return hub if hub.is_dir() else weights_dir() / "hf"
+    return Path(env).expanduser() if env else weights_dir() / "hf" / "hub"
+
+
+def hf_cache_candidates() -> list[Path]:
+    """Где искать уже скачанные веса (без сети): HF_HUB_CACHE, HF_HOME/hub, weights/hf/hub, weights/hf (старая раскладка)."""
+    cands: list[Path] = []
+    if os.environ.get("HF_HUB_CACHE"):
+        cands.append(Path(os.environ["HF_HUB_CACHE"]).expanduser())
+    if os.environ.get("HF_HOME"):
+        cands.append(Path(os.environ["HF_HOME"]).expanduser() / "hub")
+    cands += [weights_dir() / "hf" / "hub", weights_dir() / "hf"]
+    out: list[Path] = []
+    for c in cands:
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def find_cache_dir(model_id: str) -> Optional[Path]:
+    """Первый кэш-каталог, где есть непустой снапшот модели (models--org--name/snapshots/*)."""
+    sub = "models--" + model_id.replace("/", "--")
+    for c in hf_cache_candidates():
+        snap = c / sub / "snapshots"
+        if snap.is_dir() and any(p.is_dir() and any(p.iterdir()) for p in snap.iterdir()):
+            return c
+    return None
 
 
 def is_offline() -> bool:
@@ -47,10 +70,7 @@ def local_model_dir(model_id: str) -> Optional[Path]:
 
 def is_cached(model_id: str) -> bool:
     """Есть ли модель локально (save_pretrained-папка или снапшот в weights/hf) — без сети."""
-    if local_model_dir(model_id) is not None:
-        return True
-    snap = hf_cache_dir() / ("models--" + model_id.replace("/", "--")) / "snapshots"
-    return snap.is_dir() and any(snap.iterdir())
+    return local_model_dir(model_id) is not None or find_cache_dir(model_id) is not None
 
 
 def resolve(path_rel: str) -> Path:
@@ -58,9 +78,10 @@ def resolve(path_rel: str) -> Path:
     return p if p.is_absolute() else weights_dir() / p
 
 
-def pretrained_kwargs() -> dict:
+def pretrained_kwargs(model_id: Optional[str] = None) -> dict:
     """Для инференса: ТОЛЬКО локальные файлы. Скачивание — исключительно на этапе setup (download_all)."""
-    return {"cache_dir": str(hf_cache_dir()), "local_files_only": True}
+    found = find_cache_dir(model_id) if model_id else None
+    return {"cache_dir": str(found or hf_cache_dir()), "local_files_only": True}
 
 
 def model_ids(include_optional: bool = False) -> list[str]:
@@ -95,9 +116,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         for p in download_all(a.ids):
             print(p)
     else:
-        print("weights_dir:", weights_dir(), "offline:", is_offline())
-        for mid in model_ids():
-            print(mid, "local_dir:", local_model_dir(mid), "in_cache:", is_cached(mid))
+        print("weights_dir:", weights_dir(), "offline:", is_offline(), "candidates:", [str(c) for c in hf_cache_candidates()])
+        for mid in model_ids(include_optional=True):
+            print(mid, "local_dir:", local_model_dir(mid), "cache_dir:", find_cache_dir(mid))
 
 
 if __name__ == "__main__":

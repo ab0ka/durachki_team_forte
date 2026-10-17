@@ -22,12 +22,12 @@ import numpy as np
 def sheet_times(t: Optional[float], window: float, step: float, duration: float, every: Optional[float] = None) -> list[float]:
     if t is None:
         every = every or max(1.0, duration / 24.0)
-        return [round(x, 3) for x in np.arange(0.0, max(duration, 1e-3), every)]
+        return [float(x) for x in np.arange(0.0, max(duration, 1e-3), every)]
     lo, hi = max(0.0, t - window), min(duration, t + window)
     times = list(np.arange(lo, hi + 1e-6, step))
     if not any(abs(x - t) < 1e-6 for x in times) and lo <= t <= hi:
         times.append(t)
-    return sorted(round(float(x), 3) for x in times)
+    return sorted(float(x) for x in times)
 
 
 def build_sheet(

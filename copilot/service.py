@@ -21,15 +21,19 @@ import time
 from typing import Any, Iterator, Optional, Sequence
 
 from .config import copilot_enabled, default_config, is_mock
-from .corpus import Corpus, load_corpus
+from .corpus import Corpus, load_corpus, norm_url
 from .extractive import classify, compose, refusal_for, target_violations
 from .guard import UNVERIFIED_ANSWER, check_answer, complete_prefix
-from .llm import LLMBusy, LLMTimeout, make_llm
+from .llm import LLMBusy, LLMTimeout, RetrievalBackend, make_llm
 from .prompts import NormRef, build_messages, normalize_result
 
 log = logging.getLogger(__name__)
 
 DISCLAIMER = "Подсказка для проверяющего, не юридическое заключение."
+NOTICE_NO_MODEL = ("Генеративный режим недоступен: ответ собран из фактов задачи и найденных норм "
+                   "без языковой модели.")
+NOTICE_BUSY = ("Генеративный режим временно недоступен (GPU занят анализом видео): ответ собран из фактов "
+               "задачи и найденных норм.")
 
 ERROR_MESSAGES = {
     "disabled": "Ассистент отключён в этой установке (включается COPILOT_ENABLED=1).",
@@ -44,14 +48,19 @@ ERROR_MESSAGES = {
 
 
 def source_label(cite: dict[str, Any]) -> str:
-    """Читаемая подпись источника для UI: «[1] Документ, п. 9 — url»."""
+    """Читаемая подпись источника для UI: «[1] Документ, п. 9 — url (норма каталога; не сверено)»."""
     label = f"[{cite.get('ref')}] " if cite.get("ref") else ""
-    label += str(cite.get("document") or "")
+    label += str(cite.get("short") or cite.get("document") or "")
     if cite.get("clause"):
         label += f", {cite['clause']}"
     if cite.get("url"):
         label += f" — {cite['url']}"
-    return label
+    tags = ["норма каталога" if cite.get("relation") == "catalog" else "найдено поиском"]
+    if cite.get("status") == "candidate":
+        tags.append("кандидат")
+    if not cite.get("verified"):
+        tags.append("не сверено")
+    return f"{label} ({'; '.join(tags)})"
 
 
 class CopilotService:
@@ -67,21 +76,34 @@ class CopilotService:
         self._lock = threading.RLock()
         self.warnings: list[str] = []
         self.gpu_lock: Any = None  # общий замок GPU от A03 (acquire(timeout=...)/release())
+        self.busy_probe: Any = None  # A02/A03: () -> bool, идёт ли анализ видео (тогда без генерации)
+        self._no_model = False
 
     # ------------------------------------------------------------------ lazy resources
     RETRY_UNAVAILABLE_S = 30.0  # модель/llama-server могли появиться позже старта API
 
     @property
     def llm(self) -> Any:
+        """Генеративный бэкенд; нет модели -> RetrievalBackend (no_model_mode=retrieval) или None."""
         with self._lock:
-            stale = (self._llm is None and not self._llm_injected
+            stale = ((self._llm is None or self._no_model) and not self._llm_injected
                      and time.monotonic() - self._resolved_at > self.RETRY_UNAVAILABLE_S)
             if not self._llm_resolved or stale:
                 self.warnings = []
-                self._llm = make_llm(self.cfg, self.warnings) if copilot_enabled(self.cfg) else None
+                llm = make_llm(self.cfg, self.warnings) if copilot_enabled(self.cfg) else None
+                self._no_model = llm is None and copilot_enabled(self.cfg)
+                if self._no_model and str(self.cfg.get("llm", {}).get("no_model_mode", "retrieval")) == "retrieval":
+                    llm = RetrievalBackend()
+                self._llm = llm
                 self._llm_resolved = True
                 self._resolved_at = time.monotonic()
             return self._llm
+
+    def _mode(self, llm: Any) -> str:
+        name = str(getattr(llm, "name", ""))
+        if name in {"mock", "extractive", "retrieval"}:
+            return name
+        return "generative" if getattr(llm, "is_generative", False) else name or "unknown"
 
     @property
     def corpus(self) -> Corpus:
@@ -116,13 +138,19 @@ class CopilotService:
             self.warnings.append(f"ошибка инициализации: {type(exc).__name__}")
             llm, info = None, {}
         reason = None if llm is not None else ("disabled" if not enabled else "unavailable")
+        mode = self._mode(llm) if llm is not None else None
+        message = ERROR_MESSAGES.get(reason or "", "")
+        if mode == "retrieval":
+            reason, message = "generative_unavailable", NOTICE_NO_MODEL
         return {
             "enabled": bool(enabled),
             "available": llm is not None,
+            "generative": bool(getattr(llm, "is_generative", False)),
+            "mode": mode,
             "backend": getattr(llm, "name", None),
             "mock": getattr(llm, "name", "") == "mock" or (is_mock() and llm is not None),
             "reason": reason,
-            "message": ERROR_MESSAGES.get(reason or "", ""),
+            "message": message,
             "llm": info,
             "warnings": list(dict.fromkeys(self.warnings)),
             "disclaimer": DISCLAIMER,
@@ -179,11 +207,11 @@ class CopilotService:
         max_refs = int(self.cfg.get("llm", {}).get("max_norm_refs", 6))
         targets = target_violations(question, result)
         type_ids = [str(v.get("type_id")) for v in targets if v.get("type_id")]
-        chunks: list[tuple[Any, float]] = []
+        chunks: list[tuple[Any, float, str]] = []
         # 1) нормы каталога по типам нарушений, о которых спрашивают
         for tid in dict.fromkeys(type_ids):
             for c in corpus.rules_for_type(tid)[:2]:
-                chunks.append((c, 1.0))
+                chunks.append((c, 1.0, "catalog"))
         # 2) нормы, уже приложенные к результату (A12 берёт их из каталога) — перепроверяем
         for v in targets:
             for r in v.get("rules") or []:
@@ -192,8 +220,10 @@ class CopilotService:
                 hit = corpus.find(r.get("document"), r.get("clause"), r.get("url"))
                 if hit is None:
                     warnings.append(f"норма из результата не найдена в каталоге: {r.get('document')} {r.get('clause') or ''}".strip())
+                elif hit.kind == "catalog_rule" or set(hit.type_ids) & set(type_ids):
+                    chunks.append((hit, 0.9, "catalog"))
                 else:
-                    chunks.append((hit, 0.9))
+                    chunks.append((hit, 0.9, "retrieved"))
         # 3) RAG по вопросу (+ предыдущий вопрос для коротких уточнений)
         query = question
         last_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
@@ -205,15 +235,21 @@ class CopilotService:
         except Exception as exc:  # RAG не должен ронять ответ
             warnings.append(f"поиск по нормам недоступен: {type(exc).__name__}")
             hits = []
-        chunks.extend((h.chunk, h.score) for h in hits)
+        # фрагмент источника, связанный с типом события через каталог (тот же URL+пункт), — тоже «каталог»
+        chunks.extend((h.chunk, h.score, "catalog" if set(h.chunk.type_ids) & set(type_ids) else "retrieved")
+                      for h in hits)
         refs: list[NormRef] = []
         seen: set[Any] = set()
-        for c, score in chunks:
-            key = c.key if c.key[1] else (c.key[0], c.id)
-            if key in seen:
+        for c, score, relation in chunks:
+            keys = {c.key if c.key[1] else (c.key[0], c.id)}
+            if c.url and c.key[1]:
+                keys.add((norm_url(c.url), c.key[1]))  # одна норма из каталога и из источника — один раз
+            if keys & seen:
                 continue
-            seen.add(key)
-            refs.append(NormRef(n=len(refs) + 1, chunk=c, score=float(score)))
+            seen |= keys
+            events = [int(v["_n"]) for v in result.get("violations") or []
+                      if relation == "catalog" and v.get("type_id") in c.type_ids]
+            refs.append(NormRef(n=len(refs) + 1, chunk=c, score=float(score), relation=relation, events=events))
             if len(refs) >= max_refs:
                 break
         return refs
@@ -251,14 +287,23 @@ class CopilotService:
         return check_answer(raw, p["refs"], self.corpus, p["result"], p["q"], p["hist"],
                             float(gcfg.get("timecode_tolerance_s", 1.5)), float(gcfg.get("min_support_ratio", 0.3)))
 
-    def _finish(self, p: dict[str, Any], raw: str, backend: str, t0: float) -> dict[str, Any]:
+    def _finish(self, p: dict[str, Any], raw: str, backend: str, t0: float,
+                notice: Optional[str] = None) -> dict[str, Any]:
         g = self._check(p, raw)
         warnings = p["warnings"] + g.warnings
         if self.corpus.is_fixture and not any("фикстур" in w.lower() for w in warnings):
             warnings.append("нормы взяты из ТЕСТОВОЙ фикстуры — не использовать как ссылки на нормы РК")
         answer = g.answer or UNVERIFIED_ANSWER
+        mode = "retrieval" if notice else self._mode(p["llm"])
+        if mode == "retrieval" and not notice:
+            notice = NOTICE_NO_MODEL
+        if notice and bool(self.cfg.get("llm", {}).get("retrieval_notice_in_answer", True)):
+            answer = f"({notice})\n{answer}"   # A15 показывает только answer — режим должен быть виден в тексте
         return {
             "answer": answer,
+            "generative": mode == "generative",
+            "mode": mode,
+            "notice": notice,
             "citations": g.citations,
             "sources": [source_label(c) for c in g.citations],
             "grounded": g.grounded,
@@ -281,6 +326,14 @@ class CopilotService:
             text = refusal or compose(p["intent"], p["q"], p["result"], p["refs"], self.corpus)
             yield from re.findall(r"\S+\s*", text)
             return
+        probe = self.busy_probe
+        if probe is not None:
+            try:
+                busy = bool(probe())
+            except Exception:
+                busy = False
+            if busy:  # приоритет у анализа видео: не трогаем GPU
+                raise LLMBusy("analysis in progress")
         lcfg = self.cfg.get("llm", {})
         messages = build_messages(p["result"], p["refs"], self.corpus, p["q"], p["hist"])
         gpu_lock = self.gpu_lock if getattr(llm, "name", "") == "llama_cpp" else None
@@ -292,6 +345,11 @@ class CopilotService:
         finally:
             if gpu_lock is not None:
                 gpu_lock.release()
+
+    def _retrieval_text(self, p: dict[str, Any]) -> str:
+        """Негенеративный ответ из фактов задачи и найденных норм (тот же guard, что и для LLM)."""
+        return refusal_for(p["intent"], p["result"], self.corpus) or compose(
+            p["intent"], p["q"], p["result"], p["refs"], self.corpus)
 
     def answer(self, job_result: Any, question: str, history: Any = None) -> dict[str, Any]:
         try:
@@ -312,7 +370,9 @@ class CopilotService:
         except (LLMTimeout, TimeoutError):
             return self._error("timeout", p["job_id"], backend=backend)
         except LLMBusy:
-            return self._error("busy", p["job_id"], backend=backend)
+            if str(self.cfg.get("llm", {}).get("busy_policy", "retrieval")) != "retrieval":
+                return self._error("busy", p["job_id"], backend=backend)
+            return self._finish(p, self._retrieval_text(p), "retrieval", t0, notice=NOTICE_BUSY)
         except Exception as exc:
             log.exception("copilot LLM error")
             return self._error("llm_error", p["job_id"], backend=backend, detail=type(exc).__name__)
@@ -342,6 +402,11 @@ class CopilotService:
             return
         deadline = t0 + float(self.cfg.get("llm", {}).get("timeout_s", 45))
         backend = str(getattr(p["llm"], "name", "llm"))
+        if not getattr(p["llm"], "is_generative", False):  # retrieval/mock: ответ готов сразу, целиком
+            done = self._finish(p, "".join(self._generate(p, deadline)), backend, t0)
+            yield {"event": "token", "text": done["answer"]}
+            yield {"event": "done", **done}
+            return
         q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         cancel = threading.Event()
 
@@ -378,6 +443,12 @@ class CopilotService:
                             emitted = clean
                     continue
                 if kind == "exc":
+                    if isinstance(val, LLMBusy) and not emitted and str(
+                            self.cfg.get("llm", {}).get("busy_policy", "retrieval")) == "retrieval":
+                        done = self._finish(p, self._retrieval_text(p), "retrieval", t0, notice=NOTICE_BUSY)
+                        yield {"event": "token", "text": done["answer"]}
+                        yield {"event": "done", **done}
+                        return
                     if isinstance(val, (LLMTimeout, TimeoutError)):
                         code = "timeout"
                     elif isinstance(val, LLMBusy):
@@ -445,6 +516,11 @@ def release() -> None:
         get_service().release()
     except Exception as exc:
         log.warning("copilot release failed: %r", exc)
+
+
+def set_busy_probe(fn: Any) -> None:
+    """A02/A03: ``fn() -> bool`` — идёт ли анализ видео. Пока True, копилот отвечает без генерации."""
+    get_service().busy_probe = fn
 
 
 def set_gpu_lock(lock: Any) -> None:

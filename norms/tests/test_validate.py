@@ -62,6 +62,9 @@ def test_verified_true_requires_fulltext(tmp_path: Path):
                    encoding="utf-8")
     cat["types"]["V01"]["rule_checks"][0]["quote_level"] = "fulltext"
     rep = _run(cat, base)
+    assert any("quote_checked_by_human" in e for e in rep.errors)  # цитату должен сверить человек
+    cat["types"]["V01"]["rule_checks"][0]["quote_checked_by_human"] = True
+    rep = _run(cat, base)
     assert rep.ok, rep.errors
 
 
@@ -158,3 +161,35 @@ def test_real_sources_header_notes_are_not_quotable():
     q = v.quotable_text(rest, meta["retrieval"])
     assert v.normalize("Статус на самой странице adilet НЕ проверен") not in q
     assert v.normalize("Наличные деньги принимаются и пересчитываются кассовым работником в присутствии клиента.") in q
+
+
+def test_confirmed_requires_human_applicability_check(tmp_path: Path):
+    base = tmp_path / "mini"
+    shutil.copytree(FIXTURE, base)
+    src = base / "sources" / "doc_a.md"
+    src.write_text(src.read_text(encoding="utf-8").replace("retrieval: search_snippets", "retrieval: fulltext"),
+                   encoding="utf-8")
+    cat = _mini()
+    t = cat["types"]["V01"]
+    t["legal_status"] = "confirmed"
+    t["rules"][0]["verified"] = True
+    t["rule_checks"][0].update(quote_level="fulltext", quote_checked_by_human=True)
+    assert any("applicability_checked_by_human" in e for e in _run(cat, base).errors)
+    t["rule_checks"][0]["applicability_checked_by_human"] = True
+    assert _run(cat, base).ok
+
+
+def test_examples_schema():
+    cat = _mini()
+    ex = cat["types"]["V01"]["examples"]
+    ex[1]["signals"] = {"cash_visible": 0.0}  # unknown без null
+    assert any("null" in e for e in _run(cat).errors)
+    cat = _mini()
+    cat["types"]["V01"]["examples"][0]["signals"] = {"no_such_signal": 1.0}
+    assert any("SIGNALS" in e for e in _run(cat).errors)
+    cat = _mini()
+    cat["types"]["V01"]["examples"][0]["expected"] = "no_violation"
+    assert any("expected" in e for e in _run(cat).errors)
+    cat = _mini()
+    cat["types"]["V01"]["examples"] = [cat["types"]["V01"]["examples"][1]]
+    assert any("positive" in e for e in _run(cat).errors)

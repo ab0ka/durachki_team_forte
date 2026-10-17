@@ -33,13 +33,16 @@ presets:
     llamacpp: {model_file: Qwen3VL-2B-Instruct-Q8_0.gguf, mmproj_file: mmproj-Qwen3VL-2B-Instruct-F16.gguf}
 
 transformers:
-  device: cuda               # cuda | cpu
+  # Путь загрузки повторяет проверенный L1 на transformers 5.20.1 (tools/dataprep/vlm_smoke.py, ветка data/labels):
+  # AutoModelForImageTextToText + AutoProcessor, nf4 (LM) + bf16 (vision), local_files_only, cache_dir weights/hf/hub.
+  device: cuda:0             # cuda:0 | cpu
   allow_cpu: false           # на CPU 4B-модель — минуты на вызов; по умолчанию стадия пропускается
   dtype: bfloat16            # Qwen-VL обучены в bf16 (fp16 может переполняться); RTX 4060 (Ada) bf16 поддерживает
-  attn_implementation: sdpa
-  max_pixels: 200704         # 448*448 — процессор не будет апскейлить
-  min_pixels: 3136
-  skip_quant_modules: [visual, model.visual, lm_head]   # vision-энкодер не квантуем
+  attn_implementation: null  # null — по умолчанию transformers (как у L1); можно sdpa
+  max_pixels: null           # null — процессор не трогаем: кадры уже ужаты до frames.max_side
+  min_pixels: null
+  skip_quant_modules: [visual, lm_head]   # vision-энкодер и lm_head не квантуем (как у L1)
+  cache_dir: null            # null -> env SENTINEL_HF_CACHE -> <repo>/weights/hf/hub, если есть -> умолчание HF
   local_files_only: null     # null => берётся из HF_HUB_OFFLINE (прод: HF_HUB_OFFLINE=1, веса скачаны заранее)
   min_free_vram_mb: 0        # >0: не грузить модель, если свободной VRAM меньше (выставить по замеру bench)
   license_guard: warn        # strict | warn | off — license в README.md локального снапшота ∈ allowed_licenses
@@ -59,6 +62,8 @@ llamacpp_python:
 
 # Холодная загрузка модели внутри verify/discover съедает их бюджет: держите модель тёплой (vlm.warmup()).
 runtime:
+  use_registry: true            # внутри воркера A03: модель — через ModelRegistry (вытеснение LRU, unload)
+  registry_vram_gb: 3.5         # резерв для ensure_vram: 2.7 ГБ после загрузки (замер L1) + активации; уточнить bench
   lazy_load_min_budget_s: 45    # без warmup грузим лениво, только если бюджета >= 45 с
   load_retry_cooldown_s: 300    # после неудачной загрузки не пробуем снова 5 минут
 
@@ -84,6 +89,11 @@ budget:
     max_visual_tokens_total: 6000
     max_output_tokens_total: 1400
     max_retries_total: 2
+  verify_qa:                  # один вызов = один forward без генерации (1 выходной «токен»)
+    max_calls: 24
+    max_visual_tokens_total: 8000
+    max_output_tokens_total: 64
+    max_retries_total: 0
   discover:
     max_calls: 4
     max_visual_tokens_total: 3600
@@ -103,6 +113,7 @@ frames:
   jpeg_quality: 85           # для llama.cpp (data:image/jpeg;base64)
 
 verify:
+  mode: json                  # json (фаза 1, по умолчанию) | qa (фаза 2: нейтральные вопросы + логиты; ВЫКЛ до замера L2)
   # Логит-пулинг: logit(p) = logit(p0) + w * logit(p_vlm); p_vlm = c если visible, иначе 1-c
   vlm_weight: 0.6
   p_vlm_clip: [0.05, 0.95]
@@ -113,9 +124,19 @@ verify:
   retype_sources: [temporal, vlm]   # чьи события VLM может переклассифицировать
   retype_min_conf: 0.7
   drop_below: null            # null — verify никогда не удаляет события (решает fusion)
+  # extra.vlm.verdict/score — мнение для ml.fusion (confirm|reject|unsure). Флаг ниже дополнительно ставит
+  # extra.vlm_verdict="rejected" — встроенное слияние A03 такие события ВЫБРАСЫВАЕТ; выкл. до замера L2.
+  emit_vlm_verdict_rejected: false
   max_facts: 4
   dedupe_iou_s: 0.6           # совпадающие по времени события одного типа проверяем один раз
   priority: uncertain_first   # uncertain_first | confidence_desc | time
+
+# Режим verify.mode=qa: вопросы/кадры/пороги — в ml/vlm/qa_spec.yaml (меняет L2 по замерам).
+qa:
+  spec_path: null             # null — ml/vlm/qa_spec.yaml
+  vlm_weight: 0.6             # вес умножается на «доказательность» ответов (p_support + p_contra)
+  crop_pad: 0.1               # поля вокруг зоны для кропа (доля размера зоны)
+  refine_t_peak: false        # подменять t_peak моментом смены ответа (t_transition) — только после замера L2
 
 discover:
   enabled: false              # выключен до локального бенчмарка (скорость/FP); включает A03/конфиг
@@ -154,6 +175,18 @@ facts_filter:
 privacy:
   local_dump_dir: outputs/vlm   # куда CLI (try/bench) сохраняет кадры и ответы; null — не сохранять
   keep_raw_in_extra: false      # сырой текст ответа в Event.extra.vlm не кладём
+
+# ml.vlm.service — та же модель для чата копилота A14 (второй экземпляр не грузится). Анализ всегда раньше чата.
+service:
+  chat:
+    enabled: true
+    max_new_tokens: 384
+    max_new_tokens_cap: 768
+    timeout_s: 20.0           # потолок генерации одного ответа (generate max_time)
+    timeout_cap_s: 45.0
+    wait_s: 10.0              # сколько чат ждёт GPU (анализ — в приоритете); дальше честный ответ busy
+    max_input_chars: 12000
+    allow_cold_load: true     # можно ли чату загрузить модель, если анализ её ещё не грузил
 
 mock:
   latency_s: 0.0

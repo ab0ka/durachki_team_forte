@@ -1,5 +1,7 @@
 // Защитный разбор ответа GET /…/jobs/{id}. Бэкенд собирают 18 агентов —
 // UI не должен падать от лишних/пропущенных полей, строковых чисел и т.п.
+import { typeInfo } from "../lib/catalog";
+import { analyzeCompleteness } from "../lib/completeness";
 import type {
   EvidenceFrame,
   JobMeta,
@@ -154,7 +156,19 @@ export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
   const status = normalizeStatus(raw.status);
   let verdict = normalizeVerdict(raw.verdict, violations);
   if (status === "done" && verdict === null) verdict = violations.length > 0 ? "violation" : "no_violation";
-  const meta: JobMeta = isObj(raw.meta) ? (raw.meta as JobMeta) : {};
+  const meta: JobMeta = isObj(raw.meta) ? { ...(raw.meta as JobMeta) } : {};
+  // A01 UI-report дублирует coverage на верхний уровень — подставляем, если в meta его нет.
+  if (meta.coverage === undefined && raw.coverage !== undefined) meta.coverage = raw.coverage;
+  const candidates = Array.isArray(raw.candidates)
+    ? raw.candidates
+        .map((x, i) => {
+          const v = normalizeViolation(x);
+          if (v) v.index = i;
+          return v;
+        })
+        .filter((v): v is Violation => v !== null)
+        .sort((a, b) => a.timecode_sec - b.timecode_sec)
+    : [];
   const error = str(raw.error ?? raw.detail ?? meta.error ?? "") || undefined;
   let partialResult: JobResult | undefined;
   if (status === "failed" && isObj(raw.partial)) {
@@ -168,6 +182,11 @@ export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
   const el = optNum(raw.elapsed_s);
   return {
     job_id: str(raw.job_id ?? raw.id, fallbackJobId),
+    verdictState: str(raw.verdict_state) || undefined,
+    analysisComplete: typeof raw.analysis_complete === "boolean" ? raw.analysis_complete : undefined,
+    coverageProblem: str(raw.coverage_problem) || undefined,
+    candidates,
+    warnings: strList(raw.warnings),
     queuePosition: qp,
     elapsedSec: el,
     partialResult,
@@ -297,19 +316,11 @@ export function violationFacts(v: Violation, job: JobResult): string[] {
 }
 
 /**
- * Анализ неполный (часть стадий пропущена по таймауту/ошибке)? Тогда «нарушений нет»
- * нельзя показывать зелёным. Флаги — договорённость с A02/A03 (см. README → «Для интегратора»).
+ * Анализ неполный? Делегирует в lib/completeness.ts (tri-state: complete / partial / unknown).
+ * Оставлено для совместимости: true только для подтверждённо НЕПОЛНОГО анализа.
  */
 export function isPartial(job: JobResult): boolean {
-  const m = job.meta as Obj;
-  if (m.partial === true || m.incomplete === true || m.degraded === true || m.timed_out === true) return true;
-  if (m.complete === false) return true;
-  for (const k of ["skipped_stages", "stages_skipped", "failed_stages"]) {
-    const v = m[k];
-    if (Array.isArray(v) && v.length > 0) return true;
-  }
-  const warnings = Array.isArray(m.warnings) ? m.warnings.map((w) => str(w).toLowerCase()) : [];
-  return warnings.some((w) => /partial|timeout|timed out|skipped|неполн|таймаут|пропущ|не заверш/.test(w));
+  return analyzeCompleteness(job).state === "partial";
 }
 
 /** Внешний JSON жюри: строго обязательные поля ТЗ (без timeline/meta/норм). */
@@ -361,4 +372,47 @@ export function reviewHints(job: JobResult): ReviewHint[] {
     });
   }
   return out.sort((a, b) => a.timecode_sec - b.timecode_sec);
+}
+
+/** Рамка подсветки (A12 shapes kind=box, bbox нормирован к кадру: x1,y1,x2,y2). */
+export interface HighlightBox {
+  label: string;
+  color: string;
+  bbox: [number, number, number, number];
+}
+
+export function overlayBoxes(v: Violation, job: JobResult): HighlightBox[] {
+  const ov = violationOverlay(v, job);
+  if (!ov || !Array.isArray(ov.shapes)) return [];
+  const out: HighlightBox[] = [];
+  for (const sh of ov.shapes) {
+    if (!isObj(sh) || str(sh.kind) !== "box" || !Array.isArray(sh.bbox) || sh.bbox.length !== 4) continue;
+    const b = sh.bbox.map((x) => num(x, Number.NaN));
+    if (b.some((x) => !Number.isFinite(x))) continue;
+    const [x1, y1, x2, y2] = b.map((x) => Math.min(1, Math.max(0, x)));
+    if (x2 <= x1 || y2 <= y1) continue;
+    const color = /^#[0-9a-f]{3,8}$/i.test(str(sh.color)) ? str(sh.color) : "#ff3b5c";
+    out.push({ label: str(sh.label) || str(sh.key), color, bbox: [x1, y1, x2, y2] });
+  }
+  return out;
+}
+
+/** Нормы с русским статусом сверки из оверлея A12 (если есть). */
+export function rulesWithStatus(v: Violation, job: JobResult): RuleRef[] {
+  const rules = v.rules ?? [];
+  const ov = violationOverlay(v, job);
+  const norms = ov && Array.isArray(ov.norms) ? ov.norms.filter(isObj) : [];
+  if (!norms.length) return rules;
+  return rules.map((r) => {
+    const n = norms.find((x) => str(x.document) === r.document && (str(x.clause) || null) === (r.clause || null));
+    return n && str(n.status_ru) ? { ...r, status_ru: str(n.status_ru) } : r;
+  });
+}
+
+/** Что по видео установить нельзя для этого типа: от сервера (not_observable) или из каталога A13. */
+export function notCheckedFor(v: Violation, job: JobResult): string[] {
+  const ov = violationOverlay(v, job);
+  const fromServer = ov ? strList(ov.not_observable) : [];
+  if (fromServer.length) return fromServer;
+  return typeInfo(v.type_id)?.notChecked ?? [];
 }

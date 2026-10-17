@@ -125,5 +125,109 @@ def test_check_fallbacks(tmp_path):
     assert check_fallbacks.compare(tmp_path / "ml/c/_contract_fallback.py", canon)[0] == "DIVERGED"
     assert check_fallbacks.main(["--root", str(tmp_path)]) == 1
     (tmp_path / "ml/c/_contract_fallback.py").unlink()
+    (tmp_path / "ml/b/tests").mkdir()
+    (tmp_path / "ml/b/tests/test_x.py").write_text("from ml.b._contract_fallback import LABELS\n", encoding="utf-8")
+    assert check_fallbacks.unguarded_imports(tmp_path) == {"ml/b": ["ml/b/tests/test_x.py:1"]}
     assert check_fallbacks.main(["--root", str(tmp_path), "--drop"]) == 0
-    assert not list(tmp_path.rglob("_contract_fallback.py"))
+    assert [p.parent.name for p in tmp_path.rglob("_contract_fallback.py")] == ["b"]  # с прямым импортом — оставлен
+
+
+def test_guard_media(tmp_path):
+    import guard_media
+
+    assert guard_media.name_problem("data/X-1.MOV") and guard_media.name_problem("ml/detect/w.safetensors")
+    assert guard_media.name_problem("eval/frames/f.jpg") and not guard_media.name_problem("docs/assets/a.jpg")
+    assert guard_media.name_problem("ml/detect/code.py") is None
+    (tmp_path / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "big.bin").write_bytes(b"0" * (6 * 1024 * 1024))
+    (tmp_path / "video.dat").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 32)
+    (tmp_path / "frame.dat").write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 32)
+    (tmp_path / "w.bin").write_bytes(b"GGUF" + b"0" * 32)
+    assert guard_media.check_file("ok.py", tmp_path) == []
+    assert any("МБ" in p for p in guard_media.check_file("big.bin", tmp_path))
+    assert guard_media.check_file("video.dat", tmp_path) and guard_media.check_file("w.bin", tmp_path)
+    assert guard_media.check_file("frame.dat", tmp_path)
+    assert guard_media.main(["--root", str(tmp_path), "ok.py"]) == 0
+    assert guard_media.main(["--root", str(tmp_path), "ok.py", "video.dat"]) == 1
+    assert guard_media.main(["--root", str(tmp_path), "--max-mb", "10", "big.bin"]) == 0
+
+
+def test_gitignore_is_anchored():
+    lines = [ln.strip() for ln in (SCRIPTS.parent / ".gitignore").read_text(encoding="utf-8").splitlines()
+             if ln.strip() and not ln.startswith("#")]
+    for d in ("/data/", "/weights/", "/cache/", "/reports/frames/"):
+        assert d in lines
+    for bad in ("data/", "weights/", "cache/", "outputs/", "runs/"):
+        assert bad not in lines, f"неякорный шаблон {bad} спрячет папки внутри кода"
+    for ext in ("*.mov", "*.MOV", "*.mp4", "*.avi", "*.mkv", "*.onnx", "*.pt", "*.pth", "*.safetensors", "*.gguf",
+                "*.engine"):
+        assert ext in lines
+
+
+def test_repo_tracked_files_pass_guard():
+    assert subprocess.run([sys.executable, str(SCRIPTS / "guard_media.py"), "--all", "--root", str(SCRIPTS.parent)],
+                          capture_output=True).returncode == 0
+
+
+def test_compat_matrix_compare_and_scan(tmp_path):
+    import compat_matrix as cm
+
+    ok = cm.compare("A06", "ml.track", "track", ["clip", "dets"], {}, True,
+                    {"ok": True, "params": [["clip", "POSITIONAL_OR_KEYWORD", None],
+                                            ["dets", "POSITIONAL_OR_KEYWORD", None]], "qualname": "ml.track.track"})
+    assert ok.verdict == "OK"
+    renamed = cm.compare("A06", "ml.track", "track", ["clip", "dets"], {}, True,
+                         {"ok": True, "params": [["c", "POSITIONAL_OR_KEYWORD", None],
+                                                 ["d", "POSITIONAL_OR_KEYWORD", None]]})
+    assert renamed.verdict == "ЗАМЕЧАНИЕ"
+    short = cm.compare("A06", "ml.track", "track", ["clip", "dets"], {}, True,
+                       {"ok": True, "params": [["clip", "POSITIONAL_OR_KEYWORD", None],
+                                               ["zones", "KEYWORD_ONLY", None]]})
+    assert short.verdict == "РАСХОЖДЕНИЕ"
+    missing = cm.compare("A06", "ml.track", "track", ["clip", "dets"], {}, True, {"ok": False, "error": "нет"})
+    assert missing.verdict == "НЕТ"
+    pkg = tmp_path / "ml" / "x"
+    (pkg / "tests").mkdir(parents=True)
+    (pkg / "tests" / "test_a.py").write_text("from ml.x._contract_fallback import LABELS\n", encoding="utf-8")
+    (pkg / "core.py").write_text(
+        "try:\n    from contracts.sentinel_contracts import *\nexcept ImportError:\n"
+        "    from ._contract_fallback import *\n"
+        "class Event:\n    pass\n"
+        "v = signals.get('bogus_signal', 0)\nw = sig['safe_open']\nmeta['coverage'] = 1.0\n", encoding="utf-8")
+    scan = cm.static_scan(tmp_path)
+    assert scan["unguarded_fallback"] == ["ml/x/tests/test_a.py:1"]
+    assert scan["duplicate_classes"] == ["ml/x/core.py:5 class Event"]
+    assert scan["unknown_signals"] == ["ml/x/core.py:7 `bogus_signal`"]
+    assert scan["unknown_as_zero"] == ["ml/x/core.py:7 `bogus_signal`"]
+    assert scan["coverage_producers"] == ["ml/x/core.py:9"]
+    probe = cm.probe(tmp_path, "json", "dumps")
+    assert probe["ok"] and probe["params"][0][0] == "obj"
+
+
+def test_resolve_deps(tmp_path):
+    import resolve_deps as rd
+
+    lock = rd.parse_lock("# lock\ntorch==2.11.0+cu128\nopencv-python-headless==4.14.0.94\nPyYAML==6.0.3\n"
+                         "transformers==5.20.1\n--extra-index-url x\n")
+    assert lock == {"torch": "2.11.0+cu128", "opencv-python-headless": "4.14.0.94", "pyyaml": "6.0.3",
+                    "transformers": "5.20.1"}
+    for mod, text in {"ml/a": "torch>=2.3\nPyYAML>=6,<7  # ok\nopencv-python==4.10.0.84\n",
+                      "ml/b": "transformers>=4.57,<5\nfastapi>=0.110\nultralytics\n-r other.txt\n",
+                      "eval": "pyyaml==6.0.1\n"}.items():
+        (tmp_path / mod).mkdir(parents=True)
+        (tmp_path / mod / "requirements.txt").write_text(text, encoding="utf-8")
+    pkgs, skipped = rd.collect(tmp_path)
+    rd.resolve(pkgs, lock)
+    st = {k: p.status for k, p in pkgs.items()}
+    assert st == {"torch": "OK", "pyyaml": "КОНФЛИКТ", "opencv-python": "ДУБЛЬ", "transformers": "КОНФЛИКТ",
+                  "fastapi": "НЕТ В LOCK", "ultralytics": "ЗАПРЕЩЁН"}
+    assert "eval: ==6.0.1" in pkgs["pyyaml"].detail and "ml/b" in pkgs["transformers"].detail
+    out = tmp_path / "resolved.txt"
+    rd.write_resolved(pkgs, out)
+    text = out.read_text(encoding="utf-8")
+    assert "torch==2.11.0+cu128" in text and "# РЕШИТЬ fastapi" in text and "fastapi>=" not in text
+    lock_file = tmp_path / "l.txt"
+    lock_file.write_text("torch==2.11.0+cu128\n", encoding="utf-8")
+    assert rd.main(["--tree", str(tmp_path), "--lock", str(lock_file), "--out", str(tmp_path / "r.md")]) == 0
+    assert rd.main(["--tree", str(tmp_path), "--lock", str(lock_file), "--out", str(tmp_path / "r.md"),
+                    "--strict"]) == 1

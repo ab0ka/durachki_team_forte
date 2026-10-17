@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
+from copilot.config import load_config
+
 from copilot.corpus import build_corpus, chunk_markdown, norm_clause, norm_url
 from copilot.rag import Retriever
 
@@ -98,3 +104,61 @@ def test_type_boost(cfg, corpus, embedder) -> None:
 def test_empty_corpus_is_safe(cfg, embedder) -> None:
     c = build_corpus({"types": {}}, [], cfg=cfg)
     assert Retriever(c, cfg, embedder=embedder).search("телефон") == []
+
+
+# ----------------------------------------------------------------------------- формат каталога A13 v2
+
+A13_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "norms_a13"
+
+
+def _a13_corpus(cfg):
+    from copilot.corpus import load_corpus
+
+    c2 = load_config({**cfg, "corpus": {**cfg["corpus"], "catalog_path": str(A13_DIR / "catalog.yaml"),
+                                        "sources_glob": str(A13_DIR / "sources" / "*.md")}})
+    return load_corpus(c2)
+
+
+def test_a13_sources_skip_non_norm_sections(cfg) -> None:
+    corpus = _a13_corpus(cfg)
+    texts = " ".join(c.text for c in corpus.chunks)
+    assert "Пересказ" not in texts and "TODO" not in texts and "Сверить пункт 7" not in texts
+    assert "Статус: действует" not in texts and "Провенанс" not in texts and "НЕ полный текст" not in texts
+    assert "Дословность" not in texts  # преамбула под H1 не цитируется
+
+
+def test_a13_fragment_clauses_and_honest_flags(cfg) -> None:
+    corpus = _a13_corpus(cfg)
+    src = {c.heading.split(".")[0]: c for c in corpus.chunks if c.kind == "source"}
+    assert src["Ф1"].clause == "п. 20" and src["Ф1"].note.startswith("фрагмент поисковой выдачи")
+    assert src["Ф2"].clause is None                      # «номер пункта не установлен»
+    assert src["Ф3"].clause == "п. 8" and "номер пункта не сверен" in src["Ф3"].note
+    assert all(not c.verified for c in corpus.chunks)    # search_snippets — ничего не сверено
+    assert src["Ф1"].citation()["fragment"].startswith("Ф1. Пункт 20")
+
+
+def test_a13_disabled_type_not_cited_and_url_linking(cfg) -> None:
+    corpus = _a13_corpus(cfg)
+    assert corpus.rules_for_type("V01") == []            # legal_status: disabled -> «без пункта»
+    v08 = corpus.rules_for_type("V08")
+    assert len(v08) == 1 and v08[0].status == "candidate" and not v08[0].verified
+    # источник с тем же URL и пунктом связан с V08, хотя название документа в rules другое
+    src20 = [c for c in corpus.chunks if c.kind == "source" and c.clause == "п. 20"]
+    assert src20 and src20[0].type_ids == ["V08"]
+    assert corpus.short_name(src20[0].document, src20[0].url) == "ФИКСТУРА: Правила кассы (№ 1)"
+
+
+REAL_NORMS = Path(__file__).resolve().parents[2] / "norms"
+
+
+@pytest.mark.skipif(not (REAL_NORMS / "catalog.yaml").is_file(), reason="norms/ (A13) нет в этой ветке")
+def test_real_a13_norms_load_without_non_norm_text(cfg) -> None:
+    from copilot.corpus import load_corpus
+
+    c2 = load_config({**cfg, "corpus": {**cfg["corpus"], "catalog_path": str(REAL_NORMS / "catalog.yaml"),
+                                        "sources_glob": str(REAL_NORMS / "sources" / "*.md"),
+                                        "fixture_fallback": False}})
+    corpus = load_corpus(c2)
+    assert corpus.chunks and not corpus.is_fixture
+    for c in corpus.chunks:
+        assert "Провенанс" not in c.text and "пересказ" not in c.heading.lower()

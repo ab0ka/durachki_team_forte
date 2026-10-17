@@ -19,8 +19,8 @@ closed_set:
   enabled: true
   # порядок попыток: первый доступный бэкенд выигрывает
   backends: [hf]            # baseline. Дообученный ONNX — опционально: [onnx_finetuned, hf] (или SENTINEL_DETECT_EXTRAS=finetuned)
-  hf_model_id: PekingU/rtdetr_v2_r18vd          # Apache-2.0; альтернатива: ustc-community/dfine-small-coco
-  hf_fallback_ids: []                           # опц.: [ustc-community/dfine-small-coco] (проверить лицензию веса!)
+  hf_model_id: PekingU/rtdetr_v2_r18vd          # Apache-2.0 (заявлено); скачан у L1 в weights/hf/hub
+  hf_fallback_ids: [ustc-community/dfine-medium-obj2coco]   # скачан у L1; грузится, только если baseline не загрузился
   proxy_labels: true        # COCO-классы-заместители (book→document, handbag→bag, bowl→cup...) — с исходным именем в source
   onnx_path: detect/finetuned/model.onnx       # относительно SENTINEL_WEIGHTS
   onnx_labels: detect/finetuned/labels.json    # список имён классов (из LABELS)
@@ -112,6 +112,50 @@ merge:
   cross_label_suppress:      # если open-vocab и closed-set дают одно и то же, оставляем одну метку
     - [cell_phone, cell_phone]
 
+# ---------------- desk_inventory / safe_door_state (вход для правила «ушла и оставила») ----------------
+# Результат: present / unknown (детектор НИКОГДА не утверждает «нет»); для сейфа open / closed / unknown.
+inventory:
+  # АБЛЯЦИЯ (одна): baseline — только closed-set (COCO) на кадрах окна;
+  # rare_open_vocab — + редкий проход OWLv2 (только по запросу правил, ≤ max_frames кадров) с контрастными запросами.
+  # По умолчанию baseline, пока L2 не измерил выигрыш (env: SENTINEL_DETECT_EXTRAS=rare_open_vocab).
+  mode: baseline
+  window_s: 1.0             # окно вокруг t: кадры t−w/2 … t+w/2 (точные кадры clip.frame_at)
+  n_frames: 3
+  min_frames_present: 2     # present — найден минимум на 2 кадрах окна (подавление единичных ложных срабатываний)
+  zone_overlap: 0.5         # доля площади бокса внутри зоны (desk ∪ cash_tray или safe)
+  desk_zones: [desk, cash_tray]
+  safe_zones: [safe]
+  occlusion_warn: 0.6       # зона стола закрыта людьми сильнее → предупреждение «отсутствие не проверяемо»
+  # baseline: метки closed-set → вид предмета. bag = сумка НЕИЗВЕСТНОГО типа (не cash_bag, не обязательно личная)
+  from_labels: {cup: cup, bottle: cup, food: food, cell_phone: phone, bag: bag}
+  # метки, которым доверяем ТОЛЬКО от дообученной на проверенной разметке модели (source finetuned:*)
+  from_finetuned: {cash: cash, cash_bag: cash_bag, cell_phone: phone, safe_open: safe_open}
+  thr:                      # пороги по виду на кадре — ПРИОРЫ, не калиброваны (калибровка: python -m ml.detect.calibrate)
+    cash: 0.30
+    cash_bag: 0.30
+    cup: 0.35
+    food: 0.35
+    phone: 0.30
+    personal_item: 0.30
+    bag: 0.35
+    safe_open: 0.35
+  rare_open_vocab:
+    max_frames: 2           # OWLv2 — не более 2 кадров окна на вызов (стоимость), closed-set — на всех n_frames
+    queries:                # группы запросов; контрастные пары защищают от подмены смысла
+      cash: ["stack of banknotes", "cash money"]
+      cash_bag: ["green canvas money bag", "cash collection bag"]
+      generic_bag: ["handbag", "backpack", "plastic shopping bag"]
+      personal_item: ["jacket", "coat"]
+      phone: ["mobile phone", "smartphone"]
+      landline: ["desk telephone", "landline phone"]
+      cup: ["cup", "drink bottle"]
+      food: ["food"]
+      safe_open: ["open safe", "open safe door"]
+      safe_closed: ["closed metal safe", "closed safe door"]
+    thr: {cash: 0.25, cash_bag: 0.30, generic_bag: 0.30, personal_item: 0.30, phone: 0.25, landline: 0.25,
+          cup: 0.25, food: 0.30, safe_open: 0.20, safe_closed: 0.20}
+    margin: 0.05            # cash_bag − generic_bag, phone − landline, open − closed
+
 # ---------------- mock (SENTINEL_MOCK=1) ----------------
 # Синтетика: фон тёмный, объекты — залитые эллипсы/прямоугольники цветов ниже (BGR).
 mock:
@@ -137,3 +181,7 @@ mock:
     bag:           [20, 70, 140]
     document:      [245, 245, 245]
     keys:          [120, 120, 0]
+  # mock-«понятия» вне LABELS — только для MockOpenVocabScorer (контраст: стационарный телефон, куртка)
+  extra_palette:
+    landline:      [60, 160, 60]
+    jacket:        [180, 60, 180]

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["run", "warmup", "run_with_context", "ModelRegistry", "PIPELINE_VERSION"]
+__all__ = ["run", "warmup", "run_with_context", "cancel", "release_gpu", "ModelRegistry", "PIPELINE_VERSION"]
 __version__ = "1.0.0"
 PIPELINE_VERSION = __version__
 
@@ -24,6 +24,20 @@ def run_with_context(video_path: str, job_id: str, progress: Any = None, deadlin
     from .orchestrator import run_with_context as _rwc
 
     return _rwc(video_path, job_id, progress, deadline_s, **kwargs)
+
+
+def cancel(job_id: str) -> bool:
+    """Отменить задачу: воркер останавливается, модели выгружаются, результат — failed (cancelled)."""
+    from .orchestrator import cancel as _cancel
+
+    return _cancel(job_id)
+
+
+def release_gpu() -> dict:
+    """Освободить GPU между задачами (остановить воркер / выгрузить модели)."""
+    from .orchestrator import release_gpu as _release
+
+    return _release()
 
 
 def warmup() -> None:

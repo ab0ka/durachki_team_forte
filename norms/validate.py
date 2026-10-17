@@ -8,6 +8,7 @@
     python -m norms.validate --strict        # предупреждения = ошибки (verified:false и т.п.)
     python -m norms.validate --json          # машиночитаемый отчёт
     python -m norms.validate --write-fallback  # пересобрать norms/_fallback.py из YAML
+    python -m norms.validate --write-matrix    # пересобрать norms/REVIEW_MATRIX.md из YAML
 
 Что проверяется:
   1. Схема: version, все типы V01..V08 и V99, поля name / observable / not_observable /
@@ -43,7 +44,15 @@ from . import CATALOG_PATH, NORMS_DIR, RULE_KEYS, SEVERITIES, TYPE_IDS
 RETRIEVAL_KINDS = ("fulltext", "partial", "search_snippets")
 LEGAL_STATUSES = ("confirmed", "candidate", "disabled")
 QUOTE_LEVELS = ("fulltext", "snippet", "none")
-RULE_CHECK_KEYS = ("quote_level", "currency", "applicability", "conditions_visible", "conditions_not_visible")
+RULE_CHECK_KEYS = ("quote_level", "quote_checked_by_human", "applicability_checked_by_human", "currency",
+                   "applicability", "conditions_visible", "conditions_not_visible")
+EXAMPLE_KINDS = {"positive": "candidate", "negative": "no_violation", "unknown": "unknown"}
+
+try:
+    from contracts.sentinel_contracts import SIGNALS as _SIGNALS
+except ImportError:  # пока ветка A01 не смерджена
+    from contracts.sentinel_contracts import SIGNALS as _SIGNALS
+SIGNAL_NAMES = frozenset(_SIGNALS)
 _RETRIEVAL_TO_LEVEL = {"fulltext": "fulltext", "partial": "snippet", "search_snippets": "snippet"}
 _NOT_QUOTABLE_RE = re.compile(r"<!--\s*not-quotable\s*-->.*?<!--\s*/not-quotable\s*-->", re.S)
 _TYPE_ID_RE = re.compile(r"^V\d{2}$")
@@ -263,6 +272,58 @@ def _check_rule_checks(type_id: str, t: dict[str, Any], rep: Report) -> None:
             v = chk.get(k)
             if v is not None and (not isinstance(v, list) or not all(_is_str(x) for x in v)):
                 rep.errors.append(f"{where}[{i}].{k}: список строк")
+        for k in ("quote_checked_by_human", "applicability_checked_by_human"):
+            if k in chk and not isinstance(chk[k], bool):
+                rep.errors.append(f"{where}[{i}].{k}: true/false")
+        if isinstance(rule, dict) and rule.get("verified") is True:
+            if chk.get("quote_checked_by_human") is not True or level != "fulltext":
+                rep.errors.append(f"{where}[{i}]: verified=true требует quote_level=fulltext и "
+                                  f"quote_checked_by_human=true (цитату сверил человек)")
+        if t.get("legal_status") == "confirmed" and chk.get("applicability_checked_by_human") is not True:
+            rep.errors.append(f"{where}[{i}]: legal_status=confirmed требует applicability_checked_by_human=true")
+
+
+def _check_examples(type_id: str, t: dict[str, Any], rep: Report) -> None:
+    """Синтетические примеры: positive → candidate, negative → no_violation, unknown → unknown (null-сигнал)."""
+    where = f"types.{type_id}.examples"
+    ex = t.get("examples")
+    if ex is None:
+        rep.warnings.append(f"{where}: нет синтетических примеров (positive + negative/unknown)")
+        return
+    if not isinstance(ex, list) or not ex:
+        rep.errors.append(f"{where}: непустой список")
+        return
+    kinds = set()
+    for i, e in enumerate(ex):
+        w = f"{where}[{i}]"
+        if not isinstance(e, dict):
+            rep.errors.append(f"{w}: должен быть словарём")
+            continue
+        kind, expected = e.get("kind"), e.get("expected")
+        if kind not in EXAMPLE_KINDS:
+            rep.errors.append(f"{w}.kind: одно из {sorted(EXAMPLE_KINDS)}")
+            continue
+        kinds.add(kind)
+        if expected != EXAMPLE_KINDS[kind]:
+            rep.errors.append(f"{w}.expected: для kind={kind} ожидается {EXAMPLE_KINDS[kind]!r}")
+        facts = e.get("facts")
+        if not isinstance(facts, list) or not facts or not all(_is_str(x) for x in facts):
+            rep.errors.append(f"{w}.facts: непустой список строк")
+        sig = e.get("signals")
+        if not isinstance(sig, dict) or not sig:
+            rep.errors.append(f"{w}.signals: непустой словарь сигналов")
+            continue
+        for name, val in sig.items():
+            if name not in SIGNAL_NAMES:
+                rep.errors.append(f"{w}.signals.{name}: нет в contracts.SIGNALS")
+            elif val is not None and (isinstance(val, bool) or not isinstance(val, (int, float))):
+                rep.errors.append(f"{w}.signals.{name}: число или null (null = неизвестно)")
+            elif isinstance(val, (int, float)) and name != "n_persons" and not 0.0 <= float(val) <= 1.0:
+                rep.errors.append(f"{w}.signals.{name}: значение 0..1")
+        if kind == "unknown" and not any(v is None for v in sig.values()):
+            rep.errors.append(f"{w}: unknown-пример должен содержать хотя бы один null-сигнал (unknown ≠ false)")
+    if "positive" not in kinds or not kinds & {"negative", "unknown"}:
+        rep.errors.append(f"{where}: нужен positive и хотя бы один negative или unknown")
 
 
 def _check_legal_status(type_id: str, t: dict[str, Any], rep: Report) -> None:
@@ -319,6 +380,7 @@ def _check_type(type_id: str, t: Any, sources: dict[str, dict[str, Any]], rep: R
         rep.errors.append(f"{where}.research_candidates: список строк")
     _check_legal_status(type_id, t, rep)
     _check_rule_checks(type_id, t, rep)
+    _check_examples(type_id, t, rep)
     rules = t.get("rules")
     if not isinstance(rules, list):
         rep.errors.append(f"{where}.rules: список (может быть пустым)")
@@ -382,6 +444,68 @@ def write_fallback(catalog: dict[str, Any], path: Path = NORMS_DIR / "_fallback.
     )
 
 
+MATRIX_PATH = NORMS_DIR / "REVIEW_MATRIX.md"
+
+
+def _cell(x: Any) -> str:
+    return str(x).replace("|", "/").replace("\n", " ").strip() or "—"
+
+
+def _yn(x: Any) -> str:
+    return "да" if x is True else "нет"
+
+
+def render_matrix(catalog: dict[str, Any], base_dir: Path = NORMS_DIR) -> str:
+    """Review-матрица для человека: по типу и по норме — раздельные статусы проверки."""
+    docs = catalog.get("documents") or {}
+    by_url = {_norm_url(d.get("url", "")): (k, d) for k, d in docs.items() if isinstance(d, dict)}
+    retrieval: dict[str, str] = {}
+    for k, d in docs.items():
+        f = base_dir / str(d.get("source_file", ""))
+        retrieval[k] = parse_front_matter(f.read_text(encoding="utf-8"))[0].get("retrieval", "?") if f.is_file() else "нет файла"
+    out = [
+        "# Review-матрица норм (A13)", "",
+        "АВТОГЕНЕРАЦИЯ: `python -m norms.validate --write-matrix` из `catalog.yaml` — руками не править.",
+        "Колонки «цитату сверил человек» и «применимость проверил человек» — раздельные статусы;",
+        "`validate` проверяет только дословное вхождение цитаты в сохранённый текст (не юридическую гарантию).", "",
+        "## Типы и нормы", "",
+        "| тип | название | legal_status | документ / пункт | цитата сохранена | цитату сверил человек | "
+        "применимость проверил человек | verified | условия применимости | исключения |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for tid, t in (catalog.get("types") or {}).items():
+        if not isinstance(t, dict):
+            continue
+        exc = "; ".join(t.get("exclusions") or [])
+        rules, checks = t.get("rules") or [], t.get("rule_checks") or []
+        if not rules:
+            out.append(f"| {tid} | {_cell(t.get('name'))} | {t.get('legal_status', '?')} | без пункта, без правового "
+                       f"вывода | — | — | — | — | — | {_cell(exc)} |")
+            continue
+        for i, r in enumerate(rules):
+            chk = checks[i] if i < len(checks) and isinstance(checks[i], dict) else {}
+            doc_id = by_url.get(_norm_url(r.get("url", "")), (r.get("url"), {}))[0]
+            out.append(
+                f"| {tid} | {_cell(t.get('name'))} | {t.get('legal_status', '?')} | {_cell(doc_id)} / "
+                f"{_cell(r.get('clause') or 'пункт не установлен')} | {_cell(chk.get('quote_level', '?'))} | "
+                f"{_yn(chk.get('quote_checked_by_human'))} | {_yn(chk.get('applicability_checked_by_human'))} | "
+                f"{_yn(r.get('verified'))} | {_cell(chk.get('applicability', ''))} | {_cell(exc)} |")
+    out += ["", "## Документы", "", "| id | акт | URL | статус (по справочным системам) | редакция сверена | "
+            "дата доступа | файл | тип текста |", "|---|---|---|---|---|---|---|---|"]
+    for k, d in docs.items():
+        if isinstance(d, dict):
+            out.append(f"| {k} | {_cell(d.get('act', d.get('title', '')))} | {_cell(d.get('url'))} | "
+                       f"{_cell(d.get('in_force', '?'))} | {_yn(d.get('revision_checked'))} | {_cell(d.get('accessed', '?'))} | "
+                       f"{_cell(d.get('source_file'))} | {retrieval.get(k, '?')} |")
+    return "\n".join(out) + "\n"
+
+
+def check_matrix(catalog: dict[str, Any], rep: Report, path: Path = MATRIX_PATH) -> None:
+    if not path.is_file() or path.read_text(encoding="utf-8") != render_matrix(catalog):
+        rep.errors.append("norms/REVIEW_MATRIX.md устарел или отсутствует — "
+                          "запустите `python -m norms.validate --write-matrix`")
+
+
 def _load_yaml_strict(path: Path) -> dict[str, Any]:
     import yaml
 
@@ -421,15 +545,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--json", action="store_true", help="вывести отчёт в JSON")
     ap.add_argument("--no-fallback-check", action="store_true")
     ap.add_argument("--write-fallback", action="store_true", help="пересобрать norms/_fallback.py")
+    ap.add_argument("--write-matrix", action="store_true", help="пересобрать norms/REVIEW_MATRIX.md")
     args = ap.parse_args(argv)
 
     catalog = _load_yaml_strict(args.catalog)
     if args.write_fallback:
         write_fallback(catalog)
         print("norms/_fallback.py обновлён")
+    if args.write_matrix:
+        MATRIX_PATH.write_text(render_matrix(catalog), encoding="utf-8")
+        print("norms/REVIEW_MATRIX.md обновлён")
     rep = validate_catalog(catalog, args.base_dir or args.catalog.parent, strict=args.strict)
     if not args.no_fallback_check and args.catalog.resolve() == CATALOG_PATH.resolve():
         check_fallback(catalog, rep)
+        check_matrix(catalog, rep)
     if args.json:
         print(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2))
     else:

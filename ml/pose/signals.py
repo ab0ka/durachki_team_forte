@@ -52,6 +52,9 @@ class _Series:
     values: dict[str, list[Optional[float]]] = field(default_factory=dict)
     gestures: dict[str, list[Optional[float]]] = field(default_factory=dict)
     extras: dict[str, list[Optional[float]]] = field(default_factory=dict)
+    runs: dict[str, list[tuple[float, float, float]]] = field(default_factory=dict)  # (t_start, t_end, t_peak)
+    aspect: float = 0.5472
+    motion: list[Optional[dict[str, Any]]] = field(default_factory=list)
 
 
 class _ObjectIndex:
@@ -160,7 +163,8 @@ def _build_series(poses: Sequence[PoseFrame], tracks: Sequence[Track], aspect: f
         for p in plist:
             bb = (getattr(p, "extra", None) or {}).get("bbox")
             bboxes.append(tuple(float(v) for v in bb) if bb else _box_at(track, float(p.t), tol))
-        s = _Series(tid=tid, role=(track.role if track is not None else "unknown"), times=times, kps=kps, bboxes=bboxes)
+        s = _Series(tid=tid, role=(track.role if track is not None else "unknown"), times=times, kps=kps, bboxes=bboxes,
+                    aspect=aspect)
         s.iso = to_iso(kps, aspect)
         min_score = float(sc.get("kp_min_score", 0.3))
         s.scale = track_scale(list(s.iso), [bbox_to_iso(b, aspect) if b else None for b in bboxes],
@@ -183,12 +187,17 @@ def _apply_gate(series: _Series, name: str, ev: Sequence[Optional[float]], p: di
         vals, mask = gated_values(series.times[idx], [ev[i] for i in idx], p)
         for k, i in enumerate(idx):
             out[i] = float(vals[k])
+        runs = []
         for a, b in runs_from_mask(mask):
             t_a, t_b = series.times[idx[a]], series.times[idx[b]]
             fill = float(vals[a:b + 1].mean())
+            seg = [ev[idx[k]] for k in range(a, b + 1)]
+            t_peak = float(series.times[idx[a + int(np.argmax(seg))]])
+            runs.append((float(t_a), float(t_b), t_peak))
             for j in range(n):
                 if out[j] is None and t_a <= series.times[j] <= t_b:
                     out[j] = fill
+        series.runs[name] = runs
     series.values[name] = out
 
 
@@ -240,6 +249,10 @@ def _phone_to_ear(series: _Series, objs: _ObjectIndex, cfg: dict[str, Any]) -> N
             span = [j for j in range(n) if t_a <= series.times[j] <= t_b]
             confirmed = any(phone_near[j] for j in span)
             fill = float(vals[a:b + 1].mean())
+            if confirmed:
+                seg = [gesture[known[k]] for k in range(a, b + 1)]
+                series.runs.setdefault("phone_to_ear", []).append(
+                    (float(t_a), float(t_b), float(series.times[known[a + int(np.argmax(seg))]])))
             for j in span:
                 in_run[j] = True
                 gest_out[j] = fill
@@ -321,18 +334,21 @@ def _eating(series: _Series, objs: _ObjectIndex, cfg: dict[str, Any]) -> list[di
                         cycles.append(cur)
                     cur = None
                     last_far = (t, w.copy(), None if head is None else head.copy()) if d >= far else None
-    # предмет у кисти/рта во время подхода
+    # предмет (cup/bottle/food) должен быть У РТА, пока кисть у рта (dwell), а не у кисти в начале движения:
+    # стакан на столе у руки + «поправила волосы» / «почесала ухо» не дают питья
     food_labels = sc.get("food_labels", ["cup", "bottle", "food"])
     for c in cycles:
         c["object"] = False
         for j, g in enumerate(series.geoms):
             t = float(series.times[j])
-            if not (c["t_start"] - tol <= t <= c["t_end"] + tol):
+            if not (c["t_enter"] - tol <= t <= c["t_last_near"] + tol):
                 continue
-            pts = [w for _, w in g.wrists()]
             m = g.mouth()
-            if m is not None:
-                pts.append(m)
+            if m is None:
+                continue
+            pts = [m]
+            if g.ok(c["wrist"]) and g.dist(g.xy(c["wrist"]), m) <= mid:
+                pts.append(g.xy(c["wrist"]))
             for box in objs.boxes(food_labels, t - tol, t + tol):
                 if pts and min(point_box_dist(q, box) for q in pts) / g.s <= float(p["object_near"]):
                     c["object"] = True
@@ -372,6 +388,12 @@ def _eating(series: _Series, objs: _ObjectIndex, cfg: dict[str, Any]) -> list[di
         if m is not None and len(wr) == 2 and min(g.dist(w, m) for _, w in wr) > near:
             ev[j] = 0.0  # рот и обе кисти видны, кисти не у рта — наблюдаемое «нет»
     _apply_gate(series, "eating_drinking", ev, p)
+    fixed = []
+    for t_a, t_b, t_pk in series.runs.get("eating_drinking", []):
+        enters = [c["t_enter"] for c in cycles if c["object"] and t_a - 1e-6 <= c["t_enter"] <= t_b + 1e-6]
+        fixed.append((t_a, t_b, float(min(enters)) if enters else t_pk))
+    if fixed:
+        series.runs["eating_drinking"] = fixed
     series.gestures["hand_to_mouth"] = gest
     return cycles
 
@@ -440,11 +462,12 @@ def _facing_away(series: _Series, zones_iso: dict[str, list], cfg: dict[str, Any
     _apply_gate(series, "cashier_facing_away", ev, p)
 
 
-def _bending_and_posture(series: _Series, zones_iso: dict[str, list], cfg: dict[str, Any]) -> None:
+def _bending_and_posture(series: _Series, zones_iso: dict[str, list], cfg: dict[str, Any],
+                         bending: bool = True) -> None:
     sc = cfg["signals"]
     pb = sc["bending_to_safe"]
     pp = sc["posture"]
-    safes = zones_iso.get("safe", [])
+    safes = zones_iso.get("safe", []) if bending else []
     n = len(series.times)
     head_hip = []
     for g in series.geoms:
@@ -498,7 +521,7 @@ def _bending_and_posture(series: _Series, zones_iso: dict[str, list], cfg: dict[
 
 
 def _handover(series_list: list[_Series], zones_iso: dict[str, list], cfg: dict[str, Any]
-              ) -> dict[tuple[int, int], tuple[np.ndarray, list[Optional[float]]]]:
+              ) -> dict[tuple[int, int], tuple[np.ndarray, list[Optional[float]], list[tuple[float, float, float]]]]:
     p = cfg["signals"]["handover_motion"]
     zone_polys = [poly for name in p.get("zone_names", []) for poly in zones_iso.get(name, [])]
     by_time: dict[int, list[tuple[_Series, int]]] = defaultdict(list)
@@ -541,17 +564,203 @@ def _handover(series_list: list[_Series], zones_iso: dict[str, list], cfg: dict[
                     pair_ev[pair][key] = e
                 else:
                     pair_ev[pair][key] = None  # не все кисти видны — «нет передачи» не утверждаем
-    out: dict[tuple[int, int], tuple[np.ndarray, list[Optional[float]]]] = {}
+    out: dict[tuple[int, int], tuple[np.ndarray, list[Optional[float]], list[tuple[float, float, float]]]] = {}
     for pair, d in pair_ev.items():
         keys = sorted(d)
         fake = _Series(tid=-999, role="unknown", times=np.array([k / _TKEY for k in keys]),
                        kps=np.zeros((0, 17, 3)), bboxes=[])
         _apply_gate(fake, "handover_motion", [d[k] for k in keys], p)
-        out[pair] = (np.array(keys), fake.values["handover_motion"])
+        out[pair] = (np.array(keys), fake.values["handover_motion"], fake.runs.get("handover_motion", []))
     return out
 
 
 # ---------------------------------------------------------------- public
+
+
+def _body_point(series: _Series, j: int) -> Optional[np.ndarray]:
+    """Центр корпуса (плечи/таз из позы); иначе центр bbox трека (изотропные координаты)."""
+    g = series.geoms[j]
+    sm, hm = g.shoulder_mid(), g.hip_mid()
+    if sm is not None and hm is not None:
+        return (sm + hm) / 2.0
+    if sm is not None:
+        return sm
+    b = series.bboxes[j] if j < len(series.bboxes) else None
+    if b:
+        bi = bbox_to_iso(b, series.aspect)
+        return np.array([(bi[0] + bi[2]) / 2.0, (bi[1] + bi[3]) / 2.0])
+    return None
+
+
+def _motion(series: _Series, zones_iso: dict[str, list], cfg: dict[str, Any]) -> None:
+    """sitting / standing / walking + направление движения (в масштабах тела, без пикселей и цвета).
+
+    walking — скорость центра корпуса в окне window_s ≥ порогов (гистерезис, ≥ min_duration_s);
+    иначе поза сидя/стоя (эвристика); нет данных — unknown. Направление и «к какой зоне / от какой»
+    считаются по смещению за весь отрезок ходьбы.
+    """
+    p = cfg["signals"]["motion"]
+    n = len(series.times)
+    pts = [_body_point(series, j) for j in range(n)]
+    half = float(p["window_s"]) / 2.0
+    speed: list[Optional[float]] = [None] * n
+    vel: list[Optional[np.ndarray]] = [None] * n
+    tt = np.asarray(series.times, dtype=np.float64)
+    lo = np.searchsorted(tt, tt - half - 1e-9, side="left")
+    hi = np.searchsorted(tt, tt + half + 1e-9, side="right") - 1
+    nxt, prv = [-1] * (n + 1), [-1] * n
+    for k in range(n - 1, -1, -1):
+        nxt[k] = k if pts[k] is not None else nxt[k + 1]
+    for k in range(n):
+        prv[k] = k if pts[k] is not None else (prv[k - 1] if k else -1)
+    for j in range(n):
+        a, b = nxt[int(lo[j])], prv[int(hi[j])]
+        if a < 0 or b < 0 or b <= a:
+            continue
+        dt = float(series.times[b] - series.times[a])
+        if dt < 0.6 * 2 * half:
+            continue
+        v = (pts[b] - pts[a]) / dt / series.scale
+        vel[j], speed[j] = v, float(np.linalg.norm(v))
+    ev = [None if sp is None else ramp(sp, float(p["walk_speed_full"]), float(p["walk_speed_min"])) for sp in speed]
+    _apply_gate(series, "_walking", ev, p)
+    walking = series.values.pop("_walking")
+    runs = series.runs.pop("_walking", [])
+    zone_names = list(p.get("zone_names", []))
+    run_info = []
+    for t_a, t_b, _ in runs:
+        ks = [k for k in range(n) if t_a - 1e-6 <= series.times[k] <= t_b + 1e-6 and pts[k] is not None]
+        info: dict[str, Any] = {"t_start": round(t_a, 3), "t_end": round(t_b, 3), "direction": None,
+                                "toward": None, "away_from": None}
+        if len(ks) >= 2:
+            d = pts[ks[-1]] - pts[ks[0]]
+            nd = float(np.linalg.norm(d))
+            if nd > 1e-9:
+                u = d / nd
+                info["direction"] = (round(float(u[0]), 3), round(float(u[1]), 3))
+                best_to, best_from = (None, float(p["toward_cos"])), (None, -float(p["toward_cos"]))
+                for zn in zone_names:
+                    for poly in zones_iso.get(zn, []):
+                        vz = polygon_centroid(poly) - pts[ks[0]]
+                        if float(np.linalg.norm(vz)) < 1e-6:
+                            continue
+                        cos = float(np.dot(u, vz / np.linalg.norm(vz)))
+                        if cos >= best_to[1]:
+                            best_to = (zn, cos)
+                        if cos <= best_from[1]:
+                            best_from = (zn, cos)
+                info["toward"], info["away_from"] = best_to[0], best_from[0]
+        run_info.append(info)
+    sit = series.extras.get("sitting", [None] * n)
+    out: list[Optional[dict[str, Any]]] = []
+    for j in range(n):
+        t = float(series.times[j])
+        w = walking[j]
+        run = next((r for r in run_info if r["t_start"] - 1e-6 <= t <= r["t_end"] + 1e-6), None)
+        if w is not None and w >= 0.5:
+            state = "walking"
+        elif sit[j] is not None and sit[j] >= float(p["sit_hi"]):
+            state = "sitting"
+        elif sit[j] is not None and sit[j] <= float(p["sit_lo"]):
+            state = "standing"
+        else:
+            state = "unknown"
+        if state == "unknown" and speed[j] is None and pts[j] is None:
+            out.append(None)
+            continue
+        out.append({"state": state, "speed": None if speed[j] is None else round(speed[j], 3),
+                    "run": run if state == "walking" else None})
+    series.motion = out
+
+
+def _item_placements(series_list: list[_Series], tracks: Sequence[Track], zones_iso: dict[str, list],
+                     aspect: float, cfg: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
+    """Предмет положен на стол: объект-трек «лёг» (неподвижен ≥ persist_s) в зоне desk, перед этим к нему
+    подходила кисть человека, затем ушла. None — неопределимо (нет зоны desk или объект-треков).
+
+    Не событие: предмет лежал с начала видео; новый трек на месте старого (смена id); кисти рядом не было.
+    """
+    p = cfg["signals"]["item_placed_on_desk"]
+    desks = [poly for nm in p.get("zone_names", ["desk"]) for poly in zones_iso.get(nm, [])]
+    labels = set(p.get("labels", []))
+    objs = [tr for tr in tracks or [] if tr.label in labels and tr.boxes]
+    if not desks or not objs:
+        return None
+    t_video0 = min([float(s.times[0]) for s in series_list if len(s.times)] +
+                   [float(min(t for t, _ in tr.boxes)) for tr in tracks or [] if tr.boxes] or [0.0])
+    persist, stable = float(p["persist_s"]), float(p["stable_dist"])
+    events: list[dict[str, Any]] = []
+    for tr in objs:
+        items = sorted(((float(t), bbox_to_iso(b, aspect)) for t, b in tr.boxes), key=lambda x: x[0])
+        ts = np.array([x[0] for x in items])
+        cs = np.array([[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] for _, b in items])
+        settle = None
+        for k in range(len(items)):
+            if ts[-1] < ts[k] + persist - 0.25:
+                break
+            win = (ts >= ts[k]) & (ts <= ts[k] + persist)
+            if np.all(np.linalg.norm(cs[win] - cs[k], axis=1) <= stable) and any(
+                    point_polygon_dist(cs[k], d) <= float(p["zone_margin"]) for d in desks):
+                settle = k
+                break
+        if settle is None:
+            continue
+        t_s, box_s = float(ts[settle]), items[settle][1]
+        if settle == 0 and t_s - t_video0 <= 0.5:
+            continue  # лежал с начала видео
+        reid = False
+        for other in objs:
+            if other is tr or other.label != tr.label:
+                continue
+            for t_o, b_o in other.boxes:
+                bo = bbox_to_iso(b_o, aspect)
+                c_o = np.array([(bo[0] + bo[2]) / 2, (bo[1] + bo[3]) / 2])
+                if t_s - float(p["reid_gap_s"]) <= float(t_o) < t_s and np.linalg.norm(c_o - cs[settle]) <= 2 * stable:
+                    reid = True
+                    break
+            if reid:
+                break
+        if reid:
+            continue  # тот же предмет под новым id
+        best = None
+        for s in series_list:
+            t_near = None
+            for j, g in enumerate(s.geoms):
+                t = float(s.times[j])
+                if not (t_s - float(p["pre_s"]) <= t <= t_s + float(p["post_s"])):
+                    continue
+                wr = g.wrists()
+                if wr and min(point_box_dist(w, box_s) for _, w in wr) / g.s <= float(p["near"]):
+                    t_near = t
+                    break
+            if t_near is None:
+                continue
+            released = False
+            for j, g in enumerate(s.geoms):
+                t = float(s.times[j])
+                if t_near < t <= t_s + float(p["release_s"]):
+                    wr = g.wrists()
+                    if wr and min(point_box_dist(w, box_s) for _, w in wr) / g.s >= float(p["far"]):
+                        released = True
+                        break
+            if released and (best is None or t_near < best[0]):
+                best = (t_near, s)
+        if best is None:
+            continue
+        t_on, who = best
+        x1, y1, x2, y2 = (float(v) for v in items[settle][1])  # iso → нормированный bbox
+        events.append({"t_start": round(t_on, 3), "t_settle": round(t_s, 3),
+                       "t_end": round(t_s + float(p["hold_s"]), 3), "person_track_id": who.tid, "role": who.role,
+                       "object_track_id": int(tr.track_id), "label": tr.label,
+                       "bbox": (x1 / aspect, y1, x2 / aspect, y2)})
+    return events
+
+
+def _run_at(runs: Sequence[tuple[float, float, float]], t: float) -> Optional[dict[str, float]]:
+    for t_a, t_b, t_pk in runs:
+        if t_a - 1e-6 <= t <= t_b + 1e-6:
+            return {"t_start": round(t_a, 3), "t_end": round(t_b, 3), "t_peak": round(t_pk, 3)}
+    return None
 
 
 def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zones: Sequence[Zone],
@@ -559,6 +768,8 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
     """Реализация pose_signals с явным конфигом (для тестов/тюнинга)."""
     cfg = cfg or load_config()
     sc = cfg["signals"]
+    enabled = [nm for nm in POSE_SIGNALS if nm in set(sc.get("enabled", POSE_SIGNALS))]
+    extras_on = sc.get("extras", {}) or {}
     poses = list(poses or [])
     tracks = list(tracks or [])
     aspect = _aspect_from_poses(poses, float(sc.get("default_aspect_wh", 0.5472)))
@@ -567,14 +778,22 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
     series_list = _build_series(poses, tracks, aspect, cfg)
     staff_roles = set(sc.get("staff_roles", ["cashier"]))
     for s in series_list:
-        _phone_to_ear(s, objs, cfg)
-        _phone_in_hand(s, objs, cfg)
-        _eating(s, objs, cfg)
-        _hands_hidden(s, cfg)
-        _facing_away(s, zones_iso, cfg)
-        _bending_and_posture(s, zones_iso, cfg)
-    pairs = _handover(series_list, zones_iso, cfg)
+        if "phone_to_ear" in enabled:
+            _phone_to_ear(s, objs, cfg)
+        if "phone_in_hand" in enabled:
+            _phone_in_hand(s, objs, cfg)
+        if "eating_drinking" in enabled:
+            _eating(s, objs, cfg)
+        if "hands_hidden" in enabled:
+            _hands_hidden(s, cfg)
+        if "cashier_facing_away" in enabled:
+            _facing_away(s, zones_iso, cfg)
+        _bending_and_posture(s, zones_iso, cfg, bending=bool(extras_on.get("bending_to_safe", False)))
+        if extras_on.get("motion", False):
+            _motion(s, zones_iso, cfg)
+    pairs = _handover(series_list, zones_iso, cfg) if "handover_motion" in enabled else {}
     roles = {s.tid: s.role for s in series_list}
+    staff_enabled = [nm for nm in STAFF_SIGNALS if nm in enabled]
 
     # все моменты времени: позы + наблюдения person-треков (там, где позы нет, всё unknown)
     tkeys = {_tkey(p.t) for p in poses}
@@ -586,32 +805,35 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
         for j, t in enumerate(s.times):
             index[_tkey(t)].append((s, j))
     pair_index: dict[int, list[tuple[tuple[int, int], Optional[float]]]] = defaultdict(list)
-    for pair, (keys, vals) in pairs.items():
+    pair_runs = {pair: runs for pair, (_, _, runs) in pairs.items()}
+    for pair, (keys, vals, _) in pairs.items():
         for k, v in zip(keys, vals):
             pair_index[int(k)].append((pair, v))
 
     from .status import status as _pose_status
 
     pose_status = _pose_status().get("state", "unknown")
+    placements = (_item_placements(series_list, tracks, zones_iso, aspect, cfg)
+                  if extras_on.get("item_placed_on_desk", False) else None)
     states: list[PoseSceneState] = []
     for key in sorted(tkeys):
         t = key / _TKEY
         signals: dict[str, float] = {}
         extra: dict[str, Any] = {"n_posed": len(index.get(key, [])), "pose_status": pose_status,
-                                 "by_track": {}, "gestures": {}, "track_ids": {}, "boxes": {},
+                                 "by_track": {}, "gestures": {}, "track_ids": {}, "boxes": {}, "runs": {},
                                  "bending_to_safe": None, "sitting": None, "standing": None,
-                                 "handover_pairs": []}
+                                 "handover_pairs": [], "enabled": list(enabled)}
         staff_items = [(s, j) for s, j in index.get(key, []) if s.role in staff_roles]
         extra["staff_track_ids"] = [s.tid for s, _ in staff_items]
         for s, j in index.get(key, []):
             entry = {"role": s.role,
-                     "signals": {nm: s.values[nm][j] for nm in STAFF_SIGNALS if s.values.get(nm) and s.values[nm][j] is not None},
+                     "signals": {nm: s.values[nm][j] for nm in staff_enabled if s.values.get(nm) and s.values[nm][j] is not None},
                      "gestures": {gn: gv[j] for gn, gv in s.gestures.items() if gv[j] is not None},
                      "bending_to_safe": s.extras.get("bending_to_safe", [None] * (j + 1))[j],
                      "sitting": s.extras.get("sitting", [None] * (j + 1))[j],
                      "bbox": s.bboxes[j]}
             extra["by_track"][s.tid] = entry
-        for nm in STAFF_SIGNALS:
+        for nm in staff_enabled:
             best, best_s = None, None
             for s, j in staff_items:
                 v = s.values.get(nm, [None] * (j + 1))[j]
@@ -623,6 +845,9 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
                     extra["track_ids"][nm] = [best_s[0].tid]
                     if best_s[0].bboxes[best_s[1]]:
                         extra["boxes"][nm] = best_s[0].bboxes[best_s[1]]
+                    run = _run_at(best_s[0].runs.get(nm, []), t)
+                    if run:
+                        extra["runs"][nm] = run  # t_start — начало перехода (таймкод события), t_peak — максимум
         for gn in ("hand_at_head", "hand_to_mouth", "hands_not_visible"):
             vals = [s.gestures.get(gn, [None] * (j + 1))[j] for s, j in staff_items]
             vals = [v for v in vals if v is not None]
@@ -645,7 +870,23 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
                                                     roles.get(pr[1], "unknown"), round(float(vv), 4)])
             if v >= 0.5:
                 extra["track_ids"]["handover_motion"] = [pair[0], pair[1]]
-        extra["unknown"] = [nm for nm in POSE_SIGNALS if nm not in signals]
+                run = _run_at(pair_runs.get(pair, []), t)
+                if run:
+                    extra["runs"]["handover_motion"] = run
+        if extras_on.get("motion", False):
+            main = staff_items[0] if staff_items else None
+            extra["motion"] = (main[0].motion[main[1]] if main is not None and main[0].motion else None)
+            for s, j in index.get(key, []):
+                if s.motion:
+                    extra["by_track"][s.tid]["motion"] = s.motion[j]
+        if extras_on.get("item_placed_on_desk", False):
+            if placements is None:
+                extra["item_placed_on_desk"] = None  # нет зоны desk или объект-треков — unknown
+            else:
+                act = [e for e in placements if e["t_start"] - 1e-6 <= t <= e["t_end"] + 1e-6]
+                extra["item_placed_on_desk"] = 1.0 if act else 0.0
+                extra["placements"] = act
+        extra["unknown"] = [nm for nm in enabled if nm not in signals]
         states.append(PoseSceneState(t=t, signals=signals, extra=extra))
     return states
 

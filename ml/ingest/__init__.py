@@ -21,6 +21,8 @@ __all__ = [
     "NoVideoStreamError",
     "InvalidDurationError",
     "DecodeError",
+    "FrameGapError",
+    "FrameRef",
 ]
 
 _LAZY = {
@@ -34,6 +36,8 @@ _LAZY = {
     "NoVideoStreamError": ("errors", "NoVideoStreamError"),
     "InvalidDurationError": ("errors", "InvalidDurationError"),
     "DecodeError": ("errors", "DecodeError"),
+    "FrameGapError": ("errors", "FrameGapError"),
+    "FrameRef": ("video", "FrameRef"),
 }
 
 

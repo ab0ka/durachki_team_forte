@@ -66,7 +66,7 @@ def test_disabled_is_501_and_status(cfg, corpus, jobs) -> None:
 
 
 def test_unavailable_is_501(cfg, corpus, jobs) -> None:
-    svc = CopilotService(cfg=load_config({**cfg, "llm": {**cfg["llm"], "backend": "auto",
+    svc = CopilotService(cfg=load_config({**cfg, "llm": {**cfg["llm"], "backend": "auto", "no_model_mode": "unavailable",
                                                           "model_candidates": []}}), corpus=corpus)
     r = _client(svc, jobs).post("/api/v1/jobs/job-test-1/ask", json={"question": "Почему?"})
     assert r.status_code == 501 and r.json()["detail"]["error"] == "unavailable"

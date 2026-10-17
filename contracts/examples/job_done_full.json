@@ -49,18 +49,40 @@
   ],
   "verdict_state": "violation",
   "analysis_complete": true,
+  "coverage_problem": null,
   "candidates": [],
   "warnings": [],
   "progress": 1.0,
   "stage": "done",
+  "coverage": {
+    "ratio": 1.0,
+    "analyzed_sec": 48.3,
+    "duration_sec": 48.3,
+    "unknown_spans": [],
+    "stages": {
+      "ingest": "ok",
+      "detect": "ok",
+      "track": "ok",
+      "scene": "ok",
+      "rules": "ok",
+      "vlm_verify": "disabled",
+      "fusion": "ok"
+    },
+    "required": [
+      "ingest",
+      "detect",
+      "track",
+      "scene",
+      "rules",
+      "fusion"
+    ],
+    "complete": true,
+    "source": "pipeline"
+  },
   "timeline": [
     [
       0.0,
       0.02
-    ],
-    [
-      0.2,
-      0.03
     ],
     [
       21.2,
@@ -76,47 +98,74 @@
     ]
   ],
   "meta": {
-    "version": "0.1.0",
+    "pipeline_version": "0.1.0",
     "duration_sec": 48.3,
     "progress": 1.0,
     "stage": "done",
-    "completeness": {
-      "complete": true,
-      "analyzed_until_sec": 48.3,
+    "coverage": {
+      "ratio": 1.0,
+      "analyzed_sec": 48.3,
       "duration_sec": 48.3,
+      "unknown_spans": [],
       "stages": {
         "ingest": "ok",
         "detect": "ok",
+        "track": "ok",
+        "scene": "ok",
         "rules": "ok",
-        "vlm": "skipped"
+        "vlm_verify": "disabled",
+        "fusion": "ok"
       },
-      "required_stages": [
+      "required": [
         "ingest",
         "detect",
-        "rules"
-      ],
-      "reason": null
-    },
-    "provenance": {
-      "pipeline_version": "0.1.0",
-      "contract_version": "1",
-      "mock": false,
-      "models": [
-        {
-          "name": "<см. models.json модулей>"
-        }
-      ],
-      "sources": [
+        "track",
+        "scene",
         "rules",
         "fusion"
-      ]
+      ],
+      "complete": true,
+      "source": "pipeline"
     },
+    "stages": {
+      "ingest": {
+        "status": "ok"
+      },
+      "detect": {
+        "status": "ok"
+      },
+      "track": {
+        "status": "ok"
+      },
+      "scene": {
+        "status": "ok"
+      },
+      "rules": {
+        "status": "ok"
+      },
+      "vlm_verify": {
+        "status": "disabled"
+      },
+      "fusion": {
+        "status": "ok"
+      }
+    },
+    "required_stages": [
+      "ingest",
+      "detect",
+      "track",
+      "scene",
+      "rules",
+      "fusion"
+    ],
+    "complete": true,
+    "mock": false,
+    "warnings": [],
     "timings": {
       "ingest": 1.2,
       "detect": 9.8,
       "total": 31.5
     },
-    "warnings": [],
     "violation_extra": [
       {
         "provenance": {

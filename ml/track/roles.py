@@ -27,50 +27,105 @@ from .geometry import box_center, dist_point_polygon, iou, iso_dist, point_in_po
 from .views import TrackView
 
 
-def _median_speed(v: TrackView, aspect: float, window_s: float) -> float:
-    """Медианная скорость (диагоналей/с) по точкам, прореженным до ~window_s: дрожание бокса не мешает."""
-    if len(v.times) < 2:
-        return 0.0
-    keep = [0]
-    for i in range(1, len(v.times)):
-        if v.times[i] - v.times[keep[-1]] >= window_s:
-            keep.append(i)
-    if len(keep) < 2:
-        keep = [0, len(v.times) - 1]
-    t = v.times[keep]
-    p = v.pts[keep]
-    dt = np.maximum(np.diff(t), 1e-3)
-    dd = np.hypot(np.diff(p[:, 0]) * aspect, np.diff(p[:, 1])) / max(v.diag, 1e-6)
-    return float(np.median(dd / dt))
+def _local_speeds(v: TrackView, aspect: float, window_s: float) -> np.ndarray:
+    """Скорость каждого наблюдения (диагоналей/с) на окне ~window_s: дрожание бокса не мешает."""
+    n = len(v.times)
+    sp = np.zeros(n)
+    if n < 2:
+        return sp
+    j = 0
+    for i in range(n):
+        j = max(j, i)
+        while j < n - 1 and v.times[j] - v.times[i] < window_s:
+            j += 1
+        a, b = (i, j) if j > i else (max(0, i - 1), i)
+        if v.times[b] - v.times[a] < 1e-6:
+            continue
+        d = math.hypot((v.pts[b, 0] - v.pts[a, 0]) * aspect, v.pts[b, 1] - v.pts[a, 1]) / max(v.diag, 1e-6)
+        sp[i] = d / (v.times[b] - v.times[a])
+    return sp
+
+
+def cashier_side(desk: Optional[Zone], safe: Optional[Zone], aspect: float) -> dict[str, Any]:
+    """Сторона кассы из НЕЗАВИСИМЫХ опор: направление «центр стола -> сейф» (не из людей)."""
+    if desk is None or safe is None:
+        return {"support": "none", "u": None}
+    dc = polygon_centroid(desk.polygon)
+    sc = polygon_centroid(safe.polygon)
+    u = np.array([(sc[0] - dc[0]) * aspect, sc[1] - dc[1]])
+    n = float(np.linalg.norm(u))
+    if n < 1e-6:
+        return {"support": "none", "u": None}
+    return {"support": "safe", "u": (u / n).tolist(), "desk_c": dc}
+
+
+def _proj(pts: np.ndarray, side: dict, aspect: float) -> Optional[np.ndarray]:
+    if side.get("u") is None:
+        return None
+    dc, u = side["desk_c"], side["u"]
+    return (pts[:, 0] - dc[0]) * aspect * u[0] + (pts[:, 1] - dc[1]) * u[1]
+
+
+def seated_mask(v: TrackView, desk: Optional[Zone], cfg: dict, aspect: float) -> np.ndarray:
+    """Наблюдения «сидит/стоит на месте у стола» (локальная скорость мала и рядом со столом)."""
+    rc = cfg["roles"]
+    still = _local_speeds(v, aspect, rc["speed_window_s"]) <= rc["seated_speed_diag_s"]
+    if desk is None:
+        return still
+    near = np.array([dist_point_polygon(p, desk.polygon, aspect) <= rc["near_desk_diag"] * v.diag for p in v.pts])
+    return still & near
 
 
 def person_features(v: TrackView, desk: Optional[Zone], safe: Optional[Zone], cfg: dict, aspect: float,
-                    t0: float, t1: float, duration: float) -> dict[str, Any]:
+                    t0: float, t1: float, duration: float, side: Optional[dict] = None,
+                    counters: Sequence[Sequence[float]] = ()) -> dict[str, Any]:
+    """Признаки ПОВЕДЕНИЯ одного человека (без лиц, без цвета, без «кто первый»)."""
     rc = cfg["roles"]
+    side = side or {"support": "none", "u": None}
     f: dict[str, Any] = {"presence_s": round(v.presence, 3)}
-    f["start"] = 1.0 if v.t_start <= t0 + rc["early_s"] else 0.0
+    f["start"] = 1.0 if v.t_start <= t0 + rc["early_s"] else 0.0   # только для provenance (w_start=0)
     f["end"] = 1.0 if v.t_end >= t1 - rc["early_s"] else 0.0
-    med_speed = _median_speed(v, aspect, rc["speed_window_s"])
+    sp = _local_speeds(v, aspect, rc["speed_window_s"])
+    med_speed = float(np.median(sp)) if len(sp) else 0.0
     f["speed_diag_s"] = round(med_speed, 4)
     f["still"] = math.exp(-med_speed / max(rc["stationary_speed_diag_s"], 1e-6))
     dur = max(duration, 1e-6)
     f["presence_frac"] = min(1.0, v.presence / dur)
+    still_mask = sp <= rc["seated_speed_diag_s"]
     if desk is not None:
         dcen = polygon_centroid(desk.polygon)
-        f["desk_center"] = math.exp(-iso_dist(v.median_pt, dcen, aspect) / max(v.diag, 1e-6))
         near = np.array([dist_point_polygon(p, desk.polygon, aspect) <= rc["near_desk_diag"] * v.diag for p in v.pts])
         f["near_desk_s"] = round(float(v.w[near].sum()), 3)
         f["desk_frac"] = min(1.0, float(v.w[near].sum()) / dur)
+        seated = still_mask & near
+        sp_pts = v.pts[seated] if seated.any() else v.pts
+        sm = np.median(sp_pts, axis=0)
+        f["desk_center"] = math.exp(-iso_dist(sm, dcen, aspect) / max(v.diag, 1e-6))
     else:
         f["desk_frac"] = None
         f["desk_center"] = None
+        seated = still_mask
+    f["seated_s"] = round(float(v.w[seated].sum()), 3)
+    pr = _proj(v.pts, side, aspect)
+    if pr is not None:
+        on_cs = pr > -rc["side_tol_diag"] * v.diag
+        f["seated_cashier_side_s"] = round(float(v.w[seated & on_cs].sum()), 3)
+        f["seated_client_side_s"] = round(float(v.w[seated & ~on_cs].sum()), 3)
+        f["cashier_side_frac"] = round(float(v.w[on_cs].sum() / max(v.w.sum(), 1e-9)), 3)
+    else:
+        f["seated_cashier_side_s"] = f["seated_s"]
+        f["seated_client_side_s"] = None
+        f["cashier_side_frac"] = None
+    if counters:
+        nc = np.array([min(dist_point_polygon(p, [(c[0], c[1]), (c[2], c[1]), (c[2], c[3]), (c[0], c[3])], aspect)
+                           for c in counters) <= rc["near_counter_diag"] * v.diag for p in v.pts])
+        f["counter_s"] = round(float(v.w[seated & nc].sum()), 3)
+    else:
+        f["counter_s"] = None
     if safe is not None:
         sc = polygon_centroid(safe.polygon)
-        if desk is not None:
-            dc = polygon_centroid(desk.polygon)
-            mp = v.median_pt
-            proj = (mp[0] - dc[0]) * (sc[0] - dc[0]) * aspect ** 2 + (mp[1] - dc[1]) * (sc[1] - dc[1])
-            f["safe_side"] = 1.0 if proj > 0 else 0.0
+        if pr is not None:
+            f["safe_side"] = 1.0 if float(np.median(pr)) > 0 else 0.0
         else:
             f["safe_side"] = 1.0 - min(1.0, iso_dist(v.median_pt, sc, aspect) / (3.0 * v.diag))
     else:
@@ -78,14 +133,17 @@ def person_features(v: TrackView, desk: Optional[Zone], safe: Optional[Zone], cf
     return f
 
 
-def cashier_score(f: dict[str, Any], cfg: dict) -> float:
+def cashier_score(f: dict[str, Any], cfg: dict, norms: dict[str, float]) -> float:
+    """Относительный (внутри ролика) балл «работает со стороны кассы». Длительность ролика не входит."""
     rc = cfg["roles"]
-    terms = [(rc["w_start"], f["start"]), (rc["w_still"], f["still"]), (rc["w_presence"], f["presence_frac"])]
-    if f.get("desk_frac") is not None:
-        terms.append((rc["w_desk"], f["desk_frac"]))
+    terms = [(rc["w_seated"], f["seated_cashier_side_s"] / max(norms["seated"], 1e-6)),
+             (rc["w_still"], f["still"]),
+             (rc["w_presence"], f["presence_s"] / max(norms["presence"], 1e-6)),
+             (rc["w_start"], f["start"])]
+    if f.get("desk_center") is not None:
         terms.append((rc["w_desk_center"], f["desk_center"]))
-    else:  # без стола его вес уходит в «присутствие»
-        terms.append((rc["w_desk"], f["presence_frac"]))
+    if f.get("counter_s") is not None and norms.get("counter", 0) > 0:
+        terms.append((rc["w_counter"], f["counter_s"] / norms["counter"]))
     if f.get("safe_side") is not None:
         terms.append((rc["w_safe_side"], f["safe_side"]))
     wsum = sum(w for w, _ in terms)
@@ -93,38 +151,50 @@ def cashier_score(f: dict[str, Any], cfg: dict) -> float:
 
 
 def pick_cashier(views: Sequence[TrackView], desk: Optional[Zone], safe: Optional[Zone], cfg: dict,
-                 aspect: float, t0: float, t1: float, duration: float) -> dict[str, Any]:
+                 aspect: float, t0: float, t1: float, duration: float,
+                 counters: Sequence[Sequence[float]] = ()) -> dict[str, Any]:
     rc = cfg["roles"]
-    feats = {v.tid: person_features(v, desk, safe, cfg, aspect, t0, t1, duration) for v in views}
-    scores = {tid: cashier_score(f, cfg) for tid, f in feats.items()}
+    side = cashier_side(desk, safe, aspect)
+    feats = {v.tid: person_features(v, desk, safe, cfg, aspect, t0, t1, duration, side, counters) for v in views}
+    norms = {"seated": max([f["seated_cashier_side_s"] for f in feats.values()] or [0.0]),
+             "presence": max([f["presence_s"] for f in feats.values()] or [0.0]),
+             "counter": max([f["counter_s"] or 0.0 for f in feats.values()] or [0.0])}
+    scores = {tid: cashier_score(f, cfg, norms) for tid, f in feats.items()}
+    min_seated = rc["min_seated_s"] if desk is not None else 0.0
     cands = [v for v in views if feats[v.tid]["presence_s"] >= rc["min_presence_s"]
-             and scores[v.tid] >= rc["min_cashier_score"]]
+             and feats[v.tid]["seated_cashier_side_s"] >= min_seated and scores[v.tid] >= rc["min_cashier_score"]]
     res: dict[str, Any] = {"primary": None, "conf": 0.0, "independent": False, "features": feats,
-                           "scores": {k: round(s, 4) for k, s in scores.items()}}
+                           "scores": {k: round(s, 4) for k, s in scores.items()},
+                           "side_support": side["support"], "side": side}
     if not cands:
-        res["reason"] = "no_candidate_above_threshold"
+        res["reason"] = "no_person_working_at_cashier_side"
         return res
-    cands.sort(key=lambda v: -scores[v.tid])
+    cands.sort(key=lambda v: (-scores[v.tid], v.t_start, v.tid))
     best = cands[0]
     s1 = scores[best.tid]
     conf = s1
-    if len(cands) > 1:
-        margin = s1 - scores[cands[1].tid]
-        if margin < 0.15:  # два похожих кандидата — роль менее уверенна
+    # неоднозначность — только среди ОДНОВРЕМЕННО присутствующих (фрагменты одного кассира не конкуренты)
+    rivals = [v for v in cands[1:] if v.overlap_s(best) > rc["overlap_tol_s"]]
+    if rivals:
+        margin = s1 - scores[rivals[0].tid]
+        if margin < 0.15:
             conf *= 0.6 + 0.4 * margin / 0.15
-            res["ambiguous_with"] = cands[1].tid
+            res["ambiguous_with"] = rivals[0].tid
     independent = desk is not None
     if not independent:
         conf = min(conf, rc["fallback_cashier_conf_cap"])
+    elif side["support"] != "safe":
+        conf = min(conf, rc["no_side_cashier_conf_cap"])
+    fb = feats[best.tid]
     support = []
-    if feats[best.tid].get("desk_frac"):
-        support.append("near_desk_objects")
-    if feats[best.tid]["start"]:
-        support.append("present_from_start")
-    if feats[best.tid]["still"] > 0.5:
+    if fb["seated_cashier_side_s"] >= min_seated and desk is not None:
+        support.append("seated_at_desk" if side["support"] != "safe" else "seated_at_cashier_side")
+    if side["support"] == "safe":
+        support.append("side_from_safe")
+    if fb.get("counter_s"):
+        support.append("near_money_counter")
+    if fb["still"] > 0.5:
         support.append("stationary")
-    if feats[best.tid].get("safe_side"):
-        support.append("safe_side")
     if not independent:
         support.append("fallback_no_desk_objects")
     res.update(primary=best.tid, conf=round(float(conf), 3), independent=independent, support=support)
@@ -192,6 +262,7 @@ def assign_roles(views: Sequence[TrackView], objs: Sequence[TrackView], zones: d
     pv = by.get(primary) if primary is not None else None
     ca, cl = zones.get("cashier_area"), zones.get("client_area")
     bag_by_t, bag_tracks = _bag_index(objs, cfg)
+    feats = cashier.get("features", {})
     cashiers: list[TrackView] = []
     if pv is not None:
         out[pv.tid] = {"role": "cashier", "conf": float(cashier["conf"]), "reasons": list(cashier.get("support", []))}
@@ -208,6 +279,7 @@ def assign_roles(views: Sequence[TrackView], objs: Sequence[TrackView], zones: d
             continue
         in_ca, in_cl = _frac_inside(v, ca), _frac_inside(v, cl)
         entered = v.t_start > t0 + rc["early_s"]
+        fv = feats.get(v.tid, {})
         ov = overlap_with_cashiers(v)
         info: dict[str, Any] = {"in_cashier_area": round(in_ca, 3), "in_client_area": round(in_cl, 3),
                                 "entered_mid_clip": entered, "overlap_with_cashier_s": round(ov, 3)}
@@ -234,6 +306,12 @@ def assign_roles(views: Sequence[TrackView], objs: Sequence[TrackView], zones: d
                                   "reasons": ["different_appearance", "possible_shift_change"], **info}
                     continue
                 info["note"] = "different_appearance_in_cashier_area"
+            elif cashier.get("side_support") == "safe" and fv.get("seated_cashier_side_s", 0.0) >= rc["min_seated_s"]:
+                # своё поведение (сидит и работает со стороны кассы) + сторона из сейфа, а не из позиций кассира
+                out[v.tid] = {"role": "cashier", "conf": round(min(float(cashier["conf"]), rc["behavior_cashier_conf_cap"]), 3),
+                              "reasons": ["cashier_by_behavior", "seated_at_cashier_side", "side_from_safe"], **info}
+                cashiers.append(v)
+                continue
             elif same_seat:
                 out[v.tid] = {"role": "unknown", "conf": float(rc["position_only_return_conf"]),
                               "reasons": ["possible_cashier_return", "position_only_no_appearance"], **info}
@@ -257,17 +335,23 @@ def assign_roles(views: Sequence[TrackView], objs: Sequence[TrackView], zones: d
             out[v.tid] = {"role": "unknown", "conf": 0.5, "reasons": ["ambiguous_cashier_candidate"], **info}
             continue
         if pv is not None and ov > rc["overlap_tol_s"] and in_ca >= 0.3:
+            extra = ["seated_at_cashier_side"] if fv.get("seated_cashier_side_s", 0.0) >= rc["min_seated_s"] else []
             out[v.tid] = {"role": rc["second_person_role"], "conf": 0.5,
-                          "reasons": ["co_present_in_cashier_area"] + (["entered_mid_clip"] if entered else []), **info}
+                          "reasons": ["co_present_in_cashier_area"] + extra + (["entered_mid_clip"] if entered else []),
+                          **info}
             continue
         if in_ca >= 0.3:
             out[v.tid] = {"role": "unknown", "conf": 0.4, "reasons": ["in_cashier_area_without_cashier"], **info}
             continue
         # 4) посетитель (клиент)
         conf = min(0.85, 0.5 + 0.3 * in_cl + 0.05 * float(entered))
+        client_seated = (fv.get("seated_client_side_s") or 0.0) >= rc["min_seated_s"]
+        if client_seated and cashier.get("side_support") == "safe":
+            conf = max(conf, 0.8)  # сидит напротив кассира с клиентской стороны — норма, это клиент
         if not cashier.get("independent"):  # кассир найден без опор — «не кассир» тоже неуверенно
             conf = min(conf, rc["fallback_visitor_conf_cap"])
-        reasons = ["not_cashier"] + (["in_client_area"] if in_cl > 0.3 else [])
+        reasons = ["not_cashier"] + (["in_client_area"] if in_cl > 0.3 else []) + (
+            ["seated_at_client_side"] if client_seated else [])
         out[v.tid] = {"role": "visitor", "conf": round(conf, 3), "reasons": reasons, **info}
 
     # спутник инкассатора (пришли вместе) — без своей сумки роль не подтверждаем

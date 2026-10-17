@@ -6,6 +6,7 @@ action ∈ phone_to_ear | eating | hands_hidden | facing_away. Веса и ка�
 from __future__ import annotations
 
 import os
+import zlib
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -79,7 +80,8 @@ class MockPose:
         for k, (frame, box) in enumerate(items):
             t, tid = meta[k] if meta is not None else (0.0, None)
             uv, sc = scripted_pose(float(t), tid, self.actions)
-            rng = np.random.default_rng((self.seed, int(round(float(t) * 1000)), (tid or 0) + 10_000))
+            tid_i = tid if isinstance(tid, int) else (zlib.crc32(str(tid).encode()) if tid is not None else 0)
+            rng = np.random.default_rng((self.seed, int(round(float(t) * 1000)), abs(tid_i) + 10_000))
             x1, y1, x2, y2 = (float(v) for v in box)
             h_img = float(frame.shape[0]) if hasattr(frame, "shape") and len(frame.shape) >= 2 else 1.0
             uv = uv + rng.normal(0.0, self.jitter * h_img / max(y2 - y1, 1e-6), uv.shape).astype(np.float32)

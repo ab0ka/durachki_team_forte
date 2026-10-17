@@ -40,12 +40,7 @@ MODULES: dict[str, str] = {
 # Пустые файлы, которые разрешено создавать всем (у всех идентичны — конфликта нет).
 SHARED_FILES: frozenset[str] = frozenset({"ml/__init__.py", "backend/__init__.py"})
 
-# Типы файлов, которые нельзя коммитить никому (правило 6).
-FORBIDDEN_RE = re.compile(
-    r"\.(mov|mp4|avi|mkv|m4v|webm|onnx|pt|pth|ckpt|safetensors|gguf|ggml|engine|trt|plan|tflite)$", re.I)
-JPEG_RE = re.compile(r"\.(jpe?g)$", re.I)
-JPEG_ALLOWED_PREFIXES = ("docs/assets/", "pitch/assets/", "frontend/public/")
-
+# Типы файлов, которые нельзя коммитить никому (правило 6): единые правила — в guard_media.py.
 _TITLE_RE = re.compile(r"\[\s*(A\d{2})\s*\]", re.I)
 
 
@@ -67,12 +62,9 @@ def is_shared(path: str) -> bool:
 
 
 def forbidden_reason(path: str) -> Optional[str]:
-    p = path.replace("\\", "/")
-    if FORBIDDEN_RE.search(p):
-        return "видео/веса в git запрещены (правило 6)"
-    if JPEG_RE.search(p) and not p.startswith(JPEG_ALLOWED_PREFIXES):
-        return "JPEG вне docs/assets, pitch/assets, frontend/public (кадры датасета в git запрещены)"
-    return None
+    from guard_media import name_problem  # scripts/ в sys.path у всех вызывающих
+
+    return name_problem(path)
 
 
 def agent_from_title(title: str | None) -> Optional[str]:
