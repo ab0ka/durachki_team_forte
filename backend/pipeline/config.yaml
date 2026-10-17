@@ -7,7 +7,8 @@ pipeline_version: "1.0.0"
 mock: false                  # true ⇔ SENTINEL_MOCK=1: модули используют mock-бэкенды без весов
 mock_missing_modules: true   # только в mock-режиме: отсутствующий модуль заменяется встроенным фейком
 
-# Стадии по порядку. ingest и fusion выключить нельзя (у них есть встроенный fallback).
+# Стадии по порядку (feature flags). ingest и fusion выключить нельзя.
+# Минимальный сквозной путь: ingest → detect → track → scene → rules → fusion.
 stages:
   ingest: true
   detect: true
@@ -20,7 +21,29 @@ stages:
   vlm_discover: true
   fusion: true
 
+# Обязательные стадии = «заявленный базовый анализ». Их сбой/таймаут/пропуск/отсутствие модуля
+# НИКОГДА не превращается в успешный no_violation: результат либо failed, либо (если другие
+# источники нашли нарушение) done/violation с meta.degraded=true. Дополнительные стадии можно
+# выключать/пропускать — с явным warning в meta.warnings.
+required_stages: [ingest, detect, track, scene, rules, fusion]
+on_required_failure: violation_only   # violation_only | fail  (fail — всегда status=failed)
+
 detect_every_n: 1            # аргумент every_n для ml.detect.detect
+
+executor:
+  mode: process              # process (прод: один процесс-воркер владеет GPU, kill по таймауту)
+                             # | inline (тесты/отладка: в текущем процессе, таймаут не останавливает CUDA)
+  allow_fallback_ingest: true  # ml.ingest недоступен/упал → встроенный декодер OpenCV (с warning)
+  lease_timeout_s: null      # сколько ждать занятый воркер (null → до дедлайна задачи)
+  load_clip_timeout_s: 60
+  restart_on_vram_shortage: true  # после unload() VRAM не хватает → перезапуск воркера перед стадией
+  unload_before:             # перед стадией выгрузить модели этих модулей (хуки unload())
+    vlm_verify: [ml.detect, ml.pose, ml.temporal]
+    vlm_discover: [ml.detect, ml.pose, ml.temporal]
+    detect: [ml.vlm]
+    pose: [ml.vlm]
+    temporal: [ml.vlm]
+  extra_sys_path: []
 
 sampling:
   base_fps: 5.0              # частота сэмплирования по умолчанию
@@ -56,25 +79,28 @@ reserve_s:
   vlm_min_budget: 6          # если на VLM остаётся меньше — стадия пропускается
   essential_min: 1.5         # обязательная стадия стартует, только если осталось больше
 
-optional_stages: [pose, vlm_verify, vlm_discover]  # пропускаются первыми при отставании
+optional_stages: [pose, temporal, vlm_verify, vlm_discover]  # пропускаются по бюджету (с warning)
 min_start_fraction: 0.6      # необязательная стадия стартует, если влезает ≥ 60% её (масштабированного) бюджета
 
 partial:
   enabled: true
   milestones: [after_core, after_vlm_verify]  # когда писать data/jobs/<id>/partial.json
   margin_s: 25               # при остатке < margin_s промежуточный результат пишется перед каждой стадией
+  # partial.json всегда status=processing, meta.partial=true, meta.complete=false;
+  # verdict только "violation" (если уже найдено) или null — НИКОГДА no_violation.
 
 cache:
   mode: read_write           # off | read_write | from_cache (последний: CV из кэша, rules+fusion заново)
   normalize_outputs: true    # выход стадии всегда проходит JSON-roundtrip → кэш и «живой» прогон идентичны
+  # Ключ записи стадии = sha256 видео + sample_fps + идентичность ingest (препроцессинг) +
+  # идентичность модуля (версия, хэш кода/конфигов/промптов, model_info(): checkpoint/revision,
+  # fold/split; env SENTINEL_FOLD/SENTINEL_SPLIT) + хэш конфига стадии + ключи входных стадий
+  # + хэш каталога норм (rules/fusion) + mock-флаг.
 
 gpu:
   device: auto               # auto | cuda | cpu   (env SENTINEL_DEVICE)
   vram_total_gb: 8.0
   vram_reserve_gb: 0.7       # CUDA-контекст, фрагментация, активации
-  concurrency: 2             # сколько GPU-стадий одновременно (detect ∥ temporal); VLM — эксклюзивно
-  lock_timeout_s: 90         # ожидание GPU-шлюза (кросс-задачно), дальше стадия пропускается
-  empty_cache_between_stages: true
   vlm_policy: auto           # auto | keep | on_demand | off   (env SENTINEL_VLM_POLICY)
   vram_gb:                   # оценки резидентной памяти моделей, ГБ
     detect: 1.0
@@ -84,11 +110,9 @@ gpu:
     vlm_discover: 5.0
 
 gpu_stages: [detect, pose, temporal, vlm_verify, vlm_discover]
-exclusive_gpu_stages: [vlm_verify, vlm_discover]
 
 frames:
-  thread_safe_clip: true     # обёртка клипа с локом: temporal читает кадры параллельно с detect
-  cache_mb: 512              # общий кэш декодированных кадров (заполняется до лимита, без вытеснения)
+  cache_mb: 512              # кэш декодированных кадров в воркере (заполняется до лимита, без вытеснения)
 
 paths:
   ascii_safe: auto           # auto (только Windows) | always | never: кириллица в пути → ASCII-хардлинк

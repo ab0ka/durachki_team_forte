@@ -1,7 +1,10 @@
-"""ModelRegistry: тёплые модели между задачами, GPU-шлюз, учёт VRAM (8 ГБ), прогрев."""
+"""ModelRegistry: тёплые модели между задачами (внутри процесса-воркера), устройство, учёт VRAM (8 ГБ).
+
+Один владелец GPU обеспечивается исполнителем (worker.py): все вызовы моделей идут последовательно
+в одном процессе. Реестр — необязательное хранилище моделей для модулей + политика VLM.
+"""
 from __future__ import annotations
 
-import contextlib
 import gc
 import logging
 import os
@@ -9,74 +12,11 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from .config import cfg_get
 
 log = logging.getLogger("sentinel.pipeline")
-
-
-class GpuGate:
-    """Шлюз GPU-стадий (общий для всех задач процесса).
-
-    Обычные стадии идут параллельно до ``concurrency`` штук (detect ∥ temporal), эксклюзивные (VLM)
-    ждут, пока GPU освободится полностью, и на время работы блокируют остальных.
-    """
-
-    def __init__(self, concurrency: int = 2) -> None:
-        self.concurrency = max(1, int(concurrency))
-        self._cond = threading.Condition()
-        self._active = 0
-        self._exclusive = False
-        self._waiting_exclusive = 0
-
-    def acquire(self, exclusive: bool = False, timeout: Optional[float] = None) -> bool:
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        with self._cond:
-            if exclusive:
-                self._waiting_exclusive += 1
-            try:
-                while True:
-                    if exclusive:
-                        ok = not self._exclusive and self._active == 0
-                    else:  # обычные не обгоняют ждущую эксклюзивную стадию
-                        ok = (not self._exclusive and self._active < self.concurrency
-                              and self._waiting_exclusive == 0)
-                    if ok:
-                        if exclusive:
-                            self._exclusive = True
-                        else:
-                            self._active += 1
-                        return True
-                    left = None if deadline is None else deadline - time.monotonic()
-                    if left is not None and left <= 0:
-                        return False
-                    self._cond.wait(timeout=left if left is not None else 1.0)
-            finally:
-                if exclusive:
-                    self._waiting_exclusive -= 1
-
-    def release(self, exclusive: bool = False) -> None:
-        with self._cond:
-            if exclusive:
-                self._exclusive = False
-            else:
-                self._active = max(0, self._active - 1)
-            self._cond.notify_all()
-
-    @contextlib.contextmanager
-    def hold(self, exclusive: bool = False, timeout: Optional[float] = None) -> Iterator[bool]:
-        ok = self.acquire(exclusive=exclusive, timeout=timeout)
-        try:
-            yield ok
-        finally:
-            if ok:
-                self.release(exclusive=exclusive)
-
-    def state(self) -> dict:
-        with self._cond:
-            return {"active": self._active, "exclusive": self._exclusive,
-                    "waiting_exclusive": self._waiting_exclusive, "concurrency": self.concurrency}
 
 
 @dataclass
@@ -102,7 +42,6 @@ class ModelRegistry:
         self._models: dict[str, _Entry] = {}
         self._device: Optional[str] = None
         self.cfg: Mapping = cfg or {}
-        self.gate = GpuGate(int(cfg_get(self.cfg, "gpu.concurrency", 2)))
         self.warm = False
         self.warmup_report: dict[str, Any] = {}
         self.vram_measured_mb: dict[str, float] = {}
@@ -119,6 +58,11 @@ class ModelRegistry:
             elif cfg is not None:
                 cls._instance.cfg = cfg
             return cls._instance
+
+    @classmethod
+    def peek(cls) -> Optional["ModelRegistry"]:
+        """Синглтон, если уже создан (без создания)."""
+        return cls._instance
 
     @classmethod
     def reset(cls) -> None:
@@ -223,7 +167,7 @@ class ModelRegistry:
             pass
 
     def stats(self) -> dict:
-        return {"device": self.device(), "loaded": self.loaded(), "gate": self.gate.state(),
+        return {"device": self.device(), "loaded": self.loaded(),
                 "free_vram_gb": _round(self.free_vram_gb()), "warm": self.warm,
                 "vram_measured_mb": dict(self.vram_measured_mb)}
 
@@ -241,27 +185,6 @@ class ModelRegistry:
             total = float(cfg_get(self.cfg, "gpu.vram_total_gb", 8.0)) - float(cfg_get(self.cfg, "gpu.vram_reserve_gb", 0.7))
             return "keep" if need + others <= total else "on_demand"
         return policy
-
-    def prepare_for_exclusive(self, stage: str, modules: Mapping[str, Any]) -> list[str]:
-        """Перед VLM: если VRAM не хватает — выгрузить другие модели (хуки ``unload()`` модулей)."""
-        notes: list[str] = []
-        if self.device() != "cuda":
-            return notes
-        need = float(cfg_get(self.cfg, f"gpu.vram_gb.{stage}", 5.0))
-        free = self.free_vram_gb()
-        if free is not None and free >= need + 0.3:
-            return notes
-        self.ensure_vram(need)
-        for mod_name, mod in modules.items():
-            hook = getattr(mod, "unload", None)
-            if callable(hook):
-                try:
-                    hook()
-                    notes.append(f"{mod_name}.unload() перед {stage}")
-                except Exception as exc:  # noqa: BLE001
-                    notes.append(f"{mod_name}.unload() упал: {exc}")
-        self.empty_cache()
-        return notes
 
 
 def _round(v: Optional[float]) -> Optional[float]:
