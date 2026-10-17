@@ -1,9 +1,10 @@
 """Кэш промежуточных результатов по sha256 видео: cache/<sha>/{dets.jsonl, tracks.json, ...}.
 
-Каждая запись стадии валидна только при совпадении ключа: sha видео + sample_fps + отпечаток кода
-модуля (хэш его .py/.yaml/.json) + ключи входных стадий + mock-флаг + аргументы. Так правило
-«поменял код — пересчитал» соблюдается без ручного бампа версий, а тюнинг rules/fusion на 40 видео
-идёт без повторного прогона CV.
+Запись стадии валидна только при совпадении ключа (считает оркестратор, см. stages.module_identity):
+sha видео + sample_fps + идентичность ingest + версия/код/конфиги/промпты модуля + checkpoint/revision
+и fold/split из model_info() + конфиг стадии + ключи входных стадий + хэш каталога норм + mock.
+«Поменял код или веса — пересчитал» без ручного бампа версий; тюнинг rules/fusion на 40 видео идёт
+без повторного прогона CV. manifest.json хранит ключи и идентичности модулей по стадиям.
 """
 from __future__ import annotations
 
@@ -49,30 +50,6 @@ def sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
 def stable_hash(*parts: Any) -> str:
     raw = json.dumps(serde.to_jsonable(list(parts)), sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-
-_fp_cache: dict[tuple[str, float], str] = {}
-
-
-def module_fingerprint(module: Any) -> str:
-    """Отпечаток кода модуля: __version__ + хэш содержимого файлов пакета (без tests/ и кэшей)."""
-    version = str(getattr(module, "__version__", getattr(module, "VERSION", "0")))
-    file = getattr(module, "__file__", None)
-    if not file:
-        return f"{version}:nofile"
-    path = Path(file)
-    root = path.parent if path.name == "__init__.py" else path
-    files = sorted(p for p in (root.rglob("*") if root.is_dir() else [root])
-                   if p.is_file() and p.suffix in (".py", ".yaml", ".yml", ".json")
-                   and "tests" not in p.parts and "__pycache__" not in p.parts)
-    h = hashlib.sha1(version.encode())
-    for p in files:
-        try:
-            h.update(str(p.relative_to(root) if root.is_dir() else p.name).encode())
-            h.update(p.read_bytes())
-        except OSError:
-            continue
-    return f"{version}:{h.hexdigest()[:12]}"
 
 
 def _write_kind(path: Path, kind: str, value: Any) -> None:
