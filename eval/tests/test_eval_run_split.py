@@ -90,7 +90,8 @@ def test_run_inproc_end_to_end(tmp_path: Path, monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "backend.pipeline", pipe)
     out = tmp_path / "run"
     rc = runmod.main(["--videos", str(vdir), "--labels", str(lab), "--out", str(out), "--raw",
-                      "--types", str(tmp_path / "none.csv")])
+                      "--types", str(tmp_path / "none.csv"), "--log", str(tmp_path / "reports" / "runs.jsonl"),
+                      "--label", "baseline-mock", "--env", "SENTINEL_FLAG_TEST=1"])
     assert rc == 0
     assert not any("47" in Path(c).name for c in calls)                # дубликат X-47 не гоняем
     preds = sorted(p.name for p in (out / "preds").glob("X-*.json"))
@@ -105,6 +106,14 @@ def test_run_inproc_end_to_end(tmp_path: Path, monkeypatch, capsys):
     raw = [json.loads(x) for x in (out / "scores_raw.jsonl").read_text(encoding="utf-8").splitlines()]
     assert {r["video_id"] for r in raw} >= {"X-1", "X-2"} and raw[0]["scores_raw"] is not None
     assert "SCORECARD" in capsys.readouterr().out
+    prot = json.loads((out / "protocol.json").read_text(encoding="utf-8"))
+    assert prot["inputs"]["n"] == 8 and prot["inputs"]["inputs_sha"] and prot["labels_sha256"]
+    assert prot["pipeline_env"]["SENTINEL_FLAG_TEST"] == "1" and prot["evaluation_kind"] == "exploratory"
+    log = [json.loads(x) for x in (tmp_path / "reports" / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert log[-1]["label"] == "baseline-mock" and log[-1]["metrics"]["fn"] == 1
+    assert "image_base64" not in json.dumps(log) and "Признаки" not in json.dumps(log)
+    runs = [r["vram_peak_mb"] for r in json.loads((out / "preds" / "_runinfo.json").read_text()).values()]
+    assert all(v is None or v > 0 for v in runs)          # без nvidia-smi — None, не 0
 
 
 def test_holdout_requires_final(tmp_path: Path):
