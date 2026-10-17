@@ -1,9 +1,15 @@
-"""python -m ml.vlm.bench --frames dir/ — замер скорости и VRAM бэкенда для выбора локально.
+"""python -m ml.vlm.bench — замер PRODUCTION-режима VLM (не smoke на 2 токенах) для выбора конфигурации.
 
-Берёт картинки из папки (jpg/png, по порядку имён) или синтетику (--synthetic), делает N вызовов verify-промпта
-по K кадров и печатает ТОЛЬКО агрегаты: время загрузки, p50/p95 задержки, доля валидного JSON, выходные токены,
-пик VRAM (torch.cuda для in-process; nvidia-smi — для внешнего llama-server). Сырые ответы — в локальный дамп.
-Ничего не выдумываем: поля, которые нельзя измерить на этой машине, остаются null.
+Режимы (--mode, через запятую; по умолчанию json,qa,chat):
+  json — промпт verify как в проде (кадры verify_n_frames с подсветкой, max side, max_new_tokens_verify, схема):
+         фактические выходные токены, finish_reason (eos|length|time), доля валидного JSON и обрезанных,
+         время: подготовка кадров + prep (шаблон/процессор) + generation + decode + parse;
+  qa   — вопросы qa_spec для --qa-type (forward без генерации): latency на вопрос, mass, words/letters;
+  chat — ml.vlm.service.chat на нейтральном тексте (как у копилота): latency, токены, busy/ошибки.
+Холодный старт (загрузка + первый вызов) и тёплые вызовы считаются отдельно. VRAM: после загрузки, пик на
+вызов (torch), nvidia-smi до/после. Кадры: --frames DIR (jpg/png) или --synthetic N (без данных).
+Печатаются ТОЛЬКО агрегаты; тексты ответов — в локальный дамп (privacy.local_dump_dir). Поля, которые на этой
+машине не измерить (нет CUDA/nvidia-smi), остаются null — ничего не выдумываем.
 """
 from __future__ import annotations
 
@@ -43,40 +49,164 @@ def _torch_peak_mb() -> Optional[float]:
     return None
 
 
-def _load_images(frames_dir: Optional[str], synthetic: int, max_side: int) -> list[Any]:
-    from PIL import Image
-
-    from .frames import resize_max_side
-
-    if frames_dir:
-        paths = sorted(p for p in Path(frames_dir).iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp"))
-        return [resize_max_side(Image.open(p).convert("RGB"), max_side) for p in paths]
+def _load_frames(frames_dir: Optional[str], synthetic: int) -> list[Any]:
+    """BGR-кадры (как отдаёт VideoClip): из папки или синтетика 464x848."""
     import numpy as np
 
+    if frames_dir:
+        from PIL import Image
+
+        paths = sorted(p for p in Path(frames_dir).iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp"))
+        return [np.asarray(Image.open(p).convert("RGB"))[:, :, ::-1].copy() for p in paths]
     rng = np.random.default_rng(0)
-    imgs = []
-    for _ in range(max(1, synthetic)):
-        arr = (rng.random((848, 464, 3)) * 255).astype("uint8")
-        imgs.append(resize_max_side(Image.fromarray(arr, "RGB"), max_side))
-    return imgs
+    out = []
+    for i in range(max(1, synthetic)):
+        f = (rng.random((848, 464, 3)) * 40 + 150).astype("uint8")
+        f[380:520, 60:400] = (70, 110, 150)        # «стол» (BGR)
+        f[250:360, 330:420] = (130, 120, 120)      # «ящик»
+        f[200:300, 180 + 10 * i:280 + 10 * i] = (30, 30, 220)
+        out.append(f)
+    return out
 
 
 def _pct(xs: list[float], q: float) -> Optional[float]:
     if not xs:
         return None
     xs = sorted(xs)
-    k = min(len(xs) - 1, max(0, int(round(q * (len(xs) - 1)))))
-    return round(xs[k], 3)
+    return round(xs[min(len(xs) - 1, max(0, int(round(q * (len(xs) - 1)))))], 4)
+
+
+def _stats(xs: list[float]) -> dict[str, Optional[float]]:
+    return {"mean": round(statistics.mean(xs), 4) if xs else None, "p50": _pct(xs, 0.5), "p95": _pct(xs, 0.95),
+            "max": round(max(xs), 4) if xs else None}
+
+
+def _bench_json(be: Any, frames: list[Any], cfg: dict[str, Any], n: int, k: int, dump: Any) -> dict[str, Any]:
+    from .catalog import catalog_types, load_catalog
+    from .frames import prepare_images
+    from .parsing import extract_json, normalize_verify, verify_schema
+    from .prompting import render_verify
+
+    fcfg = cfg.get("frames") or {}
+    mnt = int((cfg.get("generation") or {}).get("max_new_tokens_verify", 180))
+    timeout = float((cfg.get("generation") or {}).get("call_timeout_s", 12.0))
+    allowed = sorted(catalog_types(load_catalog()))
+    types = [t for t in allowed if t != "V99"] or ["V99"]
+    rows = []
+    for i in range(max(1, n)):
+        batch = [frames[(i * k + j) % len(frames)] for j in range(k)]
+        times = [round(2.0 * j, 1) for j in range(k)]
+        t0 = time.perf_counter()
+        imgs = prepare_images(batch, times, {"person": (0.3, 0.2, 0.7, 0.9)}, times[k // 2], fcfg)
+        prep_frames = time.perf_counter() - t0
+        tid = types[i % len(types)]
+        system, user = render_verify(tid, ["(синтетический кандидат для замера)"], times, None,
+                                     str(cfg.get("lang", "ru")))
+        res = be.generate(imgs, system, user, max_new_tokens=mnt, timeout_s=timeout,
+                          json_schema=verify_schema(allowed, len(times)))
+        t1 = time.perf_counter()
+        pr = extract_json(res.text)
+        ok = pr.ok and normalize_verify(pr.data, set(allowed), len(times))[0] is not None
+        parse_s = time.perf_counter() - t1
+        tm = (res.meta or {}).get("timings") or {}
+        rows.append({"total_s": prep_frames + res.latency_s + parse_s, "prep_frames_s": prep_frames,
+                     "prep_s": tm.get("prep_s"), "gen_s": tm.get("gen_s"), "decode_s": tm.get("decode_s"),
+                     "parse_s": parse_s, "out_tokens": res.completion_tokens, "in_tokens": res.prompt_tokens,
+                     "finish": res.finish_reason or ("time" if res.timed_out else ""), "json_ok": ok,
+                     "repaired": bool(pr.ok and pr.repaired), "truncated": res.truncated,
+                     "vram_peak_mb": (res.meta or {}).get("vram_peak_mb"), "error": res.error})
+        dump({"kind": "bench_json", "call": i, "images": imgs, "prompt": user, "raw": [res.text],
+              "finish": res.finish_reason, "error": res.error})
+    return _summ(rows)
+
+
+def _summ(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    cold, warm = rows[:1], rows[1:] or rows[:1]
+
+    def col(rs: list[dict[str, Any]], key: str) -> list[float]:
+        return [float(r[key]) for r in rs if r.get(key) is not None]
+
+    fin: dict[str, int] = {}
+    for r in rows:
+        fin[r.get("finish") or "unknown"] = fin.get(r.get("finish") or "unknown", 0) + 1
+    out = {
+        "calls": len(rows),
+        "cold_first_call_s": round(rows[0]["total_s"], 4) if rows else None,
+        "warm": {k: _stats(col(warm, k)) for k in ("total_s", "prep_frames_s", "prep_s", "gen_s", "decode_s",
+                                                    "parse_s")},
+        "out_tokens": _stats(col(rows, "out_tokens")),
+        "in_tokens": _stats(col(rows, "in_tokens")),
+        "finish_reasons": fin,
+        "json_valid_rate": round(sum(r["json_ok"] for r in rows) / len(rows), 3) if rows else None,
+        "json_repaired_rate": round(sum(r["repaired"] for r in rows) / len(rows), 3) if rows else None,
+        "truncated_rate": round(sum(bool(r["truncated"]) for r in rows) / len(rows), 3) if rows else None,
+        "errors": sum(bool(r.get("error")) for r in rows),
+        "vram_peak_mb_max": max(col(rows, "vram_peak_mb")) if col(rows, "vram_peak_mb") else None,
+    }
+    if cold:
+        out["cold_first_call_s"] = round(cold[0]["total_s"], 4)
+    return out
+
+
+def _bench_qa(be: Any, frames: list[Any], cfg: dict[str, Any], n: int, qa_type: str, dump: Any) -> dict[str, Any]:
+    from .frames import resize_max_side, to_pil_rgb
+    from .prompting import get_prompt
+    from .qa import _prompt, crop_zone, load_spec
+
+    if not getattr(be, "supports_option_probs", False):
+        return {"status": "backend_without_logits"}
+    spec = load_spec((cfg.get("qa") or {}).get("spec_path"))
+    plan = (spec.get("types") or {}).get(qa_type) or []
+    system = get_prompt("system_qa", str(cfg.get("prompt_version", "v1")), str(cfg.get("lang", "ru"))).render()
+    max_side = int((cfg.get("frames") or {}).get("max_side", 448))
+    lat, mass, modes = [], [], {}
+    for i in range(max(1, n)):
+        for j, (q, at) in enumerate(plan):
+            f = frames[(i + j) % len(frames)]
+            imgs = [resize_max_side(to_pil_rgb(f), max_side)]
+            if (spec["questions"][q].get("crop")):
+                c = crop_zone(f, (0.12, 0.44, 0.86, 0.62), 0.1, max_side)  # синтетический «стол»
+                if c is not None:
+                    imgs.append(c)
+            prompt = _prompt(spec, q, 2.0 * j, len(imgs) > 1)
+            opts = (spec.get("options") or {})[spec["questions"][q].get("options", "yn")]
+            sc = be.option_probs(imgs, system, prompt, opts, timeout_s=10.0)
+            lat.append(sc.latency_s)
+            mass.append(sc.mass)
+            modes[sc.mode] = modes.get(sc.mode, 0) + 1
+            dump({"kind": "bench_qa", "question": q, "images": imgs, "prompt": prompt, "probs": sc.probs,
+                  "mass": sc.mass})
+    return {"type": qa_type, "questions_per_candidate": len(plan), "forwards": len(lat),
+            "cold_first_forward_s": round(lat[0], 4) if lat else None,
+            "forward_s": _stats(lat[1:] or lat), "candidate_s_est": round(statistics.mean(lat[1:] or lat) * len(plan), 3)
+            if lat else None, "mass": _stats(mass), "option_mode": modes}
+
+
+def _bench_chat(n: int, dump: Any, cfg: dict[str, Any]) -> dict[str, Any]:
+    from .service import VLMService
+
+    svc = VLMService(cfg)
+    rows = []
+    for i in range(max(1, n)):
+        r = svc.chat([{"role": "system", "content": "Ты помощник проверяющего. Отвечай кратко по-русски."},
+                      {"role": "user", "content": "Перечисли три общих правила хранения наличных в кассе."}])
+        rows.append(r)
+        dump({"kind": "bench_chat", "call": i, "ok": r.ok, "raw": [r.text], "error": r.error})
+    lat = [r.latency_s for r in rows if r.ok]
+    return {"calls": len(rows), "ok": sum(r.ok for r in rows), "errors": sorted({r.error for r in rows if r.error}),
+            "latency_s": _stats(lat), "out_tokens": _stats([float(r.completion_tokens) for r in rows
+                                                            if r.completion_tokens is not None]),
+            "truncated": sum(r.truncated for r in rows)}
 
 
 def run(argv: Optional[list[str]] = None) -> dict[str, Any]:
     ap = argparse.ArgumentParser(prog="python -m ml.vlm.bench", description=__doc__.split("\n\n")[0])
     ap.add_argument("--frames", default=None, help="папка с кадрами (jpg/png)")
     ap.add_argument("--synthetic", type=int, default=0, help="N синтетических кадров вместо --frames")
-    ap.add_argument("--n", type=int, default=5, help="число вызовов")
-    ap.add_argument("--images-per-call", type=int, default=5)
-    ap.add_argument("--max-side", type=int, default=None)
-    ap.add_argument("--max-new-tokens", type=int, default=None)
+    ap.add_argument("--mode", default="json,qa,chat")
+    ap.add_argument("--n", type=int, default=5, help="вызовов на режим (первый — холодный)")
+    ap.add_argument("--images-per-call", type=int, default=None, help="по умолчанию frames.verify_n_frames")
+    ap.add_argument("--qa-type", default="V02")
     ap.add_argument("--backend", default=None)
     ap.add_argument("--preset", default=None)
     ap.add_argument("--config", default=None)
@@ -88,11 +218,9 @@ def run(argv: Optional[list[str]] = None) -> dict[str, Any]:
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
 
     from .budget import visual_tokens
-    from .catalog import catalog_types, load_catalog
     from .config import load_config, preset_cfg
+    from .frames import resize_max_side, to_pil_rgb
     from .localdump import LocalDump
-    from .parsing import extract_json, normalize_verify, verify_schema
-    from .prompting import render_verify
     from .runtime import ensure_loaded, get_backend
 
     over: dict[str, Any] = {}
@@ -101,19 +229,21 @@ def run(argv: Optional[list[str]] = None) -> dict[str, Any]:
     if args.preset:
         over["preset"] = args.preset
     cfg = load_config(args.config, overrides=over or None)
-    fcfg = cfg.get("frames") or {}
-    max_side = int(args.max_side or fcfg.get("max_side", 448))
-    mnt = int(args.max_new_tokens or (cfg.get("generation") or {}).get("max_new_tokens_verify", 220))
+    modes = [m.strip() for m in args.mode.split(",") if m.strip()]
+    k = int(args.images_per_call or (cfg.get("frames") or {}).get("verify_n_frames", 5))
     px = int(preset_cfg(cfg, "transformers").get("px_per_token", 28))
-    rep: dict[str, Any] = {"backend_cfg": cfg.get("backend"), "preset": cfg.get("preset"), "max_side": max_side,
-                           "images_per_call": args.images_per_call, "calls_requested": args.n}
+    rep: dict[str, Any] = {"backend_cfg": cfg.get("backend"), "preset": cfg.get("preset"), "modes": modes,
+                           "images_per_call": k, "calls_per_mode": args.n,
+                           "max_side": int((cfg.get("frames") or {}).get("max_side", 448)),
+                           "max_new_tokens_verify": int((cfg.get("generation") or {}).get("max_new_tokens_verify", 180))}
     if not args.frames and not args.synthetic:
         rep["status"] = "no_input (use --frames DIR or --synthetic N)"
         return rep
-    imgs = _load_images(args.frames, args.synthetic or args.images_per_call, max_side)
-    rep["n_images_loaded"] = len(imgs)
+    frames = _load_frames(args.frames, args.synthetic or k)
+    rep["n_images_loaded"] = len(frames)
+    rep["visual_tokens_est_per_call"] = k * visual_tokens(
+        resize_max_side(to_pil_rgb(frames[0]), rep["max_side"]).size, px)
     rep["vram_before_mb_nvidia_smi"] = _nvidia_smi_used_mb()
-
     be, reason = get_backend(cfg)
     if be is None:
         rep.update(status="backend_unavailable", reason=reason)
@@ -126,46 +256,21 @@ def run(argv: Optional[list[str]] = None) -> dict[str, Any]:
         rep.update(status="backend_load_failed", reason=why)
         return rep
     rep["vram_after_load_mb_nvidia_smi"] = _nvidia_smi_used_mb()
-
-    allowed = set(catalog_types(load_catalog()))
     dump = LocalDump(None if args.no_dump else (args.dump_dir or (cfg.get("privacy") or {}).get("local_dump_dir")),
                      tag="bench")
-    lat, outs, parsed, repaired, vis = [], [], 0, 0, []
-    k = max(1, args.images_per_call)
-    for i in range(max(1, args.n)):
-        batch = [imgs[(i * k + j) % len(imgs)] for j in range(k)]
-        times = [float(j) for j in range(len(batch))]
-        system, user = render_verify("V99", [], times, None, str(cfg.get("lang", "ru")))
-        vis.append(sum(visual_tokens(im.size, px) for im in batch))
-        res = be.generate(batch, system, user, max_new_tokens=mnt,
-                          timeout_s=float((cfg.get("generation") or {}).get("call_timeout_s", 12.0)),
-                          json_schema=verify_schema(sorted(allowed), len(batch)))
-        lat.append(res.latency_s)
-        if res.completion_tokens is not None:
-            outs.append(res.completion_tokens)
-        pr = extract_json(res.text)
-        if pr.ok and normalize_verify(pr.data, allowed, len(batch))[0] is not None:
-            parsed += 1
-            repaired += int(pr.repaired)
-        dump({"kind": "bench", "call": i, "images": batch, "prompt": user, "raw": [res.text],
-              "latency_s": res.latency_s, "error": res.error})
-    warm = lat[1:] if len(lat) > 1 else lat  # первый вызов — прогрев
-    rep.update({
-        "status": "ok",
-        "calls": len(lat),
-        "latency_first_s": round(lat[0], 3) if lat else None,
-        "latency_p50_s": _pct(warm, 0.5),
-        "latency_p95_s": _pct(warm, 0.95),
-        "latency_mean_s": round(statistics.mean(warm), 3) if warm else None,
-        "json_valid_rate": round(parsed / max(1, len(lat)), 3),
-        "json_repaired_rate": round(repaired / max(1, len(lat)), 3),
-        "out_tokens_mean": round(statistics.mean(outs), 1) if outs else None,
-        "visual_tokens_est_per_call": round(statistics.mean(vis), 1) if vis else None,
-        "vram_peak_mb_torch": _torch_peak_mb(),
-        "vram_after_mb_nvidia_smi": _nvidia_smi_used_mb(),
-        "dump_dir": dump.path,
-    })
+    if "json" in modes:
+        rep["json"] = _bench_json(be, frames, cfg, args.n, k, dump)
+        # совместимость с отчётом фазы 1
+        rep["calls"] = rep["json"]["calls"]
+        rep["json_valid_rate"] = rep["json"]["json_valid_rate"]
+    if "qa" in modes:
+        rep["qa"] = _bench_qa(be, frames, cfg, args.n, args.qa_type, dump)
+    if "chat" in modes:
+        rep["chat"] = _bench_chat(args.n, dump, cfg)
+    rep.update({"status": "ok", "vram_peak_mb_torch": _torch_peak_mb(),
+                "vram_after_mb_nvidia_smi": _nvidia_smi_used_mb(), "dump_dir": dump.path})
     if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(rep, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     return rep
 

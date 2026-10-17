@@ -172,3 +172,17 @@ def test_calibrate_aggregates_only(tmp_path, monkeypatch, capsys):
     assert rep["discover_hit_rate_neg"] == 1.0  # mock «phone» находит везде — это и показывает FPR
     assert rep["verify_n_pos"] == 1 and rep["verify_json_ok_rate"] == 1.0
     assert "Кассир" not in out and "observed_facts" not in out  # никаких описаний сцен в stdout
+
+
+def test_bench_production_sections(tmp_path, capsys):
+    from ml.vlm.bench import main
+    rc = main(["--synthetic", "5", "--n", "3", "--mode", "json,qa,chat", "--dump-dir", str(tmp_path / "d")])
+    out = capsys.readouterr().out
+    rep = json.loads(out)
+    assert rc == 0
+    j = rep["json"]
+    assert j["calls"] == 3 and j["cold_first_call_s"] is not None and j["warm"]["total_s"]["mean"] is not None
+    assert set(j["warm"]) >= {"prep_frames_s", "gen_s", "parse_s"} and "finish_reasons" in j
+    assert rep["qa"]["forwards"] == 3 * rep["qa"]["questions_per_candidate"] and rep["qa"]["option_mode"]
+    assert rep["chat"]["ok"] == 3
+    assert "Кассир" not in out and "[mock]" not in out  # тексты ответов — только в локальном дампе
