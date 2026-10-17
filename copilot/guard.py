@@ -20,6 +20,7 @@ from typing import Any, Optional, Sequence
 from .corpus import Corpus, norm_clause, norm_text, norm_url, _CLAUSE_RE
 from .llm import strip_think
 from .prompts import NormRef, REFUSAL_NO_DATA, REFUSAL_SCOPE, REFUSAL_SOURCES, REFUSAL_VIDEO, fmt_tc
+from .safety import strip_output_artifacts
 
 _MARKER_RE = re.compile(r"[\[(]\s*([NnНн])\s*(\d{1,2})\s*[\])]")
 _VMARK_RE = re.compile(r"\[\s*[Vv]\s*(\d{1,2})\s*\]")
@@ -183,7 +184,7 @@ def _digits(s: str) -> str:
 def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], result: dict[str, Any],
                  question: str = "", history: Sequence[dict[str, str]] = (),
                  tolerance_s: float = 1.5, min_support: float = 0.3) -> GuardResult:
-    text = strip_think(raw)
+    text = strip_output_artifacts(strip_think(raw))
     removed: list[str] = []
     by_n = {r.n: r for r in refs}
     viols = {int(v.get("_n", i + 1)): v for i, v in enumerate(result.get("violations") or [])}
