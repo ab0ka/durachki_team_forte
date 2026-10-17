@@ -16,6 +16,8 @@ python -m eval.run    --subset holdout --final --out runs/eval/final      # то
 python -m eval.robustness --subset calib --variants persp_left,rot_p10,mirror,zoom80 --out runs/robust
 python -m eval.jury_sim --url https://<tunnel> --key $SENTINEL_API_KEY --videos data/videos --n 6
 python -m eval.score_like_jury --metrics runs/eval/dev1/metrics.json --robustness runs/robust/robustness.json
+python -m eval.report --run runs/eval/dev1          # runs/eval/dev1/report.html — только локально
+python -m eval.loo --scores runs/eval/dev1/scores_raw.jsonl   # exploratory LOGO + nested CV порога
 pytest eval/tests -q            # без GPU и весов; ffmpeg-тесты помечены slow
 ```
 
@@ -35,6 +37,8 @@ pytest eval/tests -q            # без GPU и весов; ffmpeg-тесты п
 | `score_like_jury.py` | **наш proxy-балл** 0..100 | `score`, `format_score` |
 | `robustness.py` | синтетические возмущения ракурса/качества, смена вердикта, сдвиг таймкода | `make_variant`, `VARIANTS`, `compare` |
 | `jury_sim.py` | имитация жюри по URL | `run_jury_sim`, `JurySim`, `format_table` |
+| `report.py` | локальный HTML-отчёт (кадры! не выносить) | `build_report` |
+| `loo.py` | LOGO (**exploratory**) и nested CV порога по `scores_raw.jsonl` | `logo`, `nested_cv`, `fit_threshold`, `video_score` |
 
 Все пороги вынесены в `eval/config.yaml` (`--config my.yaml` переопределяет).
 
