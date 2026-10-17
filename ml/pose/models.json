@@ -1,0 +1,16 @@
+[
+  {
+    "name": "RTMPose-m body7 (COCO-17, 256x192, SimCC, ONNX)",
+    "hf_id_or_url": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip",
+    "license": "Apache-2.0",
+    "size_mb": 54,
+    "purpose": "Единственный бэкенд по умолчанию: top-down поза COCO-17 по bbox-ам person-треков (onnxruntime CUDA → CPU). size_mb ≈ 13.6M параметров × 4 байта, не измерено."
+  },
+  {
+    "name": "MediaPipe Pose / BlazePose full (opt-in)",
+    "hf_id_or_url": "https://pypi.org/project/mediapipe/",
+    "license": "Apache-2.0",
+    "size_mb": 6,
+    "purpose": "Опциональный CPU-бэкенд (backend.order: [rtmpose_onnx, mediapipe]); 33 landmark-а явно перекладываются в COCO-17 (MP33_TO_COCO17). Модель поставляется внутри пакета; size_mb приблизительно."
+  }
+]
