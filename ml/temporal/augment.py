@@ -20,6 +20,15 @@ def _ingest_factory() -> Optional[Callable[[int], Augmenter]]:
         fn = getattr(ing, name, None)
         if callable(fn):
             return fn
+    if hasattr(ing, "ClipAugmenter") and hasattr(ing, "apply"):  # API A04: одни параметры на весь клип
+        def factory(seed: int) -> Augmenter:
+            import numpy as np
+
+            ca = ing.ClipAugmenter(seed=seed)
+            aug = ca.sample()
+            noise_rng = np.random.default_rng(seed + 1)
+            return lambda frame: ing.apply(frame, aug, noise_rng)
+        return factory
     return None
 
 

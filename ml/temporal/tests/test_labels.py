@@ -68,3 +68,18 @@ def test_time_inside_label_column(tmp_path):
     labs = read_labels(p)
     assert labs["X-1"].label == 1 and labs["X-1"].times == [22.0]
     assert labs["X-2"].label == 0 and labs["X-3"].label == 1 and labs["X-3"].times == []
+
+
+def test_l1_schema_labels_csv(tmp_path):
+    """Схема L1 (tools/dataprep/build_labels.py): video_id,file,label,t_sec,md5,group,t_all,conflict,raw."""
+    p = tmp_path / "labels.csv"
+    p.write_text("video_id,file,label,t_sec,md5,group,t_all,conflict,raw\n"
+                 "X-1,X-1.mov,violation,22,aa,X-1,22,0,22 сек | нарушение\n"
+                 "X-3,X-3.mov,no_violation,,bb,X-3,,0,без нарушения\n"
+                 "X-4,X-4.mov,violation,57,cc,X-4,57,1,57 сек | нарушение\n"
+                 "X-47,X-47.mov,violation,68,cc,X-4,68,1,1 мин 8 сек | нарушение\n", encoding="utf-8")
+    labs = read_labels(p)
+    assert labs["X-1"].label == 1 and labs["X-1"].times == [22.0]       # таймкод из t_all/t_sec, не из raw
+    assert labs["X-3"].label == 0 and labs["X-3"].times == []
+    assert labs["X-47"].times == [68.0]
+    assert all(lab.type_id == "" for lab in labs.values())

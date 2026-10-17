@@ -28,11 +28,19 @@ class SimpleClip:
         next_t = 0.0
         idx = 0
         last: Optional[Any] = None
+        pts_ok = False
+        last_t = -1.0
         while True:
             ok = cap.grab()
             if not ok:
                 break
-            t = idx / fps
+            pts = cap.get(cv2.CAP_PROP_POS_MSEC)  # PTS кадра: при переменном fps idx/fps врёт
+            if pts and pts > 0:
+                pts_ok = True
+            t = pts / 1000.0 if pts_ok else idx / fps
+            if t <= last_t:  # защита от немонотонных PTS
+                t = last_t + 1e-3
+            last_t = t
             if t + 0.5 / fps >= next_t:
                 ok, fr = cap.retrieve()
                 if ok and fr is not None:
@@ -51,7 +59,8 @@ class SimpleClip:
         self._frames = frames
         self.times = times
         self.height, self.width = int(last.shape[0]), int(last.shape[1])
-        self.duration = max(n / fps if n > 0 else 0.0, idx / fps)
+        self.duration = max(last_t + 1.0 / fps, times[-1]) if pts_ok else max(n / fps if n > 0 else 0.0, idx / fps)
+        self.time_source = "pts" if pts_ok else "index/fps"
         self._np = np
 
     def frame(self, i: int) -> Any:
