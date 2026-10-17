@@ -1,69 +1,130 @@
-import { useState } from "react";
-import { BadgeCheck, BookOpen, ChevronDown, ExternalLink, ShieldAlert } from "lucide-react";
+import { useId, useState } from "react";
+import { BadgeCheck, ChevronDown, ExternalLink, Scale, ShieldAlert } from "lucide-react";
 import type { RuleRef } from "../api/types";
 import { cx } from "./ui";
+import s from "./ViolationCard.module.css";
 
-/** Карточка нормы РК (данные только из norms/catalog.yaml через сервер). */
+/** Длинный текст (название документа, цитата) сворачивается до нескольких строк. */
+const LONG_TITLE = 140;
+
+/** Ссылку показываем только для http(s): прочие схемы (javascript:, data:) не рендерим как ссылку. */
+export function safeHttpUrl(url: string | undefined): URL | null {
+  if (!url) return null;
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:" ? u : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Нормативное основание (данные только из norms/catalog.yaml через сервер; ничего не дописываем).
+ * Первый уровень: документ, пункт («без пункта», если не установлен), статус сверки, понятная ссылка.
+ * Длинное название и цитата раскрываются по кнопке; при печати раскрыты.
+ */
 export default function NormCard({ rule }: { rule: RuleRef }) {
-  const [open, setOpen] = useState(false);
-  const hasQuote = !!rule.quote && rule.quote.trim().length > 0;
+  const [quoteOpen, setQuoteOpen] = useState(false);
+  const [titleOpen, setTitleOpen] = useState(false);
+  const quoteId = useId();
+  const titleId = useId();
+  const verified = rule.verified === true;
+  const clause = rule.clause && rule.clause.trim() ? rule.clause.trim() : null;
+  const quote = rule.quote && rule.quote.trim() ? rule.quote.trim() : null;
+  const document = rule.document && rule.document.trim() ? rule.document.trim() : null;
+  const longTitle = !!document && document.length > LONG_TITLE;
+  const link = safeHttpUrl(rule.url);
+
   return (
-    <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 dark:border-white/10 dark:bg-white/[.03]">
-      <div className="flex flex-wrap items-start gap-3">
-        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-ink-900 text-white dark:bg-white dark:text-ink-900">
-          <BookOpen className="h-4 w-4" />
-        </div>
+    <div className={s.norm} data-verified={verified ? "true" : "false"}>
+      <div className="flex items-start gap-2.5">
+        <Scale className="mt-0.5 h-4 w-4 shrink-0 text-ink-500 dark:text-slate-400" aria-hidden />
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-semibold leading-snug text-slate-900 dark:text-white">{rule.document}</div>
-          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
-            {rule.clause && rule.clause.trim() ? (
-              <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{rule.clause}</span>
+          {document ? (
+            <p
+              id={titleId}
+              className={cx(s.breakWords, "text-sm font-semibold leading-snug text-slate-900 dark:text-white", longTitle && !titleOpen && s.clamp2)}
+            >
+              {document}
+            </p>
+          ) : (
+            <p className="text-sm font-semibold text-slate-500">Документ не указан сервером</p>
+          )}
+          {longTitle && (
+            <button
+              type="button"
+              className={cx(s.linkButton, "no-print mt-0.5")}
+              aria-expanded={titleOpen}
+              aria-controls={titleId}
+              onClick={() => setTitleOpen((o) => !o)}
+            >
+              {titleOpen ? "Свернуть название" : "Полное название"}
+            </button>
+          )}
+
+          <dl className={cx(s.normMeta, "mt-2 text-[13px]")}>
+            <div>
+              <dt>Пункт</dt>
+              <dd>
+                {clause ? (
+                  <span className="font-mono font-semibold text-slate-800 dark:text-slate-100">{clause}</span>
+                ) : (
+                  <span className="text-slate-600 dark:text-slate-300" title="Конкретный пункт в каталоге норм не установлен — ничего не придумываем">
+                    без пункта
+                  </span>
+                )}
+              </dd>
+            </div>
+            <div>
+              <dt>Сверка</dt>
+              <dd>
+                {verified ? (
+                  <span className="inline-flex items-center gap-1 font-medium text-emerald-700 dark:text-emerald-300" title="Цитата сверена с текстом первоисточника">
+                    <BadgeCheck className="h-3.5 w-3.5" aria-hidden /> цитата сверена
+                  </span>
+                ) : (
+                  <span className={s.unverified} title="Цитату нужно сверить с первоисточником">
+                    <ShieldAlert className="h-3.5 w-3.5" aria-hidden /> цитата не сверена
+                  </span>
+                )}
+                {!verified && rule.status_ru && <span className="mt-1 block text-xs text-amber-800 dark:text-amber-200">{rule.status_ru}</span>}
+              </dd>
+            </div>
+          </dl>
+
+          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            {link ? (
+              <a href={link.href} target="_blank" rel="noopener noreferrer" className={s.docLink}>
+                <ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                <span>
+                  Открыть документ на <span className="whitespace-nowrap">{link.hostname}</span>
+                </span>
+                <span className="sr-only"> (откроется в новой вкладке)</span>
+              </a>
             ) : (
-              <span className="chip border-slate-200 text-slate-500 dark:border-white/10" title="Конкретный пункт в каталоге норм не установлен — ничего не придумываем">
-                без пункта
-              </span>
+              <span className="text-xs text-slate-500 dark:text-slate-400">Ссылка на документ не передана</span>
             )}
-            {rule.verified === true ? (
-              <span className="chip border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-400/10 dark:text-emerald-300" title="Цитата сверена с текстом первоисточника">
-                <BadgeCheck className="h-3.5 w-3.5" /> цитата сверена
-              </span>
-            ) : (
-              <span className="chip border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-400/20 dark:bg-amber-400/10 dark:text-amber-300" title="Цитату нужно сверить с первоисточником">
-                <ShieldAlert className="h-3.5 w-3.5" /> цитата не сверена
-              </span>
+            {quote && (
+              <button
+                type="button"
+                className={cx(s.linkButton, "no-print inline-flex items-center gap-1")}
+                aria-expanded={quoteOpen}
+                aria-controls={quoteId}
+                onClick={() => setQuoteOpen((o) => !o)}
+              >
+                <ChevronDown className={cx("h-3.5 w-3.5", s.chevron, quoteOpen && s.chevronOpen)} aria-hidden />
+                {quoteOpen ? "Скрыть цитату" : "Показать цитату"}
+              </button>
             )}
           </div>
-          {!rule.verified && rule.status_ru && <div className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">{rule.status_ru}</div>}
+
+          {quote && (
+            <blockquote id={quoteId} className={cx(s.quote, s.breakWords, quoteOpen ? "block animate-fade-in" : "hidden print-expand")}>
+              «{quote}»
+            </blockquote>
+          )}
         </div>
       </div>
-      {hasQuote && (
-        <>
-          <button className="no-print mt-3 inline-flex items-center gap-1 text-xs font-semibold text-brand-700 hover:underline dark:text-brand-300" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
-            <ChevronDown className={cx("h-3.5 w-3.5 transition", open && "rotate-180")} />
-            {open ? "Скрыть цитату" : "Показать цитату"}
-          </button>
-          <blockquote className={cx("mt-2 border-l-2 border-brand-500 pl-3 text-sm italic leading-relaxed text-slate-700 dark:text-slate-300", open ? "block" : "hidden print-expand")}>
-            «{rule.quote}»
-          </blockquote>
-        </>
-      )}
-      {rule.url && (
-        <a
-          href={rule.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="mt-3 inline-flex items-center gap-1.5 text-xs font-semibold text-ink-700 hover:underline dark:text-slate-200"
-        >
-          <ExternalLink className="h-3.5 w-3.5" />
-          {(() => {
-            try {
-              return new URL(rule.url).hostname;
-            } catch {
-              return "Открыть документ";
-            }
-          })()}
-        </a>
-      )}
     </div>
   );
 }
