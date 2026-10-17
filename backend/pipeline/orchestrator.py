@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -29,12 +30,15 @@ from .fallbacks import EvidenceClip, derive_risk, fallback_fuse, states_from_det
 from .media import ascii_safe_path, probe_video
 from .registry import ModelRegistry
 from .stages import STAGES, catalog_hash, is_required, load_catalog_safe
-from .worker import CLIP, CallResult, WorkerCrashed, WorkerTimeout, get_executor
+from .worker import CLIP, CallResult, WorkerCancelled, WorkerCrashed, WorkerTimeout, get_executor
 
 log = logging.getLogger("sentinel.pipeline")
 
 ProgressFn = Callable[[str, float], None]
 OK_STATUSES = ("ok", "cached")
+
+_ACTIVE: dict[str, threading.Event] = {}   # job_id → флаг отмены выполняющейся/ждущей задачи
+_ACTIVE_LOCK = threading.Lock()
 
 # kind для нормализации выходов (JSON-roundtrip) — совпадает с STAGE_FILES
 _KINDS = {stage: [kind for _f, kind in files] for stage, files in STAGE_FILES.items()}
@@ -86,6 +90,10 @@ class RunContext:
     identities: dict = field(default_factory=dict)
     _progress_done: float = 0.0
     partial_written: list[str] = field(default_factory=list)
+    cancel: threading.Event = field(default_factory=threading.Event)
+
+    def cancelled(self) -> bool:
+        return self.cancel.is_set()
 
     # ---------------------------------------------------------------- прогресс
     def report(self, label: str, frac: float) -> None:
@@ -143,14 +151,45 @@ def run_with_context(video_path: str, job_id: str, progress: Optional[ProgressFn
             float(deadline_at) - time.time()
     budget = TimeBudget(float(deadline_s), cfg)
     ctx = RunContext(job_id=job_id, video_path=str(video_path), cfg=cfg, budget=budget, progress_fn=progress)
+    with _ACTIVE_LOCK:
+        _ACTIVE[job_id] = ctx.cancel
     try:
         result = _run(ctx)
     except Exception as exc:  # noqa: BLE001 — последняя линия обороны: задача не падает исключением
         log.exception("pipeline crashed")
         ctx.warn(f"оркестратор: {type(exc).__name__}: {exc}")
         result = _failed(job_id, f"внутренняя ошибка оркестратора: {type(exc).__name__}: {exc}", _meta(ctx))
-    ctx.report("Готово" if result.status == "done" else "Ошибка", 1.0)
+    finally:
+        with _ACTIVE_LOCK:
+            if _ACTIVE.get(job_id) is ctx.cancel:
+                _ACTIVE.pop(job_id, None)
+    if ctx.cancelled():
+        result.status, result.verdict = "failed", None
+        result.meta["cancelled"] = True
+        result.meta["error"] = "задача отменена" + (f" ({result.meta['error']})" if result.meta.get("error") else "")
+        result.meta.setdefault("completeness", {})["complete"] = False
+    ctx.report("Готово" if result.status == "done" else ("Отменено" if ctx.cancelled() else "Ошибка"), 1.0)
     return result, ctx
+
+
+def cancel(job_id: str) -> bool:
+    """Отменить задачу (выполняющуюся или ждущую воркер). Текущий вызов модели прерывается
+    остановкой процесса-воркера → модели выгружены, VRAM освобождена. True — задача найдена."""
+    with _ACTIVE_LOCK:
+        ev = _ACTIVE.get(str(job_id))
+    if ev is None:
+        return False
+    ev.set()
+    return True
+
+
+def release_gpu() -> dict:
+    """Освободить GPU между задачами: process — остановить воркер (модели умирают вместе с процессом);
+    inline — хуки unload() модулей + реестр + сброс клипа. Следующая задача поднимет всё заново."""
+    try:
+        return get_executor(load_config()).release()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def warmup() -> None:
@@ -213,8 +252,10 @@ def _run(ctx: RunContext) -> AnalysisResult:
     ctx.executor = get_executor(cfg)
     lease_timeout = cfg_get(cfg, "executor.lease_timeout_s", None)
     lease_timeout = ctx.budget.remaining() - 2.0 if lease_timeout is None else float(lease_timeout)
-    with ctx.executor.lease(timeout=max(0.0, lease_timeout)) as leased:
+    with ctx.executor.lease(timeout=max(0.0, lease_timeout), cancel=ctx.cancel) as leased:
         if not leased:
+            if ctx.cancelled():
+                return _failed(ctx.job_id, "задача отменена в очереди", _meta(ctx))
             return _failed(ctx.job_id, "исполнитель занят другой задачей до самого дедлайна", _meta(ctx))
         if ctx.executor.poisoned:
             ctx.warn("inline-исполнитель «отравлен» прошлым таймаутом: зависший поток может держать GPU")
@@ -262,7 +303,7 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
     sc = _stage(ctx, "scene", [("ml.scene", "scene_states", (CLIP, dets, tracks, zones, pose_states), {})],
                 upstream=["detect", "track", "pose"])
     states = sc[0] if sc else []
-    if ctx.records["scene"].status not in OK_STATUSES and dets:
+    if ctx.records["scene"].status not in OK_STATUSES and dets and not ctx.cancelled():
         states = states_from_detections(ctx.clip_info.get("times", []), dets, pose_states)
         ctx.warn(f"scene: использованы грубые состояния из детекций ({len(states)} шт.) — анализ неполный")
     ru = _stage(ctx, "rules", [("ml.rules", "run_rules", (states, tracks, zones, ctx.catalog), {})],
@@ -310,8 +351,9 @@ def _ingest(ctx: RunContext) -> bool:
     try:
         ctx.ingest_identity = ctx.executor.request("identity", {"module": "ml.ingest", "func": "load_video"}, timeout)
         info = ctx.executor.load_clip(ctx.work_path, ctx.sample_fps, timeout)
-    except (WorkerTimeout, WorkerCrashed) as exc:
-        rec.status, rec.error = ("timeout" if isinstance(exc, WorkerTimeout) else "crashed"), str(exc)
+    except (WorkerTimeout, WorkerCrashed, WorkerCancelled) as exc:
+        rec.status = {WorkerTimeout: "timeout", WorkerCrashed: "crashed"}.get(type(exc), "cancelled")
+        rec.error = str(exc)
     except Exception as exc:  # noqa: BLE001
         rec.status, rec.error = "error", f"{type(exc).__name__}: {exc}".splitlines()[0]
     else:
@@ -353,6 +395,10 @@ def _stage(ctx: RunContext, stage: str, calls: list[tuple[str, str, tuple, dict]
     rec = StageRecord(required=required)
     ctx.report(spec.label, ctx.stage_progress_base(stage))
 
+    if ctx.cancelled():
+        rec.status, rec.error = "cancelled", "задача отменена"
+        _record(ctx, stage, rec)
+        return None
     if not cfg_get(cfg, f"stages.{stage}", True):
         rec.status, rec.error = "disabled", "выключена в конфиге/флагах"
         _record(ctx, stage, rec)
@@ -488,8 +534,13 @@ def _prepare_vram(ctx: RunContext, stage: str) -> None:
         ctx.executor.restart()
 
 
-def _fusion(ctx: RunContext, events: list[Event], risk: list[tuple[float, float]], tracks: list) -> AnalysisResult:
+def _fusion(ctx: RunContext, events: list[Event], risk: list[tuple[float, float]], tracks: list
+            ) -> Optional[AnalysisResult]:
     rec = StageRecord(required=is_required("fusion", ctx.cfg))
+    if ctx.cancelled():
+        rec.status, rec.error = "cancelled", "задача отменена"
+        _record(ctx, "fusion", rec)
+        return None
     ctx.report(STAGES["fusion"].label, ctx.stage_progress_base("fusion"))
     t0 = time.perf_counter()
     res = ctx.executor.call("ml.fusion", "fuse", (CLIP, events, risk, ctx.catalog, ctx.job_id), {},
