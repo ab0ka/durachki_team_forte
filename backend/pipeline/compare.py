@@ -15,7 +15,7 @@
   |Δ| t_peak и |Δ| onset (t_start), hit@1/2/5 с, медиана;
 * тип: только распределение предсказанных type_id (GT-типов нет);
 * время: p50/p90/max на видео + средние по стадиям; память: максимум VRAM-пика по стадиям;
-* полнота: минимум coverage обязательных стадий, число неполных/деградированных.
+* полнота: минимум meta.coverage.ratio (ядро), число неполных/деградированных.
 """
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ from .config import PIPELINE_DIR, deep_merge
 from .media import VIDEO_EXTS, normalize_video_name
 
 PROFILES_DIR = PIPELINE_DIR / "profiles"
-REQUIRED_COVERAGE = ("ingest", "detect", "track", "scene", "rules")
 
 
 def load_profile(mode: str) -> dict:
@@ -184,10 +183,9 @@ def metrics(rows: list[dict], labels: Mapping[str, dict], tols: Iterable[float] 
                 stage_s.setdefault(k, []).append(float(v))
         for k, v in (r.get("vram_mb") or {}).items():
             vram[k] = max(vram.get(k, 0.0), float(v))
-        covs = [r["coverage"].get(s) for s in REQUIRED_COVERAGE if isinstance(r.get("coverage"), dict)]
-        covs = [x for x in covs if x is not None]
-        if covs:
-            cov_min.append(min(covs))
+        cov = r.get("coverage") if isinstance(r.get("coverage"), dict) else {}
+        if cov.get("ratio") is not None:
+            cov_min.append(float(cov["ratio"]))
     tp, fp, fn, tn = c["tp"], c["fp"], c["fn"], c["tn"]
     return {
         "video": {"n": c["n"], "tp": tp, "fp": fp, "tn": tn, "fn": fn, "failed_on_violation": c["failed_pos"],
@@ -204,7 +202,7 @@ def metrics(rows: list[dict], labels: Mapping[str, dict], tols: Iterable[float] 
         "vram_peak_mb": {k: round(v, 1) for k, v in sorted(vram.items())},
         "completeness": {"incomplete": sum(1 for r in rows if r.get("complete") is False),
                          "degraded": sum(1 for r in rows if r.get("degraded")),
-                         "min_required_coverage": round(min(cov_min), 4) if cov_min else None},
+                         "min_coverage_ratio": round(min(cov_min), 4) if cov_min else None},
         "errors": errors,
     }
 
@@ -240,7 +238,7 @@ def render_md(results: Mapping[str, dict], meta: Mapping[str, Any]) -> str:
     for st in vstages:
         row(f"VRAM пик {st}, МБ", lambda r, s=st: r["vram_peak_mb"].get(s))
     row("неполных анализов", lambda r: r["completeness"]["incomplete"])
-    row("мин. покрытие обязательных", lambda r: r["completeness"]["min_required_coverage"])
+    row("мин. покрытие ядра (ratio)", lambda r: r["completeness"]["min_coverage_ratio"])
     lines += ["", "Предсказанные типы (GT-типов нет — только распределение):", ""]
     for m in modes:
         lines.append(f"* {m}: {results[m]['types_predicted'] or '—'}")

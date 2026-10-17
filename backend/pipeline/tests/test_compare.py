@@ -15,7 +15,7 @@ def _row(name, status="done", verdict="violation", tc=None, ts=None, wall=1.0):
           "confidence": 0.8}] if tc is not None else []
     return {"name": name, "status": status, "verdict": verdict, "violations": v, "wall_s": wall,
             "stage_s": {"detect": 1.0}, "vram_mb": {"detect": 900.0}, "complete": status == "done",
-            "coverage": {"ingest": 1.0, "detect": 1.0, "track": 1.0, "scene": 0.95, "rules": 0.95}}
+            "coverage": {"ratio": 0.95 if status == "done" else 0.4}}
 
 
 def test_metrics_counts_and_timecodes():
@@ -36,6 +36,7 @@ def test_metrics_counts_and_timecodes():
     assert t["n"] == 2 and t["hit_peak@1s"] == 0.5 and t["hit_peak@2s"] == 1.0  # 1.5 с и 1.0 с (ближайшая из t_all)
     assert t["hit_onset@1s"] == 1.0                                              # 0.2 с и 1.0 с
     assert m["vram_peak_mb"]["detect"] == 900.0 and m["completeness"]["incomplete"] == 1
+    assert m["completeness"]["min_coverage_ratio"] == 0.4
     assert "X-4" in m["errors"]["failed"] and "X-5" in m["errors"]["fp"]
 
 

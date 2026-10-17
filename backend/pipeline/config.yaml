@@ -109,12 +109,12 @@ reserve_s:
 optional_stages: [pose, temporal, refine, vlm_verify, vlm_discover]  # пропускаются по бюджету (с warning)
 min_start_fraction: 0.6      # необязательная стадия стартует, если влезает ≥ 60% её (масштабированного) бюджета
 
-# Полнота: meta.coverage — доля длительности, реально проанализированная стадией (по таймстемпам
-# её выхода/кадров); неизвестно → null. Гейт: обязательная стадия с покрытием < min_required делает
-# анализ неполным → никогда не no_violation (failed или degraded violation).
+# Полнота: meta.coverage — формат contracts.extensions.compute_coverage (A01): ratio ядра (пересечение
+# кадров ingest и состояний scene), unknown_spans, stages, required, complete; + by_stage — доли по
+# стадиям (неизвестно → null). Гейт: ratio < min_required → анализ неполный → никогда не no_violation.
 coverage:
   gate: true
-  min_required: 0.9
+  min_required: 0.98           # = contracts/config.yaml coverage.min_ratio_for_no_violation (A01); подбирает L2
   max_gap_s: 2.0               # разрыв между кадрами/состояниями больше этого — непокрытое время
   container_tolerance: 0.15    # контейнер длиннее декодированного на >15% → декодер не дошёл до конца
 
