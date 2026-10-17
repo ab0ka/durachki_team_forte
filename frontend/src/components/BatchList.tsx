@@ -32,13 +32,25 @@ function StatusCell({ it }: { it: BatchItem }) {
         {it.state === "failed" ? "анализ не завершён" : it.error ?? "ошибка"}
       </span>
     );
+  if (it.mock)
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300">
+        <AlertTriangle className="h-3.5 w-3.5" /> тестовый результат (mock)
+      </span>
+    );
   if (it.verdict === "violation")
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-rose-700 dark:text-rose-300">
         <OctagonAlert className="h-3.5 w-3.5" /> признаки нарушений: {it.violations?.length ?? 0}
       </span>
     );
-  if (it.verdict === "no_violation" && !it.partial)
+  if (it.verdict === "no_violation" && it.completeness === "unknown")
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300">
+        <CheckCircle2 className="h-3.5 w-3.5" /> не обнаружено · полнота не подтверждена
+      </span>
+    );
+  if (it.verdict === "no_violation" && it.completeness === "complete")
     return (
       <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 dark:text-emerald-300">
         <CheckCircle2 className="h-3.5 w-3.5" /> нарушение не обнаружено

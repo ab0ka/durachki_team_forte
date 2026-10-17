@@ -229,7 +229,7 @@ try {
       ]);
       await pg.getByText("Пакетная проверка").first().waitFor({ timeout: 5000 });
       await pg.getByText("признаки нарушений: 1").waitFor({ timeout: 15000 });
-      await pg.getByText("нарушение не обнаружено").waitFor({ timeout: 15000 });
+      await pg.getByText("не обнаружено · полнота не подтверждена").waitFor({ timeout: 15000 }); // meta без complete → не зелёный
       await pg.getByText("не поддерживается", { exact: false }).first().waitFor({ timeout: 3000 });
       assert.equal(seq, 2, `загрузок: ${seq}`);
       await pg.waitForTimeout(400);
@@ -320,7 +320,10 @@ try {
     ["failed", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "синтетическая ошибка" }, "Анализ не завершён"],
     ["failed-partial", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "timeout", partial: { ...doneJob("f1"), verdict: "no_violation", violations: [] , timeline: [[0, 0.1], [5, 0.2]] } }, "Анализ не завершён"],
     ["partial", { job_id: "f1", status: "done", verdict: "no_violation", violations: [], meta: { partial: true } }, "Анализ неполный"],
-    ["clean", { job_id: "f1", status: "done", verdict: "no_violation", violations: [], meta: {} }, "Нарушение не обнаружено"],
+    ["clean-unknown", { job_id: "f1", status: "done", verdict: "no_violation", violations: [], meta: {} }, "Нарушение не обнаружено"],
+    ["clean-complete", { job_id: "f1", status: "done", verdict: "no_violation", violations: [], meta: { complete: true, coverage: 1 } }, "Нарушение не обнаружено"],
+    ["clean-coverage-87", { job_id: "f1", status: "done", verdict: "no_violation", violations: [], meta: { complete: true, coverage: 0.87 } }, "Анализ неполный"],
+    ["mock", { job_id: "f1", status: "done", verdict: "no_violation", violations: [], meta: { mock: true, complete: true } }, "Тестовый результат"],
   ]) {
     const c = await browser.newContext({ viewport: { width: 1280, height: 860 } });
     const pg = await c.newPage();
@@ -333,7 +336,10 @@ try {
     await pg.goto(`${url}#/job/f1`);
     await step(`${name}: «${expectText}»`, async () => {
       await pg.getByText(expectText, { exact: false }).first().waitFor({ timeout: 6000 });
-      if (name !== "clean") assert.equal(await pg.getByText("Нарушение не обнаружено").count(), 0, "зелёная формулировка при неполном анализе");
+      const green = await pg.locator("section.bg-gradient-to-br.from-emerald-600").count();
+      assert.equal(green, name === "clean-complete" ? 1 : 0, `зелёный баннер: ${green} (ожидался только при подтверждённой полноте)`);
+      if (!name.startsWith("clean-u") && name !== "clean-complete")
+        assert.equal(await pg.getByRole("heading", { name: "Нарушение не обнаружено" }).count(), 0, "формулировка «не обнаружено» при неполном/mock");
       await pg.waitForTimeout(600);
       if (name === "failed") await pg.screenshot({ path: path.join(shots, "12-failed.png") });
       if (name === "partial") await pg.screenshot({ path: path.join(shots, "13-partial.png") });

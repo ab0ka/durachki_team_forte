@@ -139,6 +139,19 @@ function demoTimeline(): TimelinePoint[] {
   return pts;
 }
 
+// Синтетические записи стадий (формат meta.stages A03) — для панели «Полнота анализа» в демо.
+const DEMO_STAGES_META = {
+  ingest: { status: "ok", seconds: 3.1, required: true },
+  detect: { status: "ok", seconds: 11.4, required: true },
+  track: { status: "ok", seconds: 1.2 },
+  pose: { status: "ok", seconds: 4.6 },
+  scene: { status: "ok", seconds: 0.8 },
+  rules: { status: "ok", seconds: 0.1, required: true },
+  temporal: { status: "ok", seconds: 2.9 },
+  vlm_verify: { status: "ok", seconds: 9.7 },
+  fusion: { status: "ok", seconds: 0.6, required: true },
+};
+
 // Нормы в демо — заглушки: реальные ссылки приходят только из norms/catalog.yaml (A13).
 const DEMO_RULE_NOTE =
   "[ДЕМО] Здесь показывается дословная цитата пункта нормы из norms/catalog.yaml (A13). В демо-режиме текст нормы не подставляется, чтобы не выдумывать пункты.";
@@ -225,6 +238,10 @@ export function buildDemoResult(jobId = "demo"): JobResult {
       ],
       warnings: ["Демо-режим: результат сгенерирован в браузере, сервер не используется."],
       device: "demo",
+      complete: true,
+      coverage: 1,
+      required_stages: ["ingest", "detect", "rules", "fusion"],
+      stages: DEMO_STAGES_META,
       ui: {
         review_hints: [
           {
@@ -256,6 +273,10 @@ export function buildDemoClean(jobId = "demo-clean"): JobResult {
       duration: DEMO_DURATION,
       file_name: "demo_clean.mov",
       timings: { total: 28.2 },
+      complete: true,
+      coverage: 1,
+      required_stages: ["ingest", "detect", "rules", "fusion"],
+      stages: DEMO_STAGES_META,
       ui: {
         review_hints: [
           {
