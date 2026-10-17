@@ -245,8 +245,9 @@ def warmup() -> None:
 
 def _run(ctx: RunContext) -> AnalysisResult:
     cfg = ctx.cfg
-    if cfg.get("mock"):
-        os.environ["SENTINEL_MOCK"] = "1"
+    # mock НЕ включается мутацией os.environ: это глобальный эффект процесса API (следующие задачи
+    # ушли бы в mock). Модулям mock передаётся только через env процесса-воркера (ProcessExecutor)
+    # или явным SENTINEL_MOCK=1 / --mock на уровне процесса.
     ctx.report(STAGES["ingest"].label, 0.0)
     path = Path(ctx.video_path)
     if not path.is_file():
