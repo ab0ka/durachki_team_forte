@@ -32,14 +32,18 @@ from .common import REPO_ROOT, list_videos, load_config, normalize_video_id, rea
 
 # ----------------------------------------------------------------------------- сериализация
 def result_to_api(result: Any) -> dict:
+    """Сериализатор A01 (политика вердикта: no_violation только при подтверждённой полноте и т.д.).
+
+    Fallback на asdict — ТОЛЬКО если модуля A01 нет (автономная ветка). Исключение самого сериализатора
+    не маскируется: вызывающий записывает видео как failed с причиной (production-политику не обходим).
+    """
     try:
         from contracts.serialize import result_to_api as _r  # type: ignore
-
-        return _r(result)
-    except Exception:  # noqa: BLE001 — A01 ещё не смерджен: asdict(AnalysisResult) ⊇ схема ТЗ
+    except ImportError:  # A01 не смерджен: asdict(AnalysisResult) ⊇ схема ТЗ
         from .common import to_jsonable
 
         return to_jsonable(result)
+    return _r(result)
 
 
 def _full_meta(result: Any) -> dict:
@@ -66,6 +70,15 @@ class InprocRunner:
             except Exception as e:  # noqa: BLE001
                 print(f"warmup: {e}", file=sys.stderr)
 
+    def close(self) -> None:
+        """Остановить воркер пайплайна (A03 release_gpu): иначе процесс eval ждёт его на выходе."""
+        rel = getattr(self.pipeline, "release_gpu", None)
+        if callable(rel):
+            try:
+                rel()
+            except Exception as e:  # noqa: BLE001 — метрики уже посчитаны; сообщаем, не маскируем
+                print(f"release_gpu: {e!r}", file=sys.stderr)
+
     def run_one(self, path: Path, video_id: str) -> tuple[dict, dict]:
         from .protocol import VramSampler, torch_peak_mb
 
@@ -88,8 +101,8 @@ class InprocRunner:
             api = {"job_id": job_id, "status": "failed", "verdict": None, "violations": [], "error": repr(e)[:500]}
             info["error"] = repr(e)[:500]
         info["latency_s"] = round(time.perf_counter() - t0, 3)
-        info["vram_peak_mb"] = sampler.peak_mb            # вся карта (nvidia-smi); None без nvidia-smi
-        info["vram_torch_peak_mb"] = torch_peak_mb()       # только этот процесс (torch уже импортирован пайплайном)
+        info.update(sampler.as_info())                     # устройство: все процессы (nvidia-smi); None — не измерено
+        info["vram_eval_process_peak_mb"] = torch_peak_mb()  # процесс eval (при --inline у A03 — и пайплайн)
         return api, info
 
 
@@ -101,6 +114,9 @@ class ApiRunner:
         self.url, self.key, self.cfg, self.raw = url.rstrip("/"), key, cfg, raw
         r = cfg.get("runner") or {}
         self.poll_s, self.timeout_s = float(r.get("api_poll_s", 2.0)), float(r.get("api_timeout_s", 600))
+
+    def close(self) -> None:
+        self.s.close()
 
     def run_one(self, path: Path, video_id: str) -> tuple[dict, dict]:
         info: dict[str, Any] = {"video_id": video_id, "file": str(path), "mode": "api"}
@@ -137,7 +153,7 @@ class ApiRunner:
             info["error"] = f"timeout {self.timeout_s:.0f} s (status={api.get('status')})"
         info["latency_s"] = round(time.perf_counter() - t_acc, 3)  # от приёма, включая очередь
         sampler.__exit__()
-        info["vram_peak_mb"] = sampler.peak_mb
+        info.update(sampler.as_info())   # устройство целиком; процесс/воркер — из meta ответа (если сервис отдаёт)
         return api, info
 
 
@@ -236,14 +252,17 @@ def run_folder(videos: list[tuple[str, Path]], out_dir: Path, cfg: dict, mode: s
         results = run_cli_batch(todo, out_dir, cfg, raw)
     else:
         runner = ApiRunner(api_url, api_key, cfg, raw) if mode == "api" else InprocRunner(cfg, raw)
-        for i, (vid, p) in enumerate(todo, 1):
-            api, info = runner.run_one(p, vid)
-            results[vid] = (api, info)
-            log(f"[{i}/{len(todo)}] {vid}: {api.get('status')} {api.get('verdict')} "
-                f"{info.get('latency_s')} с {('ОШИБКА ' + info['error']) if info.get('error') else ''}")
-            write_json(preds_dir / f"{vid}.json", api)
-            runinfo[vid] = info
-            write_json(runinfo_path, runinfo)
+        try:
+            for i, (vid, p) in enumerate(todo, 1):
+                api, info = runner.run_one(p, vid)
+                results[vid] = (api, info)
+                log(f"[{i}/{len(todo)}] {vid}: {api.get('status')} {api.get('verdict')} "
+                    f"{info.get('latency_s')} с {('ОШИБКА ' + info['error']) if info.get('error') else ''}")
+                write_json(preds_dir / f"{vid}.json", api)
+                runinfo[vid] = info
+                write_json(runinfo_path, runinfo)
+        finally:
+            runner.close()
     for vid, (api, info) in results.items():
         write_json(preds_dir / f"{vid}.json", api)
         runinfo[vid] = info
@@ -287,6 +306,18 @@ def write_scores_raw(out_dir: Path, labels_csv: Optional[str | Path]) -> Optiona
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    """Флаги пайплайна (--env, --pipeline-config, raw) действуют только на время прогона: окружение процесса
+    восстанавливается при выходе (вызов из тестов/ablate --inproc-arms не оставляет SENTINEL_* после себя)."""
+    saved = dict(os.environ)
+    try:
+        return _main(argv)
+    finally:
+        for k in [k for k in os.environ if k not in saved]:
+            del os.environ[k]
+        os.environ.update(saved)
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Прогон папки через пайплайн + метрики")
     ap.add_argument("--videos", default="data/raw", help="папка видео (L1: data/raw)")
     ap.add_argument("--labels", default="data/labels.csv")

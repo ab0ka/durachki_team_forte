@@ -195,3 +195,64 @@ def load_schema_file(path: str | Path) -> dict:
     import json
 
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+# ----------------------------------------------------------------------------- полнота анализа (канон A01)
+def _f(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def min_coverage_ratio(cfg: Optional[dict] = None) -> float:
+    """Порог полноты для «нет нарушения»: eval config coverage.min, иначе A01 (contracts/config.yaml), иначе 0.98."""
+    v = ((cfg or {}).get("coverage") or {}).get("min")
+    if v is not None:
+        return float(v)
+    try:
+        from contracts.serialize import load_config as _a01_config  # type: ignore
+    except ImportError:
+        return 0.98
+    return float(_a01_config()["coverage"]["min_ratio_for_no_violation"])
+
+
+def coverage_ratio(meta: Optional[dict]) -> Optional[float]:
+    """Доля проанализированного видео: канон A01 — meta.coverage.ratio; legacy — число. None — не сообщено."""
+    cov = (meta or {}).get("coverage")
+    if isinstance(cov, dict):
+        return _f(cov.get("ratio"))
+    return _f(cov)
+
+
+def coverage_problem(meta: Optional[dict], cfg: Optional[dict] = None) -> Optional[str]:
+    """None — полнота подтверждена и «нет нарушения» допустимо; иначе причина (как contracts.extensions A01).
+
+    Если модуль A01 есть — используется он (одна семантика с production-сериализатором); иначе зеркало его правил.
+    coverage.require=false — только для старых прогонов без coverage (отсутствие тогда не считается проблемой).
+    """
+    meta = meta or {}
+    require = bool(((cfg or {}).get("coverage") or {}).get("require", True))
+    if meta.get("coverage") is None and not require and meta.get("complete") is not False:
+        return None
+    min_ratio = min_coverage_ratio(cfg)
+    try:
+        from contracts.extensions import coverage_problem as _a01_problem, mock_allowed  # type: ignore
+    except ImportError:
+        _a01_problem = None
+    if _a01_problem is not None:
+        return _a01_problem(meta, min_ratio, mock_allowed())
+    if meta.get("complete") is False:
+        return "оркестратор сообщил незавершённый анализ (meta.complete=false)"
+    cov = meta.get("coverage")
+    if cov is None:
+        return "полнота анализа не подтверждена: нет meta.coverage"
+    ratio = coverage_ratio(meta)
+    if ratio is None:
+        return "meta.coverage.ratio не задан"
+    if ratio + 1e-9 < min_ratio:
+        return f"проанализировано {ratio:.0%} видео (< {min_ratio:.0%})"
+    if isinstance(cov, dict) and cov.get("complete") is False:
+        return "meta.coverage.complete=false"
+    return None

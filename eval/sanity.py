@@ -184,7 +184,8 @@ def run_scores(run_dir: str | Path) -> dict[str, dict[str, float]]:
         import json
 
         rows = [json.loads(x) for x in sr.read_text(encoding="utf-8").splitlines() if x.strip()]
-        out["scores_raw_max"] = {r["video_id"]: video_score(r) for r in rows}
+        sc = {r["video_id"]: video_score(r) for r in rows}
+        out["scores_raw_max"] = {k: v for k, v in sc.items() if v is not None}   # нет скора — не 0
     conf = {}
     for vid, api in preds.items():
         cs = [float(v.get("confidence") or 0) for v in (api or {}).get("violations") or [] if isinstance(v, dict)]

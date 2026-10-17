@@ -45,7 +45,9 @@ def record_from_run(run_dir: str | Path, label: Optional[str] = None, role: str 
             "hit_3": (sc.get("hit_events_all") or {}).get("3"), "evidence_ok": sc.get("evidence_ok_all"),
             "extra_candidates": sc.get("extra_candidates_total"), "type_accuracy": sc.get("type_accuracy"),
             "latency_p50": lat.get("median"), "latency_p90": lat.get("p90"), "latency_max": lat.get("max"),
-            "vram_peak_mb": sc.get("vram_peak_mb_max"), "proxy_score": proxy.get("proxy_score"),
+            "vram_process_peak_mb": sc.get("vram_process_peak_mb_max"),
+            "vram_device_peak_mb": sc.get("vram_device_peak_mb_max"), "mock_results": sc.get("mock_results"),
+            "proxy_score": proxy.get("proxy_score"),
             "median_abs_dt": ((s.get("localization") or {}).get("abs_dt_matched") or {}).get("median"),
         },
     }
@@ -131,10 +133,12 @@ def render_html(runs_all: list[dict], title: str = "Kassa Sentinel — журн�
         _chart(runs, [("fn", "var(--s1)", "FN (пропуски)"), ("fp", "var(--s2)", "FP (ложные)")], "Ошибки по видео", "шт."),
         _chart(runs, [("hit_2", "var(--s1)", "hit@2")], "Попадание таймкода ±2 с", "доля"),
         _chart(runs, [("latency_p90", "var(--s1)", "p90")], "Латентность p90", "с"),
-        _chart(runs, [("vram_peak_mb", "var(--s1)", "VRAM")], "Пик VRAM", "МБ"),
+        _chart(runs, [("vram_process_peak_mb", "var(--s1)", "процесс/воркер пайплайна"),
+                      ("vram_device_peak_mb", "var(--s2)", "устройство (все процессы)")], "Пик VRAM", "МБ"),
     ]
     cols = ["label", "role", "n", "fn", "fp", "recall", "precision", "hit_1", "hit_2", "hit_3", "evidence_ok", "failed",
-            "partial", "timeouts", "latency_p90", "vram_peak_mb", "proxy_score"]
+            "partial", "timeouts", "latency_p90", "vram_process_peak_mb", "vram_device_peak_mb", "mock_results",
+            "proxy_score"]
     rows = []
     for i, r in enumerate(runs, 1):
         m = r["metrics"]
@@ -187,7 +191,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 continue
             m: dict[str, Any] = r["metrics"]
             print(f"{i:3d} {str(r.get('label'))[:40]:40s} FN={m.get('fn')} FP={m.get('fp')} hit@2={m.get('hit_2')} "
-                  f"p90={m.get('latency_p90')} VRAM={m.get('vram_peak_mb')} git={r['protocol'].get('git_sha')}")
+                  f"p90={m.get('latency_p90')} VRAM процесс={m.get('vram_process_peak_mb')} "
+                  f"устройство={m.get('vram_device_peak_mb')} git={r['protocol'].get('git_sha')}")
     else:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(render_html(load(args.log)), encoding="utf-8")
