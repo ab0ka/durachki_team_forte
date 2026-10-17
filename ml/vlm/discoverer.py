@@ -191,6 +191,7 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
             ))
 
     events = _merge(found, float(dcfg.get("merge_gap_s", 1.5)))
+    rv: Optional[dict[str, Any]] = None
     if events and do_reverify and budget.remaining() > 0:
         from .verifier import verify_events
 
@@ -205,7 +206,8 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
             "max_output_tokens_per_call": lim.max_output_tokens_per_call,
         }
         checked = verify_events(clip, events, budget.remaining(), cfg=cfg, backend=backend, limits=left,
-                                catalog=catalog, clock=clock)
+                                catalog=catalog, clock=clock, dump=dump)
+        rv = next((e.extra.get("vlm", {}).get("budget") for e in checked if e.extra.get("vlm", {}).get("budget")), None)
         kept = []
         for e in checked:
             agr = (e.extra.get("vlm") or {}).get("agreement")
@@ -217,6 +219,11 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
         events = kept
     events = sorted(events, key=lambda e: -e.confidence)[: int(dcfg.get("max_events", 4))]
     summary = budget.summary()
+    if rv:  # учитываем вызовы повторной проверки в общем отчёте
+        for k in ("calls", "retries", "visual_tokens", "output_tokens"):
+            summary[k] = int(summary.get(k) or 0) + int(rv.get(k) or 0)
+        summary["elapsed_s"] = round(budget.elapsed(), 3)
+        summary["reverify_calls"] = int(rv.get("calls") or 0)
     summary["windows_planned"] = len(wins)
     summary["windows_done"] = windows_done
     for e in events:

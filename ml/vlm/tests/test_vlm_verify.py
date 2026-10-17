@@ -129,3 +129,19 @@ def test_no_raw_text_in_extra_by_default(clip, cfg, clock):
 
 def test_empty_events(clip, cfg):
     assert verify_events(clip, [], 10.0, cfg=cfg) == []
+
+
+def test_retyped_event_does_not_share_result_with_other_type(clip, cfg, clock):
+    ans_v06 = _ans(True, "V06", 0.9, ["Кассир пьёт из чашки у стола"])
+    evs = [_ev("V05", 5.0, 0.5, "temporal"), _ev("V06", 5.1, 0.45, "rules")]
+    be = MockBackend(responses=[ans_v06, ans_v06], clock=clock)
+    out = verify_events(clip, evs, 30.0, cfg=cfg, backend=be, clock=clock)
+    assert out[0].type_id == "V06" and out[0].extra["vlm"]["retyped"]
+    assert len(be.calls) == 2  # V06-событие проверено своим вызовом, а не результатом про V05
+    assert out[1].extra["vlm"]["shared"] is False and out[1].extra["vlm"]["agreement"] == "supports"
+
+
+def test_nan_confidence_is_neutral_prior(clip, cfg, clock):
+    be = MockBackend(mode="neutral", clock=clock)
+    out = verify_events(clip, [_ev(conf=float("nan"))], 30.0, cfg=cfg, backend=be, clock=clock)[0]
+    assert out.confidence == 0.5

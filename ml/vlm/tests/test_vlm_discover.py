@@ -50,6 +50,8 @@ def test_finding_becomes_low_prior_event_and_is_reverified(clip, cfg, clock):
     assert e.facts and e.extra["vlm_discover"]["item"] == "phone"
     assert e.extra["vlm"]["stage"] == "discover+verify" and e.extra["vlm"]["agreement"] == "supports"
     assert len(be.calls) <= cfg["budget"]["discover"]["max_calls"]  # reverify — в том же общем лимите
+    b = e.extra["vlm"]["budget"]
+    assert b["calls"] == len(be.calls) and b["reverify_calls"] == 1  # отчёт включает вызов reverify
 
 
 def test_finding_without_concrete_fact_is_dropped(clip, cfg, clock):

@@ -103,12 +103,13 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
     duration = clip_duration(clip)
     n_frames = max(1, min(int(fcfg.get("verify_n_frames", 5)), lim.max_frames_per_call))
     dedupe_iou = float(vcfg.get("dedupe_iou_s", 0.6))
-    done: list[tuple[Event, dict[str, Any]]] = []  # (проверенное событие, результат) для дедупликации
+    # (исходный тип, снимок времён, результат) — для дедупликации; тип берём ДО возможной переклассификации
+    done: list[tuple[str, Event, dict[str, Any]]] = []
 
     for i in _order(out, str(vcfg.get("priority", "uncertain_first"))):
         ev = out[i]
         orig_type = ev.type_id
-        shared = next((r for (e2, r) in done if e2.type_id == orig_type and _overlap(e2, ev) >= dedupe_iou), None)
+        shared = next((r for (t2, e2, r) in done if t2 == orig_type and _overlap(e2, ev) >= dedupe_iou), None)
         if shared is not None:
             _apply(ev, shared, types, cfg, ffcfg, shared_from=True)
             continue
@@ -151,8 +152,9 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
         res["_latency_s"] = round(outcome.latency_s, 3)
         res["_repaired"] = outcome.repaired
         res["_backend"] = backend.info().get("model", backend.name)
+        snap = Event(orig_type, ev.t_start, ev.t_end, ev.t_peak, ev.confidence, ev.source)
         _apply(ev, res, types, cfg, ffcfg)
-        done.append((ev, res))
+        done.append((orig_type, snap, res))
 
     drop_below = vcfg.get("drop_below")
     if drop_below is not None:

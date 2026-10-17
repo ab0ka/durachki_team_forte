@@ -53,7 +53,9 @@ def update_confidence(p_prior: float, visible: bool, conf: float, candidate_type
     clip = tuple(vcfg.get("p_vlm_clip", (0.05, 0.95)))
     thr = float(vcfg.get("agree_threshold", 0.6))
     max_raise = float(vcfg.get("max_raise", 0.25))
-    p0 = clamp(float(p_prior), 0.0, 1.0)
+    p0 = float(p_prior)
+    p0 = 0.5 if not math.isfinite(p0) else clamp(p0, 0.0, 1.0)  # NaN/inf от источника -> нейтральный приор
+    conf = float(conf) if math.isfinite(float(conf)) else 0.5
     if visible and vlm_type and vlm_type != candidate_type:
         return p0, {"p_prior": round(p0, 4), "p_vlm": None, "p_post": round(p0, 4), "agreement": "type_mismatch"}
     pv = p_vlm(bool(visible), float(conf), (float(clip[0]), float(clip[1])))
