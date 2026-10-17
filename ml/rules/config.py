@@ -130,6 +130,7 @@ class RulesConfig:
     emit_insufficient_context: bool = True
     observation_conf_cap: float = 0.45
     insufficient_conf_cap: float = 0.3
+    derived_conf_factor: float = 0.85
     severity_factor: dict[str, float] = field(default_factory=lambda: {"high": 1.0, "medium": 0.97, "low": 0.93})
     known_signals: frozenset[str] = frozenset(SIGNALS)
     source_path: Optional[str] = None
@@ -283,6 +284,7 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         emit_insufficient_context=bool(glob.get("emit_insufficient_context", True)),
         observation_conf_cap=_num(glob, "observation_conf_cap", 0.45, 0, 1, "global."),
         insufficient_conf_cap=_num(glob, "insufficient_conf_cap", 0.3, 0, 1, "global."),
+        derived_conf_factor=_num(glob, "derived_conf_factor", 0.85, 0, 1, "global."),
         severity_factor={str(k): float(v) for k, v in sev.items()},
         known_signals=known,
         source_path=source_path,

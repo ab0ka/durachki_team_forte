@@ -90,7 +90,8 @@ save_cache("cache/", video_id, states, tracks, zones)
 
 - `global`: `ffill_max_s`, `merge_policy`, `derive_from_tracks`, `nms_window_s` (5 с),
   `same_type_merge_gap_s`, `max_events`, `min_confidence`, `require_verified_norm`,
-  `emit_review_observations`, `emit_insufficient_context`, `observation_conf_cap`, `insufficient_conf_cap`.
+  `emit_review_observations`, `emit_insufficient_context`, `observation_conf_cap`, `insufficient_conf_cap`,
+  `derived_conf_factor` (×0.85, если правило опиралось на производные сигналы из треков).
 - `signal_ranges` — диапазон неизвестного значения (по умолчанию `[0, 1]`, `n_persons: [0, 10]`).
 - `signal_defaults` — явные исключения «нет ключа = значение»; по умолчанию пусто.
 - Правило: `id`, `type_id`, `kind` (`violation`/`observation`), `enabled`, `status_reason` (обязательно),
@@ -162,7 +163,7 @@ python -m ml.rules.replay --rules-table
 ## Тесты
 
 ```bash
-python -m pytest ml/rules/tests -q        # 118 тестов, без GPU, весов и данных (~2 с)
+python -m pytest ml/rules/tests -q        # 119 тестов, без GPU, весов и данных (~2 с)
 ```
 
 Синтетика из `ml/rules/synth.py` (без реальных кадров и описаний сцен):
@@ -183,7 +184,7 @@ python -m pytest ml/rules/tests -q        # 118 тестов, без GPU, вес
 - `test_replay.py`: раскладки кэша, CSV (`;`, cp1251, кириллическая Х), сквозной CLI, sweep, таблица правил.
 
 Проверено: Python 3.13 (numpy 2.5.3) и Python 3.11 (numpy 1.26.4, PyYAML 6.0.2, pytest 8.3.3) —
-118/118. **Метрик на реальных роликах нет**: данных в этой среде нет, значения не выдумывались.
+119/119. **Метрик на реальных роликах нет**: данных в этой среде нет, значения не выдумывались.
 
 ## Зависимости, модели, лицензии
 

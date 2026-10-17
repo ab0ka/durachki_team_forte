@@ -349,6 +349,9 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
     t_peak = float(times[ip])
     t_max = float(times[i0 + int(np.argmax(seg))])
     conf, terms = confidence_for(rule, mean_s, max_s, duration, i1 - i0 + 1, sev_factor)
+    if any(n in series.derived for n in rule.names):
+        conf *= cfg.derived_conf_factor  # грубые сигналы из треков — ниже доверие
+        terms["derived_factor"] = cfg.derived_conf_factor
     if assessment == REVIEW:
         conf = min(conf, cfg.observation_conf_cap)
     elif assessment == INSUFFICIENT:
@@ -515,24 +518,30 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
 
     # 2) «могло быть, но не наблюдалось»: якорь доказан, остальное неизвестно
     if rule.anchor is not None and cfg.emit_insufficient_context:
-        absent_inputs = sorted(n for n in rule.strength.names if n in series.absent)
-        if not absent_inputs:
-            anchor_lo = rule.anchor(ctx)
-            possible = (s_hi >= rule.on) & (anchor_lo >= 0.5) & ~definite
-            for i0, i1 in merge_segments(times, mask_to_segments(possible), rule.merge_gap_s):
-                duration = float(times[i1] - times[i0]) + series.dt
-                if duration + 1e-9 < rule.min_duration_s:
-                    continue
-                unknown = [nm for nm in sorted(rule.names) if series.known(nm)[i0:i1 + 1].mean() < 0.5]
-                if not unknown:
-                    continue
-                reasons = ["не наблюдались сигналы: " + ", ".join(SIGNAL_RU.get(n, n) for n in unknown)]
-                ev = _make_event(rule, series, s_hi, i0, i1, INSUFFICIENT, reasons, tracks, zones, catalog, cfg,
-                                 from_anchor=True)
-                candidates.append({"rule_id": rule.id, "type_id": rule.type_id, "t_start": ev.t_start,
-                                   "t_end": ev.t_end, "accepted": True, "assessment": INSUFFICIENT,
-                                   "confidence": ev.confidence, "t_peak": ev.t_peak})
-                events.append(ev)
+        anchor_lo = rule.anchor(ctx)
+        # кадры, где пропал хотя бы один сигнал правила, который в ролике вообще есть
+        partial_unknown = np.zeros(series.n, dtype=bool)
+        for nm in rule.names:
+            if nm not in series.absent:
+                partial_unknown |= ~series.known(nm)
+        possible = (s_hi >= rule.on) & (anchor_lo >= 0.5) & ~definite & partial_unknown
+        for i0, i1 in merge_segments(times, mask_to_segments(possible), rule.merge_gap_s):
+            duration = float(times[i1] - times[i0]) + series.dt
+            if duration + 1e-9 < rule.min_duration_s:
+                continue
+            # только сигналы, которые в ролике есть, но здесь пропали (окклюзия/потеря);
+            # сигнал, отсутствующий во всём ролике (модуль не работал), — предупреждение, не событие
+            unknown = [nm for nm in sorted(rule.names)
+                       if nm not in series.absent and series.known(nm)[i0:i1 + 1].mean() < 0.5]
+            if not unknown:
+                continue
+            reasons = ["не наблюдались сигналы: " + ", ".join(SIGNAL_RU.get(n, n) for n in unknown)]
+            ev = _make_event(rule, series, s_hi, i0, i1, INSUFFICIENT, reasons, tracks, zones, catalog, cfg,
+                             from_anchor=True)
+            candidates.append({"rule_id": rule.id, "type_id": rule.type_id, "t_start": ev.t_start,
+                               "t_end": ev.t_end, "accepted": True, "assessment": INSUFFICIENT,
+                               "confidence": ev.confidence, "t_peak": ev.t_peak})
+            events.append(ev)
     events.sort(key=lambda e: (-_PRIORITY[e.extra["assessment"]], -e.confidence))
     return events[: rule.max_events]
 

@@ -206,3 +206,12 @@ def test_fact_with_unknown_value_is_dropped() -> None:
     evs = [e for e in run_rules(states, [], [], CAT) if e.type_id == "V01"]
     assert evs and len(evs[0].facts) == 1 and "?" not in evs[0].facts[0]
     assert case["type_id"] == "V01"
+
+
+def test_occlusion_with_absent_or_branch_still_insufficient() -> None:
+    """A08 не шлёт workplace_unattended_with_cash; кассир пропал из сигналов (окклюзия) при наличных."""
+    states = make_states(60.0, segments=[(30.0, 42.0, {"cashier_present": None, "cashier_in_workplace": None})],
+                         omit=("workplace_unattended_with_cash",))
+    evs = [e for e in run_rules(states, [], [], CAT) if e.type_id == "V02"]
+    assert evs and all(e.extra["assessment"] == INSUFFICIENT for e in evs)
+    assert all(e.t_start >= 29.0 for e in evs)  # не по всему ролику — только где кассир неизвестен

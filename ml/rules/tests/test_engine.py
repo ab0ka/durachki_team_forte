@@ -107,6 +107,10 @@ def test_derived_signals_from_tracks_when_scene_signal_absent() -> None:
     evs = [e for e in rep.events if e.type_id == "V01"]
     assert evs and evs[0].extra["trace"]["derived_signals"].get("outsider_in_cashier_area") == "tracks"
     assert rep.series.derived.get("outsider_in_cashier_area") == "tracks"
+    assert evs[0].extra["trace"]["confidence_terms"]["derived_factor"] == pytest.approx(0.85)
+    direct = make_states(60.0, segments=[(20.0, 28.0, {"outsider_in_cashier_area": 1.0, "n_persons": 2.0})])
+    ev_direct = next(e for e in run_rules(direct, [], [], CAT) if e.type_id == "V01")
+    assert evs[0].confidence < ev_direct.confidence
 
 
 def test_states_from_two_sources_are_merged() -> None:

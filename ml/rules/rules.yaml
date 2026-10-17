@@ -43,6 +43,7 @@ global:
   emit_insufficient_context: true
   observation_conf_cap: 0.45  # потолок уверенности review_observation (наивный порог 0.5 их не пропустит)
   insufficient_conf_cap: 0.3
+  derived_conf_factor: 0.85   # множитель уверенности, если правило опиралось на производные сигналы из треков
   severity_factor: {high: 1.0, medium: 0.97, low: 0.93}
 
 # Диапазоны для неизвестных значений (по умолчанию [0, 1]).
