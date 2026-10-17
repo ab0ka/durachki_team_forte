@@ -55,10 +55,18 @@ class JobStore:
             self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.executescript(_SCHEMA)
 
-    # ---- базовые операции ----
-    def _exec(self, sql: str, args: Iterable[Any] = ()) -> sqlite3.Cursor:
+    # ---- базовые операции: execute И fetch под одним локом (коннект общий для потоков) ----
+    def _run(self, sql: str, args: Iterable[Any] = ()) -> int:
         with self._lock:
-            return self._conn.execute(sql, tuple(args))
+            return self._conn.execute(sql, tuple(args)).rowcount
+
+    def _one(self, sql: str, args: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(sql, tuple(args)).fetchone()
+
+    def _all(self, sql: str, args: Iterable[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(sql, tuple(args)).fetchall()
 
     def close(self) -> None:
         with self._lock:
@@ -83,7 +91,7 @@ class JobStore:
                sha256: str, client: str = "", video_meta: Optional[dict[str, Any]] = None,
                now: Optional[float] = None) -> dict[str, Any]:
         now = time.time() if now is None else now
-        self._exec(
+        self._run(
             "INSERT INTO jobs (id, status, stage, progress, created_at, queued_at, video_path, "
             "filename, size_bytes, sha256, client, warnings, video_meta) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -92,7 +100,7 @@ class JobStore:
         return self.get(job_id) or {}
 
     def get(self, job_id: str) -> Optional[dict[str, Any]]:
-        return self._row(self._exec("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+        return self._row(self._one("SELECT * FROM jobs WHERE id=?", (job_id,)))
 
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
@@ -105,15 +113,14 @@ class JobStore:
         if "video_meta" in fields and not isinstance(fields["video_meta"], str):
             fields["video_meta"] = json.dumps(fields["video_meta"], ensure_ascii=False)
         cols = ", ".join(f"{k}=?" for k in fields)
-        self._exec(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
+        self._run(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
 
     def mark_running(self, job_id: str, now: Optional[float] = None) -> bool:
         """queued -> running (атомарно). False, если задачу уже финализировали."""
         now = time.time() if now is None else now
-        cur = self._exec(
+        return self._run(
             "UPDATE jobs SET status='running', started_at=?, attempts=attempts+1, stage=? "
-            "WHERE id=? AND status='queued'", (now, "starting", job_id))
-        return cur.rowcount == 1
+            "WHERE id=? AND status='queued'", (now, "starting", job_id)) == 1
 
     def finalize(self, job_id: str, status: str, *, result_path: Optional[str] = None,
                  error: Optional[str] = None, warnings: Optional[list[str]] = None,
@@ -121,45 +128,43 @@ class JobStore:
         """Атомарный переход active -> done/failed. Выигрывает первый (воркер или watchdog)."""
         assert status in FINAL
         now = time.time() if now is None else now
-        cur = self._exec(
+        return self._run(
             "UPDATE jobs SET status=?, finished_at=?, result_path=?, error=?, warnings=?, "
             "progress=CASE WHEN ?='done' THEN 1.0 ELSE progress END, stage=? "
             "WHERE id=? AND status IN ('queued','running')",
             (status, now, result_path, error, json.dumps(warnings or [], ensure_ascii=False),
-             status, status, job_id))
-        return cur.rowcount == 1
+             status, status, job_id)) == 1
 
     def requeue(self, job_id: str, now: Optional[float] = None) -> None:
         now = time.time() if now is None else now
-        self._exec("UPDATE jobs SET status='queued', stage='requeued', progress=0, queued_at=?, "
+        self._run("UPDATE jobs SET status='queued', stage='requeued', progress=0, queued_at=?, "
                    "started_at=NULL WHERE id=?", (now, job_id))
 
     def active(self) -> list[dict[str, Any]]:
-        rows = self._exec("SELECT * FROM jobs WHERE status IN ('queued','running') "
-                          "ORDER BY queued_at, created_at").fetchall()
+        rows = self._all("SELECT * FROM jobs WHERE status IN ('queued','running') "
+                         "ORDER BY queued_at, created_at")
         return [self._row(r) for r in rows if r is not None]  # type: ignore[misc]
 
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self._exec("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
-                          (int(limit),)).fetchall()
+        rows = self._all("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (int(limit),))
         return [self._row(r) for r in rows if r is not None]  # type: ignore[misc]
 
     def finished_before(self, ts: float) -> list[dict[str, Any]]:
-        rows = self._exec("SELECT * FROM jobs WHERE status IN ('done','failed') AND "
-                          "COALESCE(finished_at, created_at) < ?", (ts,)).fetchall()
+        rows = self._all("SELECT * FROM jobs WHERE status IN ('done','failed') AND "
+                         "COALESCE(finished_at, created_at) < ?", (ts,))
         return [self._row(r) for r in rows if r is not None]  # type: ignore[misc]
 
     def find_done_by_sha(self, sha256: str) -> Optional[dict[str, Any]]:
-        r = self._exec("SELECT * FROM jobs WHERE sha256=? AND status='done' "
-                       "ORDER BY finished_at DESC LIMIT 1", (sha256,)).fetchone()
+        r = self._one("SELECT * FROM jobs WHERE sha256=? AND status='done' "
+                      "ORDER BY finished_at DESC LIMIT 1", (sha256,))
         return self._row(r)
 
     def delete(self, job_id: str) -> None:
-        self._exec("DELETE FROM jobs WHERE id=?", (job_id,))
+        self._run("DELETE FROM jobs WHERE id=?", (job_id,))
 
     def count_active(self) -> int:
-        r = self._exec("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')").fetchone()
+        r = self._one("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')")
         return int(r[0]) if r else 0
 
     def ids(self) -> set[str]:
-        return {r[0] for r in self._exec("SELECT id FROM jobs").fetchall()}
+        return {r[0] for r in self._all("SELECT id FROM jobs")}

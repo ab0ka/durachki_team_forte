@@ -17,7 +17,7 @@ budget_s: 270                   # deadline_s = budget_s - ожидание в о
 job_cap_s: 120                  # потолок deadline_s одной задачи (чтобы одна не съела очередь)
 min_deadline_s: 15              # меньше не даём, даже если опаздываем
 fair_share: true                # делить остаток бюджета между ждущими в очереди
-watchdog_s: 285                 # от постановки в очередь: отдаём partial / failed
+watchdog_s: 285                 # от начала загрузки: не успели -> failed (partial.json — только подробности для UI)
 deadline_grace_s: 20            # pipeline.run превысил свой deadline_s на столько -> watchdog
 max_queue: 12                   # backlog: активных (в очереди + в работе) больше -> 503 + Retry-After
 max_attempts: 3                 # перезапусков после падения процесса

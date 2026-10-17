@@ -243,13 +243,13 @@ DEFAULT_PROBES: tuple[DecoderProbe, ...] = (_probe_cv2, _probe_av, _probe_ffprob
 
 
 def validate_video(path: Path, mode: str = "required",
-                   probes: tuple[DecoderProbe, ...] = DEFAULT_PROBES) -> dict[str, Any]:
+                   probes: Optional[tuple[DecoderProbe, ...]] = None) -> dict[str, Any]:
     """Открыть файл декодером и прочитать хотя бы один кадр. UploadError(415) если не видео,
     UploadError(503) если в режиме required нет ни одного декодера."""
     info = probe_mp4(path)
     if mode == "off":
         return info
-    for probe in probes:
+    for probe in (DEFAULT_PROBES if probes is None else probes):
         r = probe(path)
         if r is not None:
             info.update({k: v for k, v in r.items() if v is not None})
