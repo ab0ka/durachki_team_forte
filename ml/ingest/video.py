@@ -732,10 +732,15 @@ class Clip:
     def frames_at(self, times: Sequence[float]) -> list[FrameRef]:
         """Несколько точных кадров за один проход (отсортировано внутри, порядок ответа = порядок times)."""
         req = [float(t) for t in times]
+        t_max = self.source_times[-1] if self.source_times else math.inf
+
+        def key_of(t: float) -> float:  # вне [0, последний PTS] -> крайний кадр
+            return round(min(max(0.0, t), t_max), 4)
+
         found: dict[float, tuple[np.ndarray, float]] = {}
         missing = []
         for t in req:
-            key = round(max(0.0, t), 4)
+            key = key_of(t)
             hit = self._exact.get(key)
             if hit is not None:
                 found[key] = hit
@@ -751,7 +756,7 @@ class Clip:
                     self._exact.put(key, (img, ts), img.nbytes)
         out = []
         for t in req:
-            img, ts = found[round(max(0.0, t), 4)]
+            img, ts = found[key_of(t)]
             out.append(FrameRef(img.copy() if self._copy else img, float(ts), t))
         return out
 
