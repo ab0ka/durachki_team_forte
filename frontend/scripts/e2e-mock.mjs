@@ -315,6 +315,39 @@ try {
     await c.close();
   }
 
+  // ---------- сценарий 1д: последовательный просмотр эпизодов (синтетическое демо, виртуальный плеер) ----------
+  {
+    const c = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const pg = await c.newPage();
+    await pg.goto(`${url}?demo=1#/job/demo`);
+    const clock = () => pg.locator("div.font-mono.text-sm span.font-semibold").first().innerText();
+    await step("«Смотреть эпизод» проигрывает с запасом до начала", async () => {
+      await pg.getByRole("button", { name: "Смотреть эпизод" }).click();
+      await pg.waitForTimeout(150);
+      const a = await clock();
+      assert.ok(a.startsWith("00:16"), `старт ${a} (ожидался t_start−2 = 00:16)`);
+      await pg.waitForTimeout(1200);
+      const b = await clock();
+      assert.notEqual(a, b, "время не идёт — воспроизведение не началось");
+    });
+    await step("«›» — следующий эпизод: пауза на кадре таймкода, счётчик «2 из 2»", async () => {
+      await pg.getByRole("button", { name: "Следующий эпизод" }).click();
+      await pg.waitForTimeout(200);
+      const a = await clock();
+      assert.equal(a, "00:47.8");
+      await pg.waitForTimeout(900);
+      assert.equal(await clock(), "00:47.8", "после перехода воспроизведение должно стоять на паузе");
+      await pg.getByText("Эпизод 2 из 2", { exact: false }).waitFor({ timeout: 2000 });
+    });
+    await step("отметка «просмотрено» переживает перезагрузку", async () => {
+      await pg.getByRole("button", { name: "Отметить просмотренным" }).click();
+      await pg.getByText("просмотрено 1 из 2", { exact: false }).waitFor({ timeout: 2000 });
+      await pg.reload();
+      await pg.getByText("просмотрено 1 из 2", { exact: false }).waitFor({ timeout: 5000 });
+    });
+    await c.close();
+  }
+
   // ---------- сценарий 2: failed и неполный анализ не зелёные ----------
   for (const [name, body, expectText] of [
     ["failed", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "синтетическая ошибка" }, "Анализ не завершён"],
