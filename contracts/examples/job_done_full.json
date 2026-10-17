@@ -36,9 +36,21 @@
         "url": "https://adilet.zan.kz/rus/docs/<id из norms/catalog.yaml>",
         "quote": "<дословная цитата из norms/catalog.yaml>",
         "verified": false
+      },
+      "extra": {
+        "provenance": {
+          "sources": [
+            "rules",
+            "vlm"
+          ]
+        }
       }
     }
   ],
+  "verdict_state": "violation",
+  "analysis_complete": true,
+  "candidates": [],
+  "warnings": [],
   "progress": 1.0,
   "stage": "done",
   "timeline": [
@@ -65,16 +77,55 @@
   ],
   "meta": {
     "version": "0.1.0",
-    "contract": "1",
     "duration_sec": 48.3,
+    "progress": 1.0,
+    "stage": "done",
+    "completeness": {
+      "complete": true,
+      "analyzed_until_sec": 48.3,
+      "duration_sec": 48.3,
+      "stages": {
+        "ingest": "ok",
+        "detect": "ok",
+        "rules": "ok",
+        "vlm": "skipped"
+      },
+      "required_stages": [
+        "ingest",
+        "detect",
+        "rules"
+      ],
+      "reason": null
+    },
+    "provenance": {
+      "pipeline_version": "0.1.0",
+      "contract_version": "1",
+      "mock": false,
+      "models": [
+        {
+          "name": "<см. models.json модулей>"
+        }
+      ],
+      "sources": [
+        "rules",
+        "fusion"
+      ]
+    },
     "timings": {
       "ingest": 1.2,
       "detect": 9.8,
       "total": 31.5
     },
-    "models": [
-      "<см. models.json модулей>"
-    ],
-    "warnings": []
+    "warnings": [],
+    "violation_extra": [
+      {
+        "provenance": {
+          "sources": [
+            "rules",
+            "vlm"
+          ]
+        }
+      }
+    ]
   }
 }

@@ -10,7 +10,9 @@ import pytest
 from contracts import validate as V
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
-JOB_EXAMPLES = ["job_done_tz", "job_done_full", "job_processing", "job_no_violation", "job_failed"]
+JOB_EXAMPLES = ["job_done_tz", "job_done_full", "jury_done_full", "job_processing", "job_no_violation", "job_failed",
+                "ui_processing", "ui_failed"]
+JURY_EXAMPLES = ["job_done_tz", "jury_done_full", "job_processing", "job_no_violation", "job_failed"]
 
 
 def _load(name: str) -> dict:
@@ -29,6 +31,44 @@ def test_schema_is_valid_draft_2020_12():
 @pytest.mark.parametrize("name", JOB_EXAMPLES)
 def test_examples_are_valid(name):
     assert V.job_response_errors(_load(name)) == []
+
+
+@pytest.mark.parametrize("name", JURY_EXAMPLES)
+def test_jury_examples_pass_strict(name):
+    assert V.jury_response_errors(_load(name)) == []
+
+
+@pytest.mark.parametrize("name", ["job_done_full", "ui_processing", "ui_failed"])
+def test_ui_reports_fail_strict(name):
+    assert V.job_response_errors(_load(name), strict=True) != []
+
+
+def test_strict_schema_is_valid_and_closed():
+    jsonschema = pytest.importorskip("jsonschema")
+    strict = V.load_schema(strict=True)
+    jsonschema.Draft202012Validator.check_schema(strict)
+    assert strict["additionalProperties"] is False
+    assert set(strict["properties"]) == {"job_id", "status", "verdict", "violations"}
+    assert V.load_schema()["additionalProperties"] is True  # кэш не испорчен
+
+
+def test_jury_semantic_errors():
+    d = _load("job_done_tz")
+    d["violations"][0]["timecode_sec"] = float("nan")
+    assert any("конечное" in e for e in V.jury_response_errors(d))
+    d = _load("job_done_tz")
+    d["violations"][0]["evidence_frames"][0]["image_base64"] = "iVBORw0KGgo="
+    assert any("не JPEG" in e for e in V.jury_response_errors(d))
+    d = _load("job_done_tz")
+    d["violations"][0]["evidence_frames"] *= 4
+    assert any("кадров" in e for e in V.jury_response_errors(d))
+    assert any("длительности" in e for e in V.jury_response_errors(_load("job_done_tz"), duration=10.0))
+    d = _load("job_failed")
+    d["verdict"] = "no_violation"
+    assert any("фиктивного" in e for e in V.jury_response_errors(d))
+    d = _load("job_no_violation")
+    d["violations"] = _load("job_done_tz")["violations"]
+    assert any("ложным" in e for e in V.jury_response_errors(d))
 
 
 def test_analyze_response():
@@ -102,9 +142,12 @@ def test_fallback_validator_without_jsonschema(case, monkeypatch):
 
 def test_consistency_warnings():
     assert V.check_consistency(_load("job_done_full")) == []
-    d = _load("job_done_tz")
+    d = _load("job_done_full")
+    d["violations"][0]["type_id"] = ""
+    d["violations"][0]["rules"] = []
     warns = V.check_consistency(d)
     assert any("type_id" in w for w in warns) and any("rules" in w for w in warns)
+    assert V.check_consistency(_load("job_done_tz")) == []  # строгий ответ: нет type_id/rules — не предупреждаем
     d["verdict"] = "no_violation"
     assert any("ложным" in w for w in V.check_consistency(d))
     d = _load("job_done_full")
@@ -122,5 +165,6 @@ def test_cli(tmp_path, capsys):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"job_id": "x"}), encoding="utf-8")
     assert V.main([str(bad)]) == 1
-    assert V.main(["--strict", str(EXAMPLES / "job_done_tz.json")]) == 1
+    assert V.main(["--jury", str(EXAMPLES / "job_done_tz.json")]) == 0
+    assert V.main(["--jury", str(EXAMPLES / "job_done_full.json")]) == 1
     assert "FAIL" in capsys.readouterr().out
