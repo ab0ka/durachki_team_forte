@@ -105,6 +105,66 @@ def _keys_state(environ: dict, data_dir: Path) -> tuple[str, str]:
     return "warn", "ключ не задан: A02 сгенерирует data/api_keys.txt — передайте его жюри"
 
 
+_TRUE, _FALSE = {"1", "true", "yes", "on"}, {"0", "false", "no", "off"}
+A02_KEYS = ("workers", "gpu_slots", "warmup", "allow_mock", "fake_pipeline", "pipeline", "budget_s", "watchdog_s",
+            "job_cap_s", "warmup_wait_s", "hung_gpu_s", "min_coverage", "jury_profile", "partial_accept")
+
+
+def _yaml(path: Path) -> dict:
+    import yaml
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _envval(raw: str, current: Any) -> Any:
+    v = raw.strip()
+    if isinstance(current, bool) or v.lower() in _TRUE | _FALSE:
+        return v.lower() in _TRUE
+    try:
+        return int(v) if v.lstrip("-").isdigit() else float(v)
+    except ValueError:
+        return v
+
+
+def effective_a02(root: Path, environ: dict) -> Optional[dict]:
+    """Как backend/api/config.py: config.yaml (или SENTINEL_API_CONFIG) < env SENTINEL_<KEY> (+ алиас DEADLINE_S)."""
+    path = Path(environ.get("SENTINEL_API_CONFIG") or root / "backend" / "api" / "config.yaml")
+    if not path.is_file():
+        return None
+    cfg = _yaml(path)
+    out = {k: cfg.get(k) for k in A02_KEYS}
+    if environ.get("SENTINEL_DEADLINE_S") and not environ.get("SENTINEL_BUDGET_S"):
+        out["budget_s"] = _envval(environ["SENTINEL_DEADLINE_S"], out.get("budget_s"))
+    for k in A02_KEYS:
+        if environ.get("SENTINEL_" + k.upper()):
+            out[k] = _envval(environ["SENTINEL_" + k.upper()], out.get(k))
+    return out
+
+
+def effective_a03(root: Path, environ: dict) -> Optional[dict]:
+    """backend/pipeline/config.yaml + оверлей SENTINEL_PIPELINE_CONFIG + SENTINEL_EXECUTOR / SENTINEL_MOCK."""
+    path = root / "backend" / "pipeline" / "config.yaml"
+    if not path.is_file():
+        return None
+    cfg = _yaml(path)
+    mode = (cfg.get("executor") or {}).get("mode")
+    mock = cfg.get("mock")
+    wdl = (cfg.get("warmup") or {}).get("deadline_s")
+    extra = environ.get("SENTINEL_PIPELINE_CONFIG")
+    if extra and Path(extra).is_file():
+        over = _yaml(Path(extra))
+        mode = (over.get("executor") or {}).get("mode", mode)
+        mock = over.get("mock", mock)
+        wdl = (over.get("warmup") or {}).get("deadline_s", wdl)
+    if environ.get("SENTINEL_EXECUTOR"):
+        mode = environ["SENTINEL_EXECUTOR"].strip()
+    if environ.get("SENTINEL_MOCK"):
+        mock = environ["SENTINEL_MOCK"].strip().lower() in _TRUE
+    return {"executor_mode": mode, "mock": bool(mock), "warmup_deadline_s": wdl}
+
+
 def run_checks(cfg: dict[str, Any], root: Path = REPO_ROOT, environ: Optional[dict] = None,
                probes: Optional[Probes] = None) -> list[Check]:
     environ = dict(os.environ if environ is None else environ)
@@ -206,6 +266,36 @@ def run_checks(cfg: dict[str, Any], root: Path = REPO_ROOT, environ: Optional[di
     if mode == "named":
         add("tunnel-token", "ok" if environ.get("TUNNEL_TOKEN") else "fail",
             "TUNNEL_TOKEN задан" if environ.get("TUNNEL_TOKEN") else "named tunnel без TUNNEL_TOKEN")
+
+    a02 = effective_a02(root, environ)
+    if a02 is None:
+        add("a02:config", "fail", "нет backend/api/config.yaml — production gate не проверить")
+    else:
+        single = a02.get("workers") == 1 and a02.get("gpu_slots") == 1
+        add("a02:single-worker", "ok" if single else "fail",
+            f"workers={a02.get('workers')} gpu_slots={a02.get('gpu_slots')} (нужно 1/1: один GPU-воркер)")
+        add("a02:warmup", "ok" if a02.get("warmup") is True else "fail",
+            f"warmup={a02.get('warmup')} — без прогрева /readyz=ready ничего не доказывает")
+        real = (a02.get("fake_pipeline") is not True and a02.get("allow_mock") is not True
+                and str(a02.get("pipeline") or "").startswith("backend.pipeline"))
+        add("a02:real-pipeline", "ok" if real else "fail",
+            f"pipeline={a02.get('pipeline')} fake_pipeline={a02.get('fake_pipeline')} allow_mock={a02.get('allow_mock')}")
+    a03 = effective_a03(root, environ)
+    if a03 is None:
+        add("a03:config", "fail", "нет backend/pipeline/config.yaml")
+    else:
+        add("a03:executor", "ok" if a03["executor_mode"] == "process" else "fail",
+            f"executor.mode={a03['executor_mode']} (process: один процесс-владелец GPU, kill по таймауту "
+            f"освобождает VRAM; inline — не для прода)")
+        add("a03:mock", "fail" if a03["mock"] else "ok", f"mock={a03['mock']}")
+    measured = bool(svc.get("budgets_measured_on_gpu"))
+    budgets = {k: (a02 or {}).get(k) for k in ("budget_s", "watchdog_s", "job_cap_s", "warmup_wait_s", "hung_gpu_s")}
+    budgets.update({"a03.warmup.deadline_s": (a03 or {}).get("warmup_deadline_s"),
+                    "deploy.ready_timeout_s": svc.get("ready_timeout_s"),
+                    "deploy.trial_job_limit_s": svc.get("trial_job_limit_s")})
+    add("budgets", "ok" if measured else "warn",
+        ("замерено на GPU L2: " if measured else "UNMEASURED на GPU L2 (цифры из конфигов, не замеры): ")
+        + ", ".join(f"{k}={v}" for k, v in budgets.items()))
 
     for var, bad in (pf.get("forbid_env") or {}).items():
         if (environ.get(var) or "").strip() == str(bad):

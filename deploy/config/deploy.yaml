@@ -46,8 +46,9 @@ service:
   host: 127.0.0.1           # снаружи — только через туннель
   port: 8000
   app: backend.api.main:app
-  ready_timeout_s: 900      # /readyz (warmup A02) + пробная задача
-  trial_job_limit_s: 300
+  ready_timeout_s: 900      # /readyz (warmup A02) + пробная задача — UNMEASURED на GPU L2
+  trial_job_limit_s: 300    # UNMEASURED
+  budgets_measured_on_gpu: false   # L2: true после замера (README «Последовательность L2»), иначе preflight warn
   max_restarts: 5           # больше за restart_window_s → супервизор останавливается (не крутит crash-loop)
   restart_window_s: 600
   netguard: log             # log | block | off. В проде — аудит; block включается только в offline smoke

@@ -1,5 +1,11 @@
 # План Б: арендованная GPU-VM (Ubuntu 22.04 + Docker) — опциональный путь, НЕ проверялся
 
+> Фаза 2: окружение = lock L1 (torch 2.11.0+cu128). `Dockerfile.gpu` ещё ставит torch 2.6.0/cu124 —
+> до синхронизации с lock L1 (TODO в README) на VM надёжнее нативный путь: venv из lock L1
+> (`uv pip install -r tools/dataprep/requirements-l1.lock.txt --extra-index-url https://download.pytorch.org/whl/cu128
+> --index-strategy unsafe-best-match`), затем `deploy/supervisor.py run`.
+> `docker run --env-file` НЕ понимает комментарии в строке — передавайте переменные через compose или без `# ...`.
+
 > Обработка остаётся на наших моделях без внешних API, но VM — не «локальная» машина команды:
 > согласуйте с организаторами, допустимо ли это по правилу локальности.
 

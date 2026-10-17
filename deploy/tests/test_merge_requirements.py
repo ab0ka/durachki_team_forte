@@ -129,3 +129,38 @@ def test_lock_without_uv_fails_loudly(tmp_path, monkeypatch):
 def test_repo_merge_is_clean():
     code, report, _ = mr.run(mr.REPO_ROOT, "gpu", None, check_only=True)
     assert code == 0, report.conflicts + report.banned
+
+
+def _fake_uv(tmp_path, body: str, code: int = 0):
+    uv = tmp_path / "uv"
+    uv.write_text(f"#!{sys.executable}\nimport sys, pathlib\n"
+                  "out = sys.argv[sys.argv.index('-o') + 1]\n"
+                  f"pathlib.Path(out).write_text({body!r})\n"
+                  f"pathlib.Path(out + '.args').write_text(' '.join(sys.argv[1:]))\n"
+                  f"sys.exit({code})\n")
+    uv.chmod(uv.stat().st_mode | stat.S_IEXEC)
+    return str(uv)
+
+
+def test_resolve_check_detects_drift_and_extras(tmp_path):
+    lock = tmp_path / "l1.lock.txt"
+    lock.write_text("torch==2.11.0+cu128\npillow==13.0.0\nnumpy==2.4.6\n")
+    req = tmp_path / "r.in"
+    req.write_text("pillow>=10\nfastapi\n")
+    uv = _fake_uv(tmp_path, "torch==2.11.0\npillow==13.0.0\nnumpy==2.4.6\nfastapi==0.120.0\n")
+    res = mr.resolve_check(req, lock, "windows-cu128", tmp_path / "w", no_torch_index=True, uv=uv)
+    assert res["ok"] and res["drift"] == {} and res["extra"] == ["fastapi"]
+    args = (tmp_path / "w" / "resolve_windows-cu128.txt.args").read_text()
+    assert "--python-platform x86_64-pc-windows-msvc" in args and "--torch-backend" not in args
+    assert "torch==2.11.0\n" in (tmp_path / "w" / "constraints_pypi.txt").read_text()  # +cu128 снят
+    uv = _fake_uv(tmp_path, "torch==2.11.0+cu128\npillow==12.2.0\nnumpy==2.4.6\n")
+    res = mr.resolve_check(req, lock, "windows-cu128", tmp_path / "w2", uv=uv)
+    assert not res["ok"] and res["drift"]["pillow"] == {"lock": "13.0.0", "resolved": "12.2.0"}
+    assert "--torch-backend cu128" in (tmp_path / "w2" / "resolve_windows-cu128.txt.args").read_text()
+    uv = _fake_uv(tmp_path, "", code=1)
+    assert not mr.resolve_check(req, lock, "windows-cu128", tmp_path / "w3", uv=uv)["ok"]
+
+
+def test_parse_pins():
+    assert mr.parse_pins("a==1.0\n    # via x\nB_c[extra]==2.0 ; python_version>'3'\ntorch==2.11.0+cu128 \\\n") == {
+        "a": "1.0", "b-c": "2.0", "torch": "2.11.0+cu128"}

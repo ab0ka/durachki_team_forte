@@ -127,3 +127,82 @@ def test_api_key_sources(tmp_path):
     assert sv.api_key({"SENTINEL_API_KEYS": " a1 , b2 "}, tmp_path) == "a1"
     (tmp_path / "api_keys.txt").write_text("# comment\nfilekey123\n")
     assert sv.api_key({}, tmp_path) == "filekey123"
+
+
+def _stub_cmd(port: int, state: str) -> str:
+    return json.dumps([sys.executable, str(ROOT / "deploy/stub_api.py"), "--port", str(port), "--readyz-state", state])
+
+
+def test_terminal_readyz_blocks_trial_and_tunnel(tmp_path):
+    port, env = _free_port(), _env(tmp_path)
+    p = subprocess.Popen(SUP + ["run", "--port", str(port), "--interval", "0.2", "--allow-stub",
+                                "--api-cmd", _stub_cmd(port, "warmup_failed"), "--tunnel-cmd", json.dumps(FAKE_TUNNEL)],
+                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        st = _wait(lambda: (s := _state(tmp_path)).get("phase") == "not_ready" and s)
+        assert st and "warmup_failed" in st["detail"] and not st.get("tunnel")
+        stats = json.loads(subprocess.run([sys.executable, "-c", f"import urllib.request,sys; sys.stdout.write("
+                                           f"urllib.request.urlopen('http://127.0.0.1:{port}/__probe/stats').read().decode())"],
+                                          capture_output=True, text=True, env={**env, "NO_PROXY": "*"}).stdout)
+        assert stats["n_analyze"] == 0  # synthetic-задачу не слали: она «вылечила» бы warmup_failed у A02
+        assert not (tmp_path / "logs/public_url.txt").exists()
+    finally:
+        subprocess.run(SUP + ["stop"], env=env, capture_output=True, timeout=90)
+        p.wait(timeout=30)
+
+
+def test_gpu_hung_restarts_api_until_crash_loop(tmp_path):
+    port, env = _free_port(), _env(tmp_path)
+    r = subprocess.run(SUP + ["run", "--port", str(port), "--interval", "0.05", "--allow-stub", "--no-tunnel",
+                              "--api-cmd", _stub_cmd(port, "gpu_hung")], env=env, capture_output=True, text=True,
+                       timeout=180)
+    assert r.returncode == 4, r.stdout[-2000:]
+    st = _state(tmp_path)
+    assert st["phase"] == "crash_loop" and "gpu_hung" in (st.get("detail") or "") + (st.get("last_error") or "")
+
+
+ORPHAN_API = """import subprocess, sys, time
+c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+open(sys.argv[1], "a").write(str(c.pid) + "\\n")
+time.sleep(0.6)
+sys.exit(1)
+"""
+
+
+@pytest.mark.parametrize("hide_psutil", [False, True])
+def test_crashed_api_does_not_leave_gpu_worker_orphans(tmp_path, hide_psutil):
+    """Как spawn-воркер A03: потомок uvicorn переживает падение родителя и держит VRAM → должен быть убит."""
+    base = tmp_path / "path with spaces"
+    base.mkdir()
+    port, env = _free_port(), _env(base)
+    if hide_psutil:
+        fake = base / "no psutil" / "psutil"
+        fake.mkdir(parents=True)
+        (fake / "__init__.py").write_text("raise ImportError('hidden')\n")
+        env["PYTHONPATH"] = str(fake.parent)
+    api, pids = base / "fake api.py", base / "child pids.txt"
+    api.write_text(ORPHAN_API)
+    r = subprocess.run(SUP + ["run", "--port", str(port), "--interval", "0.05", "--no-tunnel",
+                              "--api-cmd", json.dumps([sys.executable, str(api), str(pids)])],
+                       env=env, capture_output=True, text=True, timeout=180)
+    assert r.returncode == 4, r.stdout[-1500:]
+    children = [int(x) for x in pids.read_text().split()]
+    assert len(children) >= 2
+    alive = _wait(lambda: not any(sv.pid_alive(c) for c in children), timeout=15)
+    for c in children:  # уборка, если тест упадёт
+        if sv.pid_alive(c):
+            os.kill(c, 9)
+    assert alive, f"остались сироты: {[c for c in children if sv.pid_alive(c)]}"
+    assert _state(base)["orphans_left"] == []
+
+
+def test_gpu_pids_parsing(monkeypatch):
+    monkeypatch.setattr(sv.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+
+    class R:
+        stdout = "1234\n5678\n"
+
+    monkeypatch.setattr(sv.subprocess, "run", lambda *a, **k: R())
+    assert sv.gpu_pids() == {1234, 5678}
+    monkeypatch.setattr(sv.shutil, "which", lambda name: None)
+    assert sv.gpu_pids() is None

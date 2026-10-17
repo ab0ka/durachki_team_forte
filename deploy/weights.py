@@ -88,6 +88,8 @@ def classify_source(src: str) -> tuple[str, str, str, str]:
         s = s[5:]
     if s.startswith(("http://", "https://")):
         u = urllib.parse.urlparse(s)
+        if u.netloc in {"pypi.org", "www.pypi.org"}:
+            return "bundled", "", "", ""  # модель внутри pip-колеса (напр. mediapipe) — качать нечего
         if u.netloc in {"huggingface.co", "www.huggingface.co"}:
             parts = [p for p in u.path.split("/") if p]
             if len(parts) >= 2 and parts[0] not in {"datasets", "spaces"}:
@@ -584,11 +586,16 @@ def render_licenses(rows: list[dict[str, Any]]) -> str:
 
 
 def license_rows(specs: list[ModelSpec], lock: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = []
+    """Строка на модель: из lock (точная ревизия), иначе из models.json (не подтверждено).
+    Записи adopt идут по repo id — сопоставляем и по нему; модели из lock без models.json тоже попадают."""
+    rows, used = [], set()
+    models = lock.get("models", [])
     for s in specs:
-        locked = _locked(lock, s)
+        locked = _locked(lock, s) or next((m for m in models if s.repo_id and m.get("repo_id") == s.repo_id), None)
         if locked:
-            rows.append(locked)
+            used.add(id(locked))
+            rows.append({**locked, "module": locked.get("module") or s.module,
+                         "license_declared": s.license or locked.get("license_declared")})
             continue
         banned = policy.banned_reasons(f"{s.source} {s.name}")
         ok, why = license_verdict(s.license, None if s.kind != "bundled" else s.license, banned)
@@ -596,6 +603,7 @@ def license_rows(specs: list[ModelSpec], lock: dict[str, Any]) -> list[dict[str,
             why = "не подтверждено хабом: запустите weights.py prepare"
         rows.append({"name": s.name, "module": s.module, "source": s.source, "license_declared": s.license,
                      "license_hub": None, "license_ok": ok and s.kind == "bundled", "license_note": why})
+    rows += [m for m in models if id(m) not in used]
     return rows
 
 

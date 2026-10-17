@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import re
 import shutil
@@ -30,11 +31,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
+    from packaging.markers import Marker
     from packaging.requirements import InvalidRequirement, Requirement
     from packaging.specifiers import SpecifierSet
     from packaging.utils import canonicalize_name
     from packaging.version import InvalidVersion, Version
 except ImportError:  # голый python:3.11-slim — берём vendored-копию из pip
+    from pip._vendor.packaging.markers import Marker  # type: ignore
     from pip._vendor.packaging.requirements import InvalidRequirement, Requirement  # type: ignore
     from pip._vendor.packaging.specifiers import SpecifierSet  # type: ignore
     from pip._vendor.packaging.utils import canonicalize_name  # type: ignore
@@ -50,6 +53,17 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "env", "__pycache__", "wei
              "cache", "dist", "build", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 TORCH_FAMILY = {"torch", "torchvision", "torchaudio"}
 DEFAULT_ENV_LOCK = Path("tools") / "dataprep" / "requirements-l1.lock.txt"
+# Среда, для которой вычисляются маркеры (; python_version …, ; sys_platform …): прод L1 — Windows, py3.11.
+TARGET_ENVS: dict[str, dict[str, str]] = {
+    "windows": {"python_version": "3.11", "python_full_version": "3.11.9", "sys_platform": "win32",
+                "platform_system": "Windows", "os_name": "nt", "platform_machine": "AMD64",
+                "implementation_name": "cpython", "platform_python_implementation": "CPython",
+                "platform_release": "10", "platform_version": "10.0", "extra": ""},
+    "linux": {"python_version": "3.11", "python_full_version": "3.11.9", "sys_platform": "linux",
+              "platform_system": "Linux", "os_name": "posix", "platform_machine": "x86_64",
+              "implementation_name": "cpython", "platform_python_implementation": "CPython",
+              "platform_release": "", "platform_version": "", "extra": ""},
+}
 
 # Цели lock-файлов. torch_backend → uv сам ходит в индекс PyTorch за torch/torchvision.
 LOCK_TARGETS: dict[str, dict[str, str]] = {
@@ -273,19 +287,44 @@ def load_env_lock(path: Path) -> dict[str, str]:
     return pins
 
 
-def check_against_lock(merged: list["Merged"], pins: dict[str, str], lock_name: str, report: Report) -> None:
+def _applies(marker: str, env: dict[str, str]) -> bool:
+    if not marker:
+        return True
+    try:
+        return Marker(marker).evaluate(env)
+    except Exception:  # noqa: BLE001 — непонятный маркер считаем применимым: лучше ложная тревога, чем маска
+        return True
+
+
+def check_target(merged: list["Merged"], pins: dict[str, str], lock_name: str, report: Report,
+                 env: dict[str, str]) -> None:
+    """Конфликты на ЦЕЛЕВОЙ платформе: маркеры вычисляются для env, группы одного пакета с разными маркерами
+    проверяются совместно, прямой URL против пина lock — конфликт. Ничего не скрываем подбором версий."""
+    by_name: dict[str, list[Merged]] = {}
     for g in merged:
-        if g.marker or g.urls or g.name not in pins or not g.specs:
+        if _applies(g.marker, env):
+            by_name.setdefault(g.name, []).append(g)
+    for name, groups in sorted(by_name.items()):
+        specs = [(sp, src) for g in groups for sp, src in g.specs]
+        urls = sorted({u for g in groups for u in g.urls})
+        if len(groups) > 1 and not satisfiable([sp for sp, _ in specs]):
+            detail = "; ".join(f"{sp} ← {src}" for sp, src in specs)
+            report.conflicts.append(f"{name}: несовместимо на целевой платформе (с учётом маркеров): {detail}")
+        if name not in pins:
+            continue
+        if urls:
+            report.conflicts.append(f"{name}: в {lock_name} {pins[name]}, а модуль требует прямую ссылку {urls}")
             continue
         try:
-            pin = Version(pins[g.name])
+            pin = Version(pins[name])
         except InvalidVersion:
             continue
-        bad = [(sp, src) for sp, src in g.specs if not SpecifierSet(sp).contains(pin, prereleases=True)]
+        bad = [(sp, src) for sp, src in specs if not SpecifierSet(sp).contains(pin, prereleases=True)]
         if bad:
             detail = "; ".join(f"{sp} ← {src}" for sp, src in bad)
-            report.conflicts.append(f"{g.name}: в {lock_name} {pins[g.name]}, не совместимо: {detail}")
-            g.note = "CONFLICT"
+            report.conflicts.append(f"{name}: в {lock_name} {pins[name]}, не совместимо: {detail}")
+            for g in groups:
+                g.note = "CONFLICT"
 
 
 def merge(lines: list[ReqLine], profile: str, report: Report, keep_dev: bool = False) -> list[Merged]:
@@ -387,8 +426,54 @@ def resolve_env_lock(root: Path, env_lock: Path | str | None) -> Path | None:
     return p if p.is_absolute() else root / p
 
 
+def parse_pins(text: str) -> dict[str, str]:
+    """Пины `name==version` из вывода uv pip compile / lock-файла."""
+    pins = {}
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^\s;\\]+)", line.strip())
+        if m:
+            pins[canonicalize_name(m.group(1))] = m.group(2)
+    return pins
+
+
+def resolve_check(in_path: Path, lock_path: Path, target: str, work: Path, no_torch_index: bool = False,
+                  uv: str | None = None) -> dict:
+    """Настоящий resolver: требования модулей + ВЕСЬ lock L1 (-c) на целевой платформе.
+    ok — разрешилось и каждый пакет lock остался на своей версии (дрейфа нет).
+    no_torch_index: индекс PyTorch недоступен (облако) → +cuXXX снимается с torch/torchvision, колёса с PyPI;
+    это проверка совместимости диапазонов, НЕ проверка GPU-установки."""
+    cfg = LOCK_TARGETS[target]
+    uv = uv or shutil.which("uv")
+    if not uv:
+        return {"ok": False, "error": "uv не найден"}
+    work.mkdir(parents=True, exist_ok=True)
+    lock_pins = load_env_lock(lock_path)
+    constraints = lock_path
+    if no_torch_index:
+        constraints = work / "constraints_pypi.txt"
+        constraints.write_text("".join(f"{n}=={v.split('+')[0]}\n" for n, v in sorted(lock_pins.items())),
+                               encoding="utf-8")
+    out = work / f"resolve_{target}.txt"
+    cmd = [uv, "pip", "compile", str(in_path), "-c", str(constraints), "-o", str(out), "--python-version", "3.11",
+           "--python-platform", cfg["python_platform"], "--no-header", "--quiet"]
+    if not no_torch_index:
+        cmd += ["--torch-backend", cfg["torch_backend"]]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    rep: dict = {"target": target, "no_torch_index": no_torch_index, "cmd": " ".join(cmd)}
+    if r.returncode != 0:
+        rep.update(ok=False, error=(r.stderr or r.stdout).strip()[-3000:])
+        return rep
+    got = parse_pins(out.read_text(encoding="utf-8"))
+    drift = {n: {"lock": v, "resolved": got.get(n)} for n, v in lock_pins.items()
+             if n in got and got[n].split("+")[0] != v.split("+")[0]}
+    rep.update(ok=not drift, drift=drift, extra=sorted(set(got) - set(lock_pins)),
+               not_needed=sorted(set(lock_pins) - set(got)), resolved=len(got))
+    return rep
+
+
 def run(root: Path, profile: str, out: Path | None, check_only: bool = False, keep_dev: bool = False,
-        allow_conflicts: bool = False, env_lock: Path | str | None = None) -> tuple[int, Report, str]:
+        allow_conflicts: bool = False, env_lock: Path | str | None = None,
+        target: str = "windows") -> tuple[int, Report, str]:
     report = Report()
     files = find_requirement_files(root)
     lines: list[ReqLine] = []
@@ -397,9 +482,11 @@ def run(root: Path, profile: str, out: Path | None, check_only: bool = False, ke
         lines += parse_file(f, root, report)
     merged = merge(lines, profile, report, keep_dev=keep_dev)
     lock_path = resolve_env_lock(root, env_lock)
+    if lock_path is None:
+        check_target(merged, {}, "", report, TARGET_ENVS[target])  # маркеры — и без lock
     if lock_path is not None:
         if lock_path.is_file():
-            check_against_lock(merged, load_env_lock(lock_path), lock_path.name, report)
+            check_target(merged, load_env_lock(lock_path), lock_path.name, report, TARGET_ENVS[target])
             report.constraints.append(str(lock_path))
             report.sources.append(f"{lock_path.name} (constraints: пины не меняются)")
         else:
@@ -425,6 +512,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lock", choices=sorted(LOCK_TARGETS), action="append", default=[],
                     help="построить lock через uv pip compile (можно несколько раз)")
     ap.add_argument("--locks-dir", type=Path, default=None)
+    ap.add_argument("--resolve-check", choices=sorted(LOCK_TARGETS), default=None,
+                    help="resolver: требования модулей + весь lock L1 на платформе цели, без дрейфа пинов")
+    ap.add_argument("--no-torch-index", action="store_true",
+                    help="resolve-check без индекса PyTorch (облако): torch/torchvision с PyPI, без +cuXXX")
+    ap.add_argument("--target-env", choices=sorted(TARGET_ENVS), default="windows",
+                    help="для какой платформы вычислять маркеры (прод L1 — windows)")
     ap.add_argument("--env-lock", default=None,
                     help=f"lock окружения (по умолчанию {DEFAULT_ENV_LOCK.as_posix()}, если есть); 'none' — без него")
     args = ap.parse_args(argv)
@@ -432,7 +525,8 @@ def main(argv: list[str] | None = None) -> int:
     root = args.root.resolve()
     profile = args.profile or (LOCK_TARGETS[args.lock[0]]["profile"] if args.lock else "gpu")
     out = args.out or root / "deploy" / "requirements.in"
-    code, report, _ = run(root, profile, out, args.check, args.keep_dev, args.allow_conflicts, args.env_lock)
+    code, report, _ = run(root, profile, out, args.check, args.keep_dev, args.allow_conflicts, args.env_lock,
+                          args.target_env)
     print_report(report)
     if code:
         print(f"[merge] код {code}: {'запрещённые пакеты' if code == 2 else 'конфликты'} — lock не строим",
@@ -440,6 +534,19 @@ def main(argv: list[str] | None = None) -> int:
         return code
     if not args.check:
         print(f"[merge] записано: {out}", file=sys.stderr)
+    if args.resolve_check:
+        lock_path = resolve_env_lock(root, args.env_lock)
+        if lock_path is None or not lock_path.is_file():
+            print("[merge] resolve-check: нет lock окружения", file=sys.stderr)
+            return 2
+        import tempfile
+        work = Path(tempfile.mkdtemp(prefix="sentinel_resolve_"))
+        src = out if out.is_file() and not args.check else work / "requirements.in"
+        if src != out:
+            run(root, profile, src, allow_conflicts=False, env_lock=args.env_lock, target=args.target_env)
+        res = resolve_check(src, lock_path, args.resolve_check, work, args.no_torch_index)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res.get("ok") else 3
     constraints = list(report.constraints)
     agreed = root / "deploy" / "constraints.txt"
     if agreed.is_file():

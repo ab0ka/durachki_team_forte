@@ -128,6 +128,50 @@ def kill_tree(pid: int, timeout: float = 15.0) -> None:
             pass
 
 
+def descendants(pid: int) -> dict[int, Optional[float]]:
+    """PID → время старта всех потомков (spawn-воркер A03 — потомок uvicorn). Без psutil — пусто."""
+    if psutil is None:
+        return {}
+    try:
+        return {c.pid: c.create_time() for c in psutil.Process(pid).children(recursive=True)}
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return {}
+
+
+def reap(pids: dict[int, Optional[float]], pgid: Optional[int] = None, timeout: float = 15.0) -> list[int]:
+    """Добить СВОИХ потомков (PID + время старта), в т.ч. осиротевших после падения родителя.
+    POSIX: дополнительно вся группа процессов (start_new_session → pgid = pid uvicorn, живёт без лидера)."""
+    if pgid and not IS_WIN:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except OSError:
+                break
+            end = time.time() + (timeout / 2 if sig == signal.SIGTERM else 2)
+            while time.time() < end and any(pid_alive(x) for x in pids):
+                time.sleep(0.1)
+    for pid, ct in pids.items():
+        if is_ours({"pid": pid, "create_time": ct}):
+            kill_tree(pid, timeout=5)
+    end = time.time() + timeout
+    while time.time() < end and any(is_ours({"pid": x, "create_time": c}) for x, c in pids.items()):
+        time.sleep(0.1)
+    return [x for x, c in pids.items() if is_ours({"pid": x, "create_time": c})]
+
+
+def gpu_pids() -> Optional[set[int]]:
+    """PID процессов с CUDA-контекстом (nvidia-smi); None — проверить нельзя."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--query-compute-apps=pid", "--format=csv,noheader,nounits"], capture_output=True,
+                             text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {int(x) for x in re.findall(r"\d+", out)}
+
+
 def port_busy(host: str, port: int) -> bool:
     with socket.socket() as s:
         s.settimeout(0.5)
@@ -249,13 +293,15 @@ class Supervisor:
         self.ready_timeout = float(svc.get("ready_timeout_s", 900))
         self.trial_limit = float(svc.get("trial_job_limit_s", 300))
         tun = cfg.get("tunnel") or {}
-        self.tunnel_mode = "off" if args.no_tunnel else ("named" if args.named else str(tun.get("mode", "quick")))
+        self.tunnel_mode = "off" if args.no_tunnel else (
+            "named" if args.named else str(self.env.get("SENTINEL_TUNNEL_MODE") or tun.get("mode", "quick")))
         self.protocol = str(self.env.get("CLOUDFLARED_PROTOCOL") or tun.get("protocol") or "")
         self.netguard = str(self.env.get("SENTINEL_NETGUARD") or svc.get("netguard", "log"))
         self.app = str(args.app or svc.get("app", "backend.api.main:app"))
         self.api: Optional[subprocess.Popen] = None
         self.tunnel: Optional[subprocess.Popen] = None
         self.restarts: collections.deque[float] = collections.deque()
+        self.tree: dict[int, Optional[float]] = {}  # потомки текущего api (snapshot каждый виток)
         self.st: dict[str, Any] = {}
 
     # ---- окружение детей
@@ -319,18 +365,45 @@ class Supervisor:
                 return False
             time.sleep(0.5)
         self.api = self._popen(self.api_cmd(), "api", self.child_env())
-        self.save(api=self._rec(self.api, cmd=self.app), phase="starting", api_started=time.time())
+        self.tree = {}
+        self.save(api=self._rec(self.api, cmd=self.app), phase="starting", api_started=time.time(), api_tree=[])
         self.log(f"api pid={self.api.pid} {self.app} на {self.host}:{self.port}")
         return True
 
     def stop_proc(self, p: Optional[subprocess.Popen]) -> None:
         if p is not None and p.poll() is None:
+            if p is self.api:
+                self.snapshot_tree()
             kill_tree(p.pid)
         if p is not None:
             try:
                 p.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
+        if p is not None and p is self.api:
+            self.reap_api_tree()
+
+    def snapshot_tree(self) -> None:
+        if self.api is not None and self.api.poll() is None:
+            fresh = descendants(self.api.pid)
+            if set(fresh) - set(self.tree):
+                self.tree.update(fresh)
+                self.save(api_tree=[{"pid": k, "create_time": v} for k, v in self.tree.items()])
+
+    def reap_api_tree(self) -> None:
+        """После выхода/убийства api: добить его потомков (GPU-воркер A03) и проверить, что GPU освобождён."""
+        if self.api is None:
+            return
+        left = reap(self.tree, pgid=self.api.pid)
+        ours = set(self.tree) | {self.api.pid}
+        on_gpu = gpu_pids()
+        still = sorted((on_gpu or set()) & ours)
+        if left:
+            self.log(f"ERROR не удалось завершить потомков api: {left}")
+        if still:
+            self.log(f"ERROR GPU всё ещё держат наши процессы {still}")
+        self.save(gpu_released=None if on_gpu is None else not still, orphans_left=left, api_tree=[])
+        self.tree = {}
 
     # ---- tunnel
     def tunnel_cmd(self) -> list[str]:
@@ -372,28 +445,34 @@ class Supervisor:
 
     # ---- готовность
     def check_ready(self) -> None:
-        r = httpkit.request("GET", self.url + "/readyz", timeout=5)
-        body = r.json() if r.status else None
-        if r.status == 503 or (r.status == 200 and isinstance(body, dict) and body.get("pipeline") == "fake"):
-            state = (body or {}).get("state") if isinstance(body, dict) else None
-            if isinstance(body, dict) and body.get("pipeline") == "fake":
-                self.save(phase="not_ready", detail="readyz: pipeline=fake — фиктивный пайплайн в проде запрещён")
-            else:
-                self.save(phase="warming", detail=f"readyz 503 state={state}")
+        """Production gate: /readyz A02 (ready/real) → только тогда synthetic-задача → только тогда туннель."""
+        rz = healthcheck.readiness(self.url, allow_stub=self.args.allow_stub)
+        self.st["readyz"] = {k: rz.get(k) for k in ("status", "state", "pipeline", "verdict")}
+        if rz["verdict"] == "waiting":
+            self.save(phase="warming", detail=rz["why"])
             return
-        if r.status not in (200, 404):  # 404 — API без /readyz: решает пробная задача
+        if rz["verdict"] == "terminal" and rz.get("state") == "gpu_hung":
+            self.log(f"readyz gpu_hung — перезапуск api (освобождение GPU): {rz['why']}")
+            self.save(phase="restarting", detail=rz["why"], last_error=rz["why"])
+            self.stop_proc(self.api)  # следующий виток цикла увидит выход и перезапустит
+            return
+        if rz["verdict"] in ("terminal", "bad"):
+            if self.st.get("detail") != rz["why"]:
+                self.log(f"NOT READY (без пробной задачи): {rz['why']}")
+            self.save(phase="not_ready", detail=rz["why"], last_error=rz["why"])
             return
         key = api_key(self.env, self.data)
         video = self.logs / "trial_synth.mov"
         if not video.is_file():
             from deploy.synth_video import make_video
             make_video(video, seconds=10)
-        self.save(phase="trial", detail="пробная задача (реальный inference)")
+        self.save(phase="trial", detail="synthetic-задача POST/GET (тракт и контракт, не качество CV)")
         rep = healthcheck.ready(self.url, key, video, self.trial_limit, allow_stub=self.args.allow_stub)
         (self.logs / "ready.json").write_text(json.dumps(rep, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if rep.get("ok"):
-            self.save(phase="ready", ready_at=_now(), detail=f"пробная задача {rep.get('time_to_result_s')} с")
-            self.log(f"READY: пробная задача прошла за {rep.get('time_to_result_s')} с")
+            self.save(phase="ready", ready_at=_now(),
+                      detail=f"synthetic-задача: {rep.get('from_accept_s')} с от приёма до итога")
+            self.log(f"READY: synthetic-задача {rep.get('from_accept_s')} с от приёма (server {rep.get('server')})")
             if self.tunnel is None or self.tunnel.poll() is not None:
                 self.start_tunnel()  # открываем ОДИН раз; при рестарте api туннель (и quick URL) сохраняется
         else:
@@ -431,14 +510,16 @@ class Supervisor:
 
     def _loop(self) -> int:
         signal.signal(signal.SIGTERM, lambda *_: self.store.stop_flag.touch())
-        live_fail, next_ready_try = 0, 0.0
+        live_fail, next_ready_try, next_readyz = 0, 0.0, 0.0
         while True:
             if self.store.stop_flag.exists():
                 self.log("stop requested")
                 self.store.stop_flag.unlink(missing_ok=True)
                 return 0
+            self.snapshot_tree()
             if self.api is not None and self.api.poll() is not None:
                 code = self.api.returncode
+                self.reap_api_tree()  # spawn-воркер A03 мог пережить родителя и держать VRAM
                 tail = _tail(self.logs / "api.err.log")
                 oom = OOM_RE.search(tail)
                 err = f"api завершился с кодом {code}" + (" — GPU OOM (см. deploy/RUNBOOK.md#gpu-oom)" if oom else "")
@@ -458,7 +539,7 @@ class Supervisor:
                     return 5
                 continue
             phase = self.st.get("phase")
-            if phase in ("starting", "warming", "not_ready", "trial") and time.time() >= next_ready_try:
+            if phase in ("starting", "warming", "not_ready", "trial", "restarting") and time.time() >= next_ready_try:
                 if time.time() - float(self.st.get("api_started") or time.time()) > self.ready_timeout:
                     if phase != "ready_timeout":
                         self.save(phase="ready_timeout",
@@ -470,6 +551,15 @@ class Supervisor:
             elif phase == "ready":
                 ok = healthcheck.live(self.url)["ok"]
                 live_fail = 0 if ok else live_fail + 1
+                if ok and time.time() >= next_readyz:
+                    next_readyz = time.time() + 30.0
+                    rz = healthcheck.readiness(self.url, allow_stub=self.args.allow_stub)
+                    self.st["readyz"] = {k: rz.get(k) for k in ("status", "state", "pipeline", "verdict")}
+                    if rz.get("state") == "gpu_hung":
+                        self.log(f"readyz gpu_hung — перезапуск api: {rz['why']}")
+                        self.save(phase="restarting", last_error=rz["why"])
+                        self.stop_proc(self.api)
+                        continue
                 if live_fail >= max(3, int(30 / max(self.interval, 0.1))):
                     self.log("api не отвечает — перезапуск (зависание)")
                     self.stop_proc(self.api)
@@ -525,6 +615,9 @@ def stop(store: Store, timeout: float = 60.0) -> int:
         if is_ours(rec):
             kill_tree(rec["pid"])
             killed.append(f"{name}:{rec['pid']}")
+    tree = {int(x["pid"]): x.get("create_time") for x in (store.read().get("api_tree") or st.get("api_tree") or [])}
+    left = reap(tree) if tree else []
+    killed += [f"worker:{x}" for x in tree if x not in left]
     print("[stop] остановлено" + (f"; добиты сироты {killed}" if killed else ""))
     return 0
 

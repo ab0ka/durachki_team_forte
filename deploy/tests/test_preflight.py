@@ -36,7 +36,10 @@ def _setup(tmp_path: Path) -> tuple[dict, Path]:
     (root / "tools/dataprep").mkdir(parents=True)
     (root / "tools/dataprep/requirements-l1.lock.txt").write_text(LOCK)
     (root / "backend/api").mkdir(parents=True)
-    (root / "backend/api/config.yaml").write_text("a: 1\n")
+    (root / "backend/pipeline").mkdir(parents=True)
+    (root / "backend/api/config.yaml").write_text("workers: 1\ngpu_slots: 1\nwarmup: true\nallow_mock: false\n"
+                                                  "fake_pipeline: false\npipeline: backend.pipeline\n")
+    (root / "backend/pipeline/config.yaml").write_text("mock: false\nexecutor:\n  mode: process\n")
     (root / "backend/api/requirements.txt").write_text("fastapi>=0.115\n")
     hub = root / "weights/hf/hub"
     _fake_cache_repo(hub, "PekingU/rtdetr_v2_r18vd", {"config.json": b"{}", "model.safetensors": b"\x01" * 16})
@@ -107,3 +110,41 @@ def test_preflight_key_file_and_named_tunnel(tmp_path):
     assert c["api-key"].status == "ok"
     assert c["tunnel-token"].status == "fail" and c["tool:cloudflared"].status == "fail"
     assert c["tool:ffprobe"].status == "warn"
+
+
+def _a02_a03(root: Path, api: str = "workers: 1\ngpu_slots: 1\nwarmup: true\nallow_mock: false\nfake_pipeline: false\n"
+             "pipeline: backend.pipeline\nbudget_s: 270\nwatchdog_s: 285\njob_cap_s: 120\n",
+             pipe: str = "mock: false\nexecutor:\n  mode: process\nwarmup:\n  deadline_s: 120\n") -> None:
+    (root / "backend/api").mkdir(parents=True, exist_ok=True)
+    (root / "backend/pipeline").mkdir(parents=True, exist_ok=True)
+    (root / "backend/api/config.yaml").write_text(api)
+    (root / "backend/pipeline/config.yaml").write_text(pipe)
+
+
+def test_preflight_gates_single_worker_warmup_and_real_pipeline(tmp_path):
+    cfg, root = _setup(tmp_path)
+    cfg["models"]["required"] = cfg["models"]["required"][:1]
+    _a02_a03(root)
+    env = {"SENTINEL_API_KEYS": "k" * 24}
+    c = _by(pf.run_checks(cfg, root, env, FakeProbes()))
+    for name in ("a02:single-worker", "a02:warmup", "a02:real-pipeline", "a03:executor", "a03:mock"):
+        assert c[name].status == "ok", (name, c[name].detail)
+    assert c["budgets"].status == "warn" and "UNMEASURED" in c["budgets"].detail and "budget_s=270" in c["budgets"].detail
+    bad = {**env, "SENTINEL_WORKERS": "2", "SENTINEL_WARMUP": "0", "SENTINEL_FAKE_PIPELINE": "1", "SENTINEL_EXECUTOR": "inline"}
+    c = _by(pf.run_checks(cfg, root, bad, FakeProbes()))
+    for name in ("a02:single-worker", "a02:warmup", "a02:real-pipeline", "a03:executor"):
+        assert c[name].status == "fail", name
+    over = root / "over.yaml"
+    over.write_text("executor:\n  mode: inline\n")
+    c = _by(pf.run_checks(cfg, root, {**env, "SENTINEL_PIPELINE_CONFIG": str(over)}, FakeProbes()))
+    assert c["a03:executor"].status == "fail"
+    cfg["service"]["budgets_measured_on_gpu"] = True
+    assert _by(pf.run_checks(cfg, root, env, FakeProbes()))["budgets"].status == "ok"
+
+
+def test_preflight_fails_without_backend_configs(tmp_path):
+    cfg, root = _setup(tmp_path)
+    (root / "backend/api/config.yaml").unlink()
+    (root / "backend/pipeline/config.yaml").unlink()
+    c = _by(pf.run_checks(cfg, root, {"SENTINEL_API_KEYS": "k" * 24}, FakeProbes()))
+    assert c["a02:config"].status == "fail" and c["a03:config"].status == "fail"

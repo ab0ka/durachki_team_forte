@@ -69,3 +69,28 @@ def test_required_models_demoted_by_env():
     assert "Qwen/Qwen3-VL-4B-Instruct" not in [m["repo"] for m in req]
     assert any(m.get("demoted_by_env") for m in opt)
     assert all("GGUF" not in m["repo"] for m in req + opt)
+
+
+def test_markers_and_urls_do_not_mask_lock_conflicts(tmp_path):
+    root = _tree(tmp_path, {
+        "tools/dataprep/requirements-l1.lock.txt": "pillow==13.0.0\nnumpy==2.4.6\n",
+        "ml/fusion/requirements.txt": 'Pillow>=10.0,<13 ; python_version >= "3.8"\n',   # маркер истинен на py3.11
+        "ml/x/requirements.txt": "numpy @ https://example.invalid/numpy-1.26.0-cp311-none-any.whl\n",
+        "ml/y/requirements.txt": 'pillow<12 ; sys_platform == "linux"\n',              # к Windows не относится
+    })
+    code, report, _ = mr.run(root, "gpu", None, check_only=True)
+    joined = "\n".join(report.conflicts)
+    assert code == 1
+    assert "pillow" in joined and "ml/fusion" in joined and "ml/y" not in joined
+    assert "numpy" in joined and "прямую ссылку" in joined
+    code, report, _ = mr.run(root, "gpu", None, check_only=True, target="linux")
+    assert "ml/y" in "\n".join(report.conflicts)
+
+
+def test_marker_groups_checked_jointly_without_lock(tmp_path):
+    root = _tree(tmp_path, {
+        "a/requirements.txt": "pillow<13\n",
+        "b/requirements.txt": 'pillow>=13 ; python_version >= "3.8"\n',
+    })
+    code, report, _ = mr.run(root, "gpu", None, check_only=True, env_lock="none")
+    assert code == 1 and "pillow" in report.conflicts[0]

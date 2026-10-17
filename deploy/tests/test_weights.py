@@ -63,6 +63,7 @@ def test_load_specs_lenient_and_errors(tmp_path):
     ("https://huggingface.co/org/rep/resolve/main/m.onnx", "hf_file", "org/rep", "m.onnx"),
     ("https://github.com/x/y/releases/download/v1/rtm.onnx", "url", "", "rtm.onnx"),
     ("bundled:mediapipe", "bundled", "", ""),
+    ("https://pypi.org/project/mediapipe/", "bundled", "", ""),
 ])
 def test_classify_source(src, kind, repo, fname):
     k, r, f, _ = w.classify_source(src)
@@ -277,3 +278,19 @@ def test_classify_local_and_free_text():
     assert w.classify_source("local: weights/scene/scene_signals.json — python -m ml.scene")[:3] == (
         "local", "", "weights/scene/scene_signals.json")
     assert w.classify_source("Qwen/Qwen3-4B-Instruct-2507 (GGUF Q4_K_M: конвертация)")[0] == "unknown"
+
+
+def test_license_rows_match_adopted_by_repo_id(tmp_path):
+    root = tmp_path / "repo"
+    _models(root, "ml/detect", [{"name": "RT-DETRv2-S (r18vd), COCO", "hf_id_or_url": "PekingU/rtdetr_v2_r18vd",
+                                 "license": "apache-2.0"}])
+    lock = {"models": [
+        {"name": "PekingU/rtdetr_v2_r18vd", "source": "PekingU/rtdetr_v2_r18vd", "repo_id": "PekingU/rtdetr_v2_r18vd",
+         "revision": COMMIT, "license_hub": "apache-2.0", "license_ok": True, "license_note": "ok", "module": "ml/detect"},
+        {"name": "ustc-community/dfine-medium-obj2coco", "source": "ustc-community/dfine-medium-obj2coco",
+         "repo_id": "ustc-community/dfine-medium-obj2coco", "revision": COMMIT, "license_hub": "apache-2.0",
+         "license_ok": True, "license_note": "ok", "module": "ml/detect"}]}
+    rows = w.license_rows(w.load_specs(root), lock)
+    assert len(rows) == 2 and all(r["license_ok"] for r in rows)
+    md = w.render_licenses(rows)
+    assert "красных флагов: 0" in md and "dfine-medium" in md
