@@ -203,6 +203,9 @@ def _with_coverage(out: list[Event]) -> list[Event]:
     cov = coverage(out)
     for e in out:
         e.extra.setdefault("vlm", {"status": "not_checked", "agreement": "not_checked"})["coverage"] = cov
+    from .runtime import record_stage
+
+    record_stage("verify", **cov)
     return out
 
 

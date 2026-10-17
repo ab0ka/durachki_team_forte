@@ -62,7 +62,8 @@ def test_status_warmup_unload_are_technical_only():
     vlm.warmup()
     st = vlm.status()
     assert st["backend"] == "mock" and set(st) <= {"backend", "model", "reason", "url", "schema_mode", "quant",
-                                                   "loaded", "load_s", "offline", "license"}
+                                                   "loaded", "load_s", "offline", "license", "last",
+                                                   "cache_dir_set", "vram_after_load_mb"}
     vlm.unload()
 
 
@@ -186,3 +187,24 @@ def test_bench_production_sections(tmp_path, capsys):
     assert rep["qa"]["forwards"] == 3 * rep["qa"]["questions_per_candidate"] and rep["qa"]["option_mode"]
     assert rep["chat"]["ok"] == 3
     assert "Кассир" not in out and "[mock]" not in out  # тексты ответов — только в локальном дампе
+
+
+def test_status_distinguishes_disabled_and_unavailable_discover(clip, monkeypatch):
+    vlm.discover(clip, 30.0)
+    assert vlm.status()["last"]["discover"]["status"] == "disabled"
+    from ml.vlm.discoverer import discover_events
+    from ml.vlm.config import load_config
+    cfg = load_config(use_env=False, overrides={"backend": "off"})
+    discover_events(clip, 30.0, cfg=cfg, force=True)
+    last = vlm.status()["last"]["discover"]
+    assert last["status"] == "unavailable" and last["complete"] is False  # не смотрели != ничего нет
+    vlm.verify(clip, [Event("V05", 1, 2, 1.5, 0.5, "rules")], 30.0)
+    assert vlm.status()["last"]["verify"]["total"] == 1
+
+
+def test_try_cli_qa_mode(tmp_path, capsys):
+    video = _write_video(tmp_path / "synthetic.avi")
+    from ml.vlm.cli_try import main
+    main([str(video), "--t", "3", "--type", "V05", "--verify-mode", "qa", "--no-dump"])
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["verify"]["mode"] == "qa" and rep["verify"]["asked"] == 2

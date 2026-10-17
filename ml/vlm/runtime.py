@@ -150,10 +150,19 @@ def unload_backend() -> None:
         _backend, _backend_key = None, None
 
 
+_last_stage: dict[str, dict[str, Any]] = {}
+
+
+def record_stage(stage: str, **info: Any) -> None:
+    """Последний итог стадии (verify|discover) — только технические поля и счётчики, без содержимого."""
+    _last_stage[stage] = {"t": round(time.time(), 3), **info}
+
+
 def backend_status() -> dict[str, Any]:
     be = _injected or _backend
     info = be.info() if be is not None else {"backend": None}
     info["reason"] = _backend_reason if be is None else ""
+    info["last"] = {k: dict(v) for k, v in _last_stage.items()}
     return info
 
 

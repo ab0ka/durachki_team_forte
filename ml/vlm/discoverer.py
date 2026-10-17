@@ -20,7 +20,7 @@ from .facts_filter import filter_facts
 from .frames import clip_duration, get_frame, motion_energy, prepare_images
 from .parsing import discover_schema, normalize_discover
 from .prompting import render_discover, retry_suffix
-from .runtime import call_json, ensure_loaded, fit_images, get_backend
+from .runtime import call_json, ensure_loaded, fit_images, get_backend, record_stage
 from .scoring import blend, p_vlm
 
 log = logging.getLogger(__name__)
@@ -83,10 +83,12 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
     cfg = cfg or load_config()
     dcfg = cfg.get("discover") or {}
     if not (dcfg.get("enabled", False) or force):
+        record_stage("discover", status="disabled", complete=True, events=0)
         return []
     if backend is None:
         backend, _reason = get_backend(cfg)
-        if backend is None:
+        if backend is None:  # «ничего не нашли» и «не смотрели» различаются: complete=false
+            record_stage("discover", status="unavailable", complete=False, events=0, reason=_reason[:160])
             return []
     lim = VLMLimits.from_cfg(cfg, "discover", limits)
     budget = Budget(float(budget_s), lim, **({"clock": clock} if clock else {}))
@@ -94,6 +96,7 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
     ok, _reason = ensure_loaded(backend, budget, float(rcfg.get("lazy_load_min_budget_s", 0.0)),
                                 float(rcfg.get("load_retry_cooldown_s", 300.0)))
     if not ok:
+        record_stage("discover", status="unavailable", complete=False, events=0, reason=_reason[:160])
         return []
     catalog = catalog or load_catalog()
     types = catalog_types(catalog)
@@ -228,4 +231,6 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
     summary["windows_done"] = windows_done
     for e in events:
         e.extra["vlm"]["budget"] = summary
+    record_stage("discover", status="ok", events=len(events), windows_planned=len(wins), windows_done=windows_done,
+                 complete=windows_done >= len(wins), calls=summary.get("calls"), stop_reason=summary.get("stop_reason"))
     return sorted(events, key=lambda e: e.t_peak)
