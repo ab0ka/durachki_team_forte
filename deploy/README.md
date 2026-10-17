@@ -16,6 +16,16 @@ deploy\windows\status.ps1   |   deploy\windows\stop.ps1
 ```
 Сбои — `RUNBOOK.md`, последний час — `CHECKLIST_SUBMISSION.md`, память GPU — `VRAM.md`.
 
+## Замеры для L2 (по одной команде; в чат — только числа, без кадров и описаний)
+| Что меряем | Команда | Выход | Метрики |
+|---|---|---|---|
+| Локальность моделей | `offline_smoke.ps1 -Firewall` (админ) | `runs\deploy\offline_worker_smoke.json`, `offline_proof_*.md` | `ok`, `network_attempts` (=0), `egress_selftest.all_blocked`, `result.stages.*.origin`, `timings_s` |
+| VRAM: дефолты A03 (A) против оверлея (B, выкл.) | см. `VRAM.md` → «Команда замера» | `runs\deploy\vram_{A,B}.json` | `stages.*.vram_peak_mb`, `vram_events`, выполнен ли `vlm_verify`, `timings_s.run`, verdict |
+| SLA (5+ видео одновременно) | `python -m eval.jury_sim --url <URL> --key <ключ> --videos data\videos --n 6` (A16) | отчёт A16 | время до результата у каждого (max ≤ 300 с), FP/FN, таймкод, тип |
+| Публичный URL | `deploy\tunnel_probe.py real --url <URL> --mb 30` и `tunnel --url <URL>` (против `stub_api.py` за тем же туннелем) | `runs\deploy\tunnel_*.json` | загрузка 30 МБ, 413/524, задержка `/healthz`, Range 206, Set-Cookie |
+
+Новые режимы (VRAM-оверлей, `netguard=block` в проде) включаются только после того, как замер покажет выигрыш — по одному изменению за раз.
+
 ## Что делает каждый файл
 | Файл | Назначение |
 |---|---|
