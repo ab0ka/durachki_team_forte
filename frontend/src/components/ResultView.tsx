@@ -13,11 +13,13 @@ import {
   Upload,
 } from "lucide-react";
 import { ApiError, localVideo } from "../api/client";
-import { inferDuration, isPartial, reviewHints, toJuryJson } from "../api/normalize";
+import { inferDuration, reviewHints, toJuryJson } from "../api/normalize";
 import type { JobResult } from "../api/types";
 import { useApp } from "../context";
 import { formatDateTime, formatDuration, formatTimecode } from "../lib/format";
+import { analyzeCompleteness } from "../lib/completeness";
 import { verdictView } from "../lib/verdict";
+import CompletenessPanel from "./CompletenessPanel";
 import CopilotPanel from "./CopilotPanel";
 import VideoPlayer, { type PlayerHandle } from "./VideoPlayer";
 import ViolationCard from "./ViolationCard";
@@ -52,8 +54,8 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
   const player = useRef<PlayerHandle>(null);
   const playerBox = useRef<HTMLDivElement>(null);
   const [t, setT] = useState(0);
-  const partial = isPartial(job);
-  const view = verdictView(job, partial);
+  const completeness = useMemo(() => analyzeCompleteness(job), [job]);
+  const view = verdictView(job, completeness.state, completeness.mock);
   const duration = inferDuration(job);
   const hints = reviewHints(job);
   const source = useMemo(() => {
@@ -74,7 +76,15 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
   const timings = (job.meta.timings ?? {}) as Record<string, number>;
   const total = typeof timings.total === "number" ? timings.total : undefined;
   const warnings = Array.isArray(job.meta.warnings) ? (job.meta.warnings as unknown[]).map(String) : [];
-  const models = Array.isArray(job.meta.models) ? (job.meta.models as unknown[]) : [];
+  const rawModels = job.meta.models;
+  const models: unknown[] = Array.isArray(rawModels)
+    ? rawModels
+    : rawModels && typeof rawModels === "object"
+      ? Object.entries(rawModels as Record<string, unknown>).map(([k, v]) => {
+          const o = (v ?? {}) as { origin?: unknown; version?: unknown };
+          return `${k}: ${[o.origin, o.version].filter(Boolean).join(" ")}`;
+        })
+      : [];
   const maxRisk = job.timeline.reduce((m, [, r]) => Math.max(m, r), 0);
 
   const Icon = view.tone === "danger" ? AlertOctagon : view.tone === "success" ? ShieldCheck : AlertTriangle;
@@ -108,6 +118,15 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             <div className="text-xs font-semibold uppercase tracking-[.14em] opacity-75">Вердикт системы{demo ? " · синтетическое демо" : ""}</div>
             <h1 className="mt-1 text-2xl font-extrabold leading-tight sm:text-[32px]">{view.title}</h1>
             <p className="mt-2 max-w-3xl text-sm opacity-90 sm:text-[15px]">{view.subtitle}</p>
+            {view.flags.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {view.flags.map((f) => (
+                  <span key={f} className="rounded-md bg-black/25 px-2 py-0.5 text-[11px] font-bold uppercase tracking-wider ring-1 ring-white/30">
+                    {f}
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="mt-4 flex flex-wrap gap-2 text-xs font-semibold">
               {name && <span className="rounded-full bg-white/15 px-3 py-1">{name}</span>}
               {duration > 0 && <span className="rounded-full bg-white/15 px-3 py-1 tnum">длительность {formatTimecode(duration)}</span>}
@@ -197,12 +216,16 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             </section>
           ) : (
             <section className="card p-6 text-center">
-              <ShieldCheck className={cx("mx-auto h-10 w-10", view.tone === "success" ? "text-emerald-500" : "text-amber-500")} />
+              <ShieldCheck
+                className={cx("mx-auto h-10 w-10", view.tone === "success" ? "text-emerald-500" : view.tone === "warning" ? "text-amber-500" : "text-slate-400")}
+              />
               <h2 className="mt-3 text-lg font-bold">Эпизодов с признаками нарушений не найдено</h2>
               <p className="mx-auto mt-1 max-w-lg text-sm text-slate-500">
                 {view.tone === "success"
                   ? "Система не выявила видимых признаков нарушений. Ограничения — в блоке «Что система не проверяет»."
-                  : "Анализ неполный — вывод об отсутствии нарушений сделать нельзя, просмотрите запись вручную."}
+                  : completeness.state === "partial"
+                    ? "Анализ неполный — вывод об отсутствии нарушений сделать нельзя, просмотрите запись вручную."
+                    : "Полнота анализа не подтверждена — отсутствие найденных эпизодов не означает отсутствия нарушений."}
               </p>
             </section>
           )}
@@ -256,6 +279,8 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
           )}
 
           {job.status === "done" && <CopilotPanel jobId={job.job_id} />}
+
+          <CompletenessPanel report={completeness} />
 
           <section className="card p-4">
             <div className="label mb-2 flex items-center gap-1.5">

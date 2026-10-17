@@ -1,5 +1,6 @@
 // Защитный разбор ответа GET /…/jobs/{id}. Бэкенд собирают 18 агентов —
 // UI не должен падать от лишних/пропущенных полей, строковых чисел и т.п.
+import { analyzeCompleteness } from "../lib/completeness";
 import type {
   EvidenceFrame,
   JobMeta,
@@ -297,19 +298,11 @@ export function violationFacts(v: Violation, job: JobResult): string[] {
 }
 
 /**
- * Анализ неполный (часть стадий пропущена по таймауту/ошибке)? Тогда «нарушений нет»
- * нельзя показывать зелёным. Флаги — договорённость с A02/A03 (см. README → «Для интегратора»).
+ * Анализ неполный? Делегирует в lib/completeness.ts (tri-state: complete / partial / unknown).
+ * Оставлено для совместимости: true только для подтверждённо НЕПОЛНОГО анализа.
  */
 export function isPartial(job: JobResult): boolean {
-  const m = job.meta as Obj;
-  if (m.partial === true || m.incomplete === true || m.degraded === true || m.timed_out === true) return true;
-  if (m.complete === false) return true;
-  for (const k of ["skipped_stages", "stages_skipped", "failed_stages"]) {
-    const v = m[k];
-    if (Array.isArray(v) && v.length > 0) return true;
-  }
-  const warnings = Array.isArray(m.warnings) ? m.warnings.map((w) => str(w).toLowerCase()) : [];
-  return warnings.some((w) => /partial|timeout|timed out|skipped|неполн|таймаут|пропущ|не заверш/.test(w));
+  return analyzeCompleteness(job).state === "partial";
 }
 
 /** Внешний JSON жюри: строго обязательные поля ТЗ (без timeline/meta/норм). */

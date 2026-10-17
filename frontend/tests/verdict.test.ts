@@ -9,11 +9,15 @@ const v = { type: "X", timecode_sec: 1, description: "", evidence_frames: [] };
 describe("verdictView", () => {
   it("формулировки ТЗ", () => {
     expect(verdictView({ status: "done", verdict: "violation", violations: [v] }).title).toBe("Обнаружены признаки возможных нарушений");
-    expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }).title).toBe("Нарушение не обнаружено");
+    expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }, "complete").title).toBe("Нарушение не обнаружено");
     expect(VERDICT_TEXT.no_violation).toBe("Нарушение не обнаружено");
   });
   it("зелёный — только для полного завершённого анализа", () => {
-    expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }).tone).toBe("success");
+    expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }, "complete").tone).toBe("success");
+    expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }, "unknown").tone).toBe("neutral");
+    expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }).flags).toContain("ПОЛНОТА НЕ ПОДТВЕРЖДЕНА");
+    expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }, "complete", true).tone).toBe("neutral");
+    expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }, "complete", true).title).toMatch(/Тестовый результат/);
     expect(verdictView({ status: "done", verdict: "no_violation", violations: [] }, true).tone).toBe("warning");
     expect(verdictView({ status: "failed", verdict: "no_violation", violations: [] }).tone).toBe("warning");
     expect(verdictView({ status: "processing", verdict: null, violations: [] }).tone).toBe("neutral");
