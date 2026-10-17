@@ -79,18 +79,32 @@ class _Canvas:
 
 # ----------------------------------------------------------------------------- статический фон
 
-_BG_CACHE: dict[tuple[int, int], Any] = {}
+_BG_CACHE: dict[tuple, Any] = {}
 
 
-def _background(size: tuple[int, int]):
-    if size in _BG_CACHE:
-        return _BG_CACHE[size].copy()
+def default_layout() -> dict[str, Any]:
+    """Планировка A (как в v1): горизонтальная перегородка, клиенты снизу, сейф слева вверху."""
+    lay: dict[str, Any] = dict(LAYOUT)
+    lay.update({"client_area": (0.0, LAYOUT["partition"][3], 1.0, 1.0), "window": (0.30, LAYOUT["partition"][1],
+                0.42, LAYOUT["partition"][3]), "door_hinge": DOOR_HINGE, "door_len": DOOR_LEN,
+                "door_closed_deg": 180.0, "safe_front": "bottom"})
+    return lay
+
+
+def _layout_key(layout: dict[str, Any]) -> tuple:
+    return tuple(sorted((k, repr(v)) for k, v in layout.items()))
+
+
+def _background(size: tuple[int, int], layout: Optional[dict[str, Any]] = None):
+    lay = layout or default_layout()
+    key = (size, _layout_key(lay))
+    if key in _BG_CACHE:
+        return _BG_CACHE[key].copy()
     np, cv2 = _np(), _cv2()
     c = _Canvas(size)
     img = np.empty((c.h, c.w, 3), np.uint8)
     img[:] = FLOOR_CASHIER
-    y_part = c.p(0, LAYOUT["partition"][3])[1]
-    img[y_part:] = FLOOR_CLIENT
+    c.rect(img, lay["client_area"], FLOOR_CLIENT)
     step = c.r(0.09)
     for x in range(0, c.w, step):  # плитка
         cv2.line(img, (x, 0), (x, c.h - 1), (190, 193, 197), 1)
@@ -98,64 +112,73 @@ def _background(size: tuple[int, int]):
         cv2.line(img, (0, y), (c.w - 1, y), (190, 193, 197), 1)
     cv2.rectangle(img, (0, 0), (c.w - 1, c.h - 1), (80, 80, 85), c.r(0.012))  # стены
     # стол и предметы на нём
-    c.rect(img, LAYOUT["desk"], (170, 196, 214))
-    c.rect(img, LAYOUT["desk"], (120, 140, 160), 2)
-    lx1, ly1, lx2, ly2 = LAYOUT["laptop"]
-    c.rect(img, LAYOUT["laptop"], (55, 55, 60))
-    c.rect(img, (lx1 + 0.01, ly1 + 0.006, lx2 - 0.01, ly1 + 0.045), (120, 90, 60))  # экран
-    c.rect(img, LAYOUT["desk_phone"], (30, 30, 30))
-    px1, py1, px2, py2 = LAYOUT["desk_phone"]
+    c.rect(img, lay["desk"], (170, 196, 214))
+    c.rect(img, lay["desk"], (120, 140, 160), 2)
+    lx1, ly1, lx2, ly2 = lay["laptop"]
+    c.rect(img, lay["laptop"], (55, 55, 60))
+    c.rect(img, (lx1 + 0.01, ly1 + 0.006, lx2 - 0.01, ly1 + min(0.045, (ly2 - ly1) / 2)), (120, 90, 60))  # экран
+    c.rect(img, lay["desk_phone"], (30, 30, 30))
+    px1, py1, px2, py2 = lay["desk_phone"]
     c.rect(img, (px1 + 0.01, py1 + 0.012, px2 - 0.01, py2 - 0.008), (90, 90, 90))
-    c.rect(img, LAYOUT["money_counter"], (125, 125, 130))
-    mx1, my1, mx2, my2 = LAYOUT["money_counter"]
+    c.rect(img, lay["money_counter"], (125, 125, 130))
+    mx1, my1, mx2, my2 = lay["money_counter"]
     c.rect(img, (mx1 + 0.015, my1 + 0.03, mx2 - 0.015, my1 + 0.04), (40, 40, 40))
-    c.rect(img, LAYOUT["cash_tray"], (95, 95, 100), 2)
-    c.rect(img, LAYOUT["document"], (245, 245, 245))
-    dx1, dy1, dx2, _ = LAYOUT["document"]
+    c.rect(img, lay["cash_tray"], (95, 95, 100), 2)
+    c.rect(img, lay["document"], (245, 245, 245))
+    dx1, dy1, dx2, _ = lay["document"]
     for k in range(4):
         yy = dy1 + 0.012 + k * 0.012
         cv2.line(img, c.p(dx1 + 0.008, yy), c.p(dx2 - 0.008, yy), (150, 150, 150), 1)
     # тумба сейфа
-    c.rect(img, LAYOUT["safe_stand"], (70, 70, 76))
+    c.rect(img, lay["safe_stand"], (70, 70, 76))
     # перегородка с окном
-    c.rect(img, LAYOUT["partition"], GLASS)
-    x1, y1, x2, y2 = LAYOUT["partition"]
-    cv2.line(img, c.p(x1, y1), c.p(x2, y1), FRAME, 2)
-    cv2.line(img, c.p(x1, y2), c.p(x2, y2), FRAME, 2)
-    c.rect(img, (0.30, y1, 0.42, y2), (245, 240, 230))  # окно выдачи
-    _BG_CACHE[size] = img
+    c.rect(img, lay["partition"], GLASS)
+    x1, y1, x2, y2 = lay["partition"]
+    for a, b in (((x1, y1), (x2, y1)), ((x1, y2), (x2, y2)), ((x1, y1), (x1, y2)), ((x2, y1), (x2, y2))):
+        cv2.line(img, c.p(*a), c.p(*b), FRAME, 2)
+    c.rect(img, lay["window"], (245, 240, 230))  # окно выдачи
+    _BG_CACHE[key] = img
     return img.copy()
 
 
 # ----------------------------------------------------------------------------- динамика
 
-def _draw_safe(img, c: _Canvas, open_frac: float) -> None:
+def _draw_safe(img, c: _Canvas, open_frac: float, layout: Optional[dict[str, Any]] = None) -> None:
     cv2 = _cv2()
-    x1, y1, x2, y2 = LAYOUT["safe"]
-    front_y = y1 + (y2 - y1) * 0.68
-    c.rect(img, (x1, y1, x2, front_y), (178, 183, 188))      # верхняя грань
-    c.rect(img, (x1, front_y, x2, y2), (132, 137, 142))      # передняя грань
-    c.rect(img, LAYOUT["safe"], (90, 92, 96), 2)
+    lay = layout or default_layout()
+    x1, y1, x2, y2 = lay["safe"]
+    bottom = lay.get("safe_front", "bottom") == "bottom"
+    if bottom:
+        front_y = y1 + (y2 - y1) * 0.68
+        top_face, front = (x1, y1, x2, front_y), (x1, front_y, x2, y2)
+    else:
+        front_y = y1 + (y2 - y1) * 0.32
+        top_face, front = (x1, front_y, x2, y2), (x1, y1, x2, front_y)
+    c.rect(img, top_face, (178, 183, 188))      # верхняя грань
+    c.rect(img, front, (132, 137, 142))         # передняя грань
+    c.rect(img, lay["safe"], (90, 92, 96), 2)
     if open_frac < 0.15:
-        hx, hy = c.p(x2 - 0.04, (front_y + y2) / 2)
+        hx, hy = c.p(x2 - 0.04, (front[1] + front[3]) / 2)
         cv2.circle(img, (hx, hy), c.r(0.012), (50, 50, 50), -1, cv2.LINE_AA)
-        c.rect(img, (x1 + 0.03, front_y + 0.008, x1 + 0.07, y2 - 0.008), (60, 60, 60))  # кодовый замок
+        c.rect(img, (x1 + 0.03, front[1] + 0.008, x1 + 0.07, front[3] - 0.008), (60, 60, 60))  # кодовый замок
         return
-    c.rect(img, (x1 + 0.006, front_y, x2 - 0.006, y2), (22, 22, 22))  # тёмный проём
+    c.rect(img, (x1 + 0.006, front[1], x2 - 0.006, front[3]), (22, 22, 22))  # тёмный проём
     for k in (0.35, 0.7):
-        yy = front_y + (y2 - front_y) * k
+        yy = front[1] + (front[3] - front[1]) * k
         cv2.line(img, c.p(x1 + 0.01, yy), c.p(x2 - 0.01, yy), (70, 70, 70), 1)
     theta = math.radians(100.0 * min(1.0, open_frac))
-    hinge = c.p(x2, y2)
+    hinge = c.p(x2, y2 if bottom else y1)
     length = c.r(x2 - x1)
-    end = (int(hinge[0] - length * math.cos(theta)), int(hinge[1] + length * math.sin(theta)))
+    sign = 1 if bottom else -1
+    end = (int(hinge[0] - length * math.cos(theta)), int(hinge[1] + sign * length * math.sin(theta)))
     cv2.line(img, hinge, end, (120, 125, 130), c.r(0.022), cv2.LINE_AA)  # дверца
     cv2.line(img, hinge, end, (80, 82, 86), 2, cv2.LINE_AA)
 
 
-def _draw_door(img, c: _Canvas, open_frac: float) -> None:
+def _draw_door(img, c: _Canvas, open_frac: float, layout: Optional[dict[str, Any]] = None) -> None:
     cv2 = _cv2()
-    box = LAYOUT["door"]
+    lay = layout or default_layout()
+    box = lay["door"]
     if open_frac < 0.05:
         c.rect(img, box, GLASS)
         c.rect(img, box, FRAME, 2)
@@ -163,10 +186,10 @@ def _draw_door(img, c: _Canvas, open_frac: float) -> None:
         return
     c.rect(img, box, FLOOR_CLIENT)  # проём
     cv2.line(img, c.p(box[0], box[1]), c.p(box[0], box[3]), FRAME, 3)
-    theta = math.radians(85.0 * min(1.0, open_frac))
-    hinge = c.p(*DOOR_HINGE)
-    length = c.r(DOOR_LEN)
-    end = (int(hinge[0] - length * math.cos(theta)), int(hinge[1] + length * math.sin(theta)))
+    theta = math.radians(lay.get("door_closed_deg", 180.0) - 85.0 * min(1.0, open_frac))
+    hinge = c.p(*lay["door_hinge"])
+    length = c.r(lay["door_len"])
+    end = (int(hinge[0] + length * math.cos(theta)), int(hinge[1] + length * math.sin(theta)))
     cv2.line(img, hinge, end, FRAME, c.r(0.022), cv2.LINE_AA)
     cv2.line(img, hinge, end, GLASS, max(1, c.r(0.022) - 4), cv2.LINE_AA)
 
@@ -195,6 +218,13 @@ def _draw_item(img, c: _Canvas, it: ItemState) -> None:
     elif it.label == "food":
         c.rect(img, it.bbox, (120, 180, 220))
         c.rect(img, it.bbox, (70, 120, 170), 2)
+    elif it.label == "personal_item":  # куртка/личная сумка на столе
+        cx, cy = c.p((x1 + x2) / 2, (y1 + y2) / 2)
+        ax, ay = max(1, int((x2 - x1) * c.w / 2)), max(1, int((y2 - y1) * c.h / 2))
+        cv2.ellipse(img, (cx, cy), (ax, ay), 15, 0, 360, (40, 60, 95), -1, cv2.LINE_AA)
+        cv2.ellipse(img, (cx - ax // 3, cy), (ax // 2, max(1, ay // 2)), -20, 0, 360, (30, 45, 75), -1, cv2.LINE_AA)
+    elif it.label == "handset":  # трубка стационарного телефона
+        c.rect(img, it.bbox, (35, 35, 35))
     else:
         c.rect(img, it.bbox, (200, 200, 200))
 
@@ -225,12 +255,14 @@ def _draw_person(img, c: _Canvas, p: PersonState) -> None:
             cv2.circle(img, c.p(hx, hy), c.r(HAND_R), SKIN, -1, cv2.LINE_AA)
 
 
-def render_snapshot(snap: Snapshot, size: tuple[int, int] = DEFAULT_SIZE):
-    """Кадр BGR uint8 базового ракурса для снимка сцены."""
-    img = _background(size)
+def render_snapshot(snap: Snapshot, size: tuple[int, int] = DEFAULT_SIZE,
+                    layout: Optional[dict[str, Any]] = None):
+    """Кадр BGR uint8 базового ракурса для снимка сцены (``layout`` — планировка, по умолчанию A)."""
+    lay = layout or getattr(snap, "layout", None)
+    img = _background(size, lay)
     c = _Canvas(size)
-    _draw_safe(img, c, snap.safe_open)
-    _draw_door(img, c, snap.door_open)
+    _draw_safe(img, c, snap.safe_open, lay)
+    _draw_door(img, c, snap.door_open, lay)
     for it in snap.items:
         if it.holder is None:
             _draw_item(img, c, it)
@@ -239,6 +271,9 @@ def render_snapshot(snap: Snapshot, size: tuple[int, int] = DEFAULT_SIZE):
     for it in snap.items:
         if it.holder is not None:
             _draw_item(img, c, it)
+    lights = float(getattr(snap, "lights", 1.0))
+    if lights < 0.999:  # свет выключили: кадр почти чёрный, сцена «неизвестна»
+        img = (img.astype("float32") * (0.08 + 0.92 * max(0.0, lights))).astype("uint8")
     return img
 
 

@@ -11,6 +11,7 @@ import math
 import re
 from typing import Any, Optional
 
+from contracts.extensions import EXTRA_LABELS, EXTRA_SIGNALS
 from contracts.sentinel_contracts import (
     LABELS,
     SIGNALS,
@@ -87,7 +88,7 @@ def check_detections(dets: Any) -> list[str]:
         if not isinstance(d, Detection):
             out.append(f"detections[{i}]: не Detection ({type(d).__name__})")
             continue
-        if d.label not in LABELS:
+        if d.label not in LABELS and d.label not in EXTRA_LABELS:
             out.append(f"detections[{i}]: label {d.label!r} не из LABELS")
         if not (_num(d.t) and d.t >= 0):
             out.append(f"detections[{i}]: t={d.t!r}")
@@ -158,7 +159,8 @@ def check_scene_states(states: Any, require_all: bool = False) -> list[str]:
         if not _num(s.t) or s.t < prev:
             out.append(f"states[{i}]: t={s.t!r} не возрастает")
         prev = s.t if _num(s.t) else prev
-        unknown = set(s.signals) - set(SIGNALS)
+        # расширения допустимы: EXTRA_SIGNALS (v1.1) и экспериментальные с префиксом x_
+        unknown = {k for k in set(s.signals) - set(SIGNALS) - set(EXTRA_SIGNALS) if not k.startswith("x_")}
         if unknown:
             out.append(f"states[{i}]: неизвестные сигналы {sorted(unknown)}")
         if require_all and set(SIGNALS) - set(s.signals):
