@@ -112,9 +112,13 @@ def _load_frames(a: argparse.Namespace) -> list[tuple[str, np.ndarray]]:
 
 
 def _load_zones(path: Optional[str]) -> Any:
+    """[{name, polygon}] | {name: polygon} | {"zones": [...]} (например, выгрузка зон A06)."""
     if not path:
         return None
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    z = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(z, dict) and "zones" in z:
+        z = z["zones"]
+    return z
 
 
 def _draw(img: np.ndarray, d: RawDets, zones: Any, extra: Sequence[tuple[str, Sequence[float]]] = ()) -> np.ndarray:
