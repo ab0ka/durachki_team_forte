@@ -169,7 +169,10 @@ def masked_median(stack: list[np.ndarray], masks: list[np.ndarray]) -> np.ndarra
     arr = np.stack([s.astype(np.float32) for s in stack])
     mk = np.stack([m > 0 for m in masks])
     data = np.where(mk, arr, np.nan)
-    with np.errstate(all="ignore"):
+    import warnings
+
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)  # пиксель закрыт людьми во всех кадрах → фолбэк ниже
         med = np.nanmedian(data, axis=0)
     fallback = np.median(arr, axis=0)
     return np.where(np.isfinite(med), med, fallback).astype(np.float32)

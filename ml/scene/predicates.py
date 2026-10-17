@@ -21,7 +21,8 @@ from typing import Any, Optional
 import numpy as np
 
 from . import tri
-from .geometry import BBox, anchor_point, bbox_center, bbox_gap, bbox_intersection, bbox_area, expand_bbox, point_in_polygon
+from .geometry import BBox, anchor_point, bbox_area, bbox_center, bbox_gap, bbox_intersection, expand_bbox, point_in_polygon
+from .geometry import polygon_bbox as bbox_from_poly
 from .tri import F, O, T, U
 
 Polys = list[list[tuple[float, float]]]
@@ -180,7 +181,9 @@ def _roles(ctx: PredContext, sides: list[list[tuple[Any, str]]]) -> dict[int, _T
         else:
             r.collector = o.p_collector >= 0.5
             came_from_client = client_before.get(tid, 0.0) >= float(pr["client_history_s"])
-            r.staff = r.dominant or r.collector or (o.p_cashier >= 0.7 and not came_from_client)
+            # без явной роли сотрудник — только доминирующий «работник со стороны кассы» или инкассатор;
+            # второй человек без истории в client_area — неизвестная роль (не «посторонний» и не «сотрудник»)
+            r.staff = r.dominant or r.collector
             r.non_staff = came_from_client and not r.staff
         roles[tid] = r
     return roles
@@ -258,12 +261,13 @@ def entry_pred(ctx: PredContext, evs: list[dict[str, Any]], lights: np.ndarray) 
         st = T if (vo[lo:hi] == T).any() else (F if (vo[lo:hi] == F).all() else U)
         e["valuables_open"] = tri.NAMES[int(st)]
         sel = (ctx.times >= ctx.times[i]) & (ctx.times <= ctx.times[i] + win)
-        if st == T:
+        if st == T and e["non_staff"]:
             out[sel] = T
         elif st != F:
+            # ценности открыты, но роль вошедшего неизвестна (мог вернуться сотрудник) — unknown, не true
             out[sel] = np.where(out[sel] == T, T, U)
             for j in np.flatnonzero(sel):
-                why[j] = "valuables_unknown"
+                why[j] = "role_unknown" if st == T else "valuables_unknown"
     return out, _why_fill(out, why, "no_evidence")
 
 
@@ -285,9 +289,37 @@ def leave_events(ctx: PredContext) -> tuple[np.ndarray, list[dict[str, Any]]]:
         onset = j + 1 if j + 1 < n else j
         ret = np.flatnonzero(occ[i1 + 1 :])
         t_ret = float(ctx.times[i1 + 1 + ret[0]]) if len(ret) else None
-        evs.append({"type": "leave", "t": float(ctx.times[onset]), "i": onset, "t_confirmed": float(ctx.times[i0]), "i_end": int(i1), "t_return": t_ret})
-        st[onset:i0] = np.where(st[onset:i0] == F, F, T)
+        i_desk = _left_desk_index(ctx, onset)
+        ev = {"type": "leave", "t": float(ctx.times[onset]), "i": onset, "t_confirmed": float(ctx.times[i0]), "i_end": int(i1),
+              "t_return": t_ret, "t_left_desk": float(ctx.times[i_desk]), "onset_policy": str(pr.get("leave_onset", "exit"))}
+        if pr.get("leave_onset", "exit") == "left_desk" and i_desk < onset:
+            ev["i"] = i_desk  # [H5] таймкод — момент, когда отошла от стола, а не когда вышла из зоны кассы
+        evs.append(ev)
+        st[ev["i"]:i0] = np.where(st[ev["i"]:i0] == F, F, T)
     return st, evs
+
+
+def _left_desk_index(ctx: PredContext, onset: int) -> int:
+    """Первый сэмпл после того, как «кассироподобный» человек последний раз был у стола (до выхода из зоны)."""
+    desk = ctx.zones.get("desk")
+    if not desk:
+        return onset
+    pad = float(ctx.cfg["predicates"].get("desk_near_pad", 0.12))
+    ay = float(ctx.cfg["presence"]["anchor_y"])
+    boxes = [b for b in (bbox_from_poly(p) for p in desk) if b is not None]
+    near = [expand_bbox(b, 0.0, pad) for b in boxes]
+    last = None
+    for i in range(onset - 1, -1, -1):
+        for o in ctx.tl.persons[i]:
+            if o.p_cashier < 0.4:
+                continue
+            x, y = anchor_point(o.bbox, ay)
+            if any(b[0] <= x <= b[2] and b[1] <= y <= b[3] for b in near):
+                last = i
+                break
+        if last is not None:
+            break
+    return onset if last is None else min(onset, last + 1)
 
 
 def _bag_on_desk(ctx: PredContext) -> np.ndarray:
