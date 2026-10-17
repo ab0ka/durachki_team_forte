@@ -145,6 +145,7 @@ def test_a03_layout_names_dedupe_and_conflict(tmp_path: Path, capsys: pytest.Cap
                  "--trace"]) == 0
     text = capsys.readouterr().out
     assert "TP=2 FP=0 FN=0 TN=1" in text          # Х-4 ≡ X-47 — один ролик
+    assert "Правила (профиль baseline)" in text and "V09_personal_items_on_desk" in text  # enabled/disabled + причина
     assert "конфликт таймкода: 1" in text and "predicate" in text
     res = json.loads(out_json.read_text(encoding="utf-8"))
     assert res["summary"]["n_labeled"] == 3 and res["summary"]["joint"] is not None
