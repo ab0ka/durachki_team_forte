@@ -133,7 +133,7 @@ def test_gpu_lock_busy(cfg, corpus, job_violation) -> None:
 
 
 def test_accepts_dataclass_result(cfg, corpus) -> None:
-    from copilot._contract_fallback import AnalysisResult, EvidenceFrame, Violation
+    from copilot._contract import AnalysisResult, EvidenceFrame, Violation
 
     res = AnalysisResult(job_id="dc", status="done", verdict="violation", violations=[
         Violation(type="Использование мобильного телефона при работе с ценностями", timecode_sec=10.0,
