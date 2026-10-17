@@ -44,8 +44,12 @@ git merge --no-ff --allow-unrelated-histories origin/<ветка-агента> -
    * найти оставшиеся: `git grep -n "_contract_fallback"`;
    * сверить копии с каноном и удалить совпадающие: `python scripts/check_fallbacks.py` (отчёт), затем `--drop`. На 17.10 все 14 копий побайтно совпадают с каноном.
 4. Прогнать тесты модуля: `pytest <папка> -m "not gpu and not slow"`.
-5. Прогнать сторож правил: `python scripts/check_licenses.py` (лицензии моделей, облачные API, видео/веса в git).
-6. Прогнать сквозной mock-тест: `python -m testkit.e2e_stub` (схема ответа жюри обязательна).
+5. Прогнать сторожей:
+   * `python scripts/check_licenses.py` — лицензии моделей, облачные API;
+   * `python scripts/guard_media.py --all` — медиа, веса, файлы > 5 МБ;
+   * `python scripts/resolve_deps.py --lock-ref origin/data/labels:tools/dataprep/requirements-l1.lock.txt` — зависимости против lock L1.
+6. Прогнать сквозной mock-тест строго: `python -m testkit.e2e_stub --no-backend --strict-stages` и `python -m testkit.e2e_stub --suite spec --no-backend --strict-stages`.
+7. Перегенерировать матрицу совместимости: `python scripts/compat_matrix.py --tree .` — в корне интеграционной ветки, где все модули уже на месте.
 
 ## 3. Точки стыковки, которые легко пропустить
 
