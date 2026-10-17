@@ -85,7 +85,8 @@ def test_disabled_returns_error_not_answer(cfg, corpus, job_violation) -> None:
 
 
 def test_unavailable_when_no_model(cfg, corpus, job_violation) -> None:
-    cfg2 = load_config({**cfg, "llm": {**cfg["llm"], "backend": "auto", "model_candidates": ["weights/none.gguf"]}})
+    cfg2 = load_config({**cfg, "llm": {**cfg["llm"], "backend": "auto", "no_model_mode": "unavailable",
+                                       "model_candidates": ["weights/none.gguf"]}})
     svc = CopilotService(cfg=cfg2, corpus=corpus)
     st = svc.status()
     assert st["enabled"] is True and st["available"] is False and st["reason"] == "unavailable"
@@ -125,7 +126,7 @@ def test_gpu_lock_busy(cfg, corpus, job_violation) -> None:
 
     lock = threading.Lock()
     lock.acquire()
-    cfg2 = load_config({**cfg, "llm": {**cfg["llm"], "timeout_s": 0.2}})
+    cfg2 = load_config({**cfg, "llm": {**cfg["llm"], "timeout_s": 0.2, "busy_policy": "error"}})
     svc = _svc(cfg2, corpus, _FakeLlamaCpp(["ответ [N1]"]))
     svc.gpu_lock = lock
     assert svc.answer(job_violation, "Почему?", [])["error"] == "busy"
@@ -169,14 +170,16 @@ def test_stream_consumed_from_different_threads_with_rlock(cfg, corpus, job_viol
 def test_unavailable_rechecked_later(cfg, corpus, monkeypatch) -> None:
     cfg2 = load_config({**cfg, "llm": {**cfg["llm"], "backend": "auto", "model_candidates": []}})
     svc = CopilotService(cfg=cfg2, corpus=corpus)
-    assert svc.status()["available"] is False
+    st = svc.status()
+    assert st["available"] is True and st["generative"] is False and st["mode"] == "retrieval"
     calls = []
     import copilot.service as service_mod
 
     monkeypatch.setattr(service_mod, "make_llm", lambda c, w: calls.append(1) or ScriptedLLM(["ok"]))
-    assert svc.status()["available"] is False and not calls  # кэш в пределах RETRY_UNAVAILABLE_S
+    assert svc.status()["generative"] is False and not calls  # кэш в пределах RETRY_UNAVAILABLE_S
     svc._resolved_at -= svc.RETRY_UNAVAILABLE_S + 1
-    assert svc.status()["available"] is True and calls
+    st = svc.status()
+    assert st["generative"] is True and st["mode"] == "generative" and calls
 
 
 def test_history_is_truncated(cfg, corpus, job_violation) -> None:

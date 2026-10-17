@@ -72,10 +72,11 @@ class E5Embedder:
     name = "e5"
 
     def __init__(self, model: str = "intfloat/multilingual-e5-small", device: str = "cpu",
-                 batch_size: int = 32) -> None:
+                 batch_size: int = 32, hf_cache_dir: Optional[str] = None) -> None:
         self.model_name = model
         self.device = device
         self.batch_size = batch_size
+        self.hf_cache_dir = hf_cache_dir
         self._st: Any = None
         self._tok: Any = None
         self._model: Any = None
@@ -96,7 +97,11 @@ class E5Embedder:
                 return str(cand)
         from huggingface_hub import snapshot_download  # type: ignore
 
-        return str(snapshot_download(repo_id=self.model_name, local_files_only=True))
+        kwargs: dict[str, Any] = {"repo_id": self.model_name, "local_files_only": True}
+        cache = resolve_path(self.hf_cache_dir) if self.hf_cache_dir else None
+        if cache is not None and cache.is_dir():  # офлайн-веса L1: weights/hf/hub
+            kwargs["cache_dir"] = str(cache)
+        return str(snapshot_download(**kwargs))
 
     def _load(self) -> None:
         path = self._local_path()
@@ -149,7 +154,8 @@ def make_embedder(cfg: dict[str, Any], warnings: Optional[list[str]] = None) -> 
     try:
         return E5Embedder(model=str(ecfg.get("model", "intfloat/multilingual-e5-small")),
                           device=str(ecfg.get("device", "cpu")),
-                          batch_size=int(ecfg.get("batch_size", 32)))
+                          batch_size=int(ecfg.get("batch_size", 32)),
+                          hf_cache_dir=ecfg.get("hf_cache_dir"))
     except Exception as exc:
         if backend == "e5":
             raise
