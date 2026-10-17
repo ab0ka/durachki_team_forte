@@ -373,28 +373,34 @@ class Supervisor:
 
     # ---- готовность
     def check_ready(self) -> None:
-        r = httpkit.request("GET", self.url + "/readyz", timeout=5)
-        body = r.json() if r.status else None
-        if r.status == 503 or (r.status == 200 and isinstance(body, dict) and body.get("pipeline") == "fake"):
-            state = (body or {}).get("state") if isinstance(body, dict) else None
-            if isinstance(body, dict) and body.get("pipeline") == "fake":
-                self.save(phase="not_ready", detail="readyz: pipeline=fake — фиктивный пайплайн в проде запрещён")
-            else:
-                self.save(phase="warming", detail=f"readyz 503 state={state}")
+        """Production gate: /readyz A02 (ready/real) → только тогда synthetic-задача → только тогда туннель."""
+        rz = healthcheck.readiness(self.url, allow_stub=self.args.allow_stub)
+        self.st["readyz"] = {k: rz.get(k) for k in ("status", "state", "pipeline", "verdict")}
+        if rz["verdict"] == "waiting":
+            self.save(phase="warming", detail=rz["why"])
             return
-        if r.status not in (200, 404):  # 404 — API без /readyz: решает пробная задача
+        if rz["verdict"] == "terminal" and rz.get("state") == "gpu_hung":
+            self.log(f"readyz gpu_hung — перезапуск api (освобождение GPU): {rz['why']}")
+            self.save(phase="restarting", detail=rz["why"], last_error=rz["why"])
+            self.stop_proc(self.api)  # следующий виток цикла увидит выход и перезапустит
+            return
+        if rz["verdict"] in ("terminal", "bad"):
+            if self.st.get("detail") != rz["why"]:
+                self.log(f"NOT READY (без пробной задачи): {rz['why']}")
+            self.save(phase="not_ready", detail=rz["why"], last_error=rz["why"])
             return
         key = api_key(self.env, self.data)
         video = self.logs / "trial_synth.mov"
         if not video.is_file():
             from deploy.synth_video import make_video
             make_video(video, seconds=10)
-        self.save(phase="trial", detail="пробная задача (реальный inference)")
+        self.save(phase="trial", detail="synthetic-задача POST/GET (тракт и контракт, не качество CV)")
         rep = healthcheck.ready(self.url, key, video, self.trial_limit, allow_stub=self.args.allow_stub)
         (self.logs / "ready.json").write_text(json.dumps(rep, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if rep.get("ok"):
-            self.save(phase="ready", ready_at=_now(), detail=f"пробная задача {rep.get('time_to_result_s')} с")
-            self.log(f"READY: пробная задача прошла за {rep.get('time_to_result_s')} с")
+            self.save(phase="ready", ready_at=_now(),
+                      detail=f"synthetic-задача: {rep.get('from_accept_s')} с от приёма до итога")
+            self.log(f"READY: synthetic-задача {rep.get('from_accept_s')} с от приёма (server {rep.get('server')})")
             if self.tunnel is None or self.tunnel.poll() is not None:
                 self.start_tunnel()  # открываем ОДИН раз; при рестарте api туннель (и quick URL) сохраняется
         else:
@@ -432,7 +438,7 @@ class Supervisor:
 
     def _loop(self) -> int:
         signal.signal(signal.SIGTERM, lambda *_: self.store.stop_flag.touch())
-        live_fail, next_ready_try = 0, 0.0
+        live_fail, next_ready_try, next_readyz = 0, 0.0, 0.0
         while True:
             if self.store.stop_flag.exists():
                 self.log("stop requested")
@@ -459,7 +465,7 @@ class Supervisor:
                     return 5
                 continue
             phase = self.st.get("phase")
-            if phase in ("starting", "warming", "not_ready", "trial") and time.time() >= next_ready_try:
+            if phase in ("starting", "warming", "not_ready", "trial", "restarting") and time.time() >= next_ready_try:
                 if time.time() - float(self.st.get("api_started") or time.time()) > self.ready_timeout:
                     if phase != "ready_timeout":
                         self.save(phase="ready_timeout",
@@ -471,6 +477,15 @@ class Supervisor:
             elif phase == "ready":
                 ok = healthcheck.live(self.url)["ok"]
                 live_fail = 0 if ok else live_fail + 1
+                if ok and time.time() >= next_readyz:
+                    next_readyz = time.time() + 30.0
+                    rz = healthcheck.readiness(self.url, allow_stub=self.args.allow_stub)
+                    self.st["readyz"] = {k: rz.get(k) for k in ("status", "state", "pipeline", "verdict")}
+                    if rz.get("state") == "gpu_hung":
+                        self.log(f"readyz gpu_hung — перезапуск api: {rz['why']}")
+                        self.save(phase="restarting", last_error=rz["why"])
+                        self.stop_proc(self.api)
+                        continue
                 if live_fail >= max(3, int(30 / max(self.interval, 0.1))):
                     self.log("api не отвечает — перезапуск (зависание)")
                     self.stop_proc(self.api)

@@ -30,8 +30,15 @@ RANGE_PAYLOAD = bytes(range(256)) * 4096  # 1 MiB детерминированн
 
 
 class StubState:
-    def __init__(self, keys: list[str], polls_until_done: int = 2, pipeline: str = "stub") -> None:
+    def __init__(self, keys: list[str], polls_until_done: int = 2, pipeline: str = "stub",
+                 readyz_state: str = "ready", result_meta: dict | None = None, verdict: str = "violation") -> None:
         self.keys, self.polls_until_done, self.pipeline = keys, polls_until_done, pipeline
+        self.readyz_state, self.verdict = readyz_state, verdict
+        # как meta A02/A03 (meta.api, coverage), но pipeline=stub — healthcheck без --allow-stub это отвергает
+        self.result_meta = result_meta if result_meta is not None else {
+            "complete": True, "coverage": {"ratio": 1.0, "complete": True},
+            "api": {"pipeline": "stub", "queue_wait_s": 0.0, "processing_s": 0.01, "total_s": 0.01}}
+        self.n_analyze = 0
         self.jobs: dict[str, dict] = {}
         self.lock = threading.Lock()
 
@@ -66,8 +73,12 @@ def make_handler(state: StubState):
             q = urllib.parse.parse_qs(u.query)
             if u.path == "/healthz":
                 return self._send(200, {"status": "ok", "stub": True})
-            if u.path == "/readyz":
-                return self._send(200, {"ready": True, "state": "ready", "pipeline": state.pipeline, "stub": True})
+            if u.path == "/readyz":  # как A02: 200 только при state=ready
+                ready = state.readyz_state == "ready"
+                return self._send(200 if ready else 503, {"ready": ready, "state": state.readyz_state,
+                                                          "pipeline": state.pipeline, "stub": True})
+            if u.path == "/__probe/stats":
+                return self._send(200, {"n_analyze": state.n_analyze, "stub": True})
             if u.path == "/__probe/slow":
                 secs = min(float(q.get("seconds", ["1"])[0]), 600.0)
                 time.sleep(secs)
@@ -92,8 +103,15 @@ def make_handler(state: StubState):
                     done = job["polls"] > state.polls_until_done
                 if not done:
                     return self._send(200, {"job_id": m.group(1), "status": "processing", "stub": True})
+                if state.verdict == "no_violation":
+                    return self._send(200, {"job_id": m.group(1), "status": "done", "verdict": "no_violation",
+                                            "violations": [], "stub": True, "meta": state.result_meta or {}})
+                if state.verdict == "failed":
+                    return self._send(200, {"job_id": m.group(1), "status": "failed", "verdict": None,
+                                            "violations": [], "error": "timeout (stub)", "stub": True})
                 return self._send(200, {
                     "job_id": m.group(1), "status": "done", "verdict": "violation", "stub": True,
+                    "meta": state.result_meta,
                     "violations": [{"type": "ЗАГЛУШКА (stub)", "timecode_sec": 1.0, "type_id": "V99",
                                     "description": "Ответ заглушки deploy/stub_api.py — не результат анализа.",
                                     "evidence_frames": [{"timestamp_sec": 1.0, "image_base64": TINY_JPEG_B64}]}]})
@@ -112,6 +130,7 @@ def make_handler(state: StubState):
                     return self._send(422, {"detail": "multipart field 'file' required"})
                 jid = uuid.uuid4().hex
                 with state.lock:
+                    state.n_analyze += 1
                     state.jobs[jid] = {"polls": 0, "bytes": len(body)}
                 return self._send(200, {"job_id": jid})
             return self._send(404, {"detail": "not found", "stub": True})
@@ -120,10 +139,12 @@ def make_handler(state: StubState):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000, keys: list[str] | None = None,
-          polls_until_done: int = 2, pipeline: str = "stub") -> ThreadingHTTPServer:
+          polls_until_done: int = 2, pipeline: str = "stub", readyz_state: str = "ready",
+          result_meta: dict | None = None, verdict: str = "violation") -> ThreadingHTTPServer:
     keys = keys if keys is not None else [k.strip() for k in (os.environ.get("SENTINEL_API_KEYS") or "").split(",")
                                           if k.strip()]
-    srv = ThreadingHTTPServer((host, port), make_handler(StubState(keys, polls_until_done, pipeline)))
+    srv = ThreadingHTTPServer((host, port), make_handler(StubState(keys, polls_until_done, pipeline, readyz_state,
+                                                                   result_meta, verdict)))
     srv.daemon_threads = True
     return srv
 
@@ -132,8 +153,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--readyz-state", default="ready", help="тесты deploy: состояние /readyz как у A02")
+    ap.add_argument("--polls", type=int, default=2)
     a = ap.parse_args(argv)
-    srv = serve(a.host, a.port)
+    srv = serve(a.host, a.port, polls_until_done=a.polls, readyz_state=a.readyz_state)
     print(f"!!! STUB API (не прод) на http://{a.host}:{srv.server_address[1]} — ответы фиктивные", file=sys.stderr)
     try:
         srv.serve_forever()

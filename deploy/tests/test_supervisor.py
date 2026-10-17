@@ -127,3 +127,35 @@ def test_api_key_sources(tmp_path):
     assert sv.api_key({"SENTINEL_API_KEYS": " a1 , b2 "}, tmp_path) == "a1"
     (tmp_path / "api_keys.txt").write_text("# comment\nfilekey123\n")
     assert sv.api_key({}, tmp_path) == "filekey123"
+
+
+def _stub_cmd(port: int, state: str) -> str:
+    return json.dumps([sys.executable, str(ROOT / "deploy/stub_api.py"), "--port", str(port), "--readyz-state", state])
+
+
+def test_terminal_readyz_blocks_trial_and_tunnel(tmp_path):
+    port, env = _free_port(), _env(tmp_path)
+    p = subprocess.Popen(SUP + ["run", "--port", str(port), "--interval", "0.2", "--allow-stub",
+                                "--api-cmd", _stub_cmd(port, "warmup_failed"), "--tunnel-cmd", json.dumps(FAKE_TUNNEL)],
+                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        st = _wait(lambda: (s := _state(tmp_path)).get("phase") == "not_ready" and s)
+        assert st and "warmup_failed" in st["detail"] and not st.get("tunnel")
+        stats = json.loads(subprocess.run([sys.executable, "-c", f"import urllib.request,sys; sys.stdout.write("
+                                           f"urllib.request.urlopen('http://127.0.0.1:{port}/__probe/stats').read().decode())"],
+                                          capture_output=True, text=True, env={**env, "NO_PROXY": "*"}).stdout)
+        assert stats["n_analyze"] == 0  # synthetic-задачу не слали: она «вылечила» бы warmup_failed у A02
+        assert not (tmp_path / "logs/public_url.txt").exists()
+    finally:
+        subprocess.run(SUP + ["stop"], env=env, capture_output=True, timeout=90)
+        p.wait(timeout=30)
+
+
+def test_gpu_hung_restarts_api_until_crash_loop(tmp_path):
+    port, env = _free_port(), _env(tmp_path)
+    r = subprocess.run(SUP + ["run", "--port", str(port), "--interval", "0.05", "--allow-stub", "--no-tunnel",
+                              "--api-cmd", _stub_cmd(port, "gpu_hung")], env=env, capture_output=True, text=True,
+                       timeout=180)
+    assert r.returncode == 4, r.stdout[-2000:]
+    st = _state(tmp_path)
+    assert st["phase"] == "crash_loop" and "gpu_hung" in (st.get("detail") or "") + (st.get("last_error") or "")
