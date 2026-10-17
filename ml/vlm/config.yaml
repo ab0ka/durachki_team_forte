@@ -62,6 +62,8 @@ llamacpp_python:
 
 # Холодная загрузка модели внутри verify/discover съедает их бюджет: держите модель тёплой (vlm.warmup()).
 runtime:
+  use_registry: true            # внутри воркера A03: модель — через ModelRegistry (вытеснение LRU, unload)
+  registry_vram_gb: 3.5         # резерв для ensure_vram: 2.7 ГБ после загрузки (замер L1) + активации; уточнить bench
   lazy_load_min_budget_s: 45    # без warmup грузим лениво, только если бюджета >= 45 с
   load_retry_cooldown_s: 300    # после неудачной загрузки не пробуем снова 5 минут
 
