@@ -378,23 +378,24 @@ def _peak_index(rule: RuleSpec, times: np.ndarray, strength: np.ndarray, i0: int
 
 def _transition_index(times: np.ndarray, tlo: np.ndarray, thi: np.ndarray, i0: int, i1: int,
                       lookback_s: float) -> tuple[Optional[int], str]:
-    """Наблюдаемый переход trigger: доказанно ложен → доказанно истинен (``false→true``).
+    """Наблюдаемое начало действия: где trigger стал доказанно истинным для ЭТОГО события.
 
-    Ищется в ``[t_start − lookback_s, t_end]``. Если перед истинным значением было только
-    «неизвестно» — ``unknown→true`` (начало могло быть раньше). Если trigger истинен с начала
-    окна/ролика — перехода не видно (``None``), используется fallback-политика.
+    Берётся первый кадр сегмента, где trigger истинен, и от него назад — начало непрерывного
+    отрезка «trigger истинен» (не раньше ``t_start − lookback_s``). Перед ним доказанно ложно →
+    ``false→true``; «неизвестно» → ``unknown→true`` (начало могло быть раньше). Если отрезок тянется
+    за границу окна или с начала ролика — перехода не видно (``None``), используется fallback.
+    Более ранние короткие эпизоды trigger в окне не выбираются.
     """
+    true_idx = np.nonzero(tlo[i0:i1 + 1] >= 0.5)[0]
+    if true_idx.size == 0:
+        return None, "trigger_not_true"
+    j = i0 + int(true_idx[0])
     j_start = int(np.searchsorted(times, float(times[i0]) - lookback_s - 1e-9, side="left"))
-    weak: Optional[int] = None
-    for j in range(max(j_start, 1), i1 + 1):
-        if tlo[j] >= 0.5 and tlo[j - 1] < 0.5:
-            if thi[j - 1] < 0.5:
-                return j, "false→true"
-            if weak is None:
-                weak = j
-    if weak is not None:
-        return weak, "unknown→true"
-    return None, "not_observed"
+    while j - 1 >= j_start and tlo[j - 1] >= 0.5:
+        j -= 1
+    if j == 0 or j - 1 < j_start:
+        return None, "not_observed"
+    return j, ("false→true" if thi[j - 1] < 0.5 else "unknown→true")
 
 
 def _clause_status(lo: float, hi: float) -> str:
