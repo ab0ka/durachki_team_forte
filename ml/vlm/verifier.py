@@ -61,9 +61,16 @@ def _px_per_token(cfg: dict[str, Any]) -> int:
     return int(preset_cfg(cfg, "transformers").get("px_per_token", 28))
 
 
+# VLM спросили, но надёжного ответа нет: для fusion это «не уверен» (score 0 — не перевешивает настоящие мнения),
+# а не подтверждение/отказ; уверенность события не меняется, покрытие — неполное.
+FAILED_ANSWER_STATUSES = ("parse_failed", "truncated", "timeout", "error")
+
+
 def _mark(e: Event, status: str, **kw: Any) -> None:
     v = dict(e.extra.get("vlm") or {})
     v.update({"status": status, "agreement": v.get("agreement", "not_checked")})
+    if status in FAILED_ANSWER_STATUSES:
+        v.update({"agreement": "uncertain", "verdict": "unsure", "score": 0.0, "contradiction": False})
     v.update(kw)
     e.extra["vlm"] = v
 
@@ -227,10 +234,15 @@ def _apply(ev: Event, res: dict[str, Any], types: dict[str, dict[str, Any]], cfg
     p0 = float(ev.confidence)
     p_new, trace = update_confidence(p0, visible, conf, cand, vlm_type, cfg)
     agreement = trace["agreement"]
+    degraded = "regex_fallback" in (res.get("flags") or [])
+    if degraded:  # поля вытащены регэкспом из невалидного текста — ни подтверждать, ни отклонять по ним нельзя
+        p_new = trace["p_prior"]
+        trace = {**trace, "p_post": trace["p_prior"], "agreement": "uncertain"}
+        agreement = "uncertain"
 
     # переклассификация — только для источников, чей тип слабый (temporal/vlm), и при уверенной VLM
     retyped = False
-    if (agreement == "type_mismatch" and visible and vlm_type in types
+    if (not degraded and agreement == "type_mismatch" and visible and vlm_type in types
             and ev.source in set(vcfg.get("retype_sources") or [])
             and conf >= float(vcfg.get("retype_min_conf", 0.7))):
         ev.extra["vlm_original_type_id"] = cand

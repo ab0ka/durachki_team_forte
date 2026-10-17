@@ -117,9 +117,11 @@ class LlamaCppServerBackend(VLMBackend):
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
         usage = data.get("usage") or {}
+        fr = str(choice.get("finish_reason") or "")
         return GenResult(text=str(msg.get("content") or ""), latency_s=lat,
                          prompt_tokens=usage.get("prompt_tokens"), completion_tokens=usage.get("completion_tokens"),
-                         meta={"finish_reason": choice.get("finish_reason"), "timings": data.get("timings")})
+                         finish_reason={"stop": "eos", "length": "length"}.get(fr, fr),
+                         meta={"finish_reason": fr, "timings": data.get("timings")})
 
     def info(self) -> dict[str, Any]:
         return {"backend": self.name, "model": self.model_id, "url": self.url, "schema_mode": self._schema_mode}

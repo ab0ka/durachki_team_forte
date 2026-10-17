@@ -222,7 +222,8 @@ def call_json(be: VLMBackend, images: list[Any], system: str, prompt: str, budge
     fb_data: Optional[dict[str, Any]] = None
 
     def _finish_with_fallback() -> CallOutcome:
-        if fb_data is not None:
+        # регэксп-fallback только для НЕобрезанного, но невалидного текста; обрезанный ответ им не «спасаем»
+        if fb_data is not None and out.status == "parse_failed":
             out.ok, out.status, out.data, out.repaired = True, "ok", fb_data, True
         return out
 
@@ -264,6 +265,15 @@ def call_json(be: VLMBackend, images: list[Any], system: str, prompt: str, budge
         if not res.text.strip():
             out.status, out.error = ("timeout", res.error or "timeout") if res.timed_out else ("error", res.error or "empty")
             break
+        if res.truncated:
+            # Ответ обрезан (max_new_tokens -> length, max_time -> time): даже «отремонтированный» JSON из него —
+            # недосказанный ответ, ему нельзя доверять подтверждение/отказ. length — 1 ретрай со строгим
+            # суффиксом (короче), если позволяют лимиты; time — без ретрая (дорого).
+            by_time = res.timed_out or res.finish_reason == "time"
+            out.status, out.error = ("timeout", "time") if by_time else ("truncated", "length")
+            if by_time:
+                break
+            continue
         pr = extract_json(res.text)
         if pr.ok:
             data, err = normalize(pr.data)
