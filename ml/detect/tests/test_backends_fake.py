@@ -114,3 +114,19 @@ def test_preprocess_pad_square_and_rgb():
     assert float(x[0, 2, 0, 0]) == pytest.approx(1.0)   # B → канал 2 (RGB)
     assert float(x[0, 0, 0, 0]) == pytest.approx(0.0)
     assert float(x[0, 0, 0, 3]) == pytest.approx(0.5)   # паддинг справа
+
+
+def test_owlv2_raw_score_all_queries_unpadded():
+    from ml.detect.backends.owlv2 import OwlV2Backend
+
+    logits = [[[4.0, -4.0], [-4.0, 4.0]]]
+    boxes = [[[0.25, 0.5, 0.1, 0.2], [0.4, 0.8, 0.1, 0.1]]]
+    m = FakeOwl(logits, boxes)
+    be = OwlV2Backend("fake/owl", [{"text": "open safe"}, {"text": "closed metal safe"}], device="cpu", input_size=96,
+                      model=m, processor=SimpleNamespace(tokenizer=FakeTok(), image_processor=None))
+    (b, p), = be.score([np.zeros((848, 464, 3), np.uint8)])
+    assert b.shape == (2, 4) and p.shape == (2, 2)
+    sx = 848 / 464
+    assert b[0].tolist() == pytest.approx([0.2 * sx, 0.4, 0.3 * sx, 0.6], abs=1e-5)
+    assert p[0, 0] > 0.9 and p[0, 1] < 0.1 and p[1, 1] > 0.9
+    assert be.predict([np.zeros((848, 464, 3), np.uint8)])[0].labels == []   # без label запросы не дают Detection

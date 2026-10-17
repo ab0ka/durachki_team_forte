@@ -52,7 +52,10 @@ def render(objects: Sequence[SynthObject], t: float, duration: float, width: int
            palette: Optional[dict[str, Sequence[int]]] = None) -> tuple[np.ndarray, list[tuple[str, tuple]]]:
     import cv2
 
-    pal = palette or load_config()["mock"]["palette"]
+    if palette is None:
+        m = load_config()["mock"]
+        palette = {**m["palette"], **m.get("extra_palette", {})}
+    pal = palette
     img = np.full((height, width, 3), BG, np.uint8)
     gt = []
     for ob in objects:

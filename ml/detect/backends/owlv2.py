@@ -34,7 +34,8 @@ class OwlV2Backend:
         self.name = name
         self.queries = [dict(q) for q in queries]
         self.texts = [str(q["text"]) for q in self.queries]
-        self.labels = [validate_label(str(q["label"])) for q in self.queries]
+        # label нужен только для detect(); для сырого скоринга (inventory) запросы могут быть без метки
+        self.labels = [validate_label(str(q["label"])) if q.get("label") else "" for q in self.queries]
         self.thr = np.asarray([float(q.get("thr", 0.2)) for q in self.queries], np.float32)
         self.nms_iou = float(nms_iou)
         self.max_dets = int(max_dets)
@@ -63,7 +64,8 @@ class OwlV2Backend:
         self.input_ids = enc["input_ids"].to(self.device)
         self.attention_mask = enc["attention_mask"].to(self.device)
 
-    def _forward(self, frames: Sequence[np.ndarray]) -> list[RawDets]:
+    def _raw(self, frames: Sequence[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """Кадры одного размера → (boxes (B,P,4) xyxy в долях КАДРА, probs (B,P,Q) sigmoid по всем запросам)."""
         import torch
 
         h, w = frames[0].shape[:2]
@@ -77,19 +79,32 @@ class OwlV2Backend:
                              attention_mask=self.attention_mask.repeat(b, 1), **kw)
         probs = out.logits.float().sigmoid().cpu().numpy()      # (B, P, Q)
         boxes = out.pred_boxes.float().cpu().numpy()            # (B, P, 4) cxcywh, доли квадрата
+        xyxy = cxcywh_to_xyxy(boxes.reshape(-1, 4)).reshape(boxes.shape)
+        xyxy[..., [0, 2]] *= s / w                              # снимаем паддинг до квадрата
+        xyxy[..., [1, 3]] *= s / h
+        return np.clip(xyxy, 0.0, 1.0), probs
+
+    def score(self, frames: Sequence[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Сырые скоры всех запросов по всем патчам: [(boxes (P,4), probs (P,Q))] на кадр — для контрастных проверок."""
+        out: list[Optional[tuple[np.ndarray, np.ndarray]]] = [None] * len(frames)
+        for _shape, idx in group_by_shape(frames).items():
+            boxes, probs = self._raw([frames[j] for j in idx])
+            for k, i in enumerate(idx):
+                out[i] = (clip01(boxes[k]), probs[k])
+        return [o for o in out if o is not None]
+
+    def _forward(self, frames: Sequence[np.ndarray]) -> list[RawDets]:
+        boxes, probs = self._raw(frames)
         res = []
-        for bi in range(b):
+        for bi in range(len(frames)):
             p = probs[bi]
             qbest = p.argmax(axis=1)
             sbest = p[np.arange(len(p)), qbest]
-            keep = sbest >= self.thr[qbest]
+            keep = (sbest >= self.thr[qbest]) & np.asarray([bool(self.labels[q]) for q in qbest])
             if not keep.any():
                 res.append(RawDets())
                 continue
-            xyxy = cxcywh_to_xyxy(boxes[bi][keep])
-            xyxy[:, [0, 2]] *= s / w
-            xyxy[:, [1, 3]] *= s / h
-            d = RawDets(clip01(xyxy), sbest[keep].astype(np.float32),
+            d = RawDets(clip01(boxes[bi][keep]), sbest[keep].astype(np.float32),
                         [self.labels[q] for q in qbest[keep]],
                         [f"{self.name}:{self.texts[q]}" for q in qbest[keep]])
             d = filter_by_area(d, self.min_area, self.max_area)
