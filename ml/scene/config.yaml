@@ -198,3 +198,8 @@ predicates:
   bag_alone_min_s: 3.0
   safe_working_min_s: 3.0
   timecode: onset             # onset | mid | max — t_peak интервала (подбирается замером L2)
+
+ablation:                     # только для python -m ml.scene.ablation; в проде пусто
+  smoothing: null             # переопределить сглаживание всех сигналов: {method: hmm|hysteresis|ema|none, ...}
+  naive: false                # наивный режим для сравнения (НЕ включать в проде): «не увидели = нет», пропавший трек = ушёл,
+                              # первые кадры = закрытый сейф, «не кассир» = посторонний, сторона — по перекрытию бокса

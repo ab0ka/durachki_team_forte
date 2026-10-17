@@ -101,6 +101,7 @@ def analyze_roi(
     cfg_obj: dict[str, Any],
     extra_open_votes: Optional[np.ndarray] = None,
     use_shape_prior: bool = True,
+    naive_reference: bool = False,
 ) -> AppearanceResult:
     """store — uint8-кропы (extract_u8) по индексам idxs (stride); результат — на все n сэмплов."""
     size = int(cfg_roi["size"])
@@ -220,6 +221,9 @@ def analyze_roi(
             prov.append("geom")
         res.info["shape_prior_b_open"] = prior
     p_a_open = float(sigmoid(lo))
+    if naive_reference:  # АБЛЯЦИЯ: «первые кадры = закрыто» без подтверждения
+        p_a_open = 0.0
+        prov = ["naive_reference"]
     res.p_a_open = p_a_open
     res.label_conf = float(abs(2.0 * p_a_open - 1.0))
     p_app = p_a_open * (1.0 - p_b) + (1.0 - p_a_open) * p_b

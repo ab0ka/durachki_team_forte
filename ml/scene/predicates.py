@@ -21,7 +21,7 @@ from typing import Any, Optional
 import numpy as np
 
 from . import tri
-from .geometry import BBox, anchor_point, bbox_area, bbox_center, bbox_gap, bbox_intersection, expand_bbox, point_in_polygon
+from .geometry import BBox, anchor_point, bbox_area, bbox_center, bbox_fraction_in_polygon, bbox_gap, bbox_intersection, expand_bbox, point_in_polygon
 from .geometry import polygon_bbox as bbox_from_poly
 from .tri import F, O, T, U
 
@@ -128,11 +128,14 @@ def _sides(ctx: PredContext) -> list[list[tuple[Any, str]]]:
     z = ctx.zones
     near_safe = expand_bbox(ctx.safe_roi, float(ctx.cfg["predicates"]["near_safe_pad"])) if ctx.safe_roi else None
     out: list[list[tuple[Any, str]]] = []
+    naive = bool(ctx.cfg.get("ablation", {}).get("naive"))
     for ps in ctx.tl.persons:
         row = []
         for o in ps:
             x, y = anchor_point(o.bbox, ay)
-            if _in(z.get("client_area"), x, y):
+            if naive and ctx.workplace and any(bbox_fraction_in_polygon(o.bbox, p) >= 0.3 for p in ctx.workplace):
+                side = "cashier"  # АБЛЯЦИЯ: сторона по перекрытию бокса, а не по опорной точке
+            elif _in(z.get("client_area"), x, y):
                 side = "client"
             elif _in(z.get("desk"), x, y):
                 side = "desk"
@@ -185,6 +188,8 @@ def _roles(ctx: PredContext, sides: list[list[tuple[Any, str]]]) -> dict[int, _T
             # второй человек без истории в client_area — неизвестная роль (не «посторонний» и не «сотрудник»)
             r.staff = r.dominant or r.collector
             r.non_staff = came_from_client and not r.staff
+            if ctx.cfg.get("ablation", {}).get("naive"):
+                r.non_staff = not r.staff  # АБЛЯЦИЯ: «не кассир» = посторонний
         roles[tid] = r
     return roles
 

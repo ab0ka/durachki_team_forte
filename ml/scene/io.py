@@ -45,7 +45,7 @@ def dump_states(states: Sequence[Any], path: str | Path, trace: Optional[dict[st
     p.parent.mkdir(parents=True, exist_ok=True)
     doc: dict[str, Any] = {"version": 1, "states": [state_to_dict(s) for s in states]}
     if trace is not None:
-        doc["trace"] = _jsonable({k: v for k, v in trace.items() if k in ("raw", "conf_raw", "provenance", "info", "warnings", "rois")})
+        doc["trace"] = _jsonable({k: v for k, v in trace.items() if k in ("raw", "conf_raw", "provenance", "info", "warnings", "rois", "events", "intervals")})
     if meta:
         doc["meta"] = _jsonable(meta)
     p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
