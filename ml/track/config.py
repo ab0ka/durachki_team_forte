@@ -103,6 +103,32 @@ DEFAULTS: dict[str, Any] = {
         "companion_dist_diag": 2.5,
         "second_person_role": "unknown",     # второй человек в зоне кассира: не «посторонний» автоматически
     },
+    "queries": {
+        "min_role_conf": 0.5,            # роль ниже — передаётся как unknown (fallback-кассир <= 0.45)
+        "min_zone_conf": 0.35,           # зона ниже — «не определена» (fallback-зоны <= 0.3)
+        "max_dt": 0.6,
+        "start_grace_s": 0.5,            # кто в кадре с начала — не «вошёл»
+        "vis_grace_s": 1.0,              # появление сразу после потери видимости — не вход
+        "entry_requires_boundary": True,  # вход = появление у двери/края; в глубине кадра — не вход
+        "entry_window_s": 1.0,
+        "edge_margin": 0.06,
+        "door_expand": 1.3,
+        "safe_expand": 1.3,               # «у ценностей» = в расширенной зоне сейфа
+        "low_quality_min_s": 0.6,         # трек короче — не считается человеком в n_outsiders/входах
+        "min_gap_s": 0.6,
+        "min_loss_s": 0.6,                # потеря видимости (все статичные предметы пропали)
+        "smoothing": "off",               # H-SMOOTH: off | hysteresis — по умолчанию ВЫКЛ до замера L2
+        "min_state_s": 0.4,               # гистерезис состояний (режим off)
+        "merge_gap_s": 0.0,
+        "smooth_min_state_s": 2.0,        # режим hysteresis
+        "smooth_merge_gap_s": 3.0,
+    },
+    "visibility": {
+        "min_loss_s": 0.6,
+        "bridge_tracks": False,           # H-VIS: склейка треков через потерю видимости по положению (ВЫКЛ)
+        "bridge_dist_diag": 1.0,
+        "bridge_max_s": 20.0,
+    },
     "zones": {
         "desk_labels": ["laptop", "money_counter"],
         "desk_static_labels": ["cell_phone", "keys", "document"],

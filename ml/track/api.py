@@ -23,6 +23,7 @@ from .config import load_config
 from .contract import Track, Zone
 from .stitch import merge_chain, stitch_persons, stitch_static
 from .views import TrackView, make_view
+from .visibility import loss_intervals
 
 log = logging.getLogger("ml.track")
 
@@ -154,6 +155,17 @@ def _fill_gaps(tr: Tracklet, frame_times: np.ndarray, max_gap: float) -> list[tu
     return out
 
 
+def _merge_static_times(obj_times: list, tracklets: dict) -> list:
+    """Времена наблюдений по группам статичных предметов (мерцание одного трека не важно)."""
+    out = []
+    for g, tls in tracklets.items():
+        if g == "person" or not tls:
+            continue
+        ts = np.sort(np.concatenate([np.asarray(t.times, float) for t in tls]))
+        out.append(ts)
+    return out or obj_times
+
+
 def track(clip: Any, dets: Sequence[Any]) -> tuple[list[Track], list[Zone]]:
     """Публичная функция контракта: треки (люди + предметы) с ролями и авто-зоны."""
     r = track_full(clip, dets)
@@ -211,13 +223,28 @@ def track_full(clip: Any, dets: Sequence[Any], cfg: Optional[dict] = None,
     tracklets: dict[str, list[Tracklet]] = {g: tr.finish() for g, tr in trackers.items()}
     info["timings"]["bytetrack_s"] = round(time.monotonic() - t_begin, 4)
 
+    # 1b) Потеря видимости: пропали ВСЕ статичные предметы (без яркости)
+    obj_times = []
+    for g, tls in tracklets.items():
+        if g == "person":
+            continue
+        for tl in tls:
+            obj_times.append(np.asarray(tl.times, float))
+    vloss, vstatus = loss_intervals(_merge_static_times(obj_times, tracklets), ft, 1.5 * frame_dt,
+                                    cfg["visibility"]["min_loss_s"])
+    info["coverage"]["visibility_loss"] = [list(x) for x in vloss]
+    info["coverage"]["visibility_check"] = vstatus
+    if vloss:
+        info["warnings"].append(f"visibility_loss:{len(vloss)}")
+
     # 2) Внешность людей (одежда) и склейка
     persons = tracklets.pop("person", [])
     t_app = time.monotonic()
     app, app_info = tracklet_appearance(clip, persons, cfg["appearance"], times)
     info["appearance"] = app_info
     info["timings"]["appearance_s"] = round(time.monotonic() - t_app, 4)
-    chains, stitch_log = stitch_persons(persons, app, sc, aspect)
+    bridges = vloss if cfg["visibility"]["bridge_tracks"] else []
+    chains, stitch_log = stitch_persons(persons, app, sc, aspect, bridges=bridges, vcfg=cfg["visibility"])
     info["stitch"] = stitch_log
     person_tl = []
     for ch in chains:
