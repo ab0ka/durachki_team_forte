@@ -105,6 +105,13 @@ def test_empty_and_broken_frames(mock_mode):
     assert any("frame 2" in w for w in last_stats()["warnings"])
 
 
+def test_baseline_over_soft_budget_is_not_degraded(mock_mode):
+    clip, _ = synth_clip(duration_s=1.0)
+    detect(clip, config={"runtime": {"budget_s": 0.0, "hard_budget_s": 1e9}})
+    st = last_stats()
+    assert st["extras_cut"] is False and st["status"] == "ok"  # опций нет — нечего «срезать»
+
+
 def test_budget_forces_stride(mock_mode, monkeypatch):
     clip, _ = synth_clip(duration_s=8.0, sample_fps=5.0)
     dets = detect(clip, config={"runtime": {"budget_s": 0.0, "hard_budget_s": 1e-9, "batch_size": 4}})

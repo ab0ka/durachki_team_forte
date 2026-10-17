@@ -312,13 +312,12 @@ def _detect(clip: VideoClip, every_n: int, config: Optional[dict[str, Any]]) -> 
             warnings.append(f"detect: over budget → stride {stride} from t={times[min(i, n - 1)]:.1f}s")
 
     tm["total"] = round(budget.elapsed, 4)
-    if broken or stride != base_stride or (stats["extras_cut"] if "extras_cut" in stats else False):
-        stats["status"] = "degraded"
     stats["broken_stages"] = sorted(broken)
     stats["stride_final"] = stride
     stats["n_detections"] = len(out)
-    stats["extras_cut"] = not budget.extras_allowed()
-    if stats["extras_cut"] and stats["status"] == "ok":
+    # «срезаны» только реально включённые опции (в baseline-режиме резать нечего)
+    stats["extras_cut"] = bool(hflip or tiling_on or open_on) and not budget.extras_allowed()
+    if broken or stride != base_stride or stats["extras_cut"]:
         stats["status"] = "degraded"
     _stats().update(stats)
     out.sort(key=lambda d: (d.t, d.label, -d.score))
@@ -328,6 +327,11 @@ def _detect(clip: VideoClip, every_n: int, config: Optional[dict[str, Any]]) -> 
 def warmup(config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Загружает модели и делает пустой прогон (держим тёплыми). Возвращает {status, backends, warnings, seconds}.
     Не бросает: при отсутствии весов status=unavailable (сеть не трогается)."""
+    with _RUN_LOCK:
+        return _warmup(config)
+
+
+def _warmup(config: Optional[dict[str, Any]]) -> dict[str, Any]:
     t0 = time.perf_counter()
     cfg = load_config(config)
     try:
