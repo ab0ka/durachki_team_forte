@@ -124,6 +124,7 @@ class Report:
     warnings: list[str] = field(default_factory=list)
     quotes: list[QuoteCheck] = field(default_factory=list)
     legal_status: dict[str, str] = field(default_factory=dict)
+    examples: dict[str, int] = field(default_factory=dict)  # kind → число синтетических примеров
 
     @property
     def ok(self) -> bool:
@@ -131,7 +132,8 @@ class Report:
 
     def to_dict(self) -> dict[str, Any]:
         return {"ok": self.ok, "check": "schema+quote_integrity (not a legal verification)",
-                "legal_status": self.legal_status, "errors": self.errors, "warnings": self.warnings,
+                "legal_status": self.legal_status, "examples": self.examples,
+                "errors": self.errors, "warnings": self.warnings,
                 "quotes": [asdict(q) for q in self.quotes]}
 
 
@@ -415,6 +417,10 @@ def validate_catalog(catalog: Any, base_dir: Path = NORMS_DIR, *, strict: bool =
         _check_type(str(tid), t, sources, rep)
         if isinstance(t, dict):
             rep.legal_status[str(tid)] = str(t.get("legal_status", "?"))
+            for e in t.get("examples") or []:
+                if isinstance(e, dict):
+                    k = str(e.get("kind", "?"))
+                    rep.examples[k] = rep.examples.get(k, 0) + 1
     if strict and rep.warnings:
         rep.errors.extend(f"[strict] {w}" for w in rep.warnings)
         rep.warnings = []
@@ -532,6 +538,8 @@ def _print_human(rep: Report, path: Path) -> None:
     n_quotes = sum(q.status != "EMPTY" for q in rep.quotes)
     print(f"\nЦитат найдено дословно: {n_ok}/{n_quotes}; норм всего: {len(rep.quotes)}; "
           f"verified=true: {sum(q.verified for q in rep.quotes)}")
+    if rep.examples:
+        print("Синтетические примеры (схема проверена): " + ", ".join(f"{k}={v}" for k, v in sorted(rep.examples.items())))
     for w in rep.warnings:
         print(f"WARN  {w}")
     for e in rep.errors:
