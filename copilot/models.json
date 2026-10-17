@@ -1,0 +1,23 @@
+[
+  {
+    "name": "multilingual-e5-small",
+    "hf_id_or_url": "intfloat/multilingual-e5-small",
+    "license": "MIT",
+    "size_mb": 470,
+    "purpose": "OPTIONAL. Эмбеддинги для RAG по нормам (CPU). Без весов используется встроенный hashing-эмбеддер (без модели). Размер приблизительный (fp32 safetensors)."
+  },
+  {
+    "name": "Qwen3-4B-Instruct-2507 GGUF Q4_K_M",
+    "hf_id_or_url": "Qwen/Qwen3-4B-Instruct-2507 (GGUF Q4_K_M: конвертация llama.cpp convert_hf_to_gguf.py + llama-quantize)",
+    "license": "Apache-2.0",
+    "size_mb": 2500,
+    "purpose": "OPTIONAL. Рекомендуемая локальная LLM ассистента проверяющего (llama.cpp): помещается рядом с VLM на 8 ГБ при частичном offload или на CPU. Размер приблизительный. НЕ дообучалась."
+  },
+  {
+    "name": "Qwen2.5-7B-Instruct GGUF Q4_K_M",
+    "hf_id_or_url": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+    "license": "Apache-2.0",
+    "size_mb": 4700,
+    "purpose": "OPTIONAL. Альтернатива повыше качеством, если VRAM свободна (вне анализа видео) или достаточно CPU. Размер приблизительный. НЕ дообучалась."
+  }
+]
