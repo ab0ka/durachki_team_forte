@@ -62,16 +62,28 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
     cashier_gone = np.ones(n)       # все «кассироподобные» треки подтверждённо вне рабочего места
     cashier_absent_known = np.ones(n)
     track_info: dict[int, dict[str, Any]] = {}
+    backfill_s = float(pc.get("appear_backfill_s", 1.5))
+    # проход 1: вход/выход каждого трека (выход подтверждён у края кадра / в двери / вне рабочего места)
+    geo: dict[int, dict[str, Any]] = {}
     for tid, obs in tracks.items():
         idx = sorted(obs)
         first, last = idx[0], idx[-1]
-        o0 = obs[first]
         m = {i: member(obs[i].bbox, workplace, ay, of) for i in idx} if workplace else {i: 0.5 for i in idx}
-        exit_end = workplace is not None and (m[last] < 0.3 or _near_exit(obs[last].bbox, door, border, ay, of))
-        enter_start = workplace is not None and (m[first] < 0.3 or _near_exit(obs[first].bbox, door, border, ay, of))
+        geo[tid] = {
+            "idx": idx, "first": first, "last": last, "m": m,
+            "exit_end": workplace is not None and (m[last] < 0.3 or _near_exit(obs[last].bbox, door, border, ay, of)),
+            "enter_start": workplace is not None and (m[first] < 0.3 or _near_exit(obs[first].bbox, door, border, ay, of)),
+        }
+    exit_times = sorted(float(tl.times[g["last"]]) for g in geo.values() if g["exit_end"])
+    # проход 2: статус трека на каждом сэмпле
+    for tid, obs in tracks.items():
+        g = geo[tid]
+        idx, first, last, m = g["idx"], g["first"], g["last"], g["m"]
+        o0 = obs[first]
         frac_client = float(np.mean([member(obs[i].bbox, client, ay, of) >= 0.5 for i in idx])) if client else 0.0
         track_info[tid] = {"p_cashier": o0.p_cashier, "p_collector": o0.p_collector, "explicit": o0.explicit_role, "frac_client": frac_client}
         cashierish = o0.p_cashier >= 0.4
+        t_first = float(tl.times[first])
         for i in range(n):
             if i in obs:
                 mi = m[i]
@@ -84,10 +96,13 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
                     if mi >= 0.5:
                         cashier_gone[i] = 0.0
                 continue
+            ti = float(tl.times[i])
             if i < first:
-                gone = enter_start
+                # трек «возник» посреди рабочего места: человек мог быть там и раньше (пропуски детектора).
+                # Неизвестно в окне backfill_s; раньше — «нет», только если до этого кто-то подтверждённо ушёл.
+                gone = g["enter_start"] or (t_first - ti > backfill_s and any(e <= ti for e in exit_times))
             elif i > last:
-                gone = exit_end
+                gone = g["exit_end"]
             else:  # разрыв внутри трека
                 prev = max(j for j in idx if j < i)
                 nxt = min(j for j in idx if j > i)
@@ -104,8 +119,6 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
                 if cashierish:
                     cashier_gone[i] = 0.0
                     cashier_absent_known[i] = 0.0
-            elif cashierish and i > last and not exit_end:
-                cashier_absent_known[i] = 0.0
 
     obs_unknown = np.zeros(n)
     out: dict[str, Sig] = {}

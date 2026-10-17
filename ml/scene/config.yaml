@@ -16,6 +16,9 @@ presence:
   workplace_zones: [cashier_area]
   desk_dilate: 0.12           # если нет cashier_area — рабочее место = desk, расширенный на столько (норм.)
   n_persons_median_win: 5     # медианный фильтр по числу людей (сэмплов)
+  border_margin: 0.04         # трек, исчезнувший/появившийся у края кадра, — подтверждённый выход/вход
+  appear_backfill_s: 1.5      # трек «возник» посреди рабочего места: до него столько секунд — неизвестно
+  client_history_frac: 0.2    # доля времени трека в client_area, после которой неизвестный человек = посетитель
   heuristic:                  # если роли от трекера нет
     cashier_min_track_s: 2.0
     cashier_base: 0.15
