@@ -1,0 +1,716 @@
+"""Движок правил: ряды сигналов → события (``Event``, source="rules").
+
+Конвейер для каждого правила из ``rules.yaml``:
+
+1. ``strength`` (нечёткое выражение 0..1) и ``gate`` в **интервальной** логике:
+   нижняя граница = доказано наблюдениями, верхняя = возможно (неизвестные сигналы);
+   отсутствие сигнала никогда не трактуется как отрицание;
+2. сглаживание (медиана/среднее в окне ``smooth.window_s``) — убирает одиночные вспышки;
+3. гистерезис ``on``/``off`` по доказанной силе → маска «условия наблюдаются»;
+4. дебаунс: склейка сегментов с разрывом ≤ ``merge_gap_s``, отбрасывание короче ``min_duration_s``;
+5. для правил «по бездействию» — проверка полноты этапа (предшествующее состояние,
+   начало не обрезано, покрытие сигналами); иначе ``insufficient_context``;
+6. оценка (``extra.assessment``):
+   ``candidate_violation`` — правило вида ``violation`` + у типа есть проверенная норма A13;
+   ``review_observation`` — наблюдение для проверяющего без юридического утверждения
+   (правило-наблюдение или норма не проверена/отсутствует);
+   ``insufficient_context`` — условие могло выполняться, но этап не наблюдался полностью;
+7. ``t_peak`` — фактический момент с доказательством (политика ``evidence`` по умолчанию),
+   ``confidence`` от силы и длительности (монотонно по длительности), факты по шаблонам,
+   ``bboxes`` участников на ``t_peak`` из треков, ``extra.trace`` — почему сработало.
+
+Затем по всем правилам: слияние пересекающихся событий одного типа, «уступка» типов
+(``yield_to``), NMS одного типа в окне ``nms_window_s``, порог уверенности, лимит числа событий.
+"""
+from __future__ import annotations
+
+import math
+import string
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Optional, Sequence
+
+import numpy as np
+
+from .catalog import norm_status, resolve_catalog, type_info
+from .config import RuleSpec, RulesConfig, load_rules_config
+from .expr import EvalContext
+from .signals import SignalSeries, build_series, derive_from_tracks, polygon_bbox, track_box_at
+
+try:
+    from contracts.sentinel_contracts import Event  # noqa
+except ImportError:  # пока ветка A01 не смерджена
+    from ._contract_fallback import Event  # noqa
+
+__all__ = [
+    "run_rules", "evaluate", "RulesReport", "SIGNAL_RU", "ASSESSMENTS", "CANDIDATE", "REVIEW", "INSUFFICIENT",
+    "assessment_of", "split_by_assessment", "hysteresis_mask", "mask_to_segments", "merge_segments",
+    "confidence_for", "format_fact",
+]
+
+SOURCE = "rules"
+CANDIDATE = "candidate_violation"
+REVIEW = "review_observation"
+INSUFFICIENT = "insufficient_context"
+ASSESSMENTS = (CANDIDATE, REVIEW, INSUFFICIENT)
+_PRIORITY = {CANDIDATE: 3, REVIEW: 2, INSUFFICIENT: 1}
+
+# Человекочитаемые названия сигналов — для trace/UI («почему сработало»).
+SIGNAL_RU: dict[str, str] = {
+    "cashier_present": "кассир в кадре",
+    "cashier_in_workplace": "кассир на рабочем месте",
+    "n_persons": "число людей в кадре",
+    "outsider_in_cashier_area": "посторонний в зоне кассира",
+    "collector_present": "инкассатор в кадре",
+    "safe_open": "сейф открыт",
+    "door_open": "дверь открыта",
+    "cash_visible": "наличные видны",
+    "cash_bag_visible": "инкассаторская сумка видна",
+    "phone_in_hand": "телефон в руке",
+    "phone_to_ear": "телефон у уха",
+    "eating_drinking": "приём пищи/напитков",
+    "hands_hidden": "руки скрыты от камеры",
+    "cashier_facing_away": "кассир спиной к камере",
+    "workplace_unattended_with_cash": "рабочее место с наличными без присмотра",
+    "handover_motion": "движение передачи",
+    "motion_energy": "интенсивность движения",
+}
+
+
+def assessment_of(ev: Any) -> str:
+    """Оценка события правил (для A12/fusion): candidate_violation | review_observation | insufficient_context."""
+    extra = getattr(ev, "extra", None) or {}
+    a = extra.get("assessment")
+    return a if a in ASSESSMENTS else REVIEW
+
+
+def split_by_assessment(events: Sequence[Any]) -> dict[str, list[Any]]:
+    out: dict[str, list[Any]] = {a: [] for a in ASSESSMENTS}
+    for ev in events:
+        out[assessment_of(ev)].append(ev)
+    return out
+
+
+# --------------------------------------------------------------------------- helpers
+
+def _r(x: Any, nd: int = 3) -> Optional[float]:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return round(x, nd) if math.isfinite(x) else None
+
+
+def _rf(x: Any, nd: int = 3) -> float:
+    v = _r(x, nd)
+    return 0.0 if v is None else v
+
+
+def smooth(x: np.ndarray, dt: float, window_s: float, method: str) -> np.ndarray:
+    if method == "none" or window_s <= 0 or x.shape[0] < 3:
+        return x
+    k = int(round(window_s / max(dt, 1e-6)))
+    if k < 2:
+        return x
+    if k % 2 == 0:
+        k += 1
+    k = min(k, x.shape[0] if x.shape[0] % 2 == 1 else x.shape[0] - 1)
+    if k < 3:
+        return x
+    pad = k // 2
+    xp = np.pad(x, pad, mode="edge")
+    win = np.lib.stride_tricks.sliding_window_view(xp, k)
+    if method == "median":
+        return np.median(win, axis=1)
+    return win.mean(axis=1)
+
+
+def hysteresis_mask(x: np.ndarray, on: float, off: float) -> np.ndarray:
+    """Включаемся при x ≥ on, держимся пока x ≥ off."""
+    mask = np.zeros(x.shape[0], dtype=bool)
+    active = False
+    for i, v in enumerate(x):
+        active = bool(v >= off) if active else bool(v >= on)
+        mask[i] = active
+    return mask
+
+
+def mask_to_segments(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Сегменты подряд идущих True как пары индексов (включительно)."""
+    segs: list[tuple[int, int]] = []
+    start = None
+    for i, v in enumerate(mask):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            segs.append((start, i - 1))
+            start = None
+    if start is not None:
+        segs.append((start, int(mask.shape[0]) - 1))
+    return segs
+
+
+def merge_segments(times: np.ndarray, segs: list[tuple[int, int]], gap_s: float) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for s in segs:
+        if out and float(times[s[0]] - times[out[-1][1]]) <= gap_s + 1e-9:
+            out[-1] = (out[-1][0], s[1])
+        else:
+            out.append(s)
+    return out
+
+
+def confidence_for(rule: RuleSpec, mean_strength: float, max_strength: float, duration: float,
+                   n_frames: int = 0, severity_factor: float = 1.0) -> tuple[float, dict[str, float]]:
+    """Уверенность события; неубывающая по ``duration`` при фиксированной силе."""
+    dur_term = 1.0 - math.exp(-max(0.0, duration) / rule.conf_tau_s)
+    if rule.conf_expr is not None:
+        from .expr import evaluate_scalar
+
+        raw = evaluate_scalar(rule.conf_expr, {
+            "mean_strength": mean_strength, "max_strength": max_strength, "duration": duration,
+            "dur_term": dur_term, "base": rule.conf_base, "w_strength": rule.conf_w_strength,
+            "w_duration": rule.conf_w_duration, "tau_s": rule.conf_tau_s, "n_frames": float(n_frames),
+        })
+        terms = {"expr": _rf(raw)}
+    else:
+        s_term = rule.conf_w_strength * float(np.clip(mean_strength, 0.0, 1.0))
+        d_term = rule.conf_w_duration * dur_term
+        raw = rule.conf_base + s_term + d_term
+        terms = {"base": _rf(rule.conf_base), "strength": _rf(s_term), "duration": _rf(d_term)}
+    factor = rule.weight * severity_factor
+    conf = float(np.clip(raw * factor, rule.conf_min, rule.conf_max))
+    terms["factor"] = _rf(factor)
+    return conf, terms
+
+
+class _UnknownValue(Exception):
+    pass
+
+
+class _SafeFormatter(string.Formatter):
+    """Только простые имена из контекста: без атрибутов/индексов; неизвестное значение → факт не печатается."""
+
+    def get_field(self, field_name: str, args: Sequence[Any], kwargs: Mapping[str, Any]) -> Any:
+        if not field_name.isidentifier():
+            raise _UnknownValue(field_name)
+        v = kwargs.get(field_name)
+        if v is None or (isinstance(v, float) and not math.isfinite(v)):
+            raise _UnknownValue(field_name)
+        return v, field_name
+
+    def format_field(self, value: Any, format_spec: str) -> str:
+        try:
+            return format(value, format_spec)
+        except (TypeError, ValueError):
+            return str(value)
+
+
+_FMT = _SafeFormatter()
+
+
+def format_fact(template: str, ctx: Mapping[str, Any]) -> Optional[str]:
+    """Факт по шаблону; ``None``, если какое-то значение неизвестно (не утверждаем невидимое)."""
+    try:
+        return _FMT.vformat(template, (), dict(ctx))
+    except (_UnknownValue, ValueError, IndexError, KeyError):
+        return None
+
+
+# --------------------------------------------------------------------------- report
+
+@dataclass
+class RulesReport:
+    events: list[Any]
+    series: SignalSeries
+    strengths: dict[str, np.ndarray] = field(default_factory=dict)   # доказанная сила (нижняя граница)
+    possible: dict[str, np.ndarray] = field(default_factory=dict)    # возможная сила (верхняя граница)
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    catalog_source: str = "fallback"
+    config: Optional[RulesConfig] = None
+
+    def risk_curve(self, step_s: float = 0.0) -> list[tuple[float, float]]:
+        """Кривая риска по правилам: максимум доказанной силы (правила-наблюдения ×0.5)."""
+        t = self.series.times
+        if t.shape[0] == 0:
+            return []
+        risk = np.zeros(t.shape[0])
+        kinds = {r.id: r.kind for r in (self.config.rules if self.config else [])}
+        for rid, arr in self.strengths.items():
+            w = 1.0 if kinds.get(rid) == "violation" else 0.5
+            np.maximum(risk, arr * w, out=risk)
+        pts = [(_rf(ti, 2), _rf(ri)) for ti, ri in zip(t, np.clip(risk, 0, 1))]
+        if step_s > 0 and len(pts) > 1:
+            out, last = [], -1e9
+            for p in pts:
+                if p[0] - last >= step_s - 1e-9:
+                    out.append(p)
+                    last = p[0]
+            return out
+        return pts
+
+    def summary(self) -> dict[str, Any]:
+        groups = split_by_assessment(self.events)
+        return {"n_events": len(self.events), **{a: len(v) for a, v in groups.items()},
+                "absent_signals": sorted(self.series.absent), "derived_signals": dict(self.series.derived),
+                "catalog_source": self.catalog_source, "warnings": list(self.warnings)}
+
+
+# --------------------------------------------------------------------------- core
+
+def _get(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, Mapping) else getattr(obj, name, None)
+
+
+def _bboxes_at(rule: RuleSpec, t: float, tracks: Sequence[Any], zones: Sequence[Any],
+               cfg: RulesConfig) -> tuple[dict[str, tuple[float, ...]], list[int]]:
+    boxes: dict[str, tuple[float, ...]] = {}
+    ids: list[int] = []
+    for spec in rule.highlight:
+        if len(boxes) >= cfg.max_bboxes:
+            break
+        kind, _, value = spec.partition(":")
+        if kind == "zone":
+            for z in zones or ():
+                if _get(z, "name") == value and _get(z, "polygon"):
+                    bb = polygon_bbox(_get(z, "polygon"))
+                    if bb:
+                        boxes[f"zone:{value}"] = tuple(_rf(v, 4) for v in bb)
+            continue
+        if kind not in ("role", "label"):
+            continue
+        for tr in tracks or ():
+            label, role, tid = _get(tr, "label"), _get(tr, "role"), _get(tr, "track_id")
+            if kind == "role" and not (label == "person" and role == value):
+                continue
+            if kind == "label" and label != value:
+                continue
+            bb = track_box_at(tr, t, cfg.bbox_tol_s)
+            if bb is None:
+                continue
+            boxes[f"{role if kind == 'role' else label}#{tid}"] = tuple(_rf(min(1.0, max(0.0, v)), 4) for v in bb)
+            try:
+                ids.append(int(tid))
+            except (TypeError, ValueError):
+                pass
+            if len(boxes) >= cfg.max_bboxes:
+                break
+    return boxes, sorted(set(ids))
+
+
+def _signal_stats(series: SignalSeries, names: Sequence[str], i0: int, i1: int, ip: int) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for nm in sorted(names):
+        arr = series.signals.get(nm)
+        if arr is None or arr.shape[0] == 0:
+            continue
+        seg = arr[i0:i1 + 1]
+        known = np.isfinite(seg)
+        st: dict[str, Any] = {"at_peak": _r(arr[ip]), "known_frac": _rf(known.mean(), 2)}
+        if known.any():
+            st.update(mean=_r(seg[known].mean()), min=_r(seg[known].min()), max=_r(seg[known].max()))
+        else:
+            st.update(mean=None, min=None, max=None)
+        if nm in series.derived:
+            st["source"] = series.derived[nm]
+        out[nm] = st
+    return out
+
+
+def _peak_index(rule: RuleSpec, times: np.ndarray, strength: np.ndarray, i0: int, i1: int) -> int:
+    seg = strength[i0:i1 + 1]
+    if rule.t_peak_policy == "onset":
+        return i0
+    if rule.t_peak_policy == "max":
+        return i0 + int(np.argmax(seg))
+    if rule.t_peak_policy == "center":
+        return int(np.argmin(np.abs(times - (times[i0] + times[i1]) / 2.0)))
+    if rule.t_peak_policy == "onset_plus":
+        t = float(np.clip(times[i0] + rule.t_peak_offset_s, times[0], times[i1]))
+        return int(np.argmin(np.abs(times - t)))
+    # evidence: самый ранний кадр сегмента с доказательством, близким к максимальному
+    thr = max(rule.on, float(seg.max()) - rule.evidence_tol)
+    hits = np.nonzero(seg >= thr - 1e-9)[0]
+    return i0 + int(hits[0]) if hits.size else i0
+
+
+def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: int, i1: int,
+                assessment: str, reasons: list[str], tracks: Sequence[Any], zones: Sequence[Any],
+                catalog: Mapping[str, Any], cfg: RulesConfig, from_anchor: bool = False) -> Any:
+    times = series.times
+    info = type_info(catalog, rule.type_id)
+    norm = norm_status(catalog, rule.type_id)
+    sev_factor = float(cfg.severity_factor.get(info["severity"], 1.0))
+    t_start, t_end = float(times[i0]), float(times[i1])
+    duration = t_end - t_start + series.dt
+    seg = strength[i0:i1 + 1]
+    mean_s, max_s = float(seg.mean()), float(seg.max())
+    ip = _peak_index(rule, times, strength, i0, i1)
+    t_peak = float(times[ip])
+    t_max = float(times[i0 + int(np.argmax(seg))])
+    conf, terms = confidence_for(rule, mean_s, max_s, duration, i1 - i0 + 1, sev_factor)
+    if any(n in series.derived for n in rule.names):
+        conf *= cfg.derived_conf_factor  # грубые сигналы из треков — ниже доверие
+        terms["derived_factor"] = cfg.derived_conf_factor
+    if assessment == REVIEW:
+        conf = min(conf, cfg.observation_conf_cap)
+    elif assessment == INSUFFICIENT:
+        conf = min(conf, cfg.insufficient_conf_cap)
+    terms["cap"] = rule.conf_max
+    names = sorted(set(rule.names) | {"n_persons"})
+    stats = _signal_stats(series, names, i0, i1, ip)
+    ctx: dict[str, Any] = {
+        "t_start": t_start, "t_end": t_end, "t_peak": t_peak, "duration": duration,
+        "strength": mean_s, "strength_max": max_s, "confidence": conf, "type_name": info["name"],
+    }
+    for nm, st in stats.items():
+        ctx[nm] = st["at_peak"]
+        ctx[f"{nm}_mean"] = st["mean"]
+        ctx[f"{nm}_min"] = st["min"]
+        ctx[f"{nm}_max"] = st["max"]
+    if from_anchor:
+        # условие правила не доказано — печатаем только наблюдаемый якорь
+        seen = [SIGNAL_RU.get(c.name, c.name) for c in (rule.anchor.comparisons if rule.anchor else ())]
+        templates = [f"С {{t_start:.1f}} по {{t_end:.1f}} с наблюдается: {', '.join(seen)}."] if seen else []
+    else:
+        templates = list(rule.facts) + (list(rule.facts_stage) if assessment != INSUFFICIENT else [])
+    facts = [f for f in (format_fact(tpl, ctx) for tpl in templates) if f]
+    if assessment == INSUFFICIENT and reasons:
+        facts.append("Недостаточно контекста: " + "; ".join(reasons) + ".")
+    conditions = []
+    for expr_obj in (rule.strength, rule.gate, rule.anchor):
+        if expr_obj is None:
+            continue
+        for c in expr_obj.comparisons:
+            v = series.signals.get(c.name)
+            val = float(v[ip]) if v is not None and v.shape[0] else float("nan")
+            conditions.append({"signal": c.name, "label": SIGNAL_RU.get(c.name, c.name), "op": c.op,
+                               "threshold": c.threshold, "value": _r(val), "ok": c.check(val)})
+    bboxes, track_ids = _bboxes_at(rule, t_peak, tracks, zones, cfg)
+    evidence_t = sorted({_rf(t_peak, 2), _rf(t_max, 2), _rf(t_start, 2)})[:3]
+    trace = {
+        "rule_id": rule.id,
+        "type_id": rule.type_id,
+        "kind": rule.kind,
+        "comment": rule.comment,
+        "strength_expr": rule.strength.source,
+        "gate_expr": rule.gate.source if rule.gate is not None else None,
+        "gate_mode": rule.gate_mode,
+        "anchor_expr": rule.anchor.source if rule.anchor is not None else None,
+        "inaction_before": (rule.inaction.before.source if rule.inaction and rule.inaction.before else None),
+        "thresholds": {"on": rule.on, "off": rule.off, "min_duration_s": rule.min_duration_s,
+                       "merge_gap_s": rule.merge_gap_s, "smooth_s": rule.smooth_s},
+        "t_peak_policy": rule.t_peak_policy,
+        "strength": {"mean": _r(mean_s), "max": _r(max_s), "at_peak": _r(strength[ip])},
+        "duration_s": _r(duration, 2),
+        "signals": {nm: dict(st, label=SIGNAL_RU.get(nm, nm)) for nm, st in stats.items()},
+        "conditions": conditions,
+        "confidence_terms": terms,
+        "norm_status": norm,
+        "absent_signals": sorted(n for n in rule.names if n in series.absent),
+        "derived_signals": {n: series.derived[n] for n in rule.names if n in series.derived},
+    }
+    if from_anchor:
+        trace["from_anchor"] = True
+    return Event(
+        type_id=rule.type_id,
+        t_start=_rf(t_start, 2),
+        t_end=_rf(t_end, 2),
+        t_peak=_rf(t_peak, 2),
+        confidence=_rf(conf),
+        source=SOURCE,
+        facts=facts,
+        bboxes=bboxes,
+        track_ids=track_ids,
+        extra={
+            "rule_id": rule.id,
+            "rule_ids": [rule.id],
+            "assessment": assessment,
+            "assessment_reasons": list(reasons),
+            "legal_claim": False,  # правила не делают юридических выводов — только признаки
+            "type_name": info["name"],
+            "severity": info["severity"],
+            "in_catalog": info["in_catalog"],
+            "norm_status": norm["status"],
+            "evidence_t": evidence_t,
+            "trace": trace,
+        },
+    )
+
+
+def _assess(rule: RuleSpec, catalog: Mapping[str, Any], cfg: RulesConfig) -> tuple[str, list[str]]:
+    if rule.kind == "observation":
+        return REVIEW, ["правило-наблюдение: само по себе не доказывает нарушение"]
+    norm = norm_status(catalog, rule.type_id)
+    if cfg.require_verified_norm and norm["status"] != "verified":
+        return REVIEW, [f"нет проверенной применимой нормы для {rule.type_id} в каталоге A13 "
+                        f"(статус: {norm['status']})"]
+    return CANDIDATE, []
+
+
+def _stage_reasons(rule: RuleSpec, series: SignalSeries, s_lo: np.ndarray, s_hi: np.ndarray, i0: int, i1: int,
+                   before_lo: Optional[np.ndarray]) -> list[str]:
+    """Проверка полноты этапа для правил «по бездействию»."""
+    ina = rule.inaction
+    if ina is None:
+        return []
+    times = series.times
+    reasons: list[str] = []
+    t_start = float(times[i0])
+    if t_start - float(times[0]) <= ina.edge_s + 1e-9:
+        reasons.append("начало ситуации не попало в ролик")
+    elif before_lo is not None:
+        lo_idx = int(np.searchsorted(times, t_start - ina.before_window_s - 1e-9, side="left"))
+        window = before_lo[lo_idx:i0]
+        if window.size == 0 or not bool((window >= 0.5).any()):
+            reasons.append(f"предшествующее состояние ({ina.before.source}) "
+                           f"не наблюдалось за {ina.before_window_s:g} с")
+    # кадр «не наблюдён», если условие не доказано, но возможно (неизвестные сигналы);
+    # отсутствующая OR-альтернатива при доказанной другой ветви покрытие не портит
+    unknown = (s_lo[i0:i1 + 1] < rule.on) & (s_hi[i0:i1 + 1] >= rule.on)
+    cov = 1.0 - float(unknown.mean())
+    if cov + 1e-9 < ina.min_coverage:
+        reasons.append(f"сигналы правила известны лишь в {cov:.0%} кадров (окклюзия/пропуски)")
+    return reasons
+
+
+def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: np.ndarray, s_hi: np.ndarray,
+                 tracks: Sequence[Any], zones: Sequence[Any], catalog: Mapping[str, Any], cfg: RulesConfig,
+                 candidates: list[dict[str, Any]]) -> list[Any]:
+    times = series.times
+    events: list[Any] = []
+    base_assessment, base_reasons = _assess(rule, catalog, cfg)
+    before_lo = None
+    if rule.inaction is not None and rule.inaction.before is not None:
+        before_lo = rule.inaction.before(ctx)
+    edge_end = rule.inaction.edge_s if rule.inaction else 0.0
+
+    # 1) доказанные сегменты
+    segs = merge_segments(times, mask_to_segments(hysteresis_mask(s_lo, rule.on, rule.off)), rule.merge_gap_s)
+    definite = np.zeros(series.n, dtype=bool)
+    for i0, i1 in segs:
+        definite[i0:i1 + 1] = True
+        t_start, t_end = float(times[i0]), float(times[i1])
+        duration = t_end - t_start + series.dt
+        cand = {"rule_id": rule.id, "type_id": rule.type_id, "t_start": _rf(t_start, 2), "t_end": _rf(t_end, 2),
+                "duration_s": _rf(duration, 2)}
+        reasons: list[str] = []
+        if duration + 1e-9 < rule.min_duration_s:
+            at_end = float(times[-1]) - t_end <= max(edge_end, series.dt) + 1e-9
+            if rule.inaction is not None and at_end:
+                reasons.append(f"ролик заканчивается раньше, чем истекают {rule.min_duration_s:g} с")
+            else:
+                cand["rejected"] = f"короче min_duration_s={rule.min_duration_s}"
+                candidates.append(cand)
+                continue
+        reasons += [r for r in _stage_reasons(rule, series, s_lo, s_hi, i0, i1, before_lo) if r not in reasons]
+        if reasons:
+            assessment = INSUFFICIENT
+        else:
+            assessment, reasons = base_assessment, list(base_reasons)
+        if (assessment == REVIEW and not cfg.emit_review_observations) or \
+                (assessment == INSUFFICIENT and not cfg.emit_insufficient_context):
+            cand["rejected"] = f"{assessment} отключён в global"
+            candidates.append(cand)
+            continue
+        ev = _make_event(rule, series, s_lo, i0, i1, assessment, reasons, tracks, zones, catalog, cfg)
+        cand.update(accepted=True, assessment=assessment, confidence=ev.confidence, t_peak=ev.t_peak)
+        candidates.append(cand)
+        events.append(ev)
+
+    # 2) «могло быть, но не наблюдалось»: якорь доказан, остальное неизвестно
+    if rule.anchor is not None and cfg.emit_insufficient_context:
+        anchor_lo = rule.anchor(ctx)
+        # кадры, где пропал хотя бы один сигнал правила, который в ролике вообще есть
+        partial_unknown = np.zeros(series.n, dtype=bool)
+        for nm in rule.names:
+            if nm not in series.absent:
+                partial_unknown |= ~series.known(nm)
+        possible = (s_hi >= rule.on) & (anchor_lo >= 0.5) & ~definite & partial_unknown
+        for i0, i1 in merge_segments(times, mask_to_segments(possible), rule.merge_gap_s):
+            duration = float(times[i1] - times[i0]) + series.dt
+            if duration + 1e-9 < rule.min_duration_s:
+                continue
+            # только сигналы, которые в ролике есть, но здесь пропали (окклюзия/потеря);
+            # сигнал, отсутствующий во всём ролике (модуль не работал), — предупреждение, не событие
+            unknown = [nm for nm in sorted(rule.names)
+                       if nm not in series.absent and series.known(nm)[i0:i1 + 1].mean() < 0.5]
+            if not unknown:
+                continue
+            reasons = ["не наблюдались сигналы: " + ", ".join(SIGNAL_RU.get(n, n) for n in unknown)]
+            ev = _make_event(rule, series, s_hi, i0, i1, INSUFFICIENT, reasons, tracks, zones, catalog, cfg,
+                             from_anchor=True)
+            candidates.append({"rule_id": rule.id, "type_id": rule.type_id, "t_start": ev.t_start,
+                               "t_end": ev.t_end, "accepted": True, "assessment": INSUFFICIENT,
+                               "confidence": ev.confidence, "t_peak": ev.t_peak})
+            events.append(ev)
+    events.sort(key=lambda e: (-_PRIORITY[e.extra["assessment"]], -e.confidence))
+    return events[: rule.max_events]
+
+
+def _overlap(a: Any, b: Any, gap: float) -> bool:
+    return a.t_start <= b.t_end + gap and b.t_start <= a.t_end + gap
+
+
+def _cap_for(assessment: str, cfg: RulesConfig, default_cap: float) -> float:
+    if assessment == REVIEW:
+        return min(default_cap, cfg.observation_conf_cap)
+    if assessment == INSUFFICIENT:
+        return min(default_cap, cfg.insufficient_conf_cap)
+    return default_cap
+
+
+def _merge_same_type(events: list[Any], cfg: RulesConfig) -> list[Any]:
+    by_type: dict[str, list[Any]] = {}
+    for ev in events:
+        by_type.setdefault(ev.type_id, []).append(ev)
+    out: list[Any] = []
+    for type_id, evs in by_type.items():
+        evs.sort(key=lambda e: e.t_start)
+        groups: list[list[Any]] = []
+        for ev in evs:
+            if groups and any(_overlap(ev, g, cfg.same_type_merge_gap_s) for g in groups[-1]):
+                groups[-1].append(ev)
+            else:
+                groups.append([ev])
+        for g in groups:
+            if len(g) == 1:
+                out.append(g[0])
+                continue
+            best_level = max(_PRIORITY[e.extra["assessment"]] for e in g)
+            top = [e for e in g if _PRIORITY[e.extra["assessment"]] == best_level]
+            primary = max(top, key=lambda e: e.confidence)
+            first = min(top, key=lambda e: (e.t_start, e.t_peak))
+            rule_ids: list[str] = []
+            for e in g:
+                for rid in e.extra.get("rule_ids", []):
+                    if rid not in rule_ids:
+                        rule_ids.append(rid)
+            facts: list[str] = []
+            for e in sorted(top, key=lambda e: e.t_start):
+                for f in e.facts:
+                    if f not in facts:
+                        facts.append(f)
+            bboxes = dict(first.bboxes)
+            for k, v in primary.bboxes.items():
+                bboxes.setdefault(k, v)
+            n_corrob = len({e.extra.get("rule_id") for e in top}) - 1
+            cap = max(e.extra.get("trace", {}).get("confidence_terms", {}).get("cap", 0.95) for e in top)
+            cap = _cap_for(primary.extra["assessment"], cfg, cap)
+            conf = min(cap, primary.confidence + cfg.corroboration_bonus * max(0, n_corrob))
+            extra = dict(primary.extra)
+            extra["rule_ids"] = rule_ids
+            extra["evidence_t"] = sorted({t for e in top for t in e.extra.get("evidence_t", [])} | {first.t_peak})[:3]
+            extra["merged"] = [{"rule_id": e.extra.get("rule_id"), "assessment": e.extra.get("assessment"),
+                                "t_start": e.t_start, "t_end": e.t_end, "t_peak": e.t_peak,
+                                "confidence": e.confidence} for e in g]
+            extra["traces"] = [e.extra.get("trace") for e in g if e is not primary]
+            out.append(Event(
+                type_id=type_id,
+                t_start=min(e.t_start for e in g),
+                t_end=max(e.t_end for e in g),
+                t_peak=first.t_peak,
+                confidence=_rf(conf),
+                source=SOURCE,
+                facts=facts,
+                bboxes=bboxes,
+                track_ids=sorted({t for e in g for t in e.track_ids}),
+                extra=extra,
+            ))
+    return out
+
+
+def _apply_yield(events: list[Any], cfg: RulesConfig) -> None:
+    rules = {r.id: r for r in cfg.rules}
+    for ev in events:
+        rule = rules.get(ev.extra.get("rule_id", ""))
+        if rule is None or not rule.yield_to:
+            continue
+        winners = [o for o in events if o is not ev and o.type_id in rule.yield_to and _overlap(ev, o, 0.0)]
+        if winners:
+            ev.confidence = _rf(ev.confidence * rule.yield_factor)
+            ev.extra["yielded_to"] = sorted({o.type_id for o in winners})
+
+
+def _nms(events: list[Any], window_s: float) -> list[Any]:
+    kept: list[Any] = []
+    order = sorted(events, key=lambda e: (-_PRIORITY[e.extra["assessment"]], -e.confidence))
+    for ev in order:
+        clash = next((k for k in kept if k.type_id == ev.type_id and abs(k.t_peak - ev.t_peak) < window_s), None)
+        if clash is None:
+            kept.append(ev)
+        else:
+            clash.extra.setdefault("suppressed", []).append(
+                {"rule_id": ev.extra.get("rule_id"), "assessment": ev.extra.get("assessment"),
+                 "t_peak": ev.t_peak, "confidence": ev.confidence})
+    return kept
+
+
+def evaluate(states: Sequence[Any], tracks: Sequence[Any] = (), zones: Sequence[Any] = (),
+             catalog: Optional[Mapping[str, Any]] = None, config: Optional[RulesConfig] = None) -> RulesReport:
+    """Полный прогон правил с диагностикой (для replay, UI и интегратора)."""
+    cfg = config or load_rules_config()
+    cat, cat_src = resolve_catalog(catalog)
+    warnings = list(cfg.warnings)
+    needed: set[str] = set()
+    for r in cfg.enabled_rules:
+        needed |= r.names
+    series = build_series(states, needed, defaults=cfg.signal_defaults, ffill_max_s=cfg.ffill_max_s,
+                          merge_policy=cfg.merge_policy)
+    report = RulesReport(events=[], series=series, warnings=warnings, catalog_source=cat_src, config=cfg)
+    if series.n == 0:
+        warnings.append("нет состояний сцены — правила не применялись")
+        return report
+    if cfg.derive_from_tracks and tracks:
+        absent = {n for n in needed if n in series.absent}
+        if absent:
+            try:
+                derived = derive_from_tracks(series.times, tracks, zones, presence_tol_s=cfg.presence_tol_s)
+            except Exception as exc:  # pragma: no cover - страховка
+                derived = {}
+                warnings.append(f"производные сигналы из треков: {exc}")
+            for name, arr in derived.items():
+                if name in absent:
+                    series.signals[name] = arr
+                    series.derived[name] = "tracks"
+                    series.absent.discard(name)
+    ctx = EvalContext(times=series.times, signals=series.signals, ranges=cfg.signal_ranges)
+    events: list[Any] = []
+    for rule in cfg.enabled_rules:
+        try:
+            lo, hi = rule.strength.bounds(ctx)
+            lo, hi = np.clip(lo, 0.0, 1.0), np.clip(hi, 0.0, 1.0)
+            if rule.gate is not None:
+                glo, ghi = rule.gate.bounds(ctx)
+                definite_gate = (glo > 0.5) if rule.gate_mode == "strict" else (ghi > 0.5)
+                lo = np.where(definite_gate, lo, 0.0)
+                hi = np.where(ghi > 0.5, hi, 0.0)
+            s_lo = np.clip(smooth(lo, series.dt, rule.smooth_s, rule.smooth_method), 0.0, 1.0)
+            s_hi = np.maximum(np.clip(smooth(hi, series.dt, rule.smooth_s, rule.smooth_method), 0.0, 1.0), s_lo)
+            report.strengths[rule.id] = s_lo
+            report.possible[rule.id] = s_hi
+            absent_inputs = sorted(n for n in rule.names if n in series.absent)
+            if absent_inputs:
+                warnings.append(f"{rule.id}: нет сигналов {', '.join(absent_inputs)} — они считаются неизвестными")
+            events.extend(_rule_events(rule, series, ctx, s_lo, s_hi, tracks, zones, cat, cfg, report.candidates))
+        except Exception as exc:  # одно сломанное правило не валит остальные
+            warnings.append(f"{rule.id}: ошибка вычисления: {exc}")
+    events = _merge_same_type(events, cfg)
+    _apply_yield(events, cfg)
+    events = _nms(events, cfg.nms_window_s)
+    events = [e for e in events if e.confidence >= cfg.min_confidence]
+    events.sort(key=lambda e: (-_PRIORITY[e.extra["assessment"]], -e.confidence))
+    events = events[: cfg.max_events]
+    events.sort(key=lambda e: (e.t_peak, e.type_id))
+    report.events = events
+    return report
+
+
+def run_rules(states: Sequence[Any], tracks: Sequence[Any], zones: Sequence[Any],
+              catalog: Optional[Mapping[str, Any]], config: Optional[RulesConfig] = None) -> list[Any]:
+    """Публичная функция модуля (сигнатура контракта v1 + необязательный ``config``).
+
+    Возвращает события всех трёх оценок; к вердикту «нарушение» допускаются только
+    ``extra["assessment"] == "candidate_violation"`` (см. :func:`split_by_assessment`).
+    """
+    return evaluate(states, tracks, zones, catalog, config).events

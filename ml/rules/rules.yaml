@@ -1,0 +1,326 @@
+# Kassa Sentinel — декларативные правила A09 (ml/rules).
+#
+# ВАЖНО:
+# * V01..V08 — ГИПОТЕЗЫ типов (таксономия датасета не подтверждена: разметка — только
+#   «нарушение/нет» + секунда). ID сохранены для совместимости с norms/catalog.yaml (A13).
+#   Правило включается не «для полноты списка», а только при конкретном наблюдаемом условии.
+# * kind: violation  — видимые условия правила могут подтверждать норму; событие станет
+#                      candidate_violation ТОЛЬКО если у типа в каталоге A13 есть проверенная норма
+#                      (rules[].verified: true). Иначе — review_observation.
+#   kind: observation — само по себе НЕ доказанное нарушение (телефон, еда, открытая дверь,
+#                      другой человек, невидимые руки) → всегда review_observation.
+# * Отсутствие сигнала ≠ отрицание: неизвестные значения — интервал [lo, hi] (см. expr.py).
+#   Событие строится только по доказанной (нижней) границе.
+# * inaction — нарушение «по бездействию»: нужен наблюдаемый полный этап (предшествующее
+#   состояние, необрезанное начало, покрытие сигналами), иначе insufficient_context.
+# * t_peak: policy=evidence — самый ранний кадр с доказательством, близким к максимуму в
+#   сегменте (фактический момент, а не «onset + сдвиг»). Сдвиги/пороги калибруются ТОЛЬКО на
+#   train/calibration через `python -m ml.rules.replay ... --set ...`.
+# * Все числовые пороги ниже — стартовые значения без замеров на реальных данных.
+#
+# Плейсхолдеры в facts: {t_start} {t_end} {t_peak} {duration} {strength} {strength_max}
+# {confidence} {type_name} и для каждого сигнала правила + n_persons: {sig} (в t_peak),
+# {sig_mean} {sig_min} {sig_max} (по сегменту). Если значение неизвестно — факт не печатается.
+# facts_stage — факты о полном этапе «по бездействию»; печатаются только если этап наблюдался.
+# Факты — только наблюдаемое; никаких утверждений о допуске, умысле, суммах, подлинности.
+
+version: 1
+
+global:
+  ffill_max_s: 1.0            # пропуск сигнала дольше — «неизвестно», а не последнее значение
+  merge_policy: max           # слияние состояний с одним t из разных модулей
+  derive_from_tracks: true    # грубые сигналы из треков/зон, если сигнала нет в states
+  presence_tol_s: 0.6
+  bbox_tol_s: 1.0
+  max_bboxes: 6
+  nms_window_s: 5.0           # NMS одного типа по t_peak
+  same_type_merge_gap_s: 2.0  # слияние пересекающихся событий одного типа от разных правил
+  corroboration_bonus: 0.05
+  max_events: 12
+  min_confidence: 0.15
+  require_verified_norm: true # candidate_violation только при verified-норме A13
+  emit_review_observations: true
+  emit_insufficient_context: true
+  observation_conf_cap: 0.45  # потолок уверенности review_observation (наивный порог 0.5 их не пропустит)
+  insufficient_conf_cap: 0.3
+  derived_conf_factor: 0.85   # множитель уверенности, если правило опиралось на производные сигналы из треков
+  severity_factor: {high: 1.0, medium: 0.97, low: 0.93}
+
+# Диапазоны для неизвестных значений (по умолчанию [0, 1]).
+signal_ranges:
+  n_persons: [0, 10]
+
+# Явные исключения «нет ключа = значение». По умолчанию пусто: отсутствие = неизвестно.
+signal_defaults: {}
+
+extra_signals: []
+
+defaults:
+  kind: observation
+  enabled: false
+  gate_mode: strict           # strict: gate должен быть доказан; lenient: блокирует, только если доказанно ложен
+  on: 0.5
+  off: 0.35
+  smooth: {method: median, window_s: 0.6}
+  min_duration_s: 1.5
+  merge_gap_s: 1.5
+  t_peak: {policy: evidence, evidence_tol: 0.05, offset_s: 0.0}
+  confidence: {base: 0.35, w_strength: 0.35, w_duration: 0.25, tau_s: 6.0, min: 0.05, max: 0.95}
+  max_events: 3
+
+rules:
+  # ------------------------------------------------------------------ V01
+  - id: V01_outsider_in_cashier_area
+    type_id: V01
+    kind: violation
+    enabled: true
+    status_reason: >-
+      Включено: зональный сигнал A06/A08 (человек не-кассир и не-инкассатор внутри авто-зоны
+      cashier_area) с удержанием ≥ 2 с — конкретное видимое условие, не просто «другой человек в кадре».
+    comment: >-
+      V01 — посторонний в зоне кассира. Признак: outsider_in_cashier_area доказан ≥ min_duration_s.
+      Наличие допуска у лица не наблюдаемо — только «признаки». Инкассатор исключается мягким
+      gate (блок, только если доказано: инкассатор в кадре и людей ≤ 2).
+    strength: "outsider_in_cashier_area"
+    gate: "not (collector_present > 0.5 and n_persons <= 2)"
+    gate_mode: lenient
+    min_duration_s: 2.0
+    merge_gap_s: 2.0
+    confidence: {base: 0.4, w_strength: 0.35, w_duration: 0.2, tau_s: 5.0}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с в зоне кассира находится человек, не определённый системой как кассир или инкассатор."
+      - "Людей в кадре в этот период: до {n_persons_max:.0f}."
+    highlight: ["role:visitor", "role:unknown", "role:cashier", "zone:cashier_area"]
+
+  # ------------------------------------------------------------------ V02
+  - id: V02_cash_left_unattended
+    type_id: V02
+    kind: violation
+    enabled: true
+    status_reason: >-
+      Включено: составное наблюдаемое условие (наличные видны + кассира нет в кадре) с проверкой
+      полного этапа «по бездействию» (кассир наблюдался до ухода).
+    comment: >-
+      V02 — кассир покинул рабочее место, наличные остались без присмотра (по бездействию).
+      Требуется: до начала сегмента кассир доказанно был в кадре; начало не обрезано; сигналы
+      известны ≥ 80% кадров; длительность ≥ min_duration_s.
+    strength: "max(workplace_unattended_with_cash, min(cash_visible, not cashier_present))"
+    anchor: "cash_visible > 0.5"
+    inaction:
+      before: "cashier_present > 0.5"
+      before_window_s: 30
+      edge_s: 1.0
+      min_coverage: 0.8
+    min_duration_s: 5.0
+    merge_gap_s: 2.0
+    confidence: {base: 0.35, w_strength: 0.35, w_duration: 0.25, tau_s: 10.0}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с (≈{duration:.0f} с) на рабочем месте видны наличные, кассир в кадре не наблюдается."
+    facts_stage:
+      - "До этого кассир наблюдался в кадре."
+    highlight: ["label:cash", "zone:desk", "zone:cash_tray"]
+
+  # ------------------------------------------------------------------ V03
+  - id: V03_safe_open_with_outsider
+    type_id: V03
+    kind: violation
+    enabled: true
+    status_reason: >-
+      Включено: два одновременных видимых условия (сейф открыт + посторонний в зоне кассира),
+      инкассатор исключается мягким gate.
+    comment: >-
+      V03 — сейф открыт при постороннем. Признак: min(safe_open, outsider_in_cashier_area) ≥ on
+      дольше min_duration_s.
+    strength: "min(safe_open, outsider_in_cashier_area)"
+    gate: "not (collector_present > 0.5 and n_persons <= 2)"
+    gate_mode: lenient
+    anchor: "safe_open > 0.5"
+    min_duration_s: 1.5
+    confidence: {base: 0.4, w_strength: 0.35, w_duration: 0.2, tau_s: 5.0}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с сейф открыт, в зоне кассира находится человек, не определённый как кассир или инкассатор."
+    highlight: ["label:safe_open", "label:safe", "role:visitor", "role:unknown", "zone:safe"]
+
+  - id: V03_safe_left_open
+    type_id: V03
+    kind: violation
+    enabled: true
+    status_reason: >-
+      Включено: «по бездействию» с полным этапом — сначала доказанно видно кассира при открытом
+      сейфе, затем сейф открыт, а кассира в кадре нет ≥ 5 с.
+    comment: >-
+      V03 — кассир вышел, сейф остался открытым без присмотра (по бездействию).
+    strength: "min(safe_open, not cashier_present)"
+    anchor: "safe_open > 0.5"
+    inaction:
+      before: "safe_open > 0.5 and cashier_present > 0.5"
+      before_window_s: 30
+      edge_s: 1.0
+      min_coverage: 0.8
+    min_duration_s: 5.0
+    merge_gap_s: 2.0
+    confidence: {base: 0.35, w_strength: 0.35, w_duration: 0.25, tau_s: 10.0}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с (≈{duration:.0f} с) сейф открыт, кассир в кадре не наблюдается."
+    facts_stage:
+      - "До этого кассир наблюдался в кадре при открытом сейфе."
+    highlight: ["label:safe_open", "label:safe", "zone:safe"]
+
+  # ------------------------------------------------------------------ V04
+  - id: V04_door_open_with_valuables
+    type_id: V04
+    kind: observation
+    enabled: true
+    status_reason: >-
+      Включено как наблюдение: door_open — закрытый класс детектора A05; открытая дверь сама по себе
+      не доказанное нарушение → только review_observation (≥ 5 с при видимых ценностях).
+    comment: >-
+      V04 (наблюдение) — дверь кассового помещения открыта, при этом видны наличные/сейф открыт/сумка.
+    strength: "min(door_open, max(cash_visible, safe_open, cash_bag_visible))"
+    min_duration_s: 5.0
+    merge_gap_s: 2.0
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с дверь кассового помещения открыта; в это время видны ценности (наличные, открытый сейф или сумка)."
+    highlight: ["label:door_open", "label:door", "zone:door"]
+
+  - id: V04_door_left_open
+    type_id: V04
+    kind: observation
+    enabled: false
+    status_reason: >-
+      Выключено: дверь, открытая без видимых ценностей, — нет оснований считать это нарушением;
+      порог длительности не откалиброван.
+    comment: "V04 (наблюдение) — дверь открыта долго (≥ 15 с) независимо от ценностей."
+    strength: "door_open"
+    min_duration_s: 15.0
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с дверь кассового помещения открыта."
+    highlight: ["label:door_open", "zone:door"]
+
+  # ------------------------------------------------------------------ V05
+  - id: V05_phone_in_hand_at_workplace
+    type_id: V05
+    kind: observation
+    enabled: true
+    status_reason: >-
+      Включено как наблюдение: cell_phone в руке — класс детектора; телефон сам по себе не
+      доказанное нарушение → только review_observation, и только при наблюдаемом контексте работы.
+    comment: >-
+      V05 (наблюдение) — телефон в руке ≥ 2 с, при этом доказано: кассир на рабочем месте или видны наличные.
+    strength: "phone_in_hand"
+    gate: "cashier_in_workplace > 0.5 or cash_visible > 0.5"
+    min_duration_s: 2.0
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с в руке на рабочем месте виден мобильный телефон."
+    highlight: ["label:cell_phone", "role:cashier"]
+
+  - id: V05_phone_to_ear
+    type_id: V05
+    kind: observation
+    enabled: false
+    status_reason: >-
+      Выключено: на столе стационарный телефон — жест «трубка у уха» по позе не отличает его от
+      мобильного; высокий риск ложных наблюдений.
+    comment: "V05 (наблюдение) — телефон у уха (поза A07)."
+    strength: "phone_to_ear"
+    gate: "cashier_in_workplace > 0.5"
+    min_duration_s: 3.0
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с кассир держит у уха предмет, похожий на телефон."
+    highlight: ["label:cell_phone", "role:cashier"]
+
+  # ------------------------------------------------------------------ V06
+  - id: V06_eating_drinking
+    type_id: V06
+    kind: observation
+    enabled: false
+    status_reason: >-
+      Выключено: eating_drinking — поведенческий вывод по позе/предметам, не откалиброван; еда сама
+      по себе не доказанное нарушение. Включать только после проверки на train/calibration.
+    comment: "V06 (наблюдение) — приём пищи/напитков при видимых наличных."
+    strength: "eating_drinking"
+    gate: "cash_visible > 0.5"
+    min_duration_s: 3.0
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с наблюдаются признаки приёма пищи или напитков при видимых наличных."
+    highlight: ["label:cup", "label:bottle", "label:food", "role:cashier"]
+
+  # ------------------------------------------------------------------ V07
+  - id: V07_bag_left_unattended
+    type_id: V07
+    kind: violation
+    enabled: true
+    status_reason: >-
+      Включено: конкретное видимое условие «по бездействию» — инкассаторская сумка видна, ни
+      инкассатора, ни кассира в кадре ≥ 5 с, а до этого инкассатор доказанно был в кадре.
+    comment: >-
+      V07 — инкассатор оставил сумку и вышел, сумка без присмотра (по бездействию).
+    strength: "min(cash_bag_visible, not collector_present, not cashier_present)"
+    anchor: "cash_bag_visible > 0.5"
+    inaction:
+      before: "collector_present > 0.5"
+      before_window_s: 60
+      edge_s: 1.0
+      min_coverage: 0.8
+    min_duration_s: 5.0
+    merge_gap_s: 2.0
+    confidence: {base: 0.35, w_strength: 0.35, w_duration: 0.25, tau_s: 10.0}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с инкассаторская сумка видна, ни инкассатора, ни кассира в кадре не наблюдается."
+    facts_stage:
+      - "До этого инкассатор наблюдался в кадре."
+    highlight: ["label:cash_bag"]
+
+  - id: V07_handover_without_collector
+    type_id: V07
+    kind: observation
+    enabled: false
+    status_reason: >-
+      Выключено: семантика handover_motion не откалибрована, обычное обслуживание клиента даёт то же
+      движение; риск ложных наблюдений.
+    comment: "V07 (наблюдение) — движение передачи сумки без инкассатора в кадре."
+    strength: "min(handover_motion, cash_bag_visible, not collector_present)"
+    min_duration_s: 1.0
+    facts:
+      - "Около {t_peak:.1f} с наблюдается передача инкассаторской сумки, инкассатор в кадре не определён."
+    highlight: ["label:cash_bag", "role:visitor", "role:unknown"]
+
+  # ------------------------------------------------------------------ V08
+  - id: V08_hands_hidden_with_cash
+    type_id: V08
+    kind: observation
+    enabled: false
+    status_reason: >-
+      Выключено: при потолочной камере руки часто закрыты корпусом/монитором при обычной работе;
+      невидимые руки сами по себе не доказанное нарушение.
+    comment: "V08 (наблюдение) — руки скрыты от камеры ≥ 3 с при видимых наличных."
+    strength: "min(hands_hidden, cash_visible)"
+    min_duration_s: 3.0
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с руки кассира не видны камере при видимых наличных."
+    highlight: ["role:cashier", "label:cash"]
+
+  - id: V08_counting_facing_away
+    type_id: V08
+    kind: observation
+    enabled: false
+    status_reason: >-
+      Выключено: «спиной к камере» зависит от ракурса (тест под другим углом) — не переносимо без калибровки.
+    comment: "V08 (наблюдение) — кассир спиной к камере при видимых наличных."
+    strength: "min(cashier_facing_away, cash_visible, cashier_in_workplace)"
+    min_duration_s: 4.0
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с кассир расположен спиной к камере при видимых наличных."
+    highlight: ["role:cashier", "label:cash"]
+
+  # ------------------------------------------------------------------ V99
+  - id: V99_placeholder
+    type_id: V99
+    kind: observation
+    enabled: false
+    status_reason: >-
+      Выключено: V99 (иное) не задаётся правилами по сигналам — только VLM discover (A11) / fusion
+      с конкретными видимыми фактами.
+    comment: "Заглушка V99: правило по сигналам отсутствует намеренно."
+    strength: "false"
+    facts: []
