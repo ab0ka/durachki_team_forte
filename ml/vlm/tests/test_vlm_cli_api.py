@@ -208,3 +208,30 @@ def test_try_cli_qa_mode(tmp_path, capsys):
     main([str(video), "--t", "3", "--type", "V05", "--verify-mode", "qa", "--no-dump"])
     rep = json.loads(capsys.readouterr().out)
     assert rep["verify"]["mode"] == "qa" and rep["verify"]["asked"] == 2
+
+
+def test_bench_full_json_sections_report_frames_tokens_validity(tmp_path, capsys):
+    from ml.vlm.bench import main
+    main(["--synthetic", "5", "--n", "2", "--mode", "json,discover", "--no-dump"])
+    rep = json.loads(capsys.readouterr().out)
+    for sec, frames in (("json", 5), ("discover", 4)):
+        r = rep[sec]
+        assert r["input_frames_per_call"] == frames and r["max_new_tokens"] > 2  # полный JSON, не smoke
+        assert {"json_valid_rate", "parse_ok_rate", "truncated_rate", "out_tokens", "in_tokens",
+                "finish_reasons", "vram_peak_mb_max", "cold_first_call_s"} <= set(r)
+
+
+def test_bench_truncated_answer_not_counted_valid(monkeypatch, capsys):
+    from ml.vlm import runtime
+    from ml.vlm.backends.base import GenResult
+    from ml.vlm.bench import main
+
+    class Trunc(MockBackend):
+        def generate(self, images, system, prompt, **kw):
+            return GenResult(text='{"visible": true, "type_id": "V05", "confidence": 0.9, "observed_facts": ["Кас',
+                             latency_s=0.1, completion_tokens=180, finish_reason="length")
+
+    runtime.set_backend(Trunc())
+    main(["--synthetic", "5", "--n", "2", "--mode", "json", "--no-dump"])
+    r = json.loads(capsys.readouterr().out)["json"]
+    assert r["parse_ok_rate"] == 1.0 and r["json_valid_rate"] == 0.0 and r["truncated_rate"] == 1.0
