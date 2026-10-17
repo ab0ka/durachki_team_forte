@@ -166,8 +166,14 @@ def flatten_prompts(prompts: dict) -> tuple[list[str], list[str], list[str]]:
 
 def get_text_bank(cfg: dict, backend: Any, use_cache: bool = True) -> TextBank:
     en, ru, owner = flatten_prompts(load_prompts(cfg))
+    return text_bank_from_lists(cfg, backend, en, ru, owner, use_cache)
+
+
+def text_bank_from_lists(cfg: dict, backend: Any, en: Sequence[str], ru: Sequence[str], owner: Sequence[str],
+                         use_cache: bool = True) -> TextBank:
+    """Банк подсказок из явных списков (на инференсе — из чекпоинта, чтобы совпадал с обучением)."""
     sig = feature_signature(cfg, backend.name)
-    key = stable_hash({"sig": sig["model_id"], "texts": en})
+    key = stable_hash({"sig": sig["model_id"], "texts": list(en)})
     return _text_bank_cached(key, tuple(en), tuple(ru), tuple(owner), backend, str(cache_dir(cfg)), use_cache)
 
 

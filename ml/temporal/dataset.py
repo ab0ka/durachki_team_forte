@@ -19,7 +19,10 @@ class Sample:
     group: str
     label: int
     times: list[float]                      # размеченные секунды (может быть несколько у дубликатов)
-    type_id: str = ""
+    type_id: str = ""                        # только проверенная локальная разметка типа, иначе ""
+    md5: str = ""
+    sources: list[dict] = field(default_factory=list)          # исходные метки файлов группы дубликатов
+    conflict: bool = False
     versions: list[FeatureSet] = field(default_factory=list)   # [оригинал, аугментации...]
     X: list[np.ndarray] = field(default_factory=list)           # входы на сетке модели для каждой версии
     grid: list[np.ndarray] = field(default_factory=list)        # таймстемпы сетки для каждой версии

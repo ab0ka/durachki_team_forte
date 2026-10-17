@@ -72,6 +72,8 @@ class VideoLabel:
     files: list[str] = field(default_factory=list)  # исходные пути/имена
     group: str = ""                # id группы дубликатов (для LOO)
     md5: str = ""
+    sources: list[dict] = field(default_factory=list)  # исходные метки файлов группы (не теряются при слиянии)
+    conflict: bool = False         # в группе дубликатов метки «нарушение»/«без» расходятся
 
 
 _NAME_KEYS = ("file", "name", "video", "filename", "файл", "имя", "видео", "ролик", "id")
@@ -181,7 +183,8 @@ def assign_groups(labels: dict[str, VideoLabel], md5s: dict[str, str] | None = N
     def union(a: str, b: str) -> None:
         ra, rb = find(a), find(b)
         if ra != rb:
-            parent[max(ra, rb)] = min(ra, rb)
+            lo, hi = sorted((ra, rb), key=_natural_key)
+            parent[hi] = lo
 
     by_md5: dict[str, str] = {}
     for n, h in (md5s or {}).items():
@@ -204,24 +207,27 @@ def assign_groups(labels: dict[str, VideoLabel], md5s: dict[str, str] | None = N
     return groups
 
 
-def merge_duplicates(labels: dict[str, VideoLabel]) -> dict[str, VideoLabel]:
-    """Свернуть группу дубликатов в одну запись: метка = max, таймкоды = объединение (Х-4≡Х-47 -> [57, 68])."""
-    out: dict[str, VideoLabel] = {}
+def merge_duplicates(labels: dict[str, VideoLabel], conflict_policy: str = "positive") -> dict[str, VideoLabel]:
+    """Свернуть группу дубликатов в одну обучающую запись, НЕ выбирая метку произвольно:
+    все исходные метки остаются в ``sources``; таймкоды позитивных файлов объединяются
+    (Х-4≡Х-47 -> якоря [57, 68]); расхождение «нарушение/без» помечается ``conflict`` и решается
+    явной политикой: positive (пропуск нарушения хуже) или exclude (группа исключается)."""
+    grouped: dict[str, list[VideoLabel]] = {}
     for n in sorted(labels, key=_natural_key):
-        lab = labels[n]
-        g = lab.group or n
-        if g not in out:
-            out[g] = VideoLabel(name=g, label=lab.label, times=list(lab.times), type_id=lab.type_id,
-                                files=list(lab.files), group=g, md5=lab.md5)
-        else:
-            m = out[g]
-            m.label = max(m.label, lab.label)
-            m.times = sorted(set(m.times + lab.times))
-            m.type_id = m.type_id or lab.type_id
-            m.files += lab.files
-    for m in out.values():
-        if not m.label:
-            m.times = []
+        grouped.setdefault(labels[n].group or n, []).append(labels[n])
+    out: dict[str, VideoLabel] = {}
+    for g, items in grouped.items():
+        sources = [{"name": it.name, "label": it.label, "times": list(it.times), "type_id": it.type_id,
+                    "files": list(it.files)} for it in items]
+        conflict = len({it.label for it in items}) > 1
+        if conflict and conflict_policy == "exclude":
+            continue
+        label = max(it.label for it in items)
+        times = sorted({t for it in items if it.label for t in it.times}) if label else []
+        types = {it.type_id for it in items if it.label and it.type_id}
+        out[g] = VideoLabel(name=g, label=label, times=times, type_id=types.pop() if len(types) == 1 else "",
+                            files=[f for it in items for f in it.files], group=g, md5=items[0].md5,
+                            sources=sources, conflict=conflict)
     return out
 
 
