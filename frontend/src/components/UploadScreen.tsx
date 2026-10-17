@@ -237,8 +237,13 @@ export default function UploadScreen() {
             </div>
             )}
             {error && (
-              <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-400/20 dark:bg-rose-400/10 dark:text-rose-300" role="alert">
-                {error}
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-400/20 dark:bg-rose-400/10 dark:text-rose-300" role="alert">
+                <span>{error}</span>
+                {file && !uploading && (
+                  <button className="btn-ghost px-3 py-1.5 text-xs" onClick={() => void start()}>
+                    Повторить загрузку
+                  </button>
+                )}
               </div>
             )}
             {serverOk === false && !demo && (
@@ -373,7 +378,7 @@ function DemoStart() {
   );
 }
 
-function LoginCard() {
+export function LoginCard({ onDone }: { onDone?: () => void } = {}) {
   const { login } = useApp();
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
@@ -388,6 +393,7 @@ function LoginCard() {
         try {
           await login(key);
           setKey("");
+          onDone?.();
         } catch (ex) {
           setErr(ex instanceof ApiError ? ex.message : "Не удалось войти.");
         } finally {

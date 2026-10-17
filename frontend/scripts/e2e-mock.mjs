@@ -247,14 +247,23 @@ try {
     const c = await browser.newContext({ viewport: { width: 1280, height: 900 }, acceptDownloads: true });
     const pg = await c.newPage();
     let jobPolls = 0;
+    let relogged = false;
     await pg.route("**/ui/v1/**", (route) => {
-      const p = new URL(route.request().url()).pathname;
-      if (p.endsWith("/session")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+      const req = route.request();
+      const p = new URL(req.url()).pathname;
+      if (p.endsWith("/session")) {
+        if (req.method() === "POST") {
+          relogged = true;
+          return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+        }
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+      }
       if (p.endsWith("/copilot/status")) return route.fulfill({ status: 200, contentType: "application/json", body: '{"enabled":true,"available":false,"reason":"unavailable"}' });
       if (p.endsWith("/jobs/c1/report")) return route.fulfill({ status: 200, contentType: "text/markdown; charset=utf-8", body: "# Синтетическое заключение" });
       if (p.endsWith("/jobs/c1")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(doneJob("c1")) });
       if (p.endsWith("/jobs/x1")) {
         jobPolls++;
+        if (relogged) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(doneJob("x1")) });
         return jobPolls < 2
           ? route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job_id: "x1", status: "processing", stage: "detect", progress: 0.2 }) })
           : route.fulfill({ status: 401, contentType: "application/json", body: '{"detail":"UI session required"}' });
@@ -272,8 +281,12 @@ try {
       assert.ok(dl.suggestedFilename().endsWith(".md"), dl.suggestedFilename());
     });
     await pg.goto(`${url}#/job/x1`);
-    await step("сессия истекла во время обработки → понятная ошибка, а не вечный прогресс", async () => {
-      await pg.getByText("Не удалось получить результат").waitFor({ timeout: 8000 });
+    await step("сессия истекла во время обработки → вход на странице задачи → опрос продолжается", async () => {
+      await pg.getByText("Вход для проверяющего").waitFor({ timeout: 8000 });
+      await pg.getByLabel("Ключ доступа").fill(KEY);
+      await pg.getByRole("button", { name: "Войти" }).click();
+      await pg.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 8000 });
+      assert.ok(pg.url().includes("#/job/x1"), "URL задачи сохранён");
     });
     await c.close();
   }
@@ -344,6 +357,52 @@ try {
       await pg.getByText("просмотрено 1 из 2", { exact: false }).waitFor({ timeout: 2000 });
       await pg.reload();
       await pg.getByText("просмотрено 1 из 2", { exact: false }).waitFor({ timeout: 5000 });
+    });
+    await c.close();
+  }
+
+  // ---------- сценарий 1е: обрыв сети (пауза растёт, опрос не обрывается) и повторная отправка файла ----------
+  {
+    const c = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const pg = await c.newPage();
+    let n1 = 0;
+    let uploads = 0;
+    await pg.route("**/ui-config.json", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ pollIntervalMs: 300, pollMaxIntervalMs: 1200 }) }),
+    );
+    await pg.route("**/ui/v1/**", (route) => {
+      const req = route.request();
+      const p = new URL(req.url()).pathname;
+      if (p.endsWith("/session")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+      if (p.endsWith("/analyze")) {
+        uploads++;
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job_id: uploads === 1 ? "r1" : "r2" }) });
+      }
+      if (p.endsWith("/jobs/n1")) {
+        n1++;
+        if (n1 <= 3) return route.abort("connectionreset");
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(doneJob("n1")) });
+      }
+      if (p.endsWith("/jobs/r1")) return route.fulfill({ status: 200, contentType: "application/json", body: '{"job_id":"r1","status":"failed","verdict":null,"violations":[],"error":"синтетический сбой"}' });
+      if (p.endsWith("/jobs/r2")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(doneJob("r2")) });
+      if (p.endsWith("/ui/v1/jobs")) return route.fulfill({ status: 200, contentType: "application/json", body: '{"jobs":[]}' });
+      return route.fulfill({ status: 404, body: "" });
+    });
+    await pg.goto(`${url}#/job/n1`);
+    await step("обрыв сети: баннер «Нет связи», затем результат без перезагрузки", async () => {
+      await pg.getByText("Нет связи с сервером", { exact: false }).waitFor({ timeout: 6000 });
+      await pg.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 15000 });
+      assert.ok(n1 >= 4, `запросов: ${n1}`);
+    });
+    await pg.goto(`${url}#/`);
+    await step("сбой анализа → «Отправить этот файл повторно» → новая задача → результат", async () => {
+      await pg.locator('input[type="file"]').setInputFiles({ name: "retry.mov", mimeType: "video/quicktime", buffer: Buffer.alloc(1024, 3) });
+      await pg.getByRole("button", { name: "Начать проверку" }).click();
+      await pg.getByText("Анализ не завершён").first().waitFor({ timeout: 8000 });
+      await pg.getByRole("button", { name: "Отправить этот файл повторно" }).click();
+      await pg.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 10000 });
+      assert.equal(uploads, 2);
+      assert.ok(pg.url().includes("#/job/r2"), pg.url());
     });
     await c.close();
   }

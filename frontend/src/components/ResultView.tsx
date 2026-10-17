@@ -21,6 +21,7 @@ import { analyzeCompleteness } from "../lib/completeness";
 import { verdictView } from "../lib/verdict";
 import CompletenessPanel from "./CompletenessPanel";
 import EpisodeNavigator from "./EpisodeNavigator";
+import RetryUpload from "./RetryUpload";
 import { uiConfig } from "../lib/uiConfig";
 import CopilotPanel from "./CopilotPanel";
 import VideoPlayer, { type PlayerHandle } from "./VideoPlayer";
@@ -202,6 +203,9 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
       {job.status === "failed" && (
         <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-400/30 dark:bg-amber-400/10 dark:text-amber-200" role="alert">
           <b>Анализ не завершён{job.error ? `: ${job.error}` : ""}.</b> Ниже — только то, что система успела найти до сбоя; остальная часть записи не проверена.
+          <div className="mt-2">
+            <RetryUpload jobId={job.job_id} className="btn-ghost px-3 py-1.5 text-xs" />
+          </div>
         </div>
       )}
 
