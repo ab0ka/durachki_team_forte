@@ -24,6 +24,8 @@ CAT = {  # категория → (статус-цвет, значок, подп
     "early": ("var(--warning)", "←", "рано"), "late": ("var(--warning)", "→", "поздно"),
     "wrong_type": ("var(--warning)", "≠", "не тот тип"), "failed": ("var(--critical)", "✗", "ошибка/таймаут"),
     "label_conflict": ("var(--text-secondary)", "?", "конфликт меток"),
+    "partial": ("var(--critical)", "◐", "неполный анализ (не «чисто»)"),
+    "label_unknown": ("var(--text-secondary)", "?", "метка неизвестна"),
 }
 
 CSS = """
@@ -89,7 +91,8 @@ def _strip(e: dict, api: dict, width: int = 260, height: int = 26) -> str:
 
 
 def build_report(metrics: dict, preds: Optional[dict[str, dict]] = None, robustness: Optional[dict] = None,
-                 proxy: Optional[dict] = None, with_frames: bool = True, title: str = "Kassa Sentinel — eval") -> str:
+                 proxy: Optional[dict] = None, with_frames: bool = True, title: str = "Kassa Sentinel — eval",
+                 sanity: Optional[dict] = None) -> str:
     preds = preds or {}
     s, sc = metrics["summary"], metrics.get("scorecard")
     out = [f"<!doctype html><html lang=ru><head><meta charset=utf-8><meta name=viewport content='width=device-width,"
@@ -99,6 +102,17 @@ def build_report(metrics: dict, preds: Optional[dict[str, dict]] = None, robustn
            'в облако/LLM. Наружу — summary_public.json. Результаты — подсказка, не юридическое заключение.</div>']
     if sc:
         out.append(f"<h2>Scorecard</h2><pre>{html.escape(format_scorecard(sc))}</pre>")
+    if sanity:
+        from .sanity import format_sanity
+
+        out.append(f"<h2>Санити-полы и утечки</h2><pre>{html.escape(format_sanity(sanity))}</pre>")
+    tp = s.get("timecode_policy") or {}
+    if tp:
+        out.append("<h2>Политика таймкода («что если»)</h2><table><tr><th>точка</th><th>n</th><th>median |Δt|</th>"
+                   "<th>hit</th></tr>" + "".join(
+                       f"<tr><td>{html.escape(k)}</td><td>{v['n']}</td><td>{v['median_abs_dt']}</td>"
+                       f"<td>{html.escape(str(v['hit']))}</td></tr>" for k, v in tp.items() if isinstance(v, dict))
+                   + f"</table><p class=muted>{html.escape(tp.get('note', ''))}</p>")
     if proxy:
         out.append(f"<p class=muted>Proxy-балл (наш, формула жюри неизвестна): <b>{proxy.get('proxy_score')}</b> / 100; "
                    f"n/a: {html.escape(', '.join(proxy.get('missing') or []) or '—')}</p>")
@@ -162,9 +176,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     metrics = read_json(run / "metrics.json")
     preds = load_predictions(run / "preds")[0] if (run / "preds").exists() else {}
     proxy = read_json(run / "proxy_score.json") if (run / "proxy_score.json").exists() else None
+    san = read_json(run / "sanity.json") if (run / "sanity.json").exists() else None
     rob = read_json(args.robustness) if args.robustness else None
     out = Path(args.out) if args.out else run / "report.html"
-    out.write_text(build_report(metrics, preds, rob, proxy, not args.no_frames), encoding="utf-8")
+    out.write_text(build_report(metrics, preds, rob, proxy, not args.no_frames, sanity=san), encoding="utf-8")
     print(f"→ {out} (только локально: содержит кадры)")
     return 0
 

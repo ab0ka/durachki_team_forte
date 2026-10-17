@@ -198,3 +198,24 @@ def test_failed_partial_invalid_never_clean(tmp_path: Path):
     res2 = evaluate(load_ground_truth(p), {"X-5": make_pred("e", [])}, {},
                     load_config(overrides={"coverage": {"require": True}}))
     assert {e["video_id"]: e["category"] for e in res2["per_video"]}["X-5"] == "partial"
+
+
+def test_l1_labels_format_and_policy_whatif(tmp_path: Path):
+    """Формат L1 (tools/dataprep/build_labels.py): без sha256, t_sec целым, conflict=1 у дубликатов 57/68."""
+    p = tmp_path / "labels.csv"
+    p.write_text("video_id,file,label,t_sec,md5,group,t_all,conflict,raw\n"
+                 "X-4,Х-4.mov,violation,57,aa,X-4,57,1,Х-4 | 57 секунда\n"
+                 "X-47,Х-47.mov,violation,68,aa,X-4,68,1,Х-47 | 1минута 8 секунда\n"
+                 "X-1,X-1.mov,violation,22,bb,X-1,22,0,X-1 | 22 секунда\n"
+                 "X-2,X-2.mov,no_violation,,cc,X-2,,0,X-2 | без нарушения\n", encoding="utf-8")
+    gt = load_ground_truth(p)
+    assert set(gt) == {"X-4", "X-1", "X-2"} and gt["X-4"].conflict and gt["X-4"].events == [[57.0, 68.0]]
+    assert gt["X-4"].raw["X-47"].endswith("1минута 8 секунда")                   # исходные строки сохранены
+    v = make_violation(23.5)
+    v["t_start"], v["t_end"] = 22.2, 26.0
+    res = evaluate(gt, {"X-1": make_pred("a", [v]), "X-2": make_pred("b", []), "X-4": make_pred("c", [])},
+                   {}, load_config())
+    tp = res["summary"]["timecode_policy"]
+    assert tp["timecode_sec"]["median_abs_dt"] == 1.5 and tp["t_start"]["median_abs_dt"] == pytest.approx(0.2)
+    assert tp["t_start"]["hit"]["0.5"] == 1.0 and tp["timecode_sec"]["hit"]["0.5"] == 0.0
+    assert res["summary"]["conflict_groups"][0]["gt_alternatives"] == [57.0, 68.0]

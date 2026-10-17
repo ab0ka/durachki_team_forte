@@ -145,6 +145,7 @@ class VideoEval:
     partial: bool = False                       # no_violation при неполном анализе — НЕ «чисто»
     invalid_verdict: bool = False               # status=done, но verdict не из схемы — как failed
     vram_peak_mb: Optional[float] = None
+    policy_dt: dict[str, Optional[float]] = field(default_factory=dict)   # |Δt| при разных политиках таймкода
 
     @property
     def gt_positive(self) -> bool:
@@ -368,6 +369,19 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
         ve.pred_type = v.get("type_id") or None
         ve.pred_conf = _num(v.get("confidence"))
     if gt.positive and pred_pos and events:
+        # «что если»: какой момент отдавать жюри — timecode_sec, t_start (начало) или середину интервала
+        alts = [a for ev in events for a in ev]
+        for pol in ("timecode_sec", "t_start", "t_mid"):
+            ts = []
+            for x in vios:
+                if pol == "t_mid":
+                    a_, b_ = _num(x.get("t_start")), _num(x.get("t_end"))
+                    t = (a_ + b_) / 2 if a_ is not None and b_ is not None else None
+                else:
+                    t = _num(x.get(pol))
+                if t is not None:
+                    ts.append(t)
+            ve.policy_dt[pol] = round(min(abs(t - a) for t in ts for a in alts), 3) if ts and alts else None
         for k in windows:
             ve.hits[f"{k:g}"] = ve.dt_abs is not None and ve.dt_abs <= k + 1e-9
         if v is not None and ve.matched_gt_t is not None:
@@ -612,11 +626,20 @@ def summarize(evals_all: list[VideoEval], cfg: dict, dup_check: Optional[list[di
                "within_sla_rate": _rate(sum(e.latency_s <= _sla(e) for e in lats), len(lats)),
                "rt_factor": _stats([e.latency_s / e.duration for e in lats if e.duration])}
     cats = {c: [e.video_id for e in evals_all if e.category == c] for c in CATEGORIES}
+    pol_es = [e for e in tp if e.policy_dt and in_loc(e)]
+    timecode_policy = {}
+    for pol in ("timecode_sec", "t_start", "t_mid"):
+        ds = [e.policy_dt.get(pol) for e in pol_es if e.policy_dt.get(pol) is not None]
+        timecode_policy[pol] = {"n": len(ds), "median_abs_dt": round(statistics.median(ds), 3) if ds else None,
+                                "hit": {f"{float(k):g}": _rate(sum(d <= float(k) + 1e-9 for d in ds), len(ds))
+                                        for k in cfg.get("hit_windows_s", [0.5, 1, 2, 3])}}
+    timecode_policy["note"] = ("«что если» на тех же предсказаниях (TP, ближайшее нарушение, без one-to-one): "
+                               "какую точку отдавать как timecode_sec — решать замером, не на глаз")
     vr = [e.vram_peak_mb for e in evals_all if e.vram_peak_mb is not None]
     resources = {"vram_peak_mb": _stats(vr), "vram_source": "meta/runinfo (пайплайн или сэмплер nvidia-smi)" if vr
                  else "не измерено"}
     out = {"video": video, "localization": localization, "localization_alt": localization_alt,
-           "conflict_groups": _conflict_block(evals), "resources": resources,
+           "conflict_groups": _conflict_block(evals), "resources": resources, "timecode_policy": timecode_policy,
            "evidence": evidence, "types": types, "norms": norms, "schema": schema, "language": language,
            "latency": latency, "categories": cats}
     if dup_check is not None:
