@@ -89,21 +89,25 @@ class SimpleClip:
             raise IOError(f"cannot open {path}")
         self.fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
         frames: list[np.ndarray] = []
-        step = max(1, int(round(self.fps / sample_fps)))
-        k = 0
         self._all_t: list[float] = []
+        # переменный fps: время кадра — из PTS (CAP_PROP_POS_MSEC), а не k/fps
+        next_t, k, last_t = 0.0, 0, 0.0
         while True:
             ok, fr = cap.read()
             if not ok:
                 break
-            if k % step == 0:
+            pts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            t = pts if pts > 0 or k == 0 else k / self.fps
+            last_t = t
+            if t + 1e-6 >= next_t:
                 frames.append(fr)
-                self._all_t.append(k / self.fps)
+                self._all_t.append(round(t, 4))
+                next_t += 1.0 / sample_fps
             k += 1
         cap.release()
         self._frames = frames
         self.times = list(self._all_t)
-        self.duration = k / self.fps if self.fps else 0.0
+        self.duration = last_t + (1.0 / self.fps if self.fps else 0.0)
         h, w = (frames[0].shape[:2] if frames else (0, 0))
         self.width, self.height = int(w), int(h)
 
