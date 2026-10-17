@@ -28,6 +28,23 @@
 Скрипты в `tools/dataprep/` (запускать из корня репо: `.venv/Scripts/python.exe -I -X utf8 ...`):
 `build_labels.py data`, `build_manifest.py data`, `contact_sheets.py <video> <out.jpg> <times|overview:N>`.
 
+### Разметка типов: локальная VLM → подтверждение человеком
+
+1. `vlm_types.py --root .` — Qwen3-VL-4B (nf4) получает 6 обзорных кадров и окно t−5…t+5 с, при сомнении
+   (conf < 0.6, NEW или нераспознанный ответ) ещё окно t−10…t+10 с. Дополнительно разбираются пары md5-дубликатов
+   с разными таймкодами и описывается процедура в 8 чистых видео. Сырые ответы пишутся в
+   `cache/types_review/vlm_raw.jsonl`, контакт-листы — в `cache/types_review/img/`. Повторный запуск продолжает с места остановки.
+2. `types_review.py --root .` собирает `cache/types_review/index.html` (видео с перемоткой к t, контакт-листы,
+   предложение VLM, форма подтверждения), `data/labels_types.csv` (`source=vlm, confirmed=0`) и черновик
+   `cache/DATA_FINDINGS.md`.
+3. Человек открывает HTML в Chrome/Edge и подтверждает типы, потом выгружает `labels_types.csv`, `clean_procedures.csv` и
+   `review_state.json`. Затем `types_review.py --root . --confirmed <csv> --clean-notes <csv> --state <json>`, после чего
+   в `data/labels_types.csv` попадают `source=human, confirmed=1`.
+
+Колонки `labels_types.csv`: `video_id,t_sec,type_id,confidence,what_is_visible,actors,objects,onset_or_peak,
+event_time_sec,new_type,alt_type_id,source,confirmed,notes` (надмножество для `eval.read_types_csv`).
+**Пока `confirmed=0`, типы — только гипотезы VLM, обучать на них типовую голову нельзя.**
+
 ## 2. Окружение
 
 - `uv` 0.13.1 установлен через `pip --user` в Python 3.11: `%APPDATA%\Python\Python311\Scripts\uv.exe` (**не в PATH**).
@@ -50,10 +67,18 @@
 | intfloat/multilingual-e5-small | 614241f6 | MIT | 0.47 ГБ | OK (загрузка) |
 | Qwen/Qwen3-VL-4B-Instruct | ebb281ec | Apache-2.0 | 8.3 ГБ | OK, **выбранная VLM** (§5) |
 
+Вне hub-кэша (пути, которые ищут модули):
+
+| что | путь | лицензия | статус |
+|---|---|---|---|
+| Qwen/Qwen2.5-7B-Instruct-GGUF Q4_K_M (2 шарда, 4.4 ГиБ, commit bb5d59e0) | `weights/copilot/qwen2.5-7b-instruct-q4_k_m-0000{1,2}-of-00002.gguf` | Apache-2.0 | скачано; copilot ждёт один файл `Qwen2.5-7B-Instruct-Q4_K_M.gguf`, поэтому `COPILOT_MODEL_PATH=` на шард `-00001-of-00002` (llama.cpp сам подхватит второй) |
+| RTMPose-m body7 256×192 ONNX (openmmlab) | `weights/pose/20230831/rtmpose_onnx/rtmpose-m_simcc-body7_…/end2end.onnx` | Apache-2.0 | OK: `CUDAExecutionProvider`, 11.7 мс на батч из 8 кропов; находится через `ml.pose…find_weights` (cwd = корень репо) |
+
+**onnxruntime-gpu закреплён на 1.23.2.** Версии ≥ 1.24 на PyPI собраны под CUDA 13 и не грузят CUDA-провайдер
+рядом с torch cu128. Пакет rtmlib не ставился: у `ml/pose` свой ONNX-бэкенд, а модель та же.
+
 Сознательно **не** скачано:
 - Qwen2.5-VL-7B-AWQ: 6.9 ГБ весов, на 8 ГБ при работающем рабочем столе не помещается.
-- Qwen2.5-7B-Instruct GGUF: текстовый LLM; при необходимости его подтянет `deploy/weights.py prepare` по `copilot/models.json`.
-- RTMPose (rtmlib).
 
 `weights/Qwen__Qwen3-VL-4B-Instruct-GGUF/` — **недокачанный** GGUF, загрузка прервана; не использовать.
 
