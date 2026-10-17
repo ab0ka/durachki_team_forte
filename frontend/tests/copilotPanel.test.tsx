@@ -64,7 +64,7 @@ describe("CopilotPanel: состояния", () => {
     expect(same).toContain("Перечислить кадры-доказательства");
     const other = render("job-b", { lastResult: job });
     expect(other).not.toContain("Объяснить эпизод 1");
-    expect(other).not.toContain("Быстрые вопросы");
+    expect(other).not.toContain("Спросить по отчёту");
   });
 });
 
@@ -74,14 +74,16 @@ describe("CopilotPanel: быстрые вопросы", () => {
       ...buildDemoResult("x"),
       violations: buildDemoResult("x").violations.map((v) => ({ ...v, rules: [] })),
     };
-    const labels = quickQuestions(job).map((q) => q.label);
-    expect(labels[0]).toMatch(/^Объяснить эпизод 1 · \d\d:\d\d\.\d$/);
-    expect(labels).not.toContain("Показать указанное основание");
+    const quick = quickQuestions(job);
+    expect(quick[0].label).toMatch(/^Эпизод 1 · \d\d:\d\d\.\d$/);
+    expect(quick[0].ariaLabel).toMatch(/^Объяснить эпизод 1, /);
+    expect(quick[0].question).toContain("Объясни эпизод 1");
+    expect(quick.map((q) => q.label)).not.toContain("Указанное основание");
   });
 
   it("нет нарушений → только вопрос «почему нарушений не найдено»", () => {
     const labels = quickQuestions(buildDemoClean("c")).map((q) => q.label);
-    expect(labels).toEqual(["Почему нарушений не найдено"]);
+    expect(labels).toEqual(["Почему без нарушений"]);
   });
 
   it("результат не завершён или неизвестен → вопросов нет", () => {

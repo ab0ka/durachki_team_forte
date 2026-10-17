@@ -186,6 +186,7 @@
 
 /* ---------- История ---------- */
 .log {
+  position: relative; /* offsetTop сообщений считается от ленты */
   display: flex;
   flex-direction: column;
   gap: 0.875rem;
@@ -478,6 +479,17 @@
   .sheet {
     border-radius: 0;
   }
+}
+/* В широком режиме у шапки, баннера, ленты и поля ввода один левый край. */
+.sheet .head,
+.sheet .composer {
+  padding-inline: clamp(1rem, 4vw, 2rem);
+}
+.sheet .banner {
+  margin-inline: clamp(1rem, 4vw, 2rem);
+}
+.sheet .composer {
+  padding-bottom: 1rem;
 }
 
 /* ---------- Движение ---------- */

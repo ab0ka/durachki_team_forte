@@ -27,9 +27,9 @@ type Msg =
 type NoticeMsg = Extract<Msg, { role: "notice" }>;
 type Availability = "checking" | "ready" | "unknown";
 interface Quick {
-  label: string;
+  label: string; // коротко — помещается в узкую колонку
+  ariaLabel: string; // полный смысл для скринридера и подсказки
   question: string;
-  title?: string;
 }
 
 /** История для сервера: только вопросы и ответы до указанного вопроса, без служебных уведомлений. */
@@ -49,20 +49,29 @@ function quickQuestions(result: JobResult | null): Quick[] {
   const out: Quick[] = viols.slice(0, 2).map((v, i) => {
     const tc = formatTimecode(v.timecode_sec);
     return {
-      label: `Объяснить эпизод ${i + 1} · ${tc}`,
-      title: v.type,
+      label: `Эпизод ${i + 1} · ${tc}`,
+      ariaLabel: `Объяснить эпизод ${i + 1}, ${tc}: ${v.type}`,
       question: `Объясни эпизод ${i + 1} («${v.type}», ${tc}): что видно на записи и почему это может быть нарушением?`,
     };
   });
   if (viols.some((v) => (v.evidence_frames?.length ?? 0) > 0))
-    out.push({ label: "Перечислить кадры-доказательства", question: "Перечисли кадры-доказательства по каждому эпизоду с таймкодами." });
+    out.push({
+      label: "Кадры-доказательства",
+      ariaLabel: "Перечислить кадры-доказательства по эпизодам",
+      question: "Перечисли кадры-доказательства по каждому эпизоду с таймкодами.",
+    });
   if (viols.some((v) => (v.rules?.length ?? 0) > 0))
     out.push({
-      label: "Показать указанное основание",
+      label: "Указанное основание",
+      ariaLabel: "Показать нормативное основание, указанное в отчёте",
       question: "Какое нормативное основание указано в отчёте для эпизодов? Назови документ и пункт, если они указаны.",
     });
   if (viols.length === 0 && result.verdict === "no_violation")
-    out.push({ label: "Почему нарушений не найдено", question: "Почему в отчёте нет эпизодов с признаками нарушений и что система не проверяет?" });
+    out.push({
+      label: "Почему без нарушений",
+      ariaLabel: "Почему нарушений не найдено",
+      question: "Почему в отчёте нет эпизодов с признаками нарушений и что система не проверяет?",
+    });
   return out;
 }
 
@@ -228,8 +237,8 @@ export default function CopilotPanel({ jobId }: { jobId: string }) {
     availability === "checking"
       ? "локальная модель · проверяем доступность…"
       : availability === "ready"
-        ? "локальная модель · отвечает по данным этого отчёта"
-        : "локальная модель · сервер не сообщает статус";
+        ? "локальная модель · доступна"
+        : "локальная модель · статус не сообщается";
 
   const chat = (variant: "side" | "wide") => (
     <>
@@ -348,14 +357,22 @@ function Intro({ quick, busy, onPick, wide }: { quick: Quick[]; busy: boolean; o
   return (
     <div className={cx(s.intro, wide && s.introWide)}>
       <p className="text-[13px] leading-relaxed text-slate-600 dark:text-slate-300">
-        Отвечает по данным этого отчёта: эпизоды, факты, таймкоды кадров, указанные нормы. Видео и изображения кадров не просматривает.
+        Отвечает по этому отчёту: эпизоды, факты, таймкоды кадров, указанные нормы. Видео и изображения кадров не просматривает.
       </p>
       {quick.length > 0 && (
         <div className="mt-3">
-          <div className="label mb-1.5">Быстрые вопросы</div>
+          <div className="label mb-1.5">Спросить по отчёту</div>
           <div className={s.quick}>
             {quick.map((q) => (
-              <button key={q.label} type="button" className={s.quickBtn} onClick={() => onPick(q.question)} disabled={busy} title={q.title}>
+              <button
+                key={q.label}
+                type="button"
+                className={s.quickBtn}
+                onClick={() => onPick(q.question)}
+                disabled={busy}
+                aria-label={q.ariaLabel}
+                title={q.ariaLabel}
+              >
                 {q.label}
               </button>
             ))}
@@ -382,15 +399,25 @@ function ChatLog({
   onStop: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
+  const stick = useRef(true); // читатель у последнего сообщения
+  const userScroll = useRef(false); // прокрутку начал человек (колесо, касание, клавиши), а не автопрокрутка
   const last = msgs[msgs.length - 1];
 
   // Прокрутка к новому сообщению, только если читатель внизу (не дёргаем при чтении истории) или спросил сам.
+  // Длинный ответ показываем с начала, а не с конца.
   useLayoutEffect(() => {
     const el = ref.current;
-    if (!el) return;
-    if (stick.current || last?.role === "user") el.scrollTo({ top: el.scrollHeight, behavior: prefersReducedMotion() ? "auto" : "smooth" });
-  }, [msgs.length, busy, last?.role]);
+    if (!el || !last) return;
+    if (last.role === "user") stick.current = true;
+    if (!stick.current) return;
+    const behavior: ScrollBehavior = prefersReducedMotion() ? "auto" : "smooth";
+    const node = el.querySelector<HTMLElement>(`[data-msg="${last.id}"]`);
+    if (node && last.role !== "user" && !busy && node.offsetHeight > el.clientHeight - 32) {
+      el.scrollTo({ top: Math.max(0, node.offsetTop - 12), behavior });
+      return;
+    }
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  }, [msgs.length, busy, last]);
 
   return (
     <div
@@ -402,7 +429,12 @@ function ChatLog({
       aria-busy={busy}
       aria-label="История вопросов и ответов"
       tabIndex={0}
+      onWheel={() => (userScroll.current = true)}
+      onTouchStart={() => (userScroll.current = true)}
+      onKeyDown={() => (userScroll.current = true)}
+      onPointerDown={() => (userScroll.current = true)}
       onScroll={(e) => {
+        if (!userScroll.current) return; // события автопрокрутки не меняют решение
         const el = e.currentTarget;
         stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       }}
@@ -435,7 +467,7 @@ function ChatLog({
 function MessageView({ m, busy, onRetry }: { m: Msg; busy: boolean; onRetry: (n: NoticeMsg) => void }) {
   if (m.role === "user")
     return (
-      <div className={cx(s.userRow, s.msgIn)}>
+      <div className={cx(s.userRow, s.msgIn)} data-msg={m.id}>
         <p className={s.userBubble}>
           <span className="sr-only">Вопрос: </span>
           {m.text}
@@ -444,7 +476,7 @@ function MessageView({ m, busy, onRetry }: { m: Msg; busy: boolean; onRetry: (n:
     );
   if (m.role === "assistant")
     return (
-      <article className={cx(s.answer, s.msgIn)}>
+      <article className={cx(s.answer, s.msgIn)} data-msg={m.id}>
         <div className={s.answerHead}>
           <Bot className="h-3.5 w-3.5" aria-hidden /> Copilot
         </div>
@@ -464,7 +496,7 @@ function MessageView({ m, busy, onRetry }: { m: Msg; busy: boolean; onRetry: (n:
       </article>
     );
   return (
-    <div className={cx(s.notice, m.tone === "error" ? s.noticeError : s.noticeWarn, s.msgIn)}>
+    <div className={cx(s.notice, m.tone === "error" ? s.noticeError : s.noticeWarn, s.msgIn)} data-msg={m.id}>
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
       <p className="min-w-0 flex-1">
         <span className="sr-only">{m.tone === "error" ? "Ошибка: " : "Внимание: "}</span>
