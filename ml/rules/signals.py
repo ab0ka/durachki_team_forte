@@ -304,6 +304,7 @@ def derive_from_tracks(
     collector = np.zeros(n)
     outsider = np.zeros(n)
     obj_presence: dict[str, np.ndarray] = {}
+    desk_bag = np.zeros(n) if "desk" in zone_polys else None  # личная сумка (label bag) на столе — V09
     has_person = False
     workplace_zone = "desk" if "desk" in zone_polys else ("cashier_area" if "cashier_area" in zone_polys else None)
     for tr in tracks:
@@ -318,7 +319,10 @@ def derive_from_tracks(
         idx_prev = np.clip(idx - 1, 0, len(bt) - 1)
         use_prev = np.abs(bt[idx_prev] - times) < np.abs(bt[idx] - times)
         nearest = np.where(use_prev, idx_prev, idx)
-        present = np.abs(bt[nearest] - times) <= presence_tol_s
+        # присутствие — только в пределах жизни трека (без растягивания до первого/после последнего
+        # бокса: иначе начало действия «съезжает» раньше на presence_tol_s); внутри — разрывы ≤ tol
+        alive = (times >= bt[0] - 1e-6) & (times <= bt[-1] + 1e-6)
+        present = alive & (np.abs(bt[nearest] - times) <= presence_tol_s)
         if label == "person":
             has_person = True
             n_persons += present
@@ -338,6 +342,10 @@ def derive_from_tracks(
         else:
             arr = obj_presence.setdefault(label, np.zeros(n))
             np.maximum(arr, present.astype(float), out=arr)
+            if label == "bag" and desk_bag is not None:
+                for i in np.nonzero(present)[0]:
+                    if in_zone(boxes[int(nearest[i])][1], "desk", desk_margin):
+                        desk_bag[i] = 1.0
     if has_person:
         out["n_persons"] = n_persons
         out["cashier_present"] = cashier
@@ -351,4 +359,6 @@ def derive_from_tracks(
     for label, sig in label_to_signal.items():
         if label in obj_presence:
             out[sig] = obj_presence[label]
+    if desk_bag is not None:
+        out["personal_items_on_desk"] = desk_bag
     return out
