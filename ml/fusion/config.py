@@ -32,6 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "other": 0.6,
     },
     "combine": "max",
+    "temporal_mode": "off",
     "agreement": {"min_conf": 0.3, "bonus_per_source": 0.05, "max_bonus": 0.10},
     "vlm": {"reject_factor": 0.6, "reject_min_score": 0.5, "unsure_factor": 1.0},
     "risk": {
@@ -47,9 +48,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "report_gate": {
         "require_fact": True,
         "fact_sources": ["rules", "vlm"],
-        "require_norm": True,
+        "require_norm_types": ["V99"],
         "norm_missing_if_no_catalog": "report",
         "temporal_only_types": False,
+        "upstream_assessment": True,
+        "observation_policy": "hint",
+        "insufficient_policy": "hint",
+        "uncap_norm_review": True,
+    },
+    "policies": {
+        "v02_after_window": {"enabled": False, "remain_min": 0.5, "removed_max": 0.2, "removed_factor": 0.35},
+        "v01_client_side": {"enabled": False},
+        "negative_evidence": {"enabled": False, "weight": 0.5},
     },
     "output": {
         "max_violations": 10,
@@ -117,6 +127,11 @@ DEFAULT_CONFIG["completeness"] = {
     "required": ["ingest", "detect", "rules"],
     "optional": ["track", "pose", "scene", "temporal", "vlm"],
     "ok_values": ["ok", "done", "success", "true", "skipped_by_config"],
+    "coverage_gate": True,
+    "min_decoded": 0.98,
+    "min_sampled": 0.9,
+    "max_gap_s": 2.0,
+    "unknown_coverage": "failed",
 }
 
 DEFAULT_THRESHOLDS: dict[str, Any] = {
