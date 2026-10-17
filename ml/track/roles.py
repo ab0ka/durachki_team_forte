@@ -66,6 +66,16 @@ def _proj(pts: np.ndarray, side: dict, aspect: float) -> Optional[np.ndarray]:
     return (pts[:, 0] - dc[0]) * aspect * u[0] + (pts[:, 1] - dc[1]) * u[1]
 
 
+def seated_mask(v: TrackView, desk: Optional[Zone], cfg: dict, aspect: float) -> np.ndarray:
+    """Наблюдения «сидит/стоит на месте у стола» (локальная скорость мала и рядом со столом)."""
+    rc = cfg["roles"]
+    still = _local_speeds(v, aspect, rc["speed_window_s"]) <= rc["seated_speed_diag_s"]
+    if desk is None:
+        return still
+    near = np.array([dist_point_polygon(p, desk.polygon, aspect) <= rc["near_desk_diag"] * v.diag for p in v.pts])
+    return still & near
+
+
 def person_features(v: TrackView, desk: Optional[Zone], safe: Optional[Zone], cfg: dict, aspect: float,
                     t0: float, t1: float, duration: float, side: Optional[dict] = None,
                     counters: Sequence[Sequence[float]] = ()) -> dict[str, Any]:

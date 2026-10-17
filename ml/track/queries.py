@@ -123,16 +123,19 @@ class TrackQueries:
         """Состояние кассира на сетке: at | away | unknown | not_yet."""
         out = []
         seen = False
+        was_at = False  # «ушёл с рабочего места» возможно только после того, как там был
         for t in self.grid:
             if in_intervals(t, self.vis):
-                out.append("unknown")
+                out.append("unknown" if was_at else "not_yet")
                 continue
             boxes = [b for b in (box_at(c, t, self.max_dt) for c in self.cashiers) if b is not None]
             if boxes:
                 seen = True
-                out.append("at" if any(self._in_wp(b) for b in boxes) else "away")
+                at = any(self._in_wp(b) for b in boxes)
+                was_at = was_at or at
+                out.append("at" if at else ("away" if was_at else "not_yet"))
                 continue
-            if not seen:
+            if not seen or not was_at:
                 out.append("not_yet")
                 continue
             st = "unknown"

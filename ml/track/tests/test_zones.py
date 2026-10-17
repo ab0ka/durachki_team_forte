@@ -32,6 +32,7 @@ def test_zone_provenance_in_info():
     assert zi["cashier_area"]["independent"] is False and zi["cashier_area"]["cashier_support"] == "desk_objects"
 
 
+@pytest.mark.perturbation
 @pytest.mark.parametrize("theta,scale,flip", [(25.0, 0.8, False), (-35.0, 0.65, False), (15.0, 0.85, True)])
 def test_zones_follow_camera_affine(theta, scale, flip):
     A = S.affine(theta, scale, flip_x=flip)
@@ -47,6 +48,7 @@ def test_zones_follow_camera_affine(theta, scale, flip):
     assert np.dot(ca - d, cl - d) < 0
 
 
+@pytest.mark.perturbation
 def test_rotation_90_to_landscape():
     A = np.array([[0.0, -1.0, 1.0], [1.0, 0.0, 0.0]])  # x' = 1 - y, y' = x
     res, ids, by_id, z, _ = run(S.scene_clean(), A=A, width=848, height=464)
@@ -63,3 +65,22 @@ def test_geometry_helpers():
     assert abs(polygon_area(cl) - 0.25) < 1e-9
     r = reflect_polygon([(0.6, 0.6)], (0.5, 0.5))
     assert np.allclose(r, [(0.4, 0.4)])
+
+
+@pytest.mark.perturbation
+@pytest.mark.parametrize("k", [0.25, -0.3])
+def test_perspective_tilt_keeps_roles_and_zones(k):
+    H = S.homography(k)
+    res, ids, by_id, z, _ = run(S.scene_v07(), H=H)
+    assert role_of(ids, by_id, "cashier")[0] == ["cashier"]
+    assert role_of(ids, by_id, "collector")[0] == ["collector"]
+    seat = S.apply_box_h(H, (S.SEAT[0] - 0.01, S.SEAT[1] - 0.01, S.SEAT[0] + 0.01, S.SEAT[1] + 0.01))
+    assert point_in_polygon(((seat[0] + seat[2]) / 2, (seat[1] + seat[3]) / 2), z["cashier_area"].polygon)
+
+
+@pytest.mark.perturbation
+def test_mirror_keeps_client_visitor_and_cashier():
+    A = S.affine(0.0, 1.0, flip_x=True)
+    res, ids, by_id, z, _ = run(S.scene_cashier_enters_client_seated(), A=A)
+    assert role_of(ids, by_id, "cashier")[0] == ["cashier"]
+    assert role_of(ids, by_id, "client")[0] == ["visitor"]

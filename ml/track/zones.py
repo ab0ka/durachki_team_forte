@@ -186,7 +186,8 @@ def _shrunk_corners(boxes: np.ndarray, s: float) -> list:
 
 
 def cashier_area_zone(cviews: Sequence[TrackView], desk: Optional[Zone], cfg: dict, aspect: float,
-                      cashier_conf: float, independent: bool) -> tuple[Optional[Zone], dict]:
+                      cashier_conf: float, independent: bool,
+                      seated: Optional[np.ndarray] = None) -> tuple[Optional[Zone], dict]:
     zc = cfg["zones"]
     if not cviews:
         return None, {"method": "none", "reason": "no_cashier"}
@@ -195,7 +196,9 @@ def cashier_area_zone(cviews: Sequence[TrackView], desk: Optional[Zone], cfg: di
     w = np.concatenate([v.w for v in cviews])
     diag = float(np.median([v.diag for v in cviews]))
     keep = np.ones(len(pts), bool)
-    if desk is not None:
+    if seated is not None and int(np.sum(seated)) >= 3:
+        keep = np.asarray(seated, bool)  # рабочее место = где кассир СИДИТ у стола, а не где стоял, уйдя
+    elif desk is not None:
         dist = np.array([dist_point_polygon(p, desk.polygon, aspect) for p in pts]) / diag
         near = dist <= zc["cashier_max_dist_diag"]
         if near.sum() >= 3:
