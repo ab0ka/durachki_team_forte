@@ -2,6 +2,10 @@
 # Переопределить файл целиком: env SENTINEL_INGEST_CONFIG=/path/to/ingest.yaml
 # Отсутствующие ключи берутся из встроенных значений по умолчанию (ml/ingest/config.py).
 
+sampling:
+  default_fps: 5.0         # = default контракта load_video(sample_fps=5.0); пайплайн/CLI берут отсюда
+  max_samples: 6000        # предохранитель RAM: при превышении sample_fps снижается (с warning)
+
 decode:
   backend: auto            # auto | pyav | opencv  (auto: PyAV, при ошибке — OpenCV)
   threads: 0               # потоки декодера, 0 = авто
@@ -9,17 +13,23 @@ decode:
   adaptive_skip: true      # авто-включение skip_nonref, если прогноз декода > budget_s
   budget_s: 20.0           # бюджет на декодирование одного ролика (для adaptive_skip)
   max_decode_errors: 200   # битых пакетов до отказа от бэкенда
+  min_coverage: 0.5        # декодировано < 50% заявленной длительности -> DecodeError (неполный файл)
+  warn_coverage: 0.98      # < 98% -> clip.meta["complete"] = False + warning
 
 storage:
   mode: jpeg               # jpeg | raw | memmap — как хранить сэмплы в памяти
   jpeg_quality: 92
   max_side: 1280           # сэмплы ужимаются по длинной стороне (0 = без ужатия); frame_at — всегда полный размер
+  max_ram_mb: 512          # JPEG-байты сэмплов сверх лимита уходят во временный файл на диске
   lru_size: 96             # сколько декодированных сэмплов держать в LRU
+  lru_max_mb: 256          # ...и не больше стольких МБ
   copy_on_access: true     # frame(i) возвращает копию (кэш нельзя испортить рисованием поверх)
   encode_workers: 4        # потоки JPEG-кодирования/метрик при загрузке
 
 frame_at:
   cache_size: 32           # LRU точных кадров (доказательства)
+  cache_mb: 128
+  forward_window_s: 1.5    # следующий t в пределах окна — декодируем вперёд без seek
 
 quality:
   analysis_width: 160      # ширина серого кадра для метрик (меньше = быстрее)

@@ -15,6 +15,7 @@ CONFIG_PATH = Path(__file__).with_name("config.yaml")
 ENV_CONFIG = "SENTINEL_INGEST_CONFIG"
 
 DEFAULTS: dict[str, Any] = {
+    "sampling": {"default_fps": 5.0, "max_samples": 6000},
     "decode": {
         "backend": "auto",
         "threads": 0,
@@ -22,16 +23,20 @@ DEFAULTS: dict[str, Any] = {
         "adaptive_skip": True,
         "budget_s": 20.0,
         "max_decode_errors": 200,
+        "min_coverage": 0.5,
+        "warn_coverage": 0.98,
     },
     "storage": {
         "mode": "jpeg",
         "jpeg_quality": 92,
         "max_side": 1280,
+        "max_ram_mb": 512,
         "lru_size": 96,
+        "lru_max_mb": 256,
         "copy_on_access": True,
         "encode_workers": 4,
     },
-    "frame_at": {"cache_size": 32},
+    "frame_at": {"cache_size": 32, "cache_mb": 128, "forward_window_s": 1.5},
     "quality": {
         "analysis_width": 160,
         "blur_ksize": 5,
