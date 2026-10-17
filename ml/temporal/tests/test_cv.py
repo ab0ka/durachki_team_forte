@@ -20,7 +20,7 @@ def test_nested_cv_baseline_report(cfg):
     assert {"recall@3", "recall@5", "recall@8", "mean_n"} <= set(rep["candidates"]["hybrid"])
     assert rep["candidates"]["hybrid"]["mean_n"] <= 8
     assert {"duration_only_auc", "spearman_neg", "warn"} <= set(rep["duration_watchdog"])
-    assert {"peak", "onset"} <= set(rep["timecode_by_policy"])
+    assert {"peak", "onset", "change_onset"} <= set(rep["timecode_by_policy"])
     assert "разведочная" in rep["evaluation_status"]
     assert all(set(v["scores_by_pooling"]) == {"max", "topk", "topk_null"} for v in rep["per_video"])
 

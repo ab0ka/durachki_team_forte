@@ -97,6 +97,11 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
 
     assert check_split.main(["--folds", "loo", "3", "--holdout", "0.25"]) == 0
     assert train.main(["--kind", "baseline", "--cv-report", str(out)]) == 0
+    from ml.temporal.config import weights_dir
+
+    tmeta = json.loads((weights_dir(cfg) / "baseline" / "meta.json").read_text(encoding="utf-8"))
+    assert tmeta["reproducibility"]["feature_version"] >= 3 and tmeta["null"] and tmeta["pooling"]["pooling"]
+    assert "inner grouped CV" in tmeta["threshold_source"] and tmeta["type_head_source"] is None
     from ml.temporal import predict
 
     assert predict.main(["--video", str(vids / "X-2.avi"), "--json", str(tmp_path / "pred.json")]) == 0

@@ -46,6 +46,7 @@ def train_all(samples: Sequence[Sample], bank: TextBank, cfg: dict, kinds: Seque
         if threshold not in ("auto", "", None):
             thr, src = float(threshold), "cli"
         meta = {"threshold": thr, "threshold_source": src, "n_train": len(samples),
+                "reproducibility": _repro(cfg),
                 "train_groups": sorted(s.group for s in samples),
                 "pooling": pooling, "null": cal["null"],
                 "type_head_source": type_head_source(samples, cfg) if model.type_trained else None,
@@ -65,6 +66,23 @@ def train_all(samples: Sequence[Sample], bank: TextBank, cfg: dict, kinds: Seque
     info["selected"] = select
     info["elapsed_s"] = round(time.monotonic() - t0, 1)
     return info
+
+
+def _repro(cfg: dict) -> dict:
+    """Что нужно, чтобы воспроизвести чекпоинт: версия признаков, хэш конфига, коммит, сид."""
+    import subprocess
+
+    from .config import REPO_ROOT, stable_hash
+    from .features import FEATURE_VERSION
+
+    commit = None
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True,
+                                timeout=5).stdout.strip() or None
+    except Exception:
+        pass
+    return {"feature_version": FEATURE_VERSION, "config_hash": stable_hash(cfg, 16), "git_commit": commit,
+            "seed": int(cfg["train"]["seed"]), "model_id": cfg["features"]["model_id"]}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

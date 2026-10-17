@@ -117,7 +117,7 @@ cv:
   epochs: 40                       # эпох temporal head в CV
   holdout_frac: 0.0                # >0: отложить нетронутый сгруппированный holdout (оценивается один раз)
   hit_tolerances_s: [1, 2, 3]
-  timecode_policies: [peak, onset]  # какие политики таймкода мерить в отчёте
+  timecode_policies: [peak, onset, change_onset]  # какие политики таймкода мерить в отчёте
   duration_watchdog_rho: 0.3       # |ρ(скор, длительность)| на чистых роликах выше — предупреждение
   threshold_margin: 0.02           # порог = max(score негативов inner-OOF) + margin (FP=0) / FP≤1
   min_recall_fp0: 0.8
