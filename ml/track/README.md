@@ -146,7 +146,7 @@ person_signals(tracks, zones, times, *, extended=False) -> list[SceneState]
 ## Запуск
 ```bash
 pip install -r ml/track/requirements.txt -c <lock L1>   # версии не менять вслепую (opencv < 5)
-python -m pytest ml/track/tests -q                     # 61 тест, без GPU/весов/данных (~15 с)
+python -m pytest ml/track/tests -q                     # 62 теста, без GPU/весов/данных (~15 с)
 python -m pytest ml/track/tests -q -m perturbation     # только возмущения ракурса (perspective/mirror/rotation)
 python -m ml.track.viz video.mov --cache cache/<sha> [--out out.mp4] [--recompute] [--blur-heads]
 ```

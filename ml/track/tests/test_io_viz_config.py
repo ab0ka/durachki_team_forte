@@ -88,3 +88,27 @@ def test_replay_smoke(tmp_path):
     assert match_events([1.0, 5.0], [1.5], 2.0) == (1, 1, 0, [0.5])
     rep = run_synthetic(["baseline", "smooth"], seeds=1, tol=2.0) if False else None  # полный прогон ~40 с — в CLI
     assert "v02" in SCENARIOS and rep is None
+
+
+def test_replay_real_mode_on_synthetic_cache(tmp_path):
+    """Команда L2 (--real) отрабатывает на кэше формата detections.json + CSV меток (здесь — синтетика)."""
+    from ml.track.replay import main as replay_main
+    from ml.track.serialize import detection_to_dict
+
+    for name, sc in (("Х-1", S.scene_v02()), ("X-2", S.scene_clean())):  # кириллическая и латинская X
+        d = tmp_path / "cache" / name
+        d.mkdir(parents=True)
+        clip, dets, _ = S.make(sc)
+        (d / "detections.json").write_text(json.dumps([detection_to_dict(x) for x in dets]))
+        (d / "meta.json").write_text(json.dumps({"width": 464, "height": 848, "times": clip.times,
+                                                 "duration": clip.duration}))
+    (tmp_path / "labels.csv").write_text("video,label,second\nX-1.mov,violation,16\nХ-2.mov,no_violation,\n",
+                                         encoding="utf-8")
+    out = tmp_path / "out"
+    rc = replay_main(["--real", "--dets-glob", str(tmp_path / "cache" / "*" / "detections.json"),
+                      "--labels", str(tmp_path / "labels.csv"), "--variant", "smooth", "--out", str(out)])
+    assert rc == 0
+    rep = json.loads((out / "replay.json").read_text())
+    s = rep["summary"]["baseline"]
+    assert s["videos"] == 2 and s["labeled_violation"] == 1 and s["labeled_clean"] == 1
+    assert s["violation_hit_within_2.0s"] == 1 and s["clean_with_alarm (FP-proxy)"] == 0
