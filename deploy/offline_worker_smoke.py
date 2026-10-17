@@ -273,5 +273,19 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if report["ok"] else 1
 
 
+def _release_worker() -> None:
+    """Процесс-воркер A03 (spawn) держит GPU: без явной остановки скрипт не завершается и VRAM не освобождается."""
+    try:
+        from backend.pipeline.worker import reset_executor
+
+        reset_executor()
+    except Exception:  # noqa: BLE001 — пайплайн мог не импортироваться (ранний FAIL)
+        pass
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    finally:
+        _release_worker()
+    sys.exit(code)
