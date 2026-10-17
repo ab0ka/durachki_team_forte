@@ -17,6 +17,8 @@ import { useApp } from "../context";
 import { formatBytes, formatDateTime } from "../lib/format";
 import { navigate } from "../lib/router";
 import { MAX_UPLOAD_MB, validateVideoFile } from "../lib/validate";
+import { batch } from "../lib/batch";
+import BatchList from "./BatchList";
 import { cx, LocalBadge, ProgressBar } from "./ui";
 
 export default function UploadScreen() {
@@ -56,6 +58,20 @@ export default function UploadScreen() {
     setError(err);
     setFile(err ? null : f);
   }, []);
+
+  /** Один файл — обычный путь с кнопкой «Начать проверку»; несколько — пакетная проверка. */
+  const pickMany = useCallback(
+    (list: FileList | null | undefined) => {
+      const files = list ? Array.from(list) : [];
+      if (files.length === 0) return;
+      if (files.length === 1) return pick(files[0]);
+      setError(null);
+      setFile(null);
+      batch.add(files);
+      toast(`Пакетная проверка: ${files.length} файлов поставлено в очередь`);
+    },
+    [pick, toast],
+  );
 
   const start = useCallback(async () => {
     if (!file) return;
@@ -111,7 +127,7 @@ export default function UploadScreen() {
             <ul className="mt-6 grid gap-2.5 text-sm text-slate-600 dark:text-slate-300 sm:grid-cols-2">
               {[
                 [Lock, "Видео не покидает локальный сервер"],
-                [Clock3, "Анализ ~1 мин на запись до 2,5 мин"],
+                [Clock3, "Целевое время: ≤ 1 мин на запись 2,5 мин"],
                 [ShieldCheck, "Лица не распознаются — только поведение"],
                 [CheckCircle2, "Только видимые факты, без домыслов"],
               ].map(([Icon, text], i) => {
@@ -149,7 +165,7 @@ export default function UploadScreen() {
               onDrop={(e) => {
                 e.preventDefault();
                 setDrag(false);
-                if (!uploading) pick(e.dataTransfer.files?.[0]);
+                if (!uploading) pickMany(e.dataTransfer.files);
               }}
               role="button"
               tabIndex={0}
@@ -160,9 +176,10 @@ export default function UploadScreen() {
                 ref={inputRef}
                 type="file"
                 accept=".mov,.mp4,video/quicktime,video/mp4"
+                multiple
                 className="hidden"
                 onChange={(e) => {
-                  pick(e.target.files?.[0]);
+                  pickMany(e.target.files);
                   e.target.value = "";
                 }}
               />
@@ -175,7 +192,7 @@ export default function UploadScreen() {
                   <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
                     или <span className="font-semibold text-brand-600 underline-offset-2 group-hover:underline dark:text-brand-300">выберите файл</span>
                   </div>
-                  <div className="mt-4 text-xs text-slate-400">.mov или .mp4 · до {MAX_UPLOAD_MB} МБ</div>
+                  <div className="mt-4 text-xs text-slate-400">.mov или .mp4 · до {MAX_UPLOAD_MB} МБ · можно несколько файлов сразу</div>
                 </>
               ) : (
                 <div className="w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
@@ -236,6 +253,8 @@ export default function UploadScreen() {
           </div>
         </div>
       </section>
+
+      {!demo && <BatchList />}
 
       <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
         <section className="card p-5">

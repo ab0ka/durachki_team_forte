@@ -180,6 +180,55 @@ try {
   });
   await ctx.close();
 
+  // ---------- сценарий 1б: пакетная проверка (несколько файлов) ----------
+  {
+    const c = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const pg = await c.newPage();
+    let seq = 0;
+    const polls = {};
+    await pg.route("**/ui/v1/**", (route) => {
+      const req = route.request();
+      const p = new URL(req.url()).pathname;
+      if (p.endsWith("/session")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+      if (req.method() === "POST" && req.headers()["x-csrf-token"] !== CSRF) return route.fulfill({ status: 403, body: "{}" });
+      if (p.endsWith("/analyze")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ job_id: `b-${++seq}` }) });
+      const m = p.match(/\/jobs\/(b-\d+)$/);
+      if (m) {
+        polls[m[1]] = (polls[m[1]] ?? 0) + 1;
+        const body =
+          polls[m[1]] < 2
+            ? { job_id: m[1], status: "processing", stage: "detect", progress: 0.5 }
+            : m[1] === "b-1"
+              ? doneJob("b-1")
+              : { job_id: m[1], status: "done", verdict: "no_violation", violations: [], meta: {} };
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+      }
+      if (p.endsWith("/ui/v1/jobs")) return route.fulfill({ status: 200, contentType: "application/json", body: '{"jobs":[]}' });
+      return route.fulfill({ status: 404, body: "" });
+    });
+    await pg.goto(`${url}#/`);
+    await step("пакет: 3 файла (1 неподходящий) → 2 задачи → вердикты", async () => {
+      await pg.getByText("Перетащите видео сюда").waitFor({ timeout: 5000 });
+      await pg.locator('input[type="file"]').setInputFiles([
+        { name: "batch_1.mov", mimeType: "video/quicktime", buffer: Buffer.alloc(1024, 1) },
+        { name: "batch_2.mp4", mimeType: "video/mp4", buffer: Buffer.alloc(1024, 2) },
+        { name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("x") },
+      ]);
+      await pg.getByText("Пакетная проверка").first().waitFor({ timeout: 5000 });
+      await pg.getByText("признаки нарушений: 1").waitFor({ timeout: 15000 });
+      await pg.getByText("нарушение не обнаружено").waitFor({ timeout: 15000 });
+      await pg.getByText("не поддерживается", { exact: false }).first().waitFor({ timeout: 3000 });
+      assert.equal(seq, 2, `загрузок: ${seq}`);
+      await pg.waitForTimeout(400);
+      await pg.screenshot({ path: path.join(shots, "14-batch.png") });
+    });
+    await step("пакет: «Открыть отчёт» ведёт на результат", async () => {
+      await pg.getByRole("link", { name: "Открыть отчёт" }).first().click();
+      await pg.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 8000 });
+    });
+    await c.close();
+  }
+
   // ---------- сценарий 2: failed и неполный анализ не зелёные ----------
   for (const [name, body, expectText] of [
     ["failed", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "синтетическая ошибка" }, "Анализ не завершён"],

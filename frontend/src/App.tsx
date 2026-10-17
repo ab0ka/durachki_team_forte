@@ -3,6 +3,7 @@ import { HttpBackend, type Backend } from "./api/client";
 import { DemoBackend, isDemoMode } from "./api/demo";
 import type { JobResult, SessionInfo } from "./api/types";
 import { AppContext, type AppContextValue } from "./context";
+import { setBatchBackend } from "./lib/batch";
 import { parseHash, type Route } from "./lib/router";
 import Header from "./components/Header";
 import UploadScreen from "./components/UploadScreen";
@@ -16,7 +17,7 @@ function DemoRibbon() {
   return (
     <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 bg-amber-400 px-4 py-1.5 text-center text-xs font-bold uppercase tracking-wider text-amber-950 print:static">
       <span>Синтетическое демо</span>
-      <span className="font-medium normal-case tracking-normal">данные сгенерированы в браузере, сервер анализа не используется</span>
+      <span className="hidden font-medium normal-case tracking-normal sm:inline">данные сгенерированы в браузере, сервер анализа не используется</span>
       <a className="rounded bg-amber-950/10 px-2 py-0.5 font-semibold normal-case tracking-normal underline-offset-2 hover:underline" href="./#/">
         выйти из демо
       </a>
@@ -32,7 +33,11 @@ interface Toast {
 
 export default function App() {
   const demo = useMemo(() => isDemoMode(), []);
-  const backend: Backend = useMemo(() => (demo ? new DemoBackend() : new HttpBackend()), [demo]);
+  const backend: Backend = useMemo(() => {
+    const b = demo ? new DemoBackend() : new HttpBackend();
+    setBatchBackend(b);
+    return b;
+  }, [demo]);
   const [route, setRoute] = useState<Route>(() => parseHash(window.location.hash));
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [serverOk, setServerOk] = useState<boolean | null>(null);

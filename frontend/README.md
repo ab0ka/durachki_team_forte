@@ -14,7 +14,7 @@ ML-моделей во фронтенде нет: `models.json` = `[]`.
 cd frontend
 npm ci                 # один раз, нужен интернет (потом офлайн); Node ≥ 18.18
 npm run build          # tsc --noEmit + vite build → frontend/dist (A02 раздаёт его на "/")
-npm test               # vitest: 53 теста, без браузера и без бэкенда
+npm test               # vitest: 54 теста, без браузера и без бэкенда
 npm run dev            # :5173, прокси /api и /ui → VITE_PROXY_TARGET (по умолчанию http://127.0.0.1:8000)
 npm run preview        # раздать собранный dist локально
 ```
@@ -29,7 +29,7 @@ Chromium — `CHROMIUM_PATH`):
 | Скрипт | Что делает |
 |---|---|
 | `npm run screenshots` | Скриншоты **только синтетического демо** → `screenshots/*.png` (для питча) |
-| `npm run e2e:mock` | e2e реального (не демо) HTTP-пути, бэкенд подменён синтетическими ответами в формате A02 — 15 проверок |
+| `npm run e2e:mock` | e2e реального (не демо) HTTP-пути, бэкенд подменён синтетическими ответами в формате A02 — 17 проверок |
 | `npm run e2e:real` | e2e против живого сервера: `E2E_BASE_URL=… E2E_KEY=… E2E_VIDEO=… node scripts/e2e-real.mjs`. Скриншоты — только при `E2E_SHOTS=<папка>`. **С реальными видео скриншоты не коммитить и никуда не отправлять** |
 
 ## Путь пользователя
@@ -59,9 +59,12 @@ Chromium — `CHROMIUM_PATH`):
      технические детали (`meta.timings`, `meta.models`, версия);
    - экспорт: **JSON по схеме ТЗ** (для жюри — только обязательные поля), **полный JSON** (нормы, timeline, meta),
      **печать / PDF** (отдельные print-стили: шапка отчёта, раскрытые цитаты, URL ссылок, без плеера и чата).
-5. **История.** Список «Недавние проверки» объединяет локальную историю (localStorage, только job_id, имя файла
+5. **Пакетная проверка.** Можно выбрать или перетащить несколько файлов: они встают в очередь и загружаются по одному;
+   статусы опрашиваются в фоне (пакет переживает переходы между экранами). По каждому файлу — вердикт, ссылка на отчёт;
+   есть «Сводка JSON» (файл, job_id, вердикт, эпизоды — без кадров). Неподходящие файлы отбраковываются сразу.
+6. **История.** Список «Недавние проверки» объединяет локальную историю (localStorage, только job_id, имя файла
    и вердикт) и серверную (`GET /ui/v1/jobs`).
-6. **«О системе».** Принципы работы, схема пайплайна, типы V01–V08/V99, модели и лицензии (из `meta.models`
+7. **«О системе».** Принципы работы, схема пайплайна, типы V01–V08/V99, модели и лицензии (из `meta.models`
    последнего анализа или список по архитектуре), бейдж «Работает полностью локально».
 
 ### Правила честности интерфейса
@@ -84,8 +87,8 @@ src/
                       violationFacts, violationSources
   api/client.ts       HttpBackend (cookie-сессия, CSRF, XHR-загрузка, запасной путь /api/v1), ENDPOINTS, история
   api/demo.ts         DemoBackend + генератор синтетических SVG-сцен (вид сверху, головы размыты) — только ?demo=1
-  lib/                format (таймкод и т. п.), verdict, stages, catalog (подписи V01–V99), validate, router (hash), theme
-  components/         UploadScreen, ProcessingView, ResultView, VideoPlayer, RiskTimeline, ViolationCard,
+  lib/                batch (очередь пакета), format (таймкод и т. п.), verdict, stages, catalog (подписи V01–V99), validate, router (hash), theme
+  components/         UploadScreen, BatchList, ProcessingView, ResultView, VideoPlayer, RiskTimeline, ViolationCard,
                       Lightbox, NormCard, CopilotPanel, AboutScreen, SettingsDialog, Header, ui
 tests/                vitest: format, normalize (формы ответов из contracts/examples A01), verdict, demo, SSR-рендер экранов
 scripts/              screenshots.mjs, e2e-mock.mjs, e2e-real.mjs, pw.mjs
@@ -125,14 +128,14 @@ screenshots/          снимки синтетического демо и мо
 ## Проверки, которые реально выполнены
 
 - `npm run build` — без ошибок TS, бандл ≈ 280 КБ JS (86 КБ gzip) + 51 КБ CSS + локальные шрифты.
-- `npm test` — 53 теста: форматтеры, нормализатор на формах ответов из `contracts/examples` (A01), вердикт
-  (failed/partial не зелёные), стадии, валидация файла, роутинг, демо, SSR-рендер экранов.
-- `npm run e2e:mock` — 15 проверок: вход (неверный и верный ключ), ключ не попадает в localStorage и URL,
+- `npm test` — 54 теста: форматтеры, нормализатор на формах ответов из `contracts/examples` (A01), вердикт
+  (failed/partial не зелёные), стадии, валидация файла, роутинг, демо, SSR-рендер экранов, очередь пакета.
+- `npm run e2e:mock` — 17 проверок: вход (неверный и верный ключ), ключ не попадает в localStorage и URL,
   CSRF на всех POST, очередь и реальный прогресс, результат, перемотка по таймкоду, лайтбокс, норма,
-  Copilot 501, серверная история, failed / failed+partial / partial / clean.
+  Copilot 501, серверная история, пакет из 3 файлов (1 отбракован), failed / failed+partial / partial / clean.
 - `npm run e2e:real` против **ветки A02** (fake-пайплайн, синтетический ролик ffmpeg `testsrc2`): вход по cookie,
   загрузка с CSRF (200), результат за ≈ 5 с, перемотка, кадр, `/ui/v1/jobs/{id}/video` → **206** и воспроизведение,
-  без ошибок JS.
+  без ошибок JS; пакет из 3 синтетических файлов — все 3 отчёта за ≈ 14 с (fake-пайплайн по 4 с, 1 воркер).
 - Вёрстка на 375 px без горизонтальной прокрутки (проверено скриптом: загрузка, отчёт с нарушениями, отчёт без нарушений, «О системе»).
 
 GPU, реального пайплайна и реальных данных в этой среде нет — скорость анализа и качество детекции не измерялись.
