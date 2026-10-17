@@ -52,3 +52,25 @@ def is_mock_mode() -> bool:
     if os.environ.get("SENTINEL_POSE_BACKEND", "").strip().lower() == "mock":
         return True
     return os.environ.get("SENTINEL_MOCK", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+BACKEND_NAMES = ("rtmpose_onnx", "mediapipe", "mock")
+
+
+def backend_override() -> Optional[str]:
+    """$SENTINEL_POSE_BACKEND (rtmpose_onnx | mediapipe | mock) — один бэкенд вместо backend.order."""
+    name = os.environ.get("SENTINEL_POSE_BACKEND", "").strip().lower()
+    return name if name in BACKEND_NAMES else None
+
+
+def enabled_mode(cfg: Mapping[str, Any]) -> str:
+    """Главный флаг позы: 'auto' | 'true' | 'false' ($SENTINEL_POSE_ENABLED перекрывает config)."""
+    raw: Any = os.environ.get("SENTINEL_POSE_ENABLED")
+    if raw is None or str(raw).strip() == "":
+        raw = cfg.get("enabled", "auto")
+    val = str(raw).strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return "true"
+    if val in {"0", "false", "no", "off"}:
+        return "false"
+    return "auto"

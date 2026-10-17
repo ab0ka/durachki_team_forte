@@ -4,11 +4,18 @@
 # Переопределить файл: SENTINEL_POSE_CONFIG=/path/to.yaml (deep-merge поверх этого файла).
 version: 1
 
+# Главный флаг стадии позы (env SENTINEL_POSE_ENABLED=0|1|auto перекрывает) — для замера вклада позы (L2):
+#   auto  — работаем, если веса выбранного бэкенда найдены; нет весов → stage_status "skipped" + warning
+#   true  — поза обязательна для этого запуска: нет бэкенда/весов → stage_status "failed"
+#   false — стадия выключена: estimate() → [] (stage_status "skipped"), все сигналы позы unknown
+enabled: auto
+
 backend:
   # Один реальный бэкенд: RTMPose-m (COCO-17) на onnxruntime (CUDA → CPU). MediaPipe — только opt-in
   # (order: [rtmpose_onnx, mediapipe]) с явным маппингом 33 → COCO-17 (ml/pose/backends/mediapipe_backend.py).
   # Mock — ТОЛЬКО по явному SENTINEL_MOCK=1 / SENTINEL_POSE_BACKEND=mock: при сбое реального бэкенда
   # поддельные позы не подставляются — estimate() вернёт [] и запишет ошибку в ml.pose.status().
+  # SENTINEL_POSE_BACKEND=rtmpose_onnx|mediapipe|mock — один бэкенд вместо order (для A/B у L2).
   order: [rtmpose_onnx]
   device: auto                  # auto | cuda | cpu
   rtmpose:
