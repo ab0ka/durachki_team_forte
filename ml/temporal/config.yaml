@@ -1,0 +1,120 @@
+# Kassa Sentinel — ml/temporal (A10). Все пороги и гиперпараметры здесь.
+# Переопределение: env SENTINEL_TEMPORAL_CONFIG=<путь к своему yaml> (мерджится поверх этого файла).
+version: 1
+
+paths:
+  # относительные пути считаются от корня репо; env SENTINEL_CACHE_DIR / SENTINEL_WEIGHTS_DIR перекрывают
+  cache_dir: cache
+  features_subdir: features
+  weights_dir: weights/temporal
+  reports_dir: reports
+  outputs_dir: outputs/temporal
+
+features:
+  backend: siglip2                 # siglip2 | mock (SENTINEL_MOCK=1 принудительно включает mock)
+  model_id: google/siglip2-base-patch16-224
+  fps: 4.0                         # частота признаков (шаг сетки модели = 1/fps)
+  cpu_fps: 1.0                     # если нет CUDA — реже, чтобы уложиться в SLA
+  batch_size: 64
+  fp16: true                       # только на CUDA
+  device: auto                     # auto | cpu | cuda
+  views: [full, focus]             # full — весь кадр; focus — адаптивный кроп (зона кассира или область движения)
+  cpu_views: [full]
+  focus:
+    mode: auto                     # auto: zone если зоны переданы, иначе motion | zone | motion
+    min_side: 0.45                 # мин. сторона кропа, доля короткой стороны кадра
+    expand: 1.35                   # расширение рамки области движения
+    motion_window_s: 1.0           # окно для карты движения (± сек)
+    motion_downscale: 96           # размер длинной стороны для расчёта движения
+    smooth_alpha: 0.6              # EMA сглаживание центра кропа между шагами
+  mock_dim: 64
+  max_frames: 1200                 # защита от очень длинных видео (шаг увеличится)
+
+prompts_file: prompts.yaml
+
+augment:                           # «другой угол» на этапе извлечения (только для обучения)
+  n_aug: 2                         # сколько аугментированных копий на видео
+  max_corner_shift: 0.12           # смещение углов перспективы, доля стороны
+  max_rotate_deg: 12
+  min_crop: 0.80
+  flip_prob: 0.5
+  brightness: 0.25
+  contrast: 0.25
+
+labels:
+  time_offset_s: 0.0               # «22 секунда» -> 22.0 + offset
+  # Конфликт меток внутри группы дубликатов (один файл «нарушение», другой «без»):
+  # positive — группа считается позитивной (все исходные метки сохраняются в index/отчёте); exclude — исключить
+  conflict_policy: positive
+  duplicate_groups:                # группы дубликатов (по md5 находятся автоматически, это — страховка)
+    - [X-4, X-47]
+    - [X-5, X-48]
+
+baseline:                          # первый обучаемый результат: логрегрессия по кадрам на замороженных признаках
+  context_s: 2.0                   # + скользящее среднее признаков (временной контекст, модель остаётся линейной)
+  l2: 0.001
+  iters: 400
+  lr: 0.05
+
+model:                             # temporal head (TCN+BiGRU) — сравнение с baseline
+  arch: tcn                        # tcn | gru | tcn_gru (GRU ~5x медленнее на CPU: 156 vs 31 мс/шаг)
+  input_groups: [sims, emb, dyn]   # sims — zero-shot сходства; emb — эмбеддинги; dyn — движение/смена кадра
+  emb_pca: 32                      # PCA эмбеддингов на вид (подгоняется на обучающей выборке)
+  hidden: 64
+  tcn_kernel: 5
+  tcn_dilations: [1, 2, 4, 8]
+  dropout: 0.3
+  input_dropout: 0.2
+  view_dropout: 0.15               # вероятность занулить целиком один вид (full/focus)
+  n_types: 9                       # V01..V08, V99
+
+train:
+  seed: 13
+  epochs: 60
+  steps_per_epoch: 12
+  batch_size: 8
+  lr: 0.002
+  weight_decay: 0.01
+  window_s: 48.0                   # длина случайного окна
+  pos_window_prob: 0.85            # окно содержит размеченную секунду
+  sigma_s: 1.5                     # гауссиана вокруг размеченной секунды — локальная слабая разметка
+  far_radius_s: 3.0                # в позитивном видео дальше этого от метки — НЕИЗВЕСТНО (маска)
+  far_weight: 0.0                  # 0 = маска: одна размеченная секунда не делает остальное негативом
+  pos_weight_max: 20.0
+  mil_weight: 0.5                  # вес MIL-потери уровня видео
+  mil_topk_frac: 0.04
+  type_weight: 0.3                 # голова типа учится ТОЛЬКО если в labels.csv есть проверенный type_id
+  aug_prob: 0.7                    # доля батчей, где берём аугментированную копию признаков
+  time_warp: [0.8, 1.25]
+  time_warp_prob: 0.5
+  noise_std: 0.02
+  mixup_prob: 0.2
+  mixup_alpha: 0.4
+  device: auto                     # auto | cpu | cuda
+  max_minutes: 8.0                 # жёсткий бюджет на обучение
+
+cv:
+  # Nested CV: внешний сгруппированный сплит (оценка) × внутренний (калибровка порога только на train).
+  # Скейлер/PCA/модель/порог подгоняются на train каждого внешнего фолда; валидация — только оригиналы
+  # (аугментированные копии и дубликаты той же группы в валидацию и в train этого фолда не попадают).
+  outer: loo                       # loo | <int> (для baseline)
+  outer_temporal: 5                # temporal head дороже: по умолчанию 5 фолдов
+  inner: 3                         # внутренние фолды для порога
+  epochs: 40                       # эпох temporal head в CV
+  holdout_frac: 0.0                # >0: отложить нетронутый сгруппированный holdout (оценивается один раз)
+  hit_tolerances_s: [1, 2, 3]
+  threshold_margin: 0.02           # порог = max(score негативов inner-OOF) + margin (FP=0) / FP≤1
+  min_recall_fp0: 0.8
+
+infer:
+  risk_step_s: 0.5
+  smooth_s: 1.0                    # сглаживание риск-кривой (окно, сек)
+  event_threshold: 0.55            # пик выше — событие (перекрывается weights/temporal/meta.json:threshold)
+  zero_shot_threshold: 0.5         # порог для режима без обученной модели (по sigmoid-вероятности SigLIP)
+  extent_ratio: 0.5                # границы события: риск >= ratio * пик
+  min_peak_distance_s: 6.0
+  max_events: 3
+  zero_shot_conf_cap: 0.45         # без обученной модели уверенность не выше
+  type_margin: 0.015               # минимальный отрыв zero-shot типа от «нормы», иначе V99
+  budget_s: 30.0                   # бюджет по умолчанию на score()
+  min_frames: 4
