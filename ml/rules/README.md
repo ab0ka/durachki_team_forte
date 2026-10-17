@@ -361,9 +361,9 @@ python -m pytest ml/rules/tests -q        # 199 тестов, без GPU, вес
 7. **Env**: `SENTINEL_RULES_YAML=/path/rules.yaml` — альтернативный конфиг; `SENTINEL_RULES_PROFILE=phase2`
    — профиль (по умолчанию `baseline`; сам production профиль не меняет).
    A08 может слать extra-сигнал `personal_items_on_desk` (V09); иначе он выводится из треков (`bag` в `desk`).
-8. **Контракт**: `ml/rules/_contract_fallback.py` — копия контракта v1. Удалить после мерджа ветки A01:
-   импорт идёт через `try: from contracts.sentinel_contracts import ...`. `run_rules` принимает
-   необязательный 5-й аргумент `config` — сигнатура контракта не нарушена. Предложение для A01 (не
-   реализовано в контракте): закрепить `Event.extra["assessment"]` / `evidence_t` как стандартные ключи.
-9. **Git**: ветка начинается от `076a23b` ([A01] contract, без общей истории с `main`). Разные начальные
-   истории объединяет интегратор.
+8. **Контракт**: fallback-копия контракта удалена (как в `claude/integration-cloud`, коммит A03 `a6a96f3`),
+   импорты идут из `contracts.sentinel_contracts`. `run_rules` принимает необязательный 5-й аргумент
+   `config` — сигнатура контракта не нарушена. Ключи `Event.extra` (`detection`, `legal_basis`, `assessment`,
+   `evidence_t`, `trace.clauses/interval/evidence`) — кандидаты в стандартные (`contracts/extensions.py`, A01).
+9. **Git**: ветка начинается от `076a23b` (контракт A01), общей истории с `main` нет; PR открыт в
+   интеграционную ветку `claude/integration-cloud`, куда A03 уже влил A09 до `41c1407`.

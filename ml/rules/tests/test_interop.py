@@ -13,7 +13,7 @@ from ml.rules.synth import CLEAN_BASE, RULE_CASES, make_states, verified_catalog
 try:
     from contracts.sentinel_contracts import SceneState  # noqa
 except ImportError:  # pragma: no cover
-    from ml.rules._contract_fallback import SceneState  # noqa
+    from contracts.sentinel_contracts import SceneState  # noqa
 
 CAT = verified_catalog()
 

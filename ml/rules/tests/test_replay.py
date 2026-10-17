@@ -119,7 +119,8 @@ def _a03_cache(tmp_path: Path) -> tuple[Path, Path, Path]:
         with open(d / "states.jsonl", "w", encoding="utf-8") as fh:
             for st in make_states(60.0, segments=segs):
                 fh.write(json.dumps({"t": st.t, "signals": st.signals}) + "\n")
-        (d / "dets.jsonl").write_text(json.dumps({"t": 0.0, "label": "person", "bbox": [0, 0, 1, 1], "score": 1}) + "\n",
+        det = {"t": 0.0, "label": "person", "bbox": [0, 0, 1, 1], "score": 1}
+        (d / "dets.jsonl").write_text(json.dumps(det) + "\n",
                                       encoding="utf-8")
         (d / "manifest.json").write_text(json.dumps({"sha256": sha, "video": {"duration": 60.0}}), encoding="utf-8")
     summary = tmp_path / "summary.json"
