@@ -2,8 +2,12 @@ import { CheckSquare, ChevronLeft, ChevronRight, PlayCircle, Square } from "luci
 import type { Violation } from "../api/types";
 import { formatTimecode } from "../lib/format";
 import { cx } from "./ui";
+import s from "./a15.module.css";
 
-/** Последовательный просмотр эпизодов: ‹ › , «Смотреть эпизод», отметка «просмотрено». */
+/** До стольких эпизодов шкала просмотра рисуется по сегменту на эпизод; дальше — сплошной полосой. */
+const SEGMENTS_MAX = 48;
+
+/** Последовательный просмотр эпизодов: ‹ › , «Смотреть эпизод», отметка «просмотрено», шкала просмотра. */
 export default function EpisodeNavigator({
   violations,
   current,
@@ -23,35 +27,60 @@ export default function EpisodeNavigator({
   if (n === 0) return null;
   const v = violations[current];
   const isRev = reviewed.has(current);
-  const btn = "rounded-lg border border-slate-200 p-2 text-slate-600 hover:bg-slate-50 disabled:opacity-40 dark:border-white/10 dark:text-slate-300 dark:hover:bg-white/5";
   return (
-    <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50/70 p-3 dark:border-white/10 dark:bg-white/[.03]" aria-label="Просмотр эпизодов">
-      <div className="flex flex-wrap items-center gap-2">
-        <button className={btn} onClick={() => onGo(current - 1)} disabled={current <= 0} aria-label="Предыдущий эпизод" title="Предыдущий эпизод (P)">
-          <ChevronLeft className="h-4 w-4" />
-        </button>
-        <div className="min-w-0 flex-1">
-          <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 tnum">
-            Эпизод {current + 1} из {n} · просмотрено {reviewed.size} из {n}
-          </div>
-          <button className="block max-w-full truncate text-left text-sm font-semibold hover:underline" onClick={() => onGo(current)}>
-            {v.type} · <span className="font-mono tnum">{formatTimecode(v.timecode_sec)}</span>
-          </button>
+    <div className={cx(s.scope, s.nav)} role="group" aria-label="Просмотр эпизодов">
+      <div className={s.navHead}>
+        <div className={cx(s.eyebrow, "tnum")}>
+          Эпизод {current + 1} из {n} · просмотрено {reviewed.size} из {n}
         </div>
-        <button className={btn} onClick={() => onGo(current + 1)} disabled={current >= n - 1} aria-label="Следующий эпизод" title="Следующий эпизод (N)">
-          <ChevronRight className="h-4 w-4" />
-        </button>
       </div>
-      <div className="mt-2 flex flex-wrap gap-2">
-        <button className="btn-brand px-3 py-1.5 text-xs" onClick={() => onPlay(current)} title="Проиграть эпизод с небольшим запасом до и после">
-          <PlayCircle className="h-4 w-4" /> Смотреть эпизод
+      {/* Шкала — только наглядность (кнопки ‹ › и список эпизодов дублируют её для клавиатуры и чтения с экрана). */}
+      {n <= SEGMENTS_MAX ? (
+        <div className={s.navTrack} style={{ gridTemplateColumns: `repeat(${n}, minmax(0, 1fr))` }} aria-hidden>
+          {violations.map((_, i) => (
+            <span key={i} className={s.navSeg} data-current={i === current} data-reviewed={reviewed.has(i)} />
+          ))}
+        </div>
+      ) : (
+        <div className={s.navBar} aria-hidden>
+          <span style={{ width: `${(reviewed.size / n) * 100}%` }} />
+        </div>
+      )}
+      <div className={s.navMain}>
+        <button
+          type="button"
+          className={s.navArrow}
+          onClick={() => onGo(current - 1)}
+          disabled={current <= 0}
+          aria-label="Предыдущий эпизод"
+          title="Предыдущий эпизод (P)"
+        >
+          <ChevronLeft className="h-4 w-4" aria-hidden />
+        </button>
+        <button type="button" className={s.navEpisode} onClick={() => onGo(current)} title="Перейти к эпизоду в видео">
+          <span className={s.navNum}>{current + 1}</span>
+          <span className={s.navText}>
+            <span className={s.navType}>{v.type}</span>
+            <span className={s.navTime}>{formatTimecode(v.timecode_sec)}</span>
+          </span>
         </button>
         <button
-          className={cx("btn-ghost px-3 py-1.5 text-xs", isRev && "border-emerald-300 text-emerald-700 dark:border-emerald-400/30 dark:text-emerald-300")}
-          onClick={() => onToggleReviewed(current)}
-          aria-pressed={isRev}
+          type="button"
+          className={s.navArrow}
+          onClick={() => onGo(current + 1)}
+          disabled={current >= n - 1}
+          aria-label="Следующий эпизод"
+          title="Следующий эпизод (N)"
         >
-          {isRev ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4" />} {isRev ? "Просмотрено" : "Отметить просмотренным"}
+          <ChevronRight className="h-4 w-4" aria-hidden />
+        </button>
+      </div>
+      <div className={s.navActions}>
+        <button type="button" className="btn-primary px-3 py-1.5 text-xs" onClick={() => onPlay(current)} title="Проиграть эпизод с небольшим запасом до и после">
+          <PlayCircle className="h-4 w-4" aria-hidden /> Смотреть эпизод
+        </button>
+        <button type="button" className={cx("btn-ghost px-3 py-1.5 text-xs", s.reviewBtn)} onClick={() => onToggleReviewed(current)} aria-pressed={isRev}>
+          {isRev ? <CheckSquare className="h-4 w-4" aria-hidden /> : <Square className="h-4 w-4" aria-hidden />} {isRev ? "Просмотрено" : "Отметить просмотренным"}
         </button>
       </div>
     </div>

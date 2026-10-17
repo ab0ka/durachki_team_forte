@@ -5,6 +5,7 @@ import { imageSrc, type HighlightBox } from "../api/normalize";
 import { formatTimecode } from "../lib/format";
 import { uiConfig } from "../lib/uiConfig";
 import { cx, Spinner } from "./ui";
+import s from "./a15.module.css";
 
 /** Кадр с необязательной подсветкой рамками (A12 shapes; координаты нормированы к кадру). */
 export function EvidenceImage({
@@ -20,35 +21,31 @@ export function EvidenceImage({
   className?: string;
   imgClassName?: string;
 }) {
+  const labelled = boxes.slice(0, 3).filter((b) => b.label);
   return (
     <div className={cx("relative", className ?? "block")}>
       <img src={src} alt={alt} draggable={false} className={cx("block select-none", imgClassName ?? "h-auto w-full")} />
       {boxes.length > 0 && (
         <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden>
-          {boxes.map((b, i) => (
-            <rect
-              key={i}
-              x={b.bbox[0]}
-              y={b.bbox[1]}
-              width={b.bbox[2] - b.bbox[0]}
-              height={b.bbox[3] - b.bbox[1]}
-              fill="none"
-              stroke={b.color}
-              strokeWidth={2.5}
-              vectorEffect="non-scaling-stroke"
-            />
-          ))}
+          {boxes.map((b, i) => {
+            const r = { x: b.bbox[0], y: b.bbox[1], width: b.bbox[2] - b.bbox[0], height: b.bbox[3] - b.bbox[1] };
+            return (
+              <g key={i}>
+                {/* тёмная подложка: рамка видна и на светлом участке кадра */}
+                <rect {...r} fill="none" stroke="#000" strokeOpacity={0.5} strokeWidth={5} vectorEffect="non-scaling-stroke" />
+                <rect {...r} fill="none" stroke={b.color} strokeWidth={2.5} vectorEffect="non-scaling-stroke" />
+              </g>
+            );
+          })}
         </svg>
       )}
-      {boxes.length > 0 && (
-        <div className="pointer-events-none absolute left-1 top-1 flex max-w-[95%] flex-wrap gap-1">
-          {boxes.slice(0, 3).map((b, i) =>
-            b.label ? (
-              <span key={i} className="rounded px-1 py-0.5 text-[10px] font-semibold leading-none text-white" style={{ background: b.color }}>
-                {b.label}
-              </span>
-            ) : null,
-          )}
+      {labelled.length > 0 && (
+        <div className={s.boxLabels}>
+          {labelled.map((b, i) => (
+            <span key={i} className={s.boxLabel} style={{ color: b.color }}>
+              <span className={s.boxLabelText}>{b.label}</span>
+            </span>
+          ))}
         </div>
       )}
     </div>
@@ -58,6 +55,11 @@ export function EvidenceImage({
 /** Рамки A12 заданы для кадра t_peak — рисуем их только на нём (|ts − t_peak| ≤ maxDt), не на соседних кадрах. */
 export function boxesForFrame(frame: EvidenceFrame, peakT: number, boxes: HighlightBox[], maxDt = uiConfig().highlightMaxDtS): HighlightBox[] {
   return !frame.missing && Math.abs(frame.timestamp_sec - peakT) <= maxDt ? boxes : [];
+}
+
+/** «2,0 с» — промежуток между показанными кадрами (из их меток времени). */
+function formatGap(sec: number): string {
+  return `${sec.toFixed(1).replace(".", ",")} с`;
 }
 
 /**
@@ -107,52 +109,68 @@ export function BeforeAfter({
     };
   }, [serverBeforeIdx, capture, beforeT]);
 
-  const slot = "min-w-0 flex-1 overflow-hidden rounded-lg bg-ink-950 ring-1 ring-slate-200 dark:ring-white/10";
+  const capturedSrc = captured && captured !== "loading" && captured !== "error" ? captured : null;
+  const beforeTs = serverBeforeIdx >= 0 ? frames[serverBeforeIdx].timestamp_sec : beforeT;
+  const gap = (serverBeforeIdx >= 0 || capturedSrc) && after ? after.f.timestamp_sec - beforeTs : null;
+
   return (
-    <div className="max-w-md">
-      <div className="label mb-2">До и после начала эпизода</div>
-      <div className="flex items-stretch gap-2">
-        <figure className="min-w-0 flex-1">
-          <div className={slot}>
-            {serverBeforeIdx >= 0 ? (
-              <button className="block w-full" onClick={() => onOpen(serverBeforeIdx)} aria-label="Открыть кадр «до»">
-                <EvidenceImage src={imageSrc(frames[serverBeforeIdx].image_base64)} boxes={[]} alt="Кадр до начала эпизода" />
+    <div className={cx(s.scope, s.ba)}>
+      <div className={cx(s.eyebrow, s.baHead)}>До и после начала эпизода</div>
+      <div className={s.baGrid}>
+        <figure className={s.baCell}>
+          {serverBeforeIdx >= 0 ? (
+            <button type="button" className={s.baTile} onClick={() => onOpen(serverBeforeIdx)} aria-label={`Открыть кадр «до» (${formatTimecode(beforeTs)})`}>
+              <EvidenceImage src={imageSrc(frames[serverBeforeIdx].image_base64)} boxes={[]} alt="Кадр до начала эпизода" className="w-full" />
+              <span className={s.baTime}>{formatTimecode(beforeTs)}</span>
+            </button>
+          ) : capturedSrc ? (
+            <button type="button" className={s.baTile} onClick={() => onSeek(beforeT)} aria-label={`Перейти к моменту «до» в видео (${formatTimecode(beforeT)})`}>
+              <EvidenceImage src={capturedSrc} boxes={[]} alt="Кадр из видео до начала эпизода" className="w-full" />
+              <span className={s.baTime}>{formatTimecode(beforeT)}</span>
+            </button>
+          ) : (
+            <div className={cx(s.baTile, s.baEmpty)}>
+              {captured === "loading" ? <Spinner className="h-5 w-5" /> : <ImageOff className="h-5 w-5" aria-hidden />}
+              <span>{captured === "loading" ? "берём кадр из видео…" : "кадра «до» нет"}</span>
+              <button type="button" className={s.baSeek} onClick={() => onSeek(beforeT)} aria-label={`Перейти к ${formatTimecode(beforeT)} в видео`}>
+                <Crosshair className="h-3 w-3" aria-hidden /> к {formatTimecode(beforeT)}
               </button>
-            ) : captured && captured !== "loading" && captured !== "error" ? (
-              <button className="block w-full" onClick={() => onSeek(beforeT)} aria-label="Перейти к моменту «до» в видео">
-                <EvidenceImage src={captured} boxes={[]} alt="Кадр из видео до начала эпизода" />
-              </button>
-            ) : (
-              <div className="flex aspect-[3/4] flex-col items-center justify-center gap-2 p-3 text-center text-xs text-slate-300">
-                {captured === "loading" ? <Spinner className="h-5 w-5" /> : <ImageOff className="h-5 w-5" />}
-                {captured === "loading" ? "берём кадр из видео…" : "кадра «до» нет"}
-                <button className="btn bg-white/10 px-2 py-1 text-[11px] text-white hover:bg-white/20" onClick={() => onSeek(beforeT)}>
-                  <Crosshair className="h-3 w-3" /> к {formatTimecode(beforeT)}
-                </button>
-              </div>
-            )}
-          </div>
-          <figcaption className="mt-1 text-[11px] text-slate-500 tnum">
-            до · {formatTimecode(serverBeforeIdx >= 0 ? frames[serverBeforeIdx].timestamp_sec : beforeT)}
-            {serverBeforeIdx < 0 && captured && captured !== "loading" && captured !== "error" && " · кадр из видео, без размытия"}
+            </div>
+          )}
+          <figcaption className={s.baCap}>
+            <span className={s.baWhen}>до</span>
+            {serverBeforeIdx < 0 && capturedSrc && <span className={s.baWarn}>кадр из видео, без размытия</span>}
           </figcaption>
         </figure>
-        <ArrowRight className="mt-[25%] h-5 w-5 shrink-0 text-slate-400" aria-hidden />
-        <figure className="min-w-0 flex-1">
-          <div className={slot}>
-            {after ? (
-              <button className="block w-full" onClick={() => onOpen(after.i)} aria-label="Открыть кадр «после»">
-                <EvidenceImage
-                  src={imageSrc(after.f.image_base64)}
-                  boxes={highlight ? boxesForFrame(after.f, peakT, boxes) : []}
-                  alt="Кадр после начала эпизода"
-                />
-              </button>
-            ) : (
-              <div className="flex aspect-[3/4] items-center justify-center p-3 text-center text-xs text-slate-300">кадра «после» нет</div>
-            )}
-          </div>
-          <figcaption className="mt-1 text-[11px] text-slate-500 tnum">после · {after ? formatTimecode(after.f.timestamp_sec) : "—"}</figcaption>
+        <div className={s.baLink} aria-hidden>
+          <ArrowRight className="h-4 w-4" />
+          {gap !== null && gap > 0 && <span>+{formatGap(gap)}</span>}
+        </div>
+        <figure className={s.baCell}>
+          {after ? (
+            <button
+              type="button"
+              className={s.baTile}
+              onClick={() => onOpen(after.i)}
+              aria-label={`Открыть кадр «после» (${formatTimecode(after.f.timestamp_sec)})`}
+            >
+              <EvidenceImage
+                src={imageSrc(after.f.image_base64)}
+                boxes={highlight ? boxesForFrame(after.f, peakT, boxes) : []}
+                alt="Кадр после начала эпизода"
+                className="w-full"
+              />
+              <span className={s.baTime}>{formatTimecode(after.f.timestamp_sec)}</span>
+            </button>
+          ) : (
+            <div className={cx(s.baTile, s.baEmpty)}>
+              <ImageOff className="h-5 w-5" aria-hidden />
+              <span>кадра «после» нет</span>
+            </div>
+          )}
+          <figcaption className={s.baCap}>
+            <span className={s.baWhen}>после</span>
+          </figcaption>
         </figure>
       </div>
     </div>
