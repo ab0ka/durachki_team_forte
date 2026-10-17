@@ -8,7 +8,7 @@
   "episodePostrollS": 1,
   "beforeAfterTypes": ["V02", "V03", "V07"],
   "beforeOffsetS": 2,
-  "highlightMaxDtS": 0.6,
+  "highlightMaxDtS": 0.1,
   "ptsOffsetMode": "none",
   "showReviewHints": true
 }

@@ -89,10 +89,10 @@ describe("ResultView", () => {
       job_id: "x",
       status: "done",
       verdict: "violation",
-      violations: [{ type: "Тип", timecode_sec: 22, description: "Описание.", evidence_frames: [{ timestamp_sec: 22, image_base64: "/9j/AAAA" }] }],
+      violations: [{ type: "Тип", timecode_sec: 22, description: "Описание.", evidence_frames: [{ timestamp_sec: 22, image_base64: "/9j/4AAQSkZJRgABAQAAAQABAAD" }] }],
     });
     const html = wrap(<ResultView job={job} raw={{}} />);
-    expect(html).toContain("data:image/jpeg;base64,/9j/AAAA");
+    expect(html).toContain("data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD");
     expect(html).toContain("норма в каталоге не найдена");
   });
 });

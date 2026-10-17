@@ -49,6 +49,7 @@ const STAGE_LABELS: Record<string, string> = {
   scene: "Состояние сцены",
   rules: "Правила",
   temporal: "Временная модель",
+  refine: "Уточнение окон",
   vlm_verify: "Проверка эпизодов VLM",
   vlm_discover: "Поиск новых типов VLM",
   vlm: "Проверка VLM",
@@ -105,8 +106,10 @@ export function readCoverage(meta: Obj): number | undefined {
 
 /** A03: meta.coverage = {стадия: доля 0..1 | null}. Объект A01 ({ratio,…}) сюда не относится. */
 export function readStageCoverage(meta: Obj): Record<string, number | null> {
-  const c = meta.coverage;
-  if (!isObj(c) || "ratio" in c) return {};
+  let c = meta.coverage;
+  // Канонический формат A01/A03 (2055fc4): {ratio, …, by_stage: {стадия: доля|null}}.
+  if (isObj(c) && "ratio" in c) c = c.by_stage;
+  if (!isObj(c)) return {};
   const out: Record<string, number | null> = {};
   for (const [k, v] of Object.entries(c)) {
     if (v === null) out[k] = null;
@@ -166,6 +169,7 @@ export function analyzeCompleteness(job: JobResult): CompletenessReport {
   if (m.timed_out === true || (numOrUndef(m.deadline_exceeded_s) ?? 0) > 0) reasons.push("превышен бюджет времени анализа");
   if (coverage !== undefined && coverage < COVERAGE_COMPLETE)
     reasons.push(`проанализировано ${Math.floor(coverage * 100)} % длительности записи`);
+  if (isObj(m.coverage) && m.coverage.complete === false) reasons.push("покрытие записи отмечено сервером как неполное");
   for (const s of stages) {
     if (s.required && !s.ok) reasons.push(`обязательная стадия «${s.label}»: ${s.statusLabel}`);
     if (s.required && s.ok && typeof s.coverage === "number" && s.coverage < STAGE_COVERAGE_MIN)

@@ -17,6 +17,7 @@ import { useApp } from "../context";
 import { formatBytes, formatDateTime } from "../lib/format";
 import { navigate } from "../lib/router";
 import { MAX_UPLOAD_MB, validateVideoFile } from "../lib/validate";
+import { historyView } from "../lib/verdict";
 import { batch } from "../lib/batch";
 import BatchList from "./BatchList";
 import { cx, LocalBadge, ProgressBar } from "./ui";
@@ -280,22 +281,18 @@ export default function UploadScreen() {
                     <span
                       className={cx(
                         "h-2.5 w-2.5 shrink-0 rounded-full",
-                        h.verdict === "violation"
-                          ? "bg-rose-500"
-                          : h.verdict === "no_violation"
-                            ? "bg-emerald-500"
-                            : h.status === "failed"
-                              ? "bg-amber-500"
-                              : "bg-slate-300 dark:bg-slate-600",
+                        {
+                          danger: "bg-rose-500",
+                          success: "bg-emerald-500",
+                          warning: "bg-amber-500",
+                          neutral: "bg-slate-300 dark:bg-slate-600",
+                        }[historyView(h).tone],
                       )}
                     />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-medium">{h.file_name}</span>
                       <span className="block text-xs text-slate-500 tnum">
-                        {formatDateTime(h.created_at)}
-                        {h.verdict === "violation" && ` · нарушений: ${h.n_violations ?? "?"}`}
-                        {h.verdict === "no_violation" && " · без нарушений"}
-                        {!h.verdict && (h.status === "failed" ? " · анализ не завершён" : h.status === "done" ? " · готово" : " · в обработке")}
+                        {formatDateTime(h.created_at)} · {historyView(h).label}
                       </span>
                     </span>
                     <ChevronRight className="h-4 w-4 text-slate-400" />

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Ban, CheckCircle2, Cpu, Image as ImageIcon, Scale, Sparkles, SquareDashed, Timer } from "lucide-react";
 import type { JobResult, Violation } from "../api/types";
-import { imageSrc, notCheckedFor, overlayBoxes, rulesWithStatus, violationFacts, violationSources, violationVlm } from "../api/normalize";
+import { imageSrc, notCheckedFor, overlayBoxes, overlayPeak, rulesWithStatus, violationFacts, violationSources, violationVlm } from "../api/normalize";
 import { uiConfig } from "../lib/uiConfig";
 import { BeforeAfter, boxesForFrame, EvidenceImage } from "./Evidence";
 import { typeInfo, sourceLabel } from "../lib/catalog";
@@ -27,6 +27,9 @@ export default function ViolationCard({ v, index, job, active, onSeek, capture, 
   const [lightbox, setLightbox] = useState<number | null>(null);
   const [highlight, setHighlight] = useState(true);
   const boxes = overlayBoxes(v, job);
+  const peakT = overlayPeak(v, job);
+  // Кадры с изображением — для лайтбокса и «до/после»; кадры без изображения показываются плашкой.
+  const shownFrames = v.evidence_frames.filter((f) => !f.missing);
   const notChecked = notCheckedFor(v, job);
   const transition = !!info?.transition && uiConfig().beforeAfterTypes.includes((v.type_id ?? "").toUpperCase());
   const facts = violationFacts(v, job);
@@ -98,27 +101,39 @@ export default function ViolationCard({ v, index, job, active, onSeek, capture, 
               )}
             </div>
             {transition && (
-              <BeforeAfter v={v} boxes={boxes} highlight={highlight} capture={capture} onSeek={onSeek} onOpen={setLightbox} />
+              <BeforeAfter v={v} peakT={peakT} boxes={boxes} highlight={highlight} capture={capture} onSeek={onSeek} onOpen={setLightbox} />
             )}
             <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-              {v.evidence_frames.map((f, i) => (
-                <button
-                  key={i}
-                  className="group relative overflow-hidden rounded-lg bg-ink-950 ring-1 ring-slate-200 dark:ring-white/10"
-                  onClick={() => setLightbox(i)}
-                  aria-label={`Открыть кадр ${formatTimecode(f.timestamp_sec)}`}
-                >
-                  <EvidenceImage
-                    src={imageSrc(f.image_base64)}
-                    boxes={highlight ? boxesForFrame(f, v, boxes) : []}
-                    alt={`Кадр ${formatTimecode(f.timestamp_sec)}`}
-                    imgClassName="h-auto w-full transition duration-300 group-hover:scale-[1.03]"
-                  />
-                  <span className="absolute bottom-1.5 left-1.5 rounded bg-black/70 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-white tnum">
-                    {formatTimecode(f.timestamp_sec)}
-                  </span>
-                </button>
-              ))}
+              {v.evidence_frames.map((f, i) =>
+                f.missing ? (
+                  <button
+                    key={i}
+                    className="flex aspect-[3/4] flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-slate-300 p-2 text-center text-[11px] text-slate-500 dark:border-white/15"
+                    onClick={() => onSeek(f.timestamp_sec)}
+                    title="Сервер сообщил кадр, но не передал изображение — откройте момент в видео"
+                  >
+                    кадр не передан
+                    <span className="font-mono tnum">{formatTimecode(f.timestamp_sec)}</span>
+                  </button>
+                ) : (
+                  <button
+                    key={i}
+                    className="group relative overflow-hidden rounded-lg bg-ink-950 ring-1 ring-slate-200 dark:ring-white/10"
+                    onClick={() => setLightbox(shownFrames.indexOf(f))}
+                    aria-label={`Открыть кадр ${formatTimecode(f.timestamp_sec)}`}
+                  >
+                    <EvidenceImage
+                      src={imageSrc(f.image_base64)}
+                      boxes={highlight ? boxesForFrame(f, peakT, boxes) : []}
+                      alt={`Кадр ${formatTimecode(f.timestamp_sec)}`}
+                      imgClassName="h-auto w-full transition duration-300 group-hover:scale-[1.03]"
+                    />
+                    <span className="absolute bottom-1.5 left-1.5 rounded bg-black/70 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-white tnum">
+                      {formatTimecode(f.timestamp_sec)}
+                    </span>
+                  </button>
+                ),
+              )}
             </div>
           </div>
         ) : (
@@ -207,8 +222,8 @@ export default function ViolationCard({ v, index, job, active, onSeek, capture, 
 
       {lightbox !== null && (
         <Lightbox
-          frames={v.evidence_frames}
-          boxesFor={(f) => (highlight ? boxesForFrame(f, v, boxes) : [])}
+          frames={shownFrames}
+          boxesFor={(f) => (highlight ? boxesForFrame(f, peakT, boxes) : [])}
           index={lightbox}
           caption={`Эпизод ${index + 1}: ${v.type}`}
           onClose={() => setLightbox(null)}

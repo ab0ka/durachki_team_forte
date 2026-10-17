@@ -430,6 +430,94 @@ try {
     await c.close();
   }
 
+  // ---------- сценарий 1з: формат A02 2055fc4 — failed + обёртка partial (rejected_result, «<jpeg omitted>») ----------
+  {
+    const c = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const pg = await c.newPage();
+    const wrapped = {
+      job_id: "w1",
+      status: "failed",
+      verdict: null,
+      violations: [],
+      error: "pipeline_failed: incomplete analysis (meta.completeness/coverage): no_violation is not issued",
+      partial: {
+        job_id: "w1",
+        complete: false,
+        code: "pipeline_failed",
+        partial: { status: "processing", meta: { complete: false } },
+        rejected_result: {
+          status: "failed",
+          verdict: null,
+          verdict_state: "no_violation",
+          analysis_complete: true,
+          violations: [],
+          candidates: [{ type: "Синтетический кандидат", type_id: "V05", timecode_sec: 3, description: "", evidence_frames: [{ timestamp_sec: 3, image_base64: "<jpeg omitted>" }] }],
+          timeline: [[0, 0.1], [3, 0.4], [6, 0.1]],
+          meta: { complete: true, video: { duration: 6 }, stages: { ingest: { status: "ok", required: true, seconds: 0.4 } }, coverage: { ratio: 1, complete: true, by_stage: { ingest: 1 } } },
+        },
+      },
+    };
+    await pg.route("**/ui/v1/**", (route) => {
+      const p = new URL(route.request().url()).pathname;
+      if (p.endsWith("/session")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+      if (p.endsWith("/jobs/w1")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(wrapped) });
+      return route.fulfill({ status: 404, body: "" });
+    });
+    await pg.goto(`${url}#/job/w1`);
+    await step("A02 2055fc4 failed+partial: жёлтый подробный отчёт, плашка «кадр не передан», нет битых картинок и зелёного", async () => {
+      await pg.getByText("Анализ не завершён").first().waitFor({ timeout: 6000 });
+      await pg.getByText("Полнота анализа").first().waitFor({ timeout: 3000 });
+      await pg.getByText("кадр не передан").first().waitFor({ timeout: 3000 });
+      const broken = await pg.evaluate(() => [...document.images].filter((i) => i.complete && i.naturalWidth === 0).length);
+      assert.equal(broken, 0, `битых картинок: ${broken}`);
+      assert.equal(await pg.locator("section.bg-gradient-to-br.from-emerald-600").count(), 0, "зелёный баннер у failed");
+    });
+    await c.close();
+  }
+
+  // ---------- сценарий 1и: модальные окна и мобильный экран ----------
+  for (const vp of [{ width: 1280, height: 900, name: "desktop" }, { width: 375, height: 812, name: "375px" }]) {
+    const c = await browser.newContext({ viewport: { width: vp.width, height: vp.height } });
+    const pg = await c.newPage();
+    await pg.route("**/ui/v1/**", (route) => {
+      const p = new URL(route.request().url()).pathname;
+      if (p.endsWith("/session")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+      if (p.endsWith("/jobs/m1")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...doneJob("m1"), meta: { ...doneJob("m1").meta, complete: true } }) });
+      return route.fulfill({ status: 404, body: "" });
+    });
+    await pg.goto(`${url}#/job/m1`);
+    await step(`${vp.name}: лайтбокс на весь экран и поверх всего`, async () => {
+      await pg.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 6000 });
+      await pg.locator("article button[aria-label^='Открыть кадр']").first().click();
+      const dlg = pg.getByRole("dialog", { name: "Кадр-доказательство" });
+      await dlg.waitFor({ timeout: 3000 });
+      const box = await dlg.boundingBox();
+      assert.ok(box && box.x === 0 && box.y === 0 && Math.abs(box.width - vp.width) < 2 && Math.abs(box.height - vp.height) < 2, `рамка лайтбокса ${JSON.stringify(box)}`);
+      const top = await pg.evaluate(() => {
+        const el = document.elementFromPoint(window.innerWidth / 2, 20);
+        return !!el?.closest('[role="dialog"]');
+      });
+      assert.ok(top, "лайтбокс перекрыт другим элементом (шапкой)");
+      await pg.keyboard.press("Escape");
+    });
+    await step(`${vp.name}: окно «Настройки» поверх страницы; нет горизонтальной прокрутки`, async () => {
+      await pg.getByRole("button", { name: "Настройки" }).click();
+      const dlg = pg.getByRole("dialog");
+      await dlg.waitFor({ timeout: 3000 });
+      const top = await pg.evaluate(() => {
+        const d = document.querySelector('[role="dialog"]');
+        const r = d.getBoundingClientRect();
+        const el = document.elementFromPoint(r.left + r.width / 2, r.top + 30);
+        return !!el?.closest('[role="dialog"]');
+      });
+      assert.ok(top, "окно настроек перекрыто");
+      await pg.keyboard.press("Escape");
+      const sw = await pg.evaluate(() => document.documentElement.scrollWidth);
+      assert.ok(sw <= vp.width, `scrollWidth ${sw} > ${vp.width}`);
+    });
+    await c.close();
+  }
+
   // ---------- сценарий 2: failed и неполный анализ не зелёные ----------
   for (const [name, body, expectText] of [
     ["failed", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "синтетическая ошибка" }, "Анализ не завершён"],

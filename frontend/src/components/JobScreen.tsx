@@ -8,6 +8,7 @@ import ResultView from "./ResultView";
 import RetryUpload from "./RetryUpload";
 import { LoginCard } from "./UploadScreen";
 import { uiConfig } from "../lib/uiConfig";
+import { analyzeCompleteness } from "../lib/completeness";
 import { Spinner } from "./ui";
 
 export default function JobScreen({ jobId }: { jobId: string }) {
@@ -52,12 +53,15 @@ export default function JobScreen({ jobId }: { jobId: string }) {
         setRaw(r.raw);
         setError(null);
         if (r.job.status === "done" || r.job.status === "failed") {
+          const rep = analyzeCompleteness(r.job);
           saveHistoryItem({
             job_id: jobId,
             status: r.job.status,
             verdict: r.job.status === "done" ? r.job.verdict : null,
             n_violations: r.job.violations.length,
             demo: demo || undefined,
+            completeness: rep.state,
+            mock: rep.mock,
           });
           if (r.job.status === "done") setLastResult(r.job);
           return; // опрос остановлен

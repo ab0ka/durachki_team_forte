@@ -70,12 +70,27 @@ export function normalizeProgress(v: unknown): number | undefined {
   return Math.min(1, Math.max(0, p));
 }
 
+/**
+ * Похоже ли значение на изображение: data:/blob:/http(s)-URL, путь или base64 (≥ 16 символов алфавита base64).
+ * Заглушки вроде "<jpeg omitted>" (A02 у failed) — НЕ изображение.
+ */
+export function isImagePayload(s: string): boolean {
+  const t = s.trim();
+  if (!t) return false;
+  if (/^data:image\//i.test(t) || t.startsWith("blob:") || /^https?:\/\//i.test(t)) return true;
+  if (t.startsWith("/") && /\.(jpe?g|png|webp)(\?|$)/i.test(t)) return true;
+  return t.length >= 16 && /^[A-Za-z0-9+/=\s]+$/.test(t);
+}
+
 function normalizeFrame(v: unknown): EvidenceFrame | null {
-  if (typeof v === "string") return v ? { timestamp_sec: 0, image_base64: v } : null;
+  if (typeof v === "string") return isImagePayload(v) ? { timestamp_sec: 0, image_base64: v } : null;
   if (!isObj(v)) return null;
   const img = str(v.image_base64 ?? v.image ?? v.jpeg_base64 ?? v.data ?? v.url);
+  const t = num(v.timestamp_sec ?? v.t ?? v.timestamp, 0);
   if (!img) return null;
-  return { timestamp_sec: num(v.timestamp_sec ?? v.t ?? v.timestamp, 0), image_base64: img };
+  // Кадр заявлен, но изображения нет: сохраняем момент, картинку не подставляем.
+  if (!isImagePayload(img)) return { timestamp_sec: t, image_base64: "", missing: true };
+  return { timestamp_sec: t, image_base64: img };
 }
 
 function normalizeRule(v: unknown): RuleRef | null {
@@ -173,8 +188,11 @@ export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
   let partialResult: JobResult | undefined;
   if (status === "failed" && isObj(raw.partial)) {
     try {
-      // A02: partial = частичный результат (UI-report A01 или partial.json A03 со status=processing).
-      partialResult = normalizeJob({ ...raw.partial, status: "done" }, fallbackJobId);
+      // A02 (2055fc4): partial = {code, complete, partial: <partial.json A03>, rejected_result: <отвергнутый отчёт>};
+      // раньше — сам отчёт. Берём отвергнутый отчёт (полный meta), иначе partial.json, иначе объект как есть.
+      const wrap = raw.partial;
+      const inner = isObj(wrap.rejected_result) ? wrap.rejected_result : isObj(wrap.partial) ? wrap.partial : wrap;
+      partialResult = normalizeJob({ ...inner, status: "done" }, fallbackJobId);
     } catch {
       partialResult = undefined;
     }
@@ -334,7 +352,9 @@ export function toJuryJson(job: JobResult): Record<string, unknown> {
       type: v.type,
       timecode_sec: v.timecode_sec,
       description: v.description,
-      evidence_frames: v.evidence_frames.map((f) => ({ timestamp_sec: f.timestamp_sec, image_base64: f.image_base64 })),
+      evidence_frames: v.evidence_frames
+        .filter((f) => !f.missing)
+        .map((f) => ({ timestamp_sec: f.timestamp_sec, image_base64: f.image_base64 })),
     })),
   };
 }
@@ -396,6 +416,16 @@ export function overlayBoxes(v: Violation, job: JobResult): HighlightBox[] {
     out.push({ label: str(sh.label) || str(sh.key), color, bbox: [x1, y1, x2, y2] });
   }
   return out;
+}
+
+/**
+ * Момент, к которому относятся рамки A12 (bboxes Event — «что подсветить на кадре t_peak»):
+ * meta.ui.evidence_overlays[].timecode_sec = t_peak; если оверлея нет — таймкод нарушения.
+ */
+export function overlayPeak(v: Violation, job: JobResult): number {
+  const ov = violationOverlay(v, job);
+  const t = ov ? optNum(ov.timecode_sec) : undefined;
+  return t ?? v.timecode_sec;
 }
 
 /** Нормы с русским статусом сверки из оверлея A12 (если есть). */
