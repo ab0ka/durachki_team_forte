@@ -20,6 +20,9 @@ features:
   device: auto                     # auto | cpu | cuda
   hf_cache: weights/hf/hub         # офлайн-веса (если каталог есть; env HF_HUB_CACHE/HF_HOME приоритетнее)
   views: [full, focus]             # full — весь кадр; focus — адаптивный кроп (зона кассира или область движения)
+  # Виды по зонам A06 (кропы bbox зоны; зоны нет -> вид неизвестен, NaN). Выключено, пока L2 не измерит пользу:
+  # zone_views: [desk, safe, cashier_area, door]
+  zone_views: []
   cpu_views: [full]
   focus:
     mode: auto                     # auto: zone если зоны переданы, иначе motion | zone | motion
@@ -47,6 +50,9 @@ labels:
   # Конфликт меток внутри группы дубликатов (один файл «нарушение», другой «без»):
   # positive — группа считается позитивной (все исходные метки сохраняются в index/отчёте); exclude — исключить
   conflict_policy: positive
+  # Разные таймкоды у дубликатов (Х-4/Х-47: 57 и 68 с) — решает человек. both — обе секунды остаются
+  # якорями (ничего не выбрано произвольно); video_only — кадровый надзор снят, только метка видео.
+  time_conflict_policy: both
   duplicate_groups:                # группы дубликатов (по md5 находятся автоматически, это — страховка)
     - [X-4, X-47]
     - [X-5, X-48]
@@ -61,6 +67,9 @@ model:                             # temporal head (TCN+BiGRU) — сравне�
   arch: tcn                        # tcn | gru | tcn_gru (GRU ~5x медленнее на CPU: 156 vs 31 мс/шаг)
   input_groups: [sims, emb, dyn]   # sims — zero-shot сходства; emb — эмбеддинги; dyn — движение/смена кадра
   emb_pca: 32                      # PCA эмбеддингов на вид (подгоняется на обучающей выборке)
+  # группа change (выключена по умолчанию; включается в input_groups): изменения во времени по каждому виду
+  change_lags_s: [2.0, 8.0]        # 1−cos(e_t, e_{t−Δ})
+  change_deltas_s: [1.0, 3.0]      # 1−cos(среднее [t−Δ,t), среднее [t,t+Δ)) — «до/после» (уход, вход, поднесла)
   hidden: 64
   tcn_kernel: 5
   tcn_dilations: [1, 2, 4, 8]
@@ -71,6 +80,9 @@ model:                             # temporal head (TCN+BiGRU) — сравне�
 
 train:
   seed: 13
+  # Вес в обучении: group — каждая группа (уникальное видео, дубликаты свёрнуты) весит одинаково, её версии
+  # (оригинал + аугментации) делят этот вес; frame — старый режим (каждый кадр = 1, длинные чистые ролики доминируют)
+  weighting: group
   epochs: 60
   steps_per_epoch: 12
   batch_size: 8
@@ -85,6 +97,7 @@ train:
   mil_weight: 0.5                  # вес MIL-потери уровня видео
   mil_topk_frac: 0.04
   type_weight: 0.3                 # голова типа учится ТОЛЬКО если в labels.csv есть проверенный type_id
+  use_pseudo_types: false          # псевдометки типа (type_status=vlm/pseudo) — только явно; помечаются «предварительно»
   aug_prob: 0.7                    # доля батчей, где берём аугментированную копию признаков
   time_warp: [0.8, 1.25]
   time_warp_prob: 0.5
@@ -104,10 +117,54 @@ cv:
   epochs: 40                       # эпох temporal head в CV
   holdout_frac: 0.0                # >0: отложить нетронутый сгруппированный holdout (оценивается один раз)
   hit_tolerances_s: [1, 2, 3]
+  timecode_policies: [peak, onset]  # какие политики таймкода мерить в отчёте
+  duration_watchdog_rho: 0.3       # |ρ(скор, длительность)| на чистых роликах выше — предупреждение
   threshold_margin: 0.02           # порог = max(score негативов inner-OOF) + margin (FP=0) / FP≤1
   min_recall_fp0: 0.8
 
+propose:                           # генератор кандидатов для VLM/правил: propose(clip) -> 3–8 Event
+  mode: hybrid                     # risk | change | hybrid — выбрать по замеру (cv/bench: candidates)
+  max_candidates: 8
+  min_candidates: 3
+  n_risk: 4                        # hybrid: сначала до n_risk пиков риска, остальное — кривая изменений
+  nms_s: 2.0                       # минимальное расстояние между кандидатами
+  window_s: 2.0                    # t_start/t_end кандидата = t ± window_s (окно для VLM)
+  change_deltas_s: [1.0, 3.0]      # окна «до/после» для контраста эмбеддингов
+  motion_weight: 0.5               # вклад начала движения в кривую изменений
+  change_salience_cap: 0.3         # уверенность кандидата из кривой изменений не выше (это не детекция)
+  recall_tol_s: 1.5
+  budgets: [3, 5, 8]
+
+experiments:                       # ≤ 3 заранее описанные конфигурации; сравниваются на одних и тех же фолдах
+  E0:
+    description: "baseline: логрегрессия по кадрам на SigLIP2, равный вес групп, пулинг topk_null"
+    kind: baseline
+    overrides: {}
+  E1:
+    description: "E0 + признаки изменения (change: лаги и контраст «до/после»)"
+    kind: baseline
+    overrides: {model: {input_groups: [sims, emb, dyn, change]}}
+  E2:
+    description: "temporal head (TCN + MIL) на тех же признаках, что E1"
+    kind: temporal
+    overrides: {model: {input_groups: [sims, emb, dyn, change]}}
+
+bench:
+  folds: 5
+  repeats: 3
+  inner: 3
+
 infer:
+  # Пулинг уровня видео (исправление: max по кадрам смещён в пользу длинных чистых роликов):
+  # max — старый (для сравнения) | topk — среднее pool_k лучших окон | topk_null — topk, нормированный по
+  # числу окон через null-CDF чистых роликов (подгоняется внутренним CV только на train).
+  pooling: topk_null
+  pool_k: 4                        # окон по risk_step_s (4 × 0.5 с = 2 с)
+  null_tau_s: 4.0                  # длина блока null-модели (≈ время декорреляции риска)
+  peak_rel: 0.6                    # события score(): пики ≥ peak_rel × максимум кривой (если видео помечено)
+  timecode_policy: peak            # peak | onset | change_onset — выбрать по замеру (cv: timecode_by_policy)
+  onset_ratio: 0.5
+  onset_max_s: 6.0
   risk_step_s: 0.5
   smooth_s: 1.0                    # сглаживание риск-кривой (окно, сек)
   event_threshold: 0.55            # пик выше — событие (перекрывается weights/temporal/meta.json:threshold)

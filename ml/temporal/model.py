@@ -88,12 +88,22 @@ def loss_fn(logits: Any, type_logits: Any, batch: dict, cfg: dict) -> tuple[Any,
     tr = cfg["train"]
     y, w, mask = batch["y"], batch["w"], batch["mask"]
     w = w * mask
-    pos_mass = (w * y).sum()
-    neg_mass = (w * (1 - y)).sum()
-    pw = torch.clamp(neg_mass / pos_mass.clamp(min=1e-6), 1.0, float(tr.get("pos_weight_max", 20.0)))
-    pw = torch.where(pos_mass > 0, pw, torch.ones_like(pw))
     bce = F.binary_cross_entropy_with_logits(logits, y, reduction="none")
-    wt = w * (1 + (pw - 1) * y)
+    if str(tr.get("weighting", "group")) == "group":
+        # каждое окно весит одинаково (независимо от числа валидных кадров), классы окон — поровну
+        wsum = w.sum(1, keepdim=True)
+        wn = w / wsum.clamp(min=1e-6)
+        valid = (wsum.squeeze(1) > 0).float()
+        is_pos = (batch["label"] > 0.5).float() * valid
+        is_neg = (1 - (batch["label"] > 0.5).float()) * valid
+        win_w = is_pos * 0.5 / is_pos.sum().clamp(min=1) + is_neg * 0.5 / is_neg.sum().clamp(min=1)
+        wt = wn * win_w.unsqueeze(1)
+    else:  # старый режим: кадр = 1, баланс по массе кадров
+        pos_mass = (w * y).sum()
+        neg_mass = (w * (1 - y)).sum()
+        pw = torch.clamp(neg_mass / pos_mass.clamp(min=1e-6), 1.0, float(tr.get("pos_weight_max", 20.0)))
+        pw = torch.where(pos_mass > 0, pw, torch.ones_like(pw))
+        wt = w * (1 + (pw - 1) * y)
     frame_loss = (bce * wt).sum() / wt.sum().clamp(min=1e-6)
 
     probs = torch.sigmoid(logits)

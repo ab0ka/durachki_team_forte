@@ -30,7 +30,7 @@ def test_extract_clip_mock_shapes_and_focus(tmp_path):
     fs = extract_clip(clip, MockBackend(32), cfg, fps=4.0, views=["full", "focus"])
     T = len(fs)
     assert T >= 20 and fs.emb.shape == (T, 2, 32) and fs.dyn.shape == (T, 4) and fs.boxes.shape == (T, 4)
-    assert np.allclose(np.linalg.norm(fs.emb, axis=-1), 1.0, atol=1e-4)
+    assert np.allclose(np.linalg.norm(fs.emb, axis=-1), 1.0, atol=2e-3)   # float16-точность кэша
     assert np.all(fs.boxes[:, 0] < fs.boxes[:, 2]) and np.all(fs.boxes[:, 1] < fs.boxes[:, 3])
     assert np.all((fs.boxes >= 0) & (fs.boxes <= 1))
     assert fs.meta["focus_mode"] == "motion"
@@ -87,7 +87,13 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
     # исходные метки обоих файлов сохранены, расхождение помечено (политика positive)
     assert x6["conflict"] and x6["label"] == 1
     assert {(s["name"], s["label"]) for s in x6["sources"]} == {("X-6", 0), ("X-9", 1)}
-    from ml.temporal import check_split
+    from ml.temporal import bench, check_split
+
+    bout = tmp_path / "bench.json"                        # та же команда, что запустит L2 (здесь — на mock)
+    assert bench.main(["--experiments", "E0,E1", "--folds", "3", "--repeats", "1", "--inner", "2",
+                       "--out", str(bout)]) == 0
+    brep = json.loads(bout.read_text(encoding="utf-8"))
+    assert set(brep["experiments"]) == {"E0", "E1"} and brep["n_groups"] == 8
 
     assert check_split.main(["--folds", "loo", "3", "--holdout", "0.25"]) == 0
     assert train.main(["--kind", "baseline", "--cv-report", str(out)]) == 0
@@ -103,8 +109,15 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
     risk, events = temporal.score(clip)
     st = temporal.status()
     assert st["status"] == "ok" and st["kind"] == "baseline"
+    assert st["coverage"]["complete"] and st["coverage"]["fraction"] >= 0.98
     ts = [t for t, _ in risk]
     assert np.allclose(np.diff(ts), 0.5) and all(0.0 <= r <= 1.0 for _, r in risk)
+    cands = temporal.propose(clip)                          # с чекпоинтом: кандидаты из риска + изменений
+    assert 3 <= len(cands) <= 8 and any(c.extra["candidate_source"] == "risk" for c in cands)
+    renamed = tmp_path / "renamed_copy.avi"                  # имя файла не признак: тот же контент -> тот же риск
+    renamed.write_bytes((vids / "Х-1.avi").read_bytes())
+    risk2, _ = temporal.score(SimpleClip(str(renamed), sample_fps=5.0))
+    assert risk2 == risk
     for e in events:
         assert e.source == "temporal" and e.t_start <= e.t_peak <= e.t_end
         assert e.type_id == "V99" and e.extra["type_source"] == "none"

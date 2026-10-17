@@ -99,3 +99,16 @@ def test_temporal_head_shapes_and_learning(toy, cfg, tmp_path):
     a, _ = m.predict(samples[0].X[0], spec.fps)
     b, _ = m2.predict(samples[0].X[0], spec2.fps)
     assert np.allclose(a, b, atol=1e-5) and meta["type_head_trained"] is False
+
+
+def test_pseudo_types_ignored_unless_flag(toy, cfg):
+    from ml.temporal.predictors import type_head_source
+
+    samples, bank, spec = _prep(toy, cfg)
+    for s in samples:
+        if s.label:
+            s.pseudo_type_id = "V07"
+    assert not BaselineLR(cfg).fit(samples, cfg).type_trained and type_head_source(samples, cfg) is None
+    cfg2 = {**cfg, "train": {**cfg["train"], "use_pseudo_types": True}}
+    m = BaselineLR(cfg2).fit(samples, cfg2)
+    assert m.type_trained and type_head_source(samples, cfg2) == "pseudo"

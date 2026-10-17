@@ -83,3 +83,13 @@ def test_l1_schema_labels_csv(tmp_path):
     assert labs["X-3"].label == 0 and labs["X-3"].times == []
     assert labs["X-47"].times == [68.0]
     assert all(lab.type_id == "" for lab in labs.values())
+
+
+def test_type_status_confirmed_vs_pseudo(tmp_path):
+    p = tmp_path / "l.csv"
+    p.write_text("file,label,t_sec,type_id,type_status\nX-1,violation,10,V05,confirmed\n"
+                 "X-2,violation,12,V03,vlm_pseudo\nX-3,violation,9,V06,\n", encoding="utf-8")
+    labs = read_labels(p)
+    assert labs["X-1"].type_id == "V05" and labs["X-1"].pseudo_type_id == ""
+    assert labs["X-2"].type_id == "" and labs["X-2"].pseudo_type_id == "V03"     # VLM — только предварительно
+    assert labs["X-3"].type_id == "V06"                                          # без статуса — разметка человека

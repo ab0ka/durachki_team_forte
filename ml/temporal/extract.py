@@ -24,9 +24,25 @@ from .labels import assign_groups, file_md5, find_videos, read_labels
 log = logging.getLogger("sentinel.temporal")
 
 
+def auto_zones(clip, every_n: int = 5):
+    """Зоны A06 через детекции A05 (если модули доступны); иначе None — зонные виды будут «неизвестно»."""
+    try:
+        from ml.detect import detect  # type: ignore
+        from ml.track import track  # type: ignore
+    except ImportError as e:
+        log.warning("extract: зоны недоступны (%s) — зонные виды будут неизвестны", e)
+        return None
+    try:
+        _, zones = track(clip, detect(clip, every_n=every_n))
+        return zones
+    except Exception as e:  # детектор/трекер не должен ронять извлечение
+        log.warning("extract: не удалось получить зоны: %s", e)
+        return None
+
+
 def extract_dataset(videos_dir: str, labels_csv: str, cfg: dict, n_aug: Optional[int] = None,
                     force: bool = False, backend_name: Optional[str] = None, limit: Optional[int] = None,
-                    index_out: Optional[str] = None) -> dict:
+                    index_out: Optional[str] = None, zones_mode: str = "none") -> dict:
     t_all = time.monotonic()
     backend = get_backend(cfg, force=backend_name)
     get_text_bank(cfg, backend)  # закэшировать текстовые эмбеддинги заранее
@@ -47,7 +63,8 @@ def extract_dataset(videos_dir: str, labels_csv: str, cfg: dict, n_aug: Optional
     f = cfg["features"]
     on_cuda = str(getattr(backend, "device", "cpu")).startswith("cuda") or backend.name == "mock"
     fps = float(f["fps"])  # для обучения всегда полная частота и все виды (CPU — просто дольше)
-    views = list(f["views"])
+    views = list(f["views"]) + [f"zone:{z}" for z in (f.get("zone_views") or [])]
+    want_zones = zones_mode == "auto" and any(v.startswith("zone:") for v in views)
     by_md5: dict[str, list[str]] = {}
     entries = []
     for i, n in enumerate(names):
@@ -57,18 +74,23 @@ def extract_dataset(videos_dir: str, labels_csv: str, cfg: dict, n_aug: Optional
         else:
             feats = []
             clip = None
+            zones = None
             for k in range(n_aug + 1):
                 key = {"md5": h, "sig": sig, "fps": fps, "views": views, "aug": k,
-                       "aug_cfg": cfg["augment"] if k else None}
+                       "aug_cfg": cfg["augment"] if k else None, "zones": zones_mode if want_zones else "none"}
                 p = cache_path(cfg, key)
                 if not p.exists() or force:
                     if clip is None:
                         from ._video import load_clip
 
                         clip = load_clip(str(vids[n]), sample_fps=fps)
+                        zones = auto_zones(clip) if want_zones else None
                     aug = make_augmenter(int(stable_hash([h, k], 8), 16), cfg) if k else None
                     t0 = time.monotonic()
-                    fs = extract_clip(clip, backend, cfg, augmenter=aug, fps=fps, views=views)
+                    # зоны считаются по оригиналу; для аугментированной копии (другой ракурс) их геометрия
+                    # не верна -> зонные виды аугментаций остаются «неизвестно» (NaN), как при отсутствии зон
+                    fs = extract_clip(clip, backend, cfg, zones=zones if k == 0 else None, augmenter=aug,
+                                      fps=fps, views=views)
                     fs.meta.update({"aug": k, "md5": h})
                     fs.save(p)
                     log.info("extract [%d/%d] %s aug=%d: %d кадров за %.1f с", i + 1, len(names), n, k, len(fs),
@@ -76,7 +98,8 @@ def extract_dataset(videos_dir: str, labels_csv: str, cfg: dict, n_aug: Optional
                 feats.append(str(p.relative_to(cache_dir(cfg))) if p.is_relative_to(cache_dir(cfg)) else str(p))
             by_md5[h] = feats
         entries.append({"name": n, "file": vids[n].name, "md5": h, "label": lab.label, "times": lab.times,
-                        "type_id": lab.type_id, "group": lab.group, "features": feats})
+                        "type_id": lab.type_id, "pseudo_type_id": lab.pseudo_type_id, "group": lab.group,
+                        "features": feats})
     idx = {"version": 1, "backend": backend.name, "model_id": sig["model_id"], "fps": fps, "views": views,
            "n_aug": n_aug, "on_cuda": on_cuda, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
            "videos": entries, "missing_videos": missing, "unlabeled_videos": unlabeled,
@@ -100,10 +123,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--index", default=None)
+    ap.add_argument("--zones", default="none", choices=["none", "auto"],
+                    help="auto: зоны через ml.detect+ml.track для видов features.zone_views")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     cfg = load_config()
-    idx = extract_dataset(a.videos, a.labels, cfg, a.n_aug, a.force, "mock" if a.mock else None, a.limit, a.index)
+    idx = extract_dataset(a.videos, a.labels, cfg, a.n_aug, a.force, "mock" if a.mock else None, a.limit, a.index,
+                          zones_mode=a.zones)
     print(f"готово: {len(idx['videos'])} видео за {idx['elapsed_s']} с")
     return 0
 
