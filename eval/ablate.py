@@ -207,7 +207,7 @@ def run_arm(args: argparse.Namespace, arm: str, out: Path) -> int:
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Абляция baseline vs candidate (одно изменение)")
     ap.add_argument("--name", required=True, help="ID гипотезы, напр. H07-pooling-top3")
-    ap.add_argument("--videos", default="data/videos")
+    ap.add_argument("--videos", default="data/raw", help="папка видео (L1: data/raw)")
     ap.add_argument("--labels", default="data/labels.csv")
     ap.add_argument("--types", default="data/labels_types.csv")
     ap.add_argument("--manifest", default="data/manifest.csv")

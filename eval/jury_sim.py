@@ -373,7 +373,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Black-box приёмка по публичному URL")
     ap.add_argument("--url", required=True)
     ap.add_argument("--key", default=os.environ.get("SENTINEL_API_KEY", ""))
-    ap.add_argument("--videos", default="data/videos")
+    ap.add_argument("--videos", default="data/raw", help="папка видео (L1: data/raw)")
     ap.add_argument("--n", type=int, default=None, help="сколько видео (по умолчанию config jury_sim.n_videos)")
     ap.add_argument("--concurrency", type=int, default=3)
     ap.add_argument("--skip-stress", action="store_true")

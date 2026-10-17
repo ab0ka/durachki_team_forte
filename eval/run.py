@@ -288,7 +288,7 @@ def write_scores_raw(out_dir: Path, labels_csv: Optional[str | Path]) -> Optiona
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Прогон папки через пайплайн + метрики")
-    ap.add_argument("--videos", default="data/videos")
+    ap.add_argument("--videos", default="data/raw", help="папка видео (L1: data/raw)")
     ap.add_argument("--labels", default="data/labels.csv")
     ap.add_argument("--types", default="data/labels_types.csv")
     ap.add_argument("--out", default=None, help="по умолчанию runs/eval/<дата-время>")

@@ -77,7 +77,8 @@ runner:
 
 # --- Стресс-тест ракурса / качества ---
 robustness:
-  default_set: [persp_left, persp_right, rot_p10, rot_m20, zoom80, mirror, bright_p30, bright_m30, blur, h264_crf32, fps25]
+  default_set: [persp_left, persp_right, rot_p10, rot_m20, zoom80, mirror, bright_p30, bright_m30, blur, h264_crf32, fps25,
+                landscape_rot90, landscape_pad, rotmeta90, vfr_drop]
   crf: 20
   shift_tol_s: 2.0
 
