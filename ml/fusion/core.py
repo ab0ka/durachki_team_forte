@@ -465,7 +465,8 @@ def _source_weight(cfg: dict[str, Any], source: str) -> float:
 
 def temporal_mode(cfg: dict[str, Any]) -> str:
     """off (по умолчанию) | bonus | score — влияние temporal/риск-кривой на скор кластера."""
-    mode = str(cfg.get("temporal_mode", "off")).strip().lower()
+    raw = cfg.get("temporal_mode", "off")
+    mode = "off" if raw is False or raw is None else str(raw).strip().lower()   # YAML: голое off → False
     return mode if mode in {"off", "bonus", "score"} else "off"
 
 

@@ -28,7 +28,7 @@ combine: max          # max | noisy_or
 #           такой скор не может отсеивать видео; temporal остаётся в подсказках и на timeline;
 #   bonus — участвует только в бонусе согласия; score — как в фазе 1 (может задать базовый скор).
 # Кластер ТОЛЬКО из temporal всегда остаётся подсказкой (report_gate.temporal_only_types: false).
-temporal_mode: off
+temporal_mode: "off"   # в кавычках: голое off YAML читает как false
 
 agreement:            # небольшой ограниченный бонус за согласие источников (не «перемножение вероятностей»)
   min_conf: 0.3       # источник «согласен», если его взвешенный вклад ≥ min_conf
@@ -185,7 +185,7 @@ description:
 completeness:
   required: [ingest, detect, rules]       # без них «нарушений нет» не доказано
   optional: [track, pose, scene, temporal, vlm]  # падение → вердикт остаётся, но meta.degraded
-  ok_values: [ok, done, success, true, skipped_by_config]
+  ok_values: [ok, done, success, "true", skipped_by_config]
   # meta.coverage внутри fuse(): неполное покрытие видео + нет нарушений → status=failed, verdict=None.
   coverage_gate: true
   min_decoded: 0.98       # clip.meta["coverage"] от A04 (декодированная доля длительности) ниже → неполно
