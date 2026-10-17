@@ -144,3 +144,17 @@ def test_select_videos_dedupes(tmp_path: Path):
     assert ids == ["X-1", "X-2"]
     ids = [v for v, _ in select_videos(vdir, lab, load_config(), all_members=True)]
     assert "X-47" in ids
+
+
+def test_run_main_restores_environment(tmp_path: Path):
+    """eval.run.main не оставляет --env/raw-флагов в окружении процесса после себя."""
+    import os
+
+    from eval import run as runmod
+
+    lab = _labels(tmp_path, n=2)
+    (tmp_path / "preds").mkdir()
+    before = dict(os.environ)
+    runmod.main(["--labels", str(lab), "--preds", str(tmp_path / "preds"), "--no-log", "--raw",
+                 "--env", "SENTINEL_LEAK_PROBE=1", "--types", str(tmp_path / "none.csv")])
+    assert dict(os.environ) == before

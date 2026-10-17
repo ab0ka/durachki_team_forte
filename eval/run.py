@@ -291,6 +291,18 @@ def write_scores_raw(out_dir: Path, labels_csv: Optional[str | Path]) -> Optiona
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    """Флаги пайплайна (--env, --pipeline-config, raw) действуют только на время прогона: окружение процесса
+    восстанавливается при выходе (вызов из тестов/ablate --inproc-arms не оставляет SENTINEL_* после себя)."""
+    saved = dict(os.environ)
+    try:
+        return _main(argv)
+    finally:
+        for k in [k for k in os.environ if k not in saved]:
+            del os.environ[k]
+        os.environ.update(saved)
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Прогон папки через пайплайн + метрики")
     ap.add_argument("--videos", default="data/raw", help="папка видео (L1: data/raw)")
     ap.add_argument("--labels", default="data/labels.csv")

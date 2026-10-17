@@ -8,6 +8,38 @@
 **Все 42 видео датасета уже использованы в разведке → любая оценка на них — `exploratory`, не независимый тест.**
 Наш 100-балльный балл — явно помеченная аппроксимация (proxy), не официальная формула жюри.
 
+## Исправления после аудита интеграции (`claude/integration-cloud` @ 2055fc4)
+
+Проверено на актуальных A01 (`contracts.serialize`/`extensions`), A12 (`ml.fusion.tune`) и A03 (`backend.pipeline`):
+
+* **LOGO / nested CV — явный выбор тюнера** (`python -m eval.loo --tuner scalar|fusion`):
+  * `scalar` — встроенный скалярный порог (max `confidence` кандидатов `scores_raw` без gate/suppressed, как у A12);
+  * `fusion` — адаптер к настоящему `ml.fusion.tune`: `candidates_for(pred, cfg, types)` → `Sample`,
+    `fit(samples, start, default, …)` → пороги по типам, `predict(s, thr, default)` → вердикт.
+  
+  Сигнатуры, поля dataclass и форма результатов проверяются; несовпадение — `TunerContractError` (выход 2),
+  без подмены встроенным тюнером. Исключения тюнера не глушатся. Единица — группа дубликатов; каждый фолд
+  проверяет, что train и test не пересекаются (`assert_no_leak`). Видео без scores_raw исключаются с причиной,
+  а не получают скор 0.
+* **Тесты не меняют окружение сессии.** `SENTINEL_MOCK=1` больше не ставится при импорте conftest. Mock включается
+  только фикстурой `mock_mode` (monkeypatch). Автофикстура убирает `SENTINEL_*` хоста и выключает GPU-измерители
+  хоста (`SENTINEL_EVAL_DEVICE_METERS=off`). `eval.run.main` восстанавливает `os.environ` после прогона.
+  Фейковые пайплайны тестов следуют контракту A01: канонический `meta.coverage` (`compute_coverage`) и
+  `meta.mock=True` вместе с явным `SENTINEL_MOCK`. Production-сериализатор не ослаблен: `eval.run.result_to_api`
+  откатывается на asdict только при отсутствии модуля A01, ошибки самого сериализатора дают failed с причиной.
+* **Полнота анализа — канон A01:** `meta.coverage.ratio` / `complete` / required stages через
+  `contracts.extensions.coverage_problem`, порог `min_ratio_for_no_violation` из `contracts/config.yaml` (0.98).
+  `no_violation` без coverage не подтверждён, это partial (`coverage.require: true`).
+* **jury_sim:** `accept_to_done_s = 0.0` (мгновенный ответ, dedup/кэш) — валидное время. `None` (не измерено) — NOT RUN,
+  но не таймаут и не PASS. То же для времени загрузки.
+* **VRAM: две разные величины, подписаны отдельно.**
+  * **процесс/воркер пайплайна** — A03 `meta.stages[*].vram_peak_mb`, иначе `meta.vram_peak_mb`, иначе пик процесса eval;
+  * **устройство целиком** (nvidia-smi `memory.used`, все процессы на карте, включая чужие) — пик, фон до старта и прирост.
+  
+  Бюджет абляции (7500 МБ, не менялся) проверяется по памяти процесса/воркера, а если её нет — по приросту устройства
+  над фоном. Высокая занятость карты чужими процессами — только предупреждение. Нет измерения — `NOT MEASURED`, не 0.
+* **CLI A03:** у `backend.pipeline batch` нет `--raw`, поэтому eval его больше не передаёт (`scores_raw` A12 всегда кладёт в `meta`).
+
 ## Одна команда для L2 (абляция «одно изменение»)
 
 ```bash
@@ -84,10 +116,10 @@ pytest eval/tests -q                                  # без GPU и весов
 
 ## Решения фазы 2 (записано по требованию «решения — в README»)
 
-1. **Семантика «нет ответа ≠ чисто».** failed, missing, невалидный вердикт и `no_violation` при `meta.coverage < 0.95`
-   (partial) никогда не считаются TN. На позитиве это пропуск (FN), на негативе — `unresolved_neg`, что снижает
-   specificity. `coverage.require: false`: пока A03 не отдаёт coverage, отсутствие coverage не считается partial,
-   но считается в scorecard (`coverage_unknown`). Когда coverage появится, включить `require: true`.
+1. **Семантика «нет ответа ≠ чисто».** failed, missing, невалидный вердикт и `no_violation` без подтверждённой полноты
+   (канон A01: `meta.coverage.ratio` < 0.98, `complete=false`, нет coverage) — partial, никогда не TN. На позитиве это
+   пропуск (FN), на негативе — `unresolved_neg`, что снижает specificity. `coverage_unknown` — число ответов без
+   доли покрытия. `coverage.require: false` — только для старых прогонов без coverage.
 2. **unknown ≠ false в разметке.** Пустая или непонятная метка в labels.csv даёт `unknown`: группа исключается
    из метрик и выводится в `label_unknown_ids`, а не превращается в «без нарушения».
 3. **Конфликт 57/68 — отдельно** (`conflict_policy: separate`). Группа дубликатов с разными таймкодами считается
@@ -111,8 +143,10 @@ pytest eval/tests -q                                  # без GPU и весов
 `git_sha` (+dirty), `eval_version`, хэш и содержимое eval-конфига, путь и хэш конфига пайплайна (`--pipeline-config`
 → env `SENTINEL_PIPELINE_CONFIG`), флаги `SENTINEL_*` (`--env K=V`; ключи маскируются), версии пакетов через
 `importlib.metadata` (torch, transformers, bitsandbytes, opencv… — без импорта), GPU (nvidia-smi), список входов и
-`inputs_sha` (sha256 из labels.csv), `labels_sha256`, вид оценки, режим, subset. VRAM: пик `memory.used` всей карты
-по nvidia-smi на каждое видео (`VramSampler`) и `torch.cuda.max_memory_allocated`, если torch уже импортирован пайплайном.
+`inputs_sha` (sha256 из labels.csv), `labels_sha256`, вид оценки, режим, subset. VRAM на каждое видео:
+`vram_device_peak_mb` / `vram_device_baseline_mb` — вся карта по nvidia-smi (`VramSampler`, все процессы);
+`vram_eval_process_peak_mb` — процесс eval (torch уже импортирован пайплайном). Память воркера A03 берётся из
+ответа (`meta.stages[*].vram_peak_mb`). Не измерено — `null`.
 
 ## Санити-полы (`sanity.py`)
 
@@ -126,7 +160,8 @@ pytest eval/tests -q                                  # без GPU и весов
 
 * **Scorecard** (главное): вид оценки, n (+/−), recall / precision / specificity с 95% CI Вильсона, FN, FP, failed,
   partial, unresolved_neg, timeouts, degraded, coverage_unknown, hit событий @0.5/1/2/3, кадр ±1 с, лишние кандидаты,
-  тип (только при GT), latency median/p90/max, превышения SLA, пик VRAM, версии и хэши.
+  тип (только при GT), latency median/p90/max, превышения SLA, VRAM процесса/воркера и VRAM устройства (раздельно),
+  число mock-результатов (⚠ — проверка кода, не измерение), версии и хэши.
 * **Локализация — one-to-one** в окне `match_window_s` (5 с); hit@k по событиям. «Рано» / «поздно» — по знаку Δt.
   Лишние кандидаты считаются отдельно и в FP по видео не входят: разметка событий неполная (одна секунда на видео).
 * **Типы** — только по настоящей разметке (`labels_types.csv`, для наших съёмок — колонка `type_id`), иначе n/a.
@@ -173,7 +208,8 @@ n/a-компоненты исключаются, остальное перено
 
 Перспектива, поворот, кроп, зеркало, яркость, blur, h264, 25 fps — **синтетические возмущения, не доказательство
 работы на реальном новом ракурсе**. Варианты наследуют split исходника. LOGO по данным, на ошибках которых меняли
-пайплайн, — **exploratory**; nested CV оценивает процедуру подбора порога.
+пайплайн, — **exploratory**; nested CV оценивает процедуру подбора порога. Тюнер — явно: `--tuner scalar|fusion`
+(см. «Исправления после аудита»).
 
 ## Зависимости и модели
 
@@ -186,7 +222,7 @@ ffmpeg/ffprobe, nvidia-smi (опционально, для VRAM). torch eval н�
 * **A03 (`backend.pipeline`)**: inproc зовёт `run(path, job_id, progress, deadline_s)` / `warmup()`. Конфиг пайплайна
   передаётся через env `SENTINEL_PIPELINE_CONFIG` (имя — `runner.pipeline_config_env`), флаги — через `SENTINEL_*`.
   Их нужно читать при вызове `run()`, а не только при импорте: тогда работает и `--inproc-arms`.
-  **Просьба положить в `meta`:** `version`; `duration` (по PTS); `coverage` (0..1 или `{stage: доля}`; без неё partial не отличить
+  **Просьба положить в `meta`:** `version`; `duration` (по PTS); `coverage` (канон A01 `compute_coverage`; без неё partial не отличить
   от «чисто»); `models` (список hf_id); `mock` (true только в тестах/демо); `vram_peak_mb`; `timings.total_s`; `warnings`
   (строки с deadline/timeout при деградации); `error` при failed; `scores_raw` при `SENTINEL_RAW_SCORES=1`.
 * **A02 (API)**: jury_sim ожидает 401 / 415 / 404 / 413, `error` у failed. Загрузка ~29 МБ должна укладываться в таймаут
@@ -195,4 +231,24 @@ ffmpeg/ffprobe, nvidia-smi (опционально, для VRAM). torch eval н�
 * **A10**: train — по `data/splits.csv` (не holdout), аугментации — после split.
 * **A01**: решить про `reports/` в .gitignore (журнал — только агрегаты).
 * Ограничения: CLI-режим не знает латентности по каждому видео; сопоставление жадное (на 1–2 события результат тот же);
-  VRAM по nvidia-smi — пик всей карты с шагом опроса 0.5 с.
+  VRAM устройства по nvidia-smi — пик всей карты с шагом опроса 0.5 с (не память пайплайна).
+
+## Команды реальной оценки для L2 (локально; на 42 видео всё — exploratory, типы без разметки — n/a)
+
+```bash
+# 1. FN/FP/failed/partial, локализация hit@1/2/3, кадр ±1 с, схема ТЗ, latency, VRAM процесса и устройства:
+python -m eval.run --videos data/raw --labels data/labels.csv --label base --out runs/eval/base --raw
+# 2. Очередь + латентность через сервис (время от приёма, включая очередь), тот же scorecard:
+python -m eval.run --api http://127.0.0.1:8000 --key $SENTINEL_API_KEY --videos data/raw --labels data/labels.csv \
+    --label base-api --out runs/eval/base-api
+# 3. Black-box приёмка (последовательно 5+, затем пачка ≤ 3; Cloudflare-загрузка, PTS, JPEG, mock, partial):
+python -m eval.jury_sim --url https://<tunnel> --key $SENTINEL_API_KEY --videos data/raw --n 6 --concurrency 3
+# 4. Пороги: LOGO (exploratory) и nested CV для обоих тюнеров на сырых скорах прогона 1:
+python -m eval.loo --scores runs/eval/base/scores_raw.jsonl --tuner fusion
+python -m eval.loo --scores runs/eval/base/scores_raw.jsonl --tuner scalar
+# 5. Санити-полы и утечки длительности/позиции/номера файла:
+python -m eval.sanity --labels data/labels.csv --manifest data/manifest.csv --run runs/eval/base
+```
+
+Наружу — только `summary_public.json`, `compare_public.json`, `loo_*.json` (агрегаты; `excluded`/`per_fold` содержат
+ID видео — оставить локально или удалить перед передачей) и `reports/runs.jsonl`.

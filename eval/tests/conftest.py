@@ -18,12 +18,16 @@ if str(REPO) not in sys.path:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_eval_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_eval_env(monkeypatch: pytest.MonkeyPatch):
     """Каждый тест eval стартует без SENTINEL_* хоста и без GPU-измерителей хоста (nvidia-smi/torch):
-    иначе состояние чужой видеокарты (например, 7.6 ГБ занято) попадает в юниттест. Всё откатывается."""
+    иначе состояние чужой видеокарты (например, 7.6 ГБ занято) попадает в юниттест. После теста убираются и
+    SENTINEL_*, поставленные кодом мимо monkeypatch; затем monkeypatch возвращает значения хоста."""
     for k in [k for k in os.environ if k.startswith("SENTINEL_")]:
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("SENTINEL_EVAL_DEVICE_METERS", "off")
+    yield
+    for k in [k for k in os.environ if k.startswith("SENTINEL_")]:
+        del os.environ[k]
 
 
 @pytest.fixture
