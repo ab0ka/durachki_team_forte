@@ -44,7 +44,7 @@ def test_event_objects_are_accepted() -> None:
     try:
         from contracts.sentinel_contracts import Event  # type: ignore
     except ImportError:
-        from ml.ingest._contract_fallback import Event
+        from contracts.sentinel_contracts import Event
     ev = Event(type_id="V02", t_start=2.0, t_end=3.0, t_peak=2.4, confidence=0.6, source="rules")
     (w,) = CF.merge_windows([ev], duration=10.0, pad_s=0.0, min_window_s=0.5)
     assert (w.t0, w.t1, w.score) == (2.0, 3.0, 0.6) and w.meta["type_id"] == "V02"

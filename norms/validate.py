@@ -51,7 +51,7 @@ EXAMPLE_KINDS = {"positive": "candidate", "negative": "no_violation", "unknown":
 try:
     from contracts.sentinel_contracts import SIGNALS as _SIGNALS
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import SIGNALS as _SIGNALS
+    from contracts.sentinel_contracts import SIGNALS as _SIGNALS
 SIGNAL_NAMES = frozenset(_SIGNALS)
 _RETRIEVAL_TO_LEVEL = {"fulltext": "fulltext", "partial": "snippet", "search_snippets": "snippet"}
 _NOT_QUOTABLE_RE = re.compile(r"<!--\s*not-quotable\s*-->.*?<!--\s*/not-quotable\s*-->", re.S)
