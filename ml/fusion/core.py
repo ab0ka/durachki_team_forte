@@ -17,6 +17,7 @@ from .catalog import known_type, resolve_catalog, rule_refs, type_info
 from .config import load_config, load_thresholds, threshold_for
 from .describe import build_description, clean_facts, format_time
 from .serialize import event_to_dict, to_jsonable
+from .timing import clip_times, snap_time
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class Candidate:
     risk_support: float = 0.0
     n_events: int = 0
     facts: list[str] = field(default_factory=list)
+    obs_facts: list[str] = field(default_factory=list)   # наблюдаемые факты от rules/VLM (для гейта)
     bboxes: dict[str, BBox] = field(default_factory=dict)
     track_ids: list[int] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -83,6 +85,7 @@ class Candidate:
     threshold: float = 0.5
     reported: bool = False
     suppressed_by: Optional[str] = None
+    gate: list[str] = field(default_factory=list)        # почему НЕ нарушение (пусто — гейт пройден)
 
     @property
     def key(self) -> str:
@@ -109,6 +112,8 @@ class Candidate:
                 "threshold": self.threshold,
                 "reported": self.reported,
                 "suppressed_by": self.suppressed_by,
+                "gate": self.gate,
+                "n_obs_facts": len(self.obs_facts),
             },
             4,
         )
@@ -470,8 +475,12 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
     ordered = sorted(pool, key=lambda e: (SOURCE_PRIORITY.index(e.source) if e.source in SOURCE_PRIORITY
                                           else len(SOURCE_PRIORITY), -e.confidence))
     facts: list[str] = []
+    obs_facts: list[str] = []
+    fact_sources = set((cfg.get("report_gate") or {}).get("fact_sources") or ["rules", "vlm"])
     for e in ordered:
         facts.extend(e.facts)
+        if e.positive and e.source in fact_sources:
+            obs_facts.extend(e.facts)
     bboxes: dict[str, BBox] = dict(peak_ev.bboxes)
     box_dt = _f((cfg.get("evidence") or {}).get("box_max_dt_s", 1.5), 1.5)
     for e in ordered:
@@ -510,6 +519,7 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
         risk_support=risk_support,
         n_events=len(group),
         facts=facts,
+        obs_facts=obs_facts,
         bboxes=bboxes,
         track_ids=track_ids,
         extra=extra,
@@ -545,7 +555,10 @@ def risk_only_candidates(
     types: dict[str, dict[str, Any]],
     cfg: dict[str, Any],
 ) -> list[Candidate]:
-    """Высокий риск temporal без событий rules/других источников → V99/лучший тип с пониженной уверенностью."""
+    """Высокий риск temporal без событий других источников → ПОДСКАЗКА (V99/лучший тип) для просмотра человеком.
+
+    Такие кандидаты никогда не становятся нарушением: «модель заметила аномалию» — не наблюдаемый факт.
+    """
     if not risk:
         return []
     rcfg = cfg.get("risk") or {}
@@ -575,6 +588,7 @@ def risk_only_candidates(
                 n_events=0,
                 facts=[fact],
                 peak_source="risk_curve",
+                gate=["risk_only"],
             )
         )
     out.sort(key=lambda c: -c.confidence)
@@ -604,6 +618,30 @@ def cross_type_nms(cands: list[Candidate], cfg: dict[str, Any]) -> None:
                 break
         if c.suppressed_by is None:
             kept.append(c)
+
+
+def catalog_has_norms(types: dict[str, dict[str, Any]]) -> bool:
+    return any(entry.get("rules") for entry in types.values() if isinstance(entry, dict))
+
+
+def gate_reasons(c: Candidate, types: dict[str, dict[str, Any]], cfg: dict[str, Any], catalog_ok: bool
+                 ) -> list[str]:
+    """Нарушение = конкретный наблюдаемый факт + применимая норма (+ не только temporal)."""
+    gcfg = cfg.get("report_gate") or {}
+    reasons: list[str] = []
+    if c.origin == "risk":
+        return ["risk_only"]
+    if gcfg.get("require_fact", True) and not clean_facts(c.obs_facts, cfg, max_facts=1):
+        reasons.append("no_observable_fact")
+    if not gcfg.get("temporal_only_types", False) and set(c.conf_by_source) <= {"temporal"}:
+        reasons.append("temporal_only")
+    if gcfg.get("require_norm", True):
+        if catalog_ok:
+            if not rule_refs(types, c.type_id):
+                reasons.append("no_norm")
+        elif str(gcfg.get("norm_missing_if_no_catalog", "report")).lower() == "hint":
+            reasons.append("norms_catalog_unavailable")
+    return reasons
 
 
 def timecode(t: float, duration: float, ndigits: int = 1) -> float:
@@ -645,8 +683,14 @@ def fuse_scores(
     types: dict[str, dict[str, Any]],
     cfg: dict[str, Any],
     thresholds: dict[str, Any],
+    catalog_ok: Optional[bool] = None,
 ) -> FusionOutcome:
-    """Чистое слияние без кадров: кандидаты, вердикт, timeline. Используется fuse() и тюнером."""
+    """Чистое слияние без кадров: кандидаты, вердикт, timeline. Используется fuse() и тюнером.
+
+    ``confidence`` кандидата — эвристический скор 0..1 (источники коррелированы), не вероятность.
+    """
+    if catalog_ok is None:
+        catalog_ok = catalog_has_norms(types)
     norm, warnings = normalize_events(events, duration, types, cfg)
     curve = RiskCurve(risk)
     gap = _f((cfg.get("grouping") or {}).get("merge_gap_s", 3.0), 3.0)
@@ -663,7 +707,10 @@ def fuse_scores(
         c.t_end = timecode(max(c.t_end, c.t_peak), duration, nd)
         c.confidence = round(c.confidence, 4)
         c.threshold = threshold_for(thresholds, c.type_id)
-        c.reported = c.suppressed_by is None and c.confidence > 0 and c.confidence >= c.threshold
+        if c.origin != "risk":
+            c.gate = gate_reasons(c, types, cfg, catalog_ok)
+        c.reported = (c.suppressed_by is None and not c.gate and c.confidence > 0
+                      and c.confidence >= c.threshold)
 
     max_v = int(_f(ocfg.get("max_violations", 10), 10))
     reported = sorted((c for c in cands if c.reported), key=lambda c: -c.confidence)
@@ -722,9 +769,71 @@ def _evidence_enabled(cfg: dict[str, Any]) -> bool:
     return bool((cfg.get("evidence") or {}).get("enabled", True))
 
 
+_GATE_RU = {
+    "risk_only": "только высокий риск временной модели — нет наблюдаемого факта",
+    "no_observable_fact": "нет конкретного наблюдаемого факта от правил/VLM",
+    "temporal_only": "сигнал только временной модели",
+    "no_norm": "для типа нет применимой нормы в каталоге",
+    "norms_catalog_unavailable": "каталог норм недоступен",
+    "below_threshold": "скор ниже порога",
+    "suppressed": "перекрыт более сильным нарушением другого типа",
+    "over_limit": "превышен лимит нарушений в ответе",
+}
+
+
+def _hint(c: Candidate, types: dict[str, dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
+    reasons = list(c.gate)
+    if c.suppressed_by:
+        reasons.append("suppressed")
+    if not reasons and c.confidence < c.threshold:
+        reasons.append("below_threshold")
+    if not reasons:
+        reasons.append("over_limit")
+    return {
+        "type_id": c.type_id,
+        "type": str(type_info(types, c.type_id).get("name") or c.type_id),
+        "timecode_sec": c.t_peak,
+        "t_start": c.t_start,
+        "t_end": c.t_end,
+        "score": c.confidence,
+        "threshold": c.threshold,
+        "facts": clean_facts(c.facts, cfg),
+        "reasons": reasons,
+        "reasons_ru": [_GATE_RU.get(r, r) for r in reasons],
+        "suppressed_by": c.suppressed_by,
+        "origin": c.origin,
+    }
+
+
+def _norms_ui(types: dict[str, dict[str, Any]], type_id: str) -> list[dict[str, Any]]:
+    """Нормы для UI-отчёта: статус проверки явно, неподтверждённые не выдаются за подтверждённые."""
+    out = []
+    for r in rule_refs(types, type_id):
+        out.append({
+            "document": r.document, "clause": r.clause, "url": r.url, "quote": r.quote,
+            "verified": bool(r.verified),
+            "status_ru": "норма сверена с источником" if r.verified else "НЕ подтверждено: требует сверки юристом",
+        })
+    return out
+
+
+def _verified_norm_text(types: dict[str, dict[str, Any]], type_id: str, cfg: dict[str, Any]) -> Optional[str]:
+    """Короткая ссылка на первую СВЕРЕННУЮ норму для текста описания; неподтверждённые не цитируются."""
+    if str((cfg.get("description") or {}).get("cite_norm", "verified_only")).lower() != "verified_only":
+        return None
+    for r in rule_refs(types, type_id):
+        if r.verified:
+            return f"{r.document}, {r.clause}" if r.clause else r.document
+    return None
+
+
 def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog: dict, job_id: str
          ) -> AnalysisResult:
-    """Слияние событий → AnalysisResult(status="done"). Сигнатура заморожена контрактом v1."""
+    """Слияние событий → AnalysisResult(status="done"). Сигнатура заморожена контрактом v1.
+
+    Полноту анализа (упавшие стадии) fuse не видит — оркестратор вызывает
+    ``ml.fusion.apply_completeness(result, stages)`` после fuse (см. README).
+    """
     t0 = time.perf_counter()
     events = list(events or [])
     risk = list(risk or [])
@@ -732,12 +841,26 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
     thresholds = load_thresholds()
     try:
         types, warnings = resolve_catalog(catalog)
+        catalog_ok = catalog_has_norms(types)
         duration = _clip_duration(clip, events, risk)
-        outcome = fuse_scores(events, risk, duration, types, cfg, thresholds)
-    except Exception as exc:  # noqa: BLE001 — аварийный режим: не теряем нарушение
+        outcome = fuse_scores(events, risk, duration, types, cfg, thresholds, catalog_ok=catalog_ok)
+    except Exception as exc:  # noqa: BLE001 — аварийный режим: не теряем нарушение и не выдаём ложно-чистый
         log.exception("fusion failed, emergency mode")
-        return _emergency_result(clip, events, risk, catalog, job_id, cfg, thresholds, exc)
+        return _emergency_result(clip, events, catalog, job_id, cfg, thresholds, exc)
     warnings = warnings + outcome.warnings
+    # Таймкод = PTS реального кадра (сетка clip.times / fps) → совпадает с основным кадром-доказательством.
+    times, fps = clip_times(clip), _f(getattr(clip, "fps", 0.0), 0.0)
+    nd = int(_f((cfg.get("output") or {}).get("timecode_round", 1), 1))
+    for cand in outcome.reported:
+        pts = snap_time(times, fps, duration, cand.t_peak)
+        if abs(pts - cand.t_peak) <= 0.5:
+            cand.extra["t_peak_pts"] = round(pts, 4)
+            cand.t_peak = pts
+            cand.t_start = min(cand.t_start, pts)
+            cand.t_end = max(cand.t_end, pts)
+        cand.t_peak = timecode(cand.t_peak, duration, nd)
+    if not catalog_ok:
+        warnings.append("norms: в каталоге нет ни одной нормы — нарушения выдаются без ссылок на нормы")
     t_scores = time.perf_counter() - t0
 
     renderer = None
@@ -750,18 +873,21 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
             warnings.append(f"evidence disabled: {exc!r}")
 
     violations: list[Violation] = []
-    for cand in outcome.reported:
+    overlays: list[dict[str, Any]] = []
+    for i, cand in enumerate(outcome.reported):
         info = type_info(types, cand.type_id)
         try:
-            description = build_description(cand.type_id, info, cand.facts, cand.t_peak, cfg, cand.confidence)
+            description = build_description(cand.type_id, info, cand.facts, cand.t_peak, cfg, cand.confidence,
+                                            norm_ref=_verified_norm_text(types, cand.type_id, cfg))
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"description fallback for {cand.key}: {exc!r}")
             description = (f"На {format_time(cand.t_peak)} зафиксированы признаки возможного нарушения "
                            f"«{info.get('name', cand.type_id)}». Требуется проверка человеком.")
-        frames = []
+        frames: list[Any] = []
+        ui: dict[str, Any] = {}
         if renderer is not None:
             try:
-                frames = renderer.render(cand, info)
+                frames, ui = renderer.render(cand, info)
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"evidence failed for {cand.key}: {exc!r}")
         violations.append(
@@ -777,37 +903,42 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
                 rules=rule_refs(types, cand.type_id),
             )
         )
+        overlays.append({
+            "violation_index": i,
+            "type_id": cand.type_id,
+            "timecode_sec": cand.t_peak,
+            "frames": ui.get("frames", []),
+            "shapes": ui.get("shapes", []),
+            "facts": clean_facts(cand.facts, cfg),
+            "norms": _norms_ui(types, cand.type_id),
+            "sources": {k: round(v, 3) for k, v in cand.conf_by_source.items()},
+            "vlm": cand.vlm_state,
+        })
     if renderer is not None:
         warnings.extend(renderer.warnings)
 
     floor = _f((cfg.get("output") or {}).get("candidate_floor", 0.15), 0.15)
-    hints = [
-        {
-            "type_id": c.type_id,
-            "type": str(type_info(types, c.type_id).get("name") or c.type_id),
-            "timecode_sec": c.t_peak,
-            "confidence": c.confidence,
-            "threshold": c.threshold,
-            "facts": clean_facts(c.facts, cfg),
-            "suppressed_by": c.suppressed_by,
-        }
-        for c in outcome.candidates
-        if not c.reported and c.confidence >= floor
-    ]
+    hints = [_hint(c, types, cfg) for c in outcome.candidates if not c.reported and c.confidence >= floor]
     meta = {
         "scores_raw": _raw_scores(events, risk, outcome),
         "fusion": {
             "version": FUSION_VERSION,
+            "combine": str(cfg.get("combine", "max")),
+            "score_note": "confidence — эвристический скор 0..1 по коррелированным источникам, не вероятность",
             "thresholds": {"default": thresholds.get("default"), "per_type": thresholds.get("per_type"),
                            "tuned": thresholds.get("tuned", False)},
             "n_events_in": len(events),
             "n_candidates": len(outcome.candidates),
-            "candidates": hints,
             "timings": {
                 "scores_s": round(t_scores, 4),
                 "evidence_s": round(renderer.elapsed if renderer is not None else 0.0, 4),
                 "total_s": round(time.perf_counter() - t0, 4),
             },
+        },
+        "ui": {
+            "review_hints": hints,
+            "evidence_overlays": overlays,
+            "norms_catalog": "ok" if catalog_ok else "unavailable",
         },
         "warnings": warnings,
         "disclaimer": "Результат — подсказка для проверяющего, а не юридическое заключение.",
@@ -822,9 +953,10 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
     )
 
 
-def _emergency_result(clip: Any, events: list[Any], risk: list[Any], catalog: Any, job_id: str,
-                      cfg: dict[str, Any], thresholds: dict[str, Any], exc: Exception) -> AnalysisResult:
-    """Минимальный результат без кадров, если основная логика упала: событие ≥ τ → нарушение."""
+def _emergency_result(clip: Any, events: list[Any], catalog: Any, job_id: str, cfg: dict[str, Any],
+                      thresholds: dict[str, Any], exc: Exception) -> AnalysisResult:
+    """Слияние упало. Найденное событие с фактом ≥ τ → violation (неполный анализ помечен);
+    иначе — технический status=failed без вердикта, а НЕ скрытый «чистый» no_violation."""
     try:
         types, _ = resolve_catalog(catalog)
     except Exception:  # noqa: BLE001
@@ -835,13 +967,14 @@ def _emergency_result(clip: Any, events: list[Any], risk: list[Any], catalog: An
         try:
             type_id = str(_get(ev, "type_id", "V99") or "V99")
             conf = _clamp(_f(_get(ev, "confidence"), 0.0), 0.0, 1.0)
-            if conf < threshold_for(thresholds, type_id):
+            facts = clean_facts(_get(ev, "facts", []) or [], cfg)
+            if conf < threshold_for(thresholds, type_id) or not facts:
                 continue
             info = type_info(types, type_id) if types else {"name": type_id}
             t = timecode(_f(_get(ev, "t_peak"), 0.0), duration)
             violations.append(Violation(
                 type=str(info.get("name") or type_id), timecode_sec=t,
-                description=(f"На {format_time(t)} зафиксированы признаки возможного нарушения "
+                description=(f"На {format_time(t)} видно: {'; '.join(facts)}. Признаки возможного нарушения "
                              f"«{info.get('name', type_id)}». Требуется проверка человеком."),
                 evidence_frames=[], type_id=type_id, confidence=round(conf, 3), t_start=t, t_end=t,
                 rules=rule_refs(types, type_id) if types else []))
@@ -849,9 +982,12 @@ def _emergency_result(clip: Any, events: list[Any], risk: list[Any], catalog: An
             continue
     violations = sorted(violations, key=lambda v: -v.confidence)[:10]
     violations.sort(key=lambda v: v.timecode_sec)
-    return AnalysisResult(
-        job_id=str(job_id), status="done",
-        verdict="violation" if violations else "no_violation",
-        violations=violations, timeline=[],
-        meta={"warnings": [f"fusion emergency mode: {exc!r}"], "fusion": {"version": FUSION_VERSION}},
-    )
+    error = {"stage": "fusion", "error": repr(exc)}
+    meta: dict[str, Any] = {"warnings": [f"fusion emergency mode: {exc!r}"], "fusion": {"version": FUSION_VERSION},
+                            "analysis_complete": False, "errors": [error]}
+    if violations:
+        return AnalysisResult(job_id=str(job_id), status="done", verdict="violation", violations=violations,
+                              timeline=[], meta=meta)
+    meta["failure"] = {"reason": "fusion_error",
+                       "message_ru": "Анализ не завершён из-за технической ошибки слияния; вердикт не выносится."}
+    return AnalysisResult(job_id=str(job_id), status="failed", verdict=None, violations=[], timeline=[], meta=meta)

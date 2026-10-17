@@ -91,8 +91,61 @@ def event_from_dict(d: dict[str, Any]) -> Event:
     )
 
 
+JURY_VIOLATION_KEYS = ("type", "timecode_sec", "description", "evidence_frames")
+JURY_TOP_KEYS = ("job_id", "status", "verdict", "violations")
+
+
+def result_to_jury(result: AnalysisResult) -> dict[str, Any]:
+    """Строгий ответ жюри. Канон — ``contracts.serialize.result_to_api`` (A01); пока его нет —
+    локальный fallback РОВНО по схеме ТЗ (без meta/подсказок/оверлеев)."""
+    try:
+        from contracts.serialize import result_to_api as a01_result_to_api  # type: ignore[import-not-found]
+    except ImportError:
+        a01_result_to_api = None
+    if a01_result_to_api is not None:
+        return a01_result_to_api(result)
+    out = {
+        "job_id": str(result.job_id),
+        "status": str(result.status),
+        "verdict": result.verdict if result.status == "done" else None,
+        "violations": [
+            {
+                "type": str(v.type),
+                "timecode_sec": float(v.timecode_sec),
+                "description": str(v.description),
+                "evidence_frames": [
+                    {"timestamp_sec": float(f.timestamp_sec), "image_base64": str(f.image_base64)}
+                    for f in (v.evidence_frames or [])
+                ],
+            }
+            for v in (result.violations or [])
+        ] if result.status == "done" else [],
+    }
+    return out
+
+
+def result_to_ui_report(result: AnalysisResult) -> dict[str, Any]:
+    """Полный отчёт для UI/проверяющего: всё из API + нормы со статусом сверки, подсказки, оверлеи,
+    полнота анализа. Не для автоматической проверки жюри."""
+    out = result_to_api(result)
+    meta = result.meta or {}
+    ui = meta.get("ui") or {}
+    out["ui"] = to_jsonable(ui)
+    out["analysis_complete"] = meta.get("analysis_complete")
+    out["warnings"] = to_jsonable(meta.get("warnings") or [])
+    out["disclaimer"] = meta.get("disclaimer", "Результат — подсказка для проверяющего, а не юридическое заключение.")
+    for v in out["violations"]:
+        for r in v.get("rules") or []:
+            r["status_ru"] = ("норма сверена с источником" if r.get("verified")
+                              else "НЕ подтверждено: требует сверки юристом")
+    return out
+
+
 def result_to_api(result: AnalysisResult) -> dict[str, Any]:
-    """AnalysisResult → JSON ответа ``GET /api/v1/jobs/{job_id}``: обязательные поля ТЗ + доп. поля."""
+    """AnalysisResult → JSON ответа ``GET /api/v1/jobs/{job_id}``: обязательные поля ТЗ + доп. поля.
+
+    Fallback до слияния A01 (contracts.serialize). ``rules[].verified`` — как в каталоге, не «повышается».
+    """
     violations = []
     for v in result.violations or []:
         violations.append(

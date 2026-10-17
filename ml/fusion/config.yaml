@@ -18,12 +18,15 @@ sources:
   fusion: 0.8
   other: 0.6
 
-combine: noisy_or     # noisy_or | max — как объединять взвешенные уверенности источников
+# Как объединять взвешенные скоры источников. Скоры rules/temporal/VLM КОРРЕЛИРОВАНЫ (одни и те же кадры,
+# общие детекции), поэтому итог — эвристический скор 0..1, а НЕ вероятность. По умолчанию — max
+# (не предполагает независимости); noisy_or предполагает независимость и завышает скор — не рекомендуется.
+combine: max          # max | noisy_or
 
-agreement:            # бонус за согласие независимых источников
+agreement:            # небольшой ограниченный бонус за согласие источников (не «перемножение вероятностей»)
   min_conf: 0.3       # источник «согласен», если его взвешенный вклад ≥ min_conf
-  bonus_per_source: 0.07
-  max_bonus: 0.15
+  bonus_per_source: 0.05
+  max_bonus: 0.10
 
 vlm:
   reject_factor: 0.6      # множитель уверенности, если VLM отклонил событие (VLM-понижение)
@@ -34,11 +37,21 @@ risk:                     # риск-кривая temporal
   support_weight: 0.6     # вклад кривой в кластер, если явного temporal-события нет
   support_min: 0.5        # значения кривой ниже — не считаются поддержкой
   support_pad_s: 1.0      # окно поиска поддержки вокруг события
-  high: 0.65              # «высокий риск» для событий только по кривой (правил нет)
+  # Участки высокого риска БЕЗ событий других источников НЕ становятся нарушением (нет наблюдаемого
+  # факта и нормы) — они уходят в meta.ui.review_hints как «участок для просмотра человеком».
+  high: 0.65              # «высокий риск» для подсказок
   min_duration_s: 0.4     # минимальная длительность участка высокого риска
-  only_factor: 0.7        # понижение уверенности для события только по кривой
-  fallback_type: V99      # тип, если temporal не подсказал лучший
-  max_events: 3           # не больше стольких событий только по кривой на видео
+  only_factor: 0.7        # скор подсказки = пик риска * only_factor
+  fallback_type: V99      # тип подсказки, если temporal не подсказал лучший
+  max_events: 3           # не больше стольких подсказок по кривой на видео
+
+# Что нужно, чтобы кандидат стал НАРУШЕНИЕМ в ответе (иначе — подсказка в meta.ui.review_hints).
+report_gate:
+  require_fact: true            # ≥1 конкретный наблюдаемый факт от rules/VLM (не «модель заметила аномалию»)
+  fact_sources: [rules, vlm]    # чьи факты считаются наблюдаемыми
+  require_norm: true            # тип есть в каталоге и у него ≥1 норма
+  norm_missing_if_no_catalog: report   # каталог norms недоступен целиком: report (с warning) | hint
+  temporal_only_types: false    # событие ТОЛЬКО от temporal (без фактов) — нарушение? (false → подсказка)
 
 output:
   max_violations: 10
@@ -48,6 +61,10 @@ output:
 
 evidence:
   enabled: true
+  # В evidence_frames (ответ жюри) — ЧИСТЫЙ исходный кадр с реальным PTS (без рамок и подписей).
+  # Кадры с оверлеями (боксы, подписи, штамп времени) — отдельно в meta.ui.evidence_overlays для UI.
+  ui_overlays: true       # рендерить JPEG с оверлеями для UI
+  ui_overlay_frames: 1    # сколько кадров каждого нарушения рендерить с оверлеем (экономия размера)
   max_frames: 3           # 1..3 кадра на нарушение
   window_s: 1.0           # поиск самого резкого кадра в t_peak ± window_s
   min_sep_s: 0.4          # кадры одного нарушения — разные моменты
@@ -59,13 +76,17 @@ evidence:
   max_bytes: 200000       # JPEG ≤ 200 КБ
   jpeg_quality: [88, 80, 72, 64, 56, 48, 40, 32]
   budget_s: 20.0          # бюджет на все кадры видео; при превышении — по 1 кадру без поиска резкости
-  blur_heads: true        # приватность: размытие голов
-  head_frac: 0.18         # без ключевых точек — размываем верхние 18% бокса человека
+  blur_heads: true        # приватность: размытие голов ТОЛЬКО по надёжной локализации
+                          # (ключевые точки головы COCO 0..4 или явные head_boxes в Event.extra)
+  head_fallback: none     # none | top_frac. top_frac — верх bbox (на потолочной камере НЕ голова, может
+                          # скрыть руки/действия) — включать только осознанно
+  head_frac: 0.18         # доля высоты bbox для head_fallback=top_frac
   head_kp_min_score: 0.3
   draw_boxes: true
   font_paths: []          # доп. пути к TTF с кириллицей (env SENTINEL_FONT приоритетнее)
 
 description:
+  cite_norm: verified_only   # verified_only | none — в текст описания попадает только СВЕРЕННАЯ норма
   max_facts: 3
   max_chars: 420
   check_sentence: "Требуется проверка человеком."
@@ -95,3 +116,11 @@ description:
     - "присвоил\\w*"
     - "присвоени\\w*"
     - "нарушил\\w*"
+
+# Полнота анализа (согласовано с A03): apply_completeness(result, stages) после fuse().
+# Если обязательная стадия упала/не выполнена и нарушений не найдено — status=failed, verdict=None
+# (технический отказ), а НЕ скрытый «чистый» вердикт done/no_violation.
+completeness:
+  required: [ingest, detect, rules]       # без них «нарушений нет» не доказано
+  optional: [track, pose, scene, temporal, vlm]  # падение → вердикт остаётся, но meta.degraded
+  ok_values: [ok, done, success, true, skipped_by_config]

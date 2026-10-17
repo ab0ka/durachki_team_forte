@@ -137,6 +137,15 @@ def severity(types: dict[str, dict[str, Any]], type_id: str) -> str:
     return sev if sev in {"low", "medium", "high"} else "medium"
 
 
+def is_verified(value: Any) -> bool:
+    """Строго: только YAML true / "true" / "yes" / 1. Строка "false" или мусор → False (не выдаём за сверенную)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value).strip().lower() in {"true", "yes", "да", "1", "verified"}
+
+
 def rule_refs(types: dict[str, dict[str, Any]], type_id: str) -> list[RuleRef]:
     """Нормы ТОЛЬКО из каталога: поля document/clause/url/quote/verified как в нём."""
     entry = types.get(type_id) or {}
@@ -155,7 +164,7 @@ def rule_refs(types: dict[str, dict[str, Any]], type_id: str) -> list[RuleRef]:
                 clause=str(clause) if clause not in (None, "") else None,
                 url=url,
                 quote=str(raw.get("quote") or ""),
-                verified=bool(raw.get("verified", False)),
+                verified=is_verified(raw.get("verified", False)),
             )
         )
     return out

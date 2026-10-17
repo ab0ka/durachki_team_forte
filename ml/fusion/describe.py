@@ -106,8 +106,12 @@ def build_description(
     t_peak: float,
     cfg: dict[str, Any],
     confidence: Optional[float] = None,
+    norm_ref: Optional[str] = None,
 ) -> str:
-    """1–3 предложения: что видно → почему это может быть нарушением → проверка человеком."""
+    """1–3 предложения: что видно → почему это может быть нарушением → проверка человеком.
+
+    ``norm_ref`` — ТОЛЬКО сверенная норма из каталога (verified=true); дописывается к «почему».
+    """
     dcfg = cfg.get("description") or {}
     check = _ensure_period(str(dcfg.get("check_sentence") or "Требуется проверка человеком."))
     max_chars = int(dcfg.get("max_chars", 420))
@@ -156,6 +160,9 @@ def build_description(
     if not any("возможн" in s.lower() for s in body):
         why_generic = f"Это может быть признаком возможного нарушения: «{name}»."
         body = body[:1] + [why_generic]
+    if norm_ref and not (rx and rx.search(norm_ref)):
+        last = body[-1].rstrip(".!?… ")
+        body[-1] = f"{last} (норма: {norm_ref.strip().rstrip('.')})."
     text = " ".join(body + [check])
     if len(text) > max_chars:
         head = " ".join(body)

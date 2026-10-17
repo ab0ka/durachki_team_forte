@@ -31,8 +31,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fusion": 0.8,
         "other": 0.6,
     },
-    "combine": "noisy_or",
-    "agreement": {"min_conf": 0.3, "bonus_per_source": 0.07, "max_bonus": 0.15},
+    "combine": "max",
+    "agreement": {"min_conf": 0.3, "bonus_per_source": 0.05, "max_bonus": 0.10},
     "vlm": {"reject_factor": 0.6, "reject_min_score": 0.5, "unsure_factor": 1.0},
     "risk": {
         "support_weight": 0.6,
@@ -44,6 +44,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fallback_type": "V99",
         "max_events": 3,
     },
+    "report_gate": {
+        "require_fact": True,
+        "fact_sources": ["rules", "vlm"],
+        "require_norm": True,
+        "norm_missing_if_no_catalog": "report",
+        "temporal_only_types": False,
+    },
     "output": {
         "max_violations": 10,
         "timeline_step_s": 0.5,
@@ -52,6 +59,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "evidence": {
         "enabled": True,
+        "ui_overlays": True,
+        "ui_overlay_frames": 1,
         "max_frames": 3,
         "window_s": 1.0,
         "min_sep_s": 0.4,
@@ -64,12 +73,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "jpeg_quality": [88, 80, 72, 64, 56, 48, 40, 32],
         "budget_s": 20.0,
         "blur_heads": True,
+        "head_fallback": "none",
         "head_frac": 0.18,
         "head_kp_min_score": 0.3,
         "draw_boxes": True,
         "font_paths": [],
     },
     "description": {
+        "cite_norm": "verified_only",
         "max_facts": 3,
         "max_chars": 420,
         "check_sentence": "Требуется проверка человеком.",
@@ -100,6 +111,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             r"нарушил\w*",
         ],
     },
+}
+
+DEFAULT_CONFIG["completeness"] = {
+    "required": ["ingest", "detect", "rules"],
+    "optional": ["track", "pose", "scene", "temporal", "vlm"],
+    "ok_values": ["ok", "done", "success", "true", "skipped_by_config"],
 }
 
 DEFAULT_THRESHOLDS: dict[str, Any] = {
