@@ -62,6 +62,8 @@ safe:
   geom_scale: 0.15
   geom_c: 0.6
   ref_open_det_thr: 0.5       # если в эталонных кадрах детектор видит safe_open — эталон «открыт», ROI-признак инвертируется
+  cluster_mode: ref_first     # ref_first | kmeans2 — [H1, выкл до замера L2] два кластера вида по всему ролику
+  namer: {backend: none, k: 3, weight: 1.5, single_state_weight: 1.0, cap: 3.0}   # none | siglip2 — [H2, выкл]
   smoothing: {method: hmm, switch_per_s: 0.05, prior: 0.1, gain: 1.0}
 
 door:
@@ -85,6 +87,8 @@ door:
   traffic_cross_p: 0.92       # трек пересёк границу cashier_area рядом с дверью
   traffic_cross_window_s: 1.0
   ref_open_det_thr: 0.5
+  cluster_mode: ref_first     # [H1]
+  namer: {backend: none, k: 3, weight: 1.5, single_state_weight: 1.0, cap: 3.0}   # [H2]
   smoothing: {method: hmm, switch_per_s: 0.08, prior: 0.15, gain: 1.0}
 
 cash:
@@ -198,6 +202,11 @@ predicates:
   bag_alone_min_s: 3.0
   safe_working_min_s: 3.0
   timecode: onset             # onset | mid | max — t_peak интервала (подбирается замером L2)
+
+namer:                        # общие настройки open-vocab именователя (используется, только если backend != none)
+  model: google/siglip2-base-patch16-224
+  cache_dir: weights/hf/hub   # офлайн HF-кэш (L1); env SENTINEL_HF_CACHE переопределяет
+  device: auto                # auto | cuda | cpu
 
 ablation:                     # только для python -m ml.scene.ablation; в проде пусто
   smoothing: null             # переопределить сглаживание всех сигналов: {method: hmm|hysteresis|ema|none, ...}
