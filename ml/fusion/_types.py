@@ -17,7 +17,7 @@ try:
         Violation,
     )
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import (  # type: ignore[no-redef]  # noqa: F401
+    from contracts.sentinel_contracts import (  # type: ignore[no-redef]  # noqa: F401
         LABELS,
         SIGNALS,
         AnalysisResult,

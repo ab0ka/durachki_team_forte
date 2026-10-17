@@ -7,7 +7,7 @@ from typing import Iterable, Mapping, Optional
 try:
     from contracts.sentinel_contracts import LABELS  # noqa
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import LABELS  # noqa
+    from contracts.sentinel_contracts import LABELS  # noqa
 
 # COCO-80 (имена как в id2label HF-моделей RT-DETR / D-FINE) → LABELS
 COCO_TO_LABEL: dict[str, str] = {

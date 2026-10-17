@@ -62,7 +62,7 @@ def make_fake_runner(seconds: float = 3.0) -> Callable[..., Any]:
             from contracts.sentinel_contracts import (  # type: ignore
                 AnalysisResult, EvidenceFrame, RuleRef, Violation)
         except ImportError:
-            from ._contract_fallback import AnalysisResult, EvidenceFrame, RuleRef, Violation
+            from contracts.sentinel_contracts import AnalysisResult, EvidenceFrame, RuleRef, Violation
 
         total = max(0.0, min(float(seconds), max(0.0, float(deadline_s)) * 0.5))
         stages = ["decode", "detect", "track", "rules", "fusion"]

@@ -1,4 +1,4 @@
-from ml.detect._contract_fallback import LABELS
+from contracts.sentinel_contracts import LABELS
 from ml.detect.labels import (COCO_TO_LABEL, build_index_map, is_proxy, map_label, normalize_name,
                               source_tag)
 

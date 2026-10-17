@@ -17,7 +17,7 @@ from .features import FeatureSet, cache_path, extract_clip, get_backend, type_sc
 try:
     from contracts.sentinel_contracts import Event  # noqa
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import Event  # noqa
+    from contracts.sentinel_contracts import Event  # noqa
 
 log = logging.getLogger("sentinel.temporal")
 _CK_LOCK = threading.Lock()

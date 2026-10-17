@@ -39,7 +39,7 @@ from .signals import SignalSeries, build_series, derive_from_tracks, polygon_bbo
 try:
     from contracts.sentinel_contracts import Event  # noqa
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import Event  # noqa
+    from contracts.sentinel_contracts import Event  # noqa
 
 __all__ = [
     "run_rules", "evaluate", "RulesReport", "SIGNAL_RU", "ASSESSMENTS", "CANDIDATE", "REVIEW", "INSUFFICIENT",

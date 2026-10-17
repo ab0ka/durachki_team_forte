@@ -35,7 +35,7 @@ from .worker import JobManager, PipelineSpec
 try:
     from contracts.sentinel_contracts import AnalysisResult  # noqa: F401
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import AnalysisResult  # noqa: F401
+    from contracts.sentinel_contracts import AnalysisResult  # noqa: F401
 
 API_VERSION = "1.0.0"
 SESSION_COOKIE = "ks_session"

@@ -21,7 +21,7 @@ import numpy as np
 try:
     from contracts.sentinel_contracts import Detection, VideoClip  # noqa
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import Detection, VideoClip  # noqa
+    from contracts.sentinel_contracts import Detection, VideoClip  # noqa
 
 from .backends import Backends, DetectorUnavailable, get_backends, is_mock
 from .boxes import (RawDets, classwise_nms, hflip_boxes, make_tiles, suppress_contained, tile_to_frame,

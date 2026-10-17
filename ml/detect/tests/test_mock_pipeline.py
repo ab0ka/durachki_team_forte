@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from ml.detect import detect, last_stats
-from ml.detect._contract_fallback import LABELS, Detection
+from contracts.sentinel_contracts import LABELS, Detection
 from ml.detect.boxes import iou_matrix
 from ml.detect.synth import ArrayClip, make_synth_video, synth_clip
 

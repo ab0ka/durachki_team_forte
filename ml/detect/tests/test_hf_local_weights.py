@@ -27,7 +27,7 @@ def _tiny_rtdetr(dst):
 
 def test_detect_with_local_tiny_rtdetr(tmp_path, monkeypatch, no_network):
     from ml.detect import available, detect, last_stats, warmup
-    from ml.detect._contract_fallback import LABELS
+    from contracts.sentinel_contracts import LABELS
     from ml.detect.synth import synth_clip
 
     wdir = tmp_path / "w"

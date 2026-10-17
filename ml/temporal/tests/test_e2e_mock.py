@@ -44,7 +44,7 @@ def test_extract_clip_mock_shapes_and_focus(tmp_path):
 
 
 def test_extract_with_zone_and_deadline(tmp_path):
-    from ml.temporal._contract_fallback import Zone
+    from contracts.sentinel_contracts import Zone
 
     cfg = load_config()
     clip = SimpleClip(str(write_video(tmp_path / "v.avi", seconds=6.0)), sample_fps=4.0)

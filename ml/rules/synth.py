@@ -13,7 +13,7 @@ import numpy as np
 try:
     from contracts.sentinel_contracts import SceneState, Track, Zone  # noqa
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import SceneState, Track, Zone  # noqa
+    from contracts.sentinel_contracts import SceneState, Track, Zone  # noqa
 
 __all__ = ["CLEAN_BASE", "make_states", "make_tracks", "make_zones", "verified_catalog", "unverified_catalog",
            "CLEAN_SCENARIOS", "RULE_CASES"]

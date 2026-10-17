@@ -24,7 +24,7 @@ from backend.api.worker import PipelineSpec  # noqa: E402
 try:
     from contracts.sentinel_contracts import AnalysisResult, EvidenceFrame, Violation  # noqa: E402
 except ImportError:
-    from backend.api._contract_fallback import AnalysisResult, EvidenceFrame, Violation  # noqa: E402
+    from contracts.sentinel_contracts import AnalysisResult, EvidenceFrame, Violation  # noqa: E402
 
 KEY = "test-key-123"
 H = {"X-API-Key": KEY}

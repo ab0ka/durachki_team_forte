@@ -12,7 +12,7 @@ from norms import validate as v
 try:
     from contracts.sentinel_contracts import RuleRef  # noqa: F401
 except ImportError:  # пока ветка A01 не смерджена
-    from norms._contract_fallback import RuleRef  # noqa: F401
+    from contracts.sentinel_contracts import RuleRef  # noqa: F401
 
 
 @pytest.fixture(autouse=True)

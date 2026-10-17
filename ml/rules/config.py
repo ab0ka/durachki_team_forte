@@ -14,7 +14,7 @@ from .expr import CompiledExpr, ExprError, compile_expr
 try:
     from contracts.sentinel_contracts import SIGNALS  # noqa
 except ImportError:  # пока ветка A01 не смерджена
-    from ._contract_fallback import SIGNALS  # noqa
+    from contracts.sentinel_contracts import SIGNALS  # noqa
 
 __all__ = [
     "RuleSpec",
