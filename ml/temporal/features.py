@@ -63,9 +63,19 @@ class SiglipBackend:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.dtype = torch.float16 if (fp16 and device.startswith("cuda")) else torch.float32
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model_id = model_id
+        try:
+            self.processor = AutoProcessor.from_pretrained(model_id)
+            ip = getattr(self.processor, "image_processor", None)
+        except Exception:  # нет токенизатора рядом с весами — картинки всё равно считаем
+            self.processor = None
+            try:
+                from transformers import AutoImageProcessor
+
+                ip = AutoImageProcessor.from_pretrained(model_id)
+            except Exception:
+                ip = None
         self.model = AutoModel.from_pretrained(model_id, torch_dtype=self.dtype).to(device).eval()
-        ip = getattr(self.processor, "image_processor", None)
         self.mean = np.asarray(getattr(ip, "image_mean", None) or [0.5, 0.5, 0.5], dtype=np.float32)
         self.std = np.asarray(getattr(ip, "image_std", None) or [0.5, 0.5, 0.5], dtype=np.float32)
         self.logit_scale = float(self.model.logit_scale.exp().item()) if hasattr(self.model, "logit_scale") else 1.0
@@ -97,8 +107,14 @@ class SiglipBackend:
 
     def encode_texts(self, texts: Sequence[str]) -> np.ndarray:
         torch = self._torch
-        inp = self.processor(text=list(texts), padding="max_length", max_length=64, truncation=True,
-                             return_tensors="pt")
+        if self.processor is not None:
+            inp = self.processor(text=list(texts), padding="max_length", max_length=64, truncation=True,
+                                 return_tensors="pt")
+        else:
+            from transformers import AutoTokenizer
+
+            inp = AutoTokenizer.from_pretrained(self.model_id)(list(texts), padding="max_length", max_length=64,
+                                                               truncation=True, return_tensors="pt")
         inp = {k: v.to(self.device) for k, v in inp.items() if k in ("input_ids", "attention_mask")}
         with torch.no_grad():
             try:

@@ -1,0 +1,8 @@
+# ml/temporal (A10). Все лицензии допускают коммерческое использование.
+numpy>=1.26            # BSD-3-Clause
+PyYAML>=6.0            # MIT
+opencv-python-headless>=4.9   # Apache-2.0 (декодирование, аугментации, карта движения)
+torch>=2.3             # BSD-3-Clause (SigLIP2 и temporal head; baseline работает без torch)
+transformers>=4.49     # Apache-2.0 (SigLIP2 появился в 4.49; проверено на 5.20.1 с крошечной случайной моделью)
+sentencepiece>=0.2     # Apache-2.0 (на случай медленного токенизатора Gemma)
+pytest>=8              # MIT (тесты)
