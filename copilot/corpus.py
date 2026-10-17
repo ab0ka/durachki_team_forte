@@ -75,8 +75,10 @@ class Chunk:
     kind: str                  # catalog_rule | source
     type_ids: list[str] = field(default_factory=list)
     source_file: str = ""
-    heading: str = ""
-    verified: bool = False
+    heading: str = ""          # для источника — метка фрагмента («Ф3. Пункт 20 (приём наличных)»)
+    verified: bool = False     # цитата сверена с полным текстом (A13: verified / retrieval=full_text)
+    status: str = ""           # legal_status типа из каталога: confirmed | candidate | disabled | ""
+    note: str = ""             # оговорки: «номер пункта не сверен», «фрагмент поисковой выдачи» …
 
     @property
     def embed_text(self) -> str:
@@ -88,7 +90,10 @@ class Chunk:
         return norm_text(self.document), norm_clause(self.clause)
 
     def citation(self) -> dict[str, Any]:
-        return {"document": self.document, "clause": self.clause, "url": self.url}
+        out: dict[str, Any] = {"document": self.document, "clause": self.clause, "url": self.url}
+        if self.kind == "source" and self.heading:
+            out["fragment"] = self.heading
+        return out
 
 
 @dataclass
@@ -148,6 +153,19 @@ class Corpus:
     def known_urls(self) -> set[str]:
         return {norm_url(c.url) for c in self.chunks if c.url}
 
+    def short_name(self, document: str, url: str = "") -> str:
+        """Короткое имя документа из каталога A13 (``documents[*].short``), если есть."""
+        docs = self.catalog.get("documents") if isinstance(self.catalog, dict) else None
+        if isinstance(docs, dict):
+            u = norm_url(url)
+            d = norm_text(document)
+            for info in docs.values():
+                if not isinstance(info, dict) or not info.get("short"):
+                    continue
+                if (u and norm_url(info.get("url")) == u) or (d and norm_text(info.get("title")) == d):
+                    return str(info["short"])
+        return document
+
 
 # ----------------------------------------------------------------------------- loading
 
@@ -158,15 +176,15 @@ def _read_yaml(path: Path) -> Any:
         return yaml.safe_load(fh)
 
 
-def _load_catalog(cfg: dict[str, Any], warnings: list[str]) -> tuple[dict[str, Any], bool]:
-    """Возвращает (catalog, is_fixture)."""
+def _load_catalog(cfg: dict[str, Any], warnings: list[str]) -> tuple[dict[str, Any], bool, bool]:
+    """Возвращает (catalog, is_fixture, used_fallback_fixture)."""
     ccfg = cfg.get("corpus", {})
     path = resolve_path(ccfg.get("catalog_path"))
     if path and path.is_file():
         try:
             data = _read_yaml(path) or {}
             if isinstance(data, dict):
-                return data, bool(data.get("fixture"))
+                return data, bool(data.get("fixture")), False
         except Exception as exc:  # битый YAML не должен ронять ассистента
             warnings.append(f"catalog read error: {exc}")
     # A13 может отдавать каталог функцией (если файл лежит в другом месте/собирается)
@@ -176,7 +194,7 @@ def _load_catalog(cfg: dict[str, Any], warnings: list[str]) -> tuple[dict[str, A
 
             data = load_catalog()
             if isinstance(data, dict) and data.get("types"):
-                return data, False
+                return data, False, False
         except Exception:
             pass
     if fixture_allowed(cfg):
@@ -184,18 +202,23 @@ def _load_catalog(cfg: dict[str, Any], warnings: list[str]) -> tuple[dict[str, A
         fx_path = fx / "catalog.yaml" if fx else None
         if fx_path and fx_path.is_file():
             warnings.append("norms/catalog.yaml не найден — используется ТЕСТОВАЯ фикстура (не нормы РК)")
-            return _read_yaml(fx_path) or {}, True
+            return _read_yaml(fx_path) or {}, True, True
     warnings.append("каталог норм недоступен — ссылки на нормы не будут приводиться")
-    return {"version": 1, "types": {}}, False
+    return {"version": 1, "types": {}}, False, False
 
 
-def catalog_chunks(catalog: dict[str, Any]) -> list[Chunk]:
+def catalog_chunks(catalog: dict[str, Any], cite_disabled: bool = False) -> list[Chunk]:
+    """Нормы каталога. Типы с legal_status=disabled (норма не подтверждена/неприменима) по умолчанию
+    не цитируются: для них честный ответ — «без пункта»."""
     out: list[Chunk] = []
     types = catalog.get("types") if isinstance(catalog, dict) else None
     if not isinstance(types, dict):
         return out
     for type_id, info in types.items():
         if not isinstance(info, dict):
+            continue
+        status = str(info.get("legal_status") or "").strip().lower()
+        if status == "disabled" and not cite_disabled:
             continue
         for j, rule in enumerate(info.get("rules") or []):
             if not isinstance(rule, dict) or not rule.get("document"):
@@ -212,6 +235,8 @@ def catalog_chunks(catalog: dict[str, Any]) -> list[Chunk]:
                 type_ids=[str(type_id)],
                 heading=name,
                 verified=bool(rule.get("verified", False)),
+                status=status,
+                note="" if rule.get("verified") else "цитата не сверена с полным текстом",
             ))
     # одна и та же норма может относиться к нескольким типам — объединяем type_ids
     merged: dict[tuple[str, str, str], Chunk] = {}
@@ -254,25 +279,45 @@ def _split_window(text: str, max_chars: int, overlap: int) -> list[str]:
     return parts
 
 
-def _clause_from_heading(title: str) -> Optional[str]:
+_UNVERIFIED_NUM_RE = re.compile(r"не\s+сверен|не\s+установлен|по\s+сводке", re.I)
+_NO_CLAUSE_RE = re.compile(r"номер\s+пункта\s+не\s+установлен", re.I)
+
+
+def _clause_from_heading(title: str) -> tuple[Optional[str], bool]:
+    """(пункт, номер_сверен). «### п. 12», «12.», «Ф3. Пункт 20 (…)», «Г1. … (пункт 8; номер не сверен)»."""
+    if _NO_CLAUSE_RE.search(title):
+        return None, False
+    num_ok = not _UNVERIFIED_NUM_RE.search(title)
     m = _CLAUSE_RE.search(title)
-    if m and m.start() < 4:
+    if m:
         kind = m.group("kind").lower()
         num = m.group("num")
         if kind.startswith(("подпункт", "пп")):
-            return f"пп. {num}"
+            # подпункт без номера пункта — не самостоятельная ссылка
+            return (f"пп. {num}", num_ok) if m.start() < 4 else (None, False)
         if kind.startswith(("стат", "ст.")):
-            return f"ст. {num.rstrip(')')}"
-        return f"п. {num.rstrip(')')}"
+            return f"ст. {num.rstrip(')')}", num_ok
+        return f"п. {num.rstrip(')')}", num_ok
     m2 = re.match(r"^\s*(\d{1,3}(?:\.\d{1,3})*)\.?\s*$", title)
     if m2:
-        return f"п. {m2.group(1)}"
-    return None
+        return f"п. {m2.group(1)}", num_ok
+    return None, num_ok
+
+
+_SKIP_SECTIONS_DEFAULT = r"не\s+цитат|пересказ|todo|реквизит|статус|провенанс"
+_SKIP_LINES_DEFAULT = r"^\s*(?:провенанс|источник|\*\*внимание|внимание:)"
 
 
 def chunk_markdown(text: str, source_file: str = "", max_chars: int = 900, overlap: int = 120,
-                   min_chars: int = 40) -> list[Chunk]:
-    """Чанкинг markdown-источника нормы: front matter / H1 -> документ; заголовки и «N.» -> пункты."""
+                   min_chars: int = 40, skip_sections: Optional[str] = _SKIP_SECTIONS_DEFAULT,
+                   skip_lines: Optional[str] = _SKIP_LINES_DEFAULT, skip_preamble: bool = True) -> list[Chunk]:
+    """Чанкинг markdown-источника нормы: front matter / H1 -> документ; заголовки и «N.» -> пункты.
+
+    Формат A13 (norms/sources/*.md): front matter ``title``/``url``/``retrieval``; разделы «Реквизиты»,
+    «Не цитаты: пересказы», «TODO» не являются текстом нормы и не цитируются; строки «Провенанс:»
+    отбрасываются; ``retrieval`` не ``full_text`` -> все фрагменты помечаются как не сверенные.
+    Преамбула под заголовком документа (до первого раздела или пункта «N.») — не норма и не цитируется.
+    """
     meta: dict[str, Any] = {}
     m = _FRONT_MATTER_RE.match(text)
     if m:
@@ -300,18 +345,27 @@ def chunk_markdown(text: str, source_file: str = "", max_chars: int = 900, overl
         um = _ADILET_RE.search(text) or _URL_RE.search(text)
         url = um.group(0) if um else ""
     doc_id = str(meta.get("doc_id") or meta.get("id") or Path(source_file).stem or "doc")
+    retrieval = str(meta.get("retrieval") or "full_text").strip().lower()
+    fragmentary = retrieval not in {"full_text", "full", "adilet"}
+    doc_verified = bool(meta.get("verified", False)) and not fragmentary
+    skip_sec_re = re.compile(skip_sections, re.I) if skip_sections else None
+    skip_line_re = re.compile(skip_lines, re.I) if skip_lines else None
 
-    sections: list[tuple[Optional[str], str, list[str]]] = []  # (clause, heading_path, lines)
+    # (clause, clause_verified, heading_path, lines)
+    sections: list[tuple[Optional[str], bool, str, list[str]]] = []
     headings: dict[int, str] = {}
     cur_clause: Optional[str] = None
+    cur_num_ok = True
     cur_lines: list[str] = []
     cur_heading = ""
+    skip_level: Optional[int] = None  # внутри пропускаемого раздела этого уровня
+    in_preamble = skip_preamble       # текст до первого раздела/пункта
 
     def flush() -> None:
         nonlocal cur_lines
         body = "\n".join(cur_lines).strip()
-        if body:
-            sections.append((cur_clause, cur_heading, [body]))
+        if body and skip_level is None:
+            sections.append((cur_clause, cur_num_ok, cur_heading, [body]))
         cur_lines = []
 
     for ln in lines:
@@ -319,30 +373,48 @@ def chunk_markdown(text: str, source_file: str = "", max_chars: int = 900, overl
         if hm:
             level = len(hm.group(1))
             title = hm.group(2).strip()
-            if level == 1 and norm_text(title) == norm_text(document):
-                continue
             flush()
+            if skip_level is not None and level <= skip_level:
+                skip_level = None
+            if level == 1:  # заголовок документа (дублирует title)
+                headings = {}
+                cur_clause, cur_num_ok, cur_heading = None, True, ""
+                in_preamble = skip_preamble
+                continue
+            in_preamble = False
+            if skip_sec_re is not None and skip_sec_re.search(title):
+                skip_level = level if skip_level is None else min(skip_level, level)
+                continue
             headings = {k: v for k, v in headings.items() if k < level}
-            clause = _clause_from_heading(title)
-            if clause:
-                cur_clause = clause
-            else:
-                headings[level] = title
-                cur_clause = None
+            clause, num_ok = _clause_from_heading(title)
+            headings[level] = title
+            cur_clause, cur_num_ok = clause, num_ok
             cur_heading = " / ".join(headings[k] for k in sorted(headings))
+            continue
+        if skip_level is not None:
+            continue
+        if skip_line_re is not None and skip_line_re.search(ln):
             continue
         bm = _BARE_NUM_RE.match(ln)
         if bm and not ln.lstrip().startswith(("#", ">")):
             flush()
-            cur_clause = f"п. {bm.group(1)}"
+            in_preamble = False
+            cur_clause, cur_num_ok = f"п. {bm.group(1)}", True
+        if in_preamble:
+            continue
         cur_lines.append(ln.strip().lstrip("> ").strip())
     flush()
 
     chunks: list[Chunk] = []
-    for i, (clause, heading, body_lines) in enumerate(sections):
+    for i, (clause, num_ok, heading, body_lines) in enumerate(sections):
         body = re.sub(r"\s+", " ", " ".join(body_lines)).strip()
         if len(body) < min_chars and not clause:
             continue
+        notes = []
+        if fragmentary:
+            notes.append("фрагмент поисковой выдачи, дословность не сверена")
+        if clause and not num_ok:
+            notes.append("номер пункта не сверен")
         for j, part in enumerate(_split_window(body, max_chars, overlap)):
             chunks.append(Chunk(
                 id=f"src:{doc_id}:{i}:{j}",
@@ -352,8 +424,9 @@ def chunk_markdown(text: str, source_file: str = "", max_chars: int = 900, overl
                 url=url,
                 kind="source",
                 source_file=source_file,
-                heading=heading,
-                verified=bool(meta.get("verified", False)),
+                heading=heading.split(" / ")[-1] if heading else "",
+                verified=doc_verified and num_ok,
+                note="; ".join(notes),
             ))
     return chunks
 
@@ -374,31 +447,40 @@ def build_corpus(catalog: dict[str, Any], source_texts: Iterable[tuple[str, str]
                  warnings: Optional[list[str]] = None) -> Corpus:
     """Собрать корпус из каталога и пар (имя_файла, markdown). Удобно для тестов."""
     ccfg = (cfg or default_config()).get("corpus", {})
-    chunks = catalog_chunks(catalog)
+    chunks = catalog_chunks(catalog, cite_disabled=bool(ccfg.get("cite_disabled", False)))
     for name, text in source_texts:
         chunks.extend(chunk_markdown(
             text, source_file=name,
             max_chars=int(ccfg.get("chunk_max_chars", 900)),
             overlap=int(ccfg.get("chunk_overlap_chars", 120)),
             min_chars=int(ccfg.get("chunk_min_chars", 40)),
+            skip_sections=ccfg.get("skip_sections_regex", _SKIP_SECTIONS_DEFAULT),
+            skip_lines=ccfg.get("skip_lines_regex", _SKIP_LINES_DEFAULT),
+            skip_preamble=bool(ccfg.get("skip_preamble", True)),
         ))
-    # привязка источников к типам: если пункт совпадает с пунктом из каталога
+    # привязка источников к типам: пункт совпадает с пунктом каталога (по документу или по URL —
+    # в каталоге A13 название документа в rules и title в источнике сформулированы по-разному)
     by_key: dict[tuple[str, str], list[str]] = {}
     for c in chunks:
-        if c.kind == "catalog_rule":
+        if c.kind == "catalog_rule" and c.key[1]:
             by_key.setdefault(c.key, []).extend(c.type_ids)
+            if c.url:
+                by_key.setdefault((norm_url(c.url), c.key[1]), []).extend(c.type_ids)
     for c in chunks:
-        if c.kind == "source" and c.key in by_key:
-            c.type_ids = sorted(set(by_key[c.key]))
+        if c.kind != "source" or not c.key[1]:
+            continue
+        linked = by_key.get(c.key, []) + by_key.get((norm_url(c.url), c.key[1]), [])
+        if linked:
+            c.type_ids = sorted(set(linked))
     return Corpus(chunks=chunks, catalog=catalog, is_fixture=is_fixture, warnings=list(warnings or []))
 
 
 def load_corpus(cfg: Optional[dict[str, Any]] = None) -> Corpus:
     cfg = cfg or default_config()
     warnings: list[str] = []
-    catalog, is_fixture = _load_catalog(cfg, warnings)
+    catalog, is_fixture, used_fallback = _load_catalog(cfg, warnings)
     texts: list[tuple[str, str]] = []
-    for path in _source_files(cfg, use_fixture=is_fixture):
+    for path in _source_files(cfg, use_fixture=used_fallback):
         try:
             texts.append((path.name, path.read_text(encoding="utf-8")))
         except OSError as exc:
