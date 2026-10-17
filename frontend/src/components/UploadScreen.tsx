@@ -20,7 +20,7 @@ import { MAX_UPLOAD_MB, validateVideoFile } from "../lib/validate";
 import { cx, LocalBadge, ProgressBar } from "./ui";
 
 export default function UploadScreen() {
-  const { backend, demo, serverOk, toast, openSettings } = useApp();
+  const { backend, demo, serverOk, toast, openSettings, authenticated } = useApp();
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [drag, setDrag] = useState(false);
@@ -110,6 +110,11 @@ export default function UploadScreen() {
           </div>
 
           <div>
+            {demo ? (
+              <DemoStart />
+            ) : serverOk && !authenticated ? (
+              <LoginCard />
+            ) : (
             <div
               className={cx(
                 "group relative flex min-h-[260px] cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed p-6 text-center transition",
@@ -192,6 +197,7 @@ export default function UploadScreen() {
                 </div>
               )}
             </div>
+            )}
             {error && (
               <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-400/20 dark:bg-rose-400/10 dark:text-rose-300" role="alert">
                 {error}
@@ -282,5 +288,85 @@ export default function UploadScreen() {
         </section>
       </div>
     </div>
+  );
+}
+
+function DemoStart() {
+  const { backend } = useApp();
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="flex min-h-[260px] flex-col items-center justify-center rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50/60 p-6 text-center dark:border-amber-400/30 dark:bg-amber-400/5">
+      <div className="text-xs font-bold uppercase tracking-wider text-amber-700 dark:text-amber-300">Синтетическое демо</div>
+      <p className="mt-2 max-w-sm text-sm text-slate-600 dark:text-slate-300">
+        В демо-режиме реальные файлы не загружаются и не анализируются. Можно посмотреть синтетический пример отчёта.
+      </p>
+      <div className="mt-5 flex flex-wrap justify-center gap-2">
+        <button
+          className="btn-brand"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            const id = await backend.upload(new File([], "synthetic_demo.mov"), () => undefined).promise;
+            saveHistoryItem({ job_id: id, file_name: "synthetic_demo.mov", demo: true });
+            navigate({ name: "job", id });
+          }}
+        >
+          <Sparkles className="h-4 w-4" /> Симуляция обработки
+        </button>
+        <a className="btn-ghost" href="?demo=1#/job/demo">
+          Отчёт с нарушениями
+        </a>
+        <a className="btn-ghost" href="?demo=1#/job/demo-clean">
+          Отчёт без нарушений
+        </a>
+      </div>
+      <a className="mt-4 text-xs font-semibold text-slate-500 underline-offset-2 hover:underline" href="./#/">
+        Выйти из демо и загрузить реальное видео
+      </a>
+    </div>
+  );
+}
+
+function LoginCard() {
+  const { login } = useApp();
+  const [key, setKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  return (
+    <form
+      className="flex min-h-[260px] flex-col justify-center rounded-2xl border border-slate-200 bg-white p-6 shadow-card dark:border-white/10 dark:bg-ink-800"
+      onSubmit={async (e) => {
+        e.preventDefault();
+        setBusy(true);
+        setErr(null);
+        try {
+          await login(key);
+          setKey("");
+        } catch (ex) {
+          setErr(ex instanceof ApiError ? ex.message : "Не удалось войти.");
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <div className="flex items-center gap-2 text-base font-bold">
+        <Lock className="h-4 w-4 text-brand-600 dark:text-brand-300" /> Вход для проверяющего
+      </div>
+      <p className="mt-1 text-sm text-slate-500">Введите ключ доступа. Сервер откроет защищённую сессию; ключ не сохраняется в браузере.</p>
+      <input
+        className="input mt-4 font-mono"
+        type="password"
+        autoComplete="off"
+        spellCheck={false}
+        placeholder="ключ доступа"
+        value={key}
+        onChange={(e) => setKey(e.target.value)}
+        aria-label="Ключ доступа"
+      />
+      {err && <div className="mt-2 text-sm text-rose-600 dark:text-rose-400">{err}</div>}
+      <button className="btn-primary mt-4" type="submit" disabled={busy || !key.trim()}>
+        {busy ? "Проверяем…" : "Войти"}
+      </button>
+    </form>
   );
 }

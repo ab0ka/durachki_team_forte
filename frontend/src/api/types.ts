@@ -70,6 +70,10 @@ export interface AskResponse {
 
 export interface SessionInfo {
   token: string | null;
+  /** Сервер ответил (любой HTTP-статус). */
+  reachable: boolean;
+  /** Есть действующая сессия (HttpOnly cookie) или API-ключ в памяти вкладки. */
+  authenticated: boolean;
   features: { copilot?: boolean; [k: string]: unknown };
   version?: string;
 }

@@ -13,7 +13,10 @@ export const ENDPOINTS = {
   apiAnalyze: "/api/v1/analyze",
   apiJob: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}`,
   apiAsk: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/ask`,
-  video: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/video`,
+  /** Видео для плеера: защищённый cookie UI-маршрут с поддержкой Range. */
+  uiVideo: (id: string) => `/ui/v1/jobs/${encodeURIComponent(id)}/video`,
+  /** Запасной путь (только с API-ключом в памяти вкладки → blob). */
+  apiVideo: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/video`,
 };
 
 export class ApiError extends Error {
@@ -52,12 +55,15 @@ const LS = {
   },
 };
 
+// API-ключ живёт только в памяти вкладки: не в localStorage, не в URL, не в бандле.
+let memoryApiKey = "";
+
 export const settings = {
   get apiKey(): string {
-    return LS.get("ks.apiKey") ?? "";
+    return memoryApiKey;
   },
   set apiKey(v: string) {
-    LS.set("ks.apiKey", v.trim());
+    memoryApiKey = v.trim();
   },
   get apiBase(): string {
     const env = (import.meta as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE ?? "";
@@ -97,18 +103,49 @@ export interface UploadHandle {
 
 export interface Backend {
   kind: "http" | "demo";
+  /** Проверка сессии (HttpOnly cookie). Публичной выдачи сессии без ключа нет. */
   init(): Promise<SessionInfo>;
+  /** Вход проверяющего: ключ/секрет → сервер ставит HttpOnly cookie. Ключ не сохраняется. */
+  login(key: string): Promise<SessionInfo>;
+  logout(): Promise<void>;
   upload(file: File, onProgress: (fraction: number) => void): UploadHandle;
   getJob(id: string): Promise<{ job: JobResult; raw: unknown }>;
   ask(id: string, question: string, history: { role: "user" | "assistant"; text: string }[]): Promise<AskResponse>;
-  /** URL исходного видео для <video>. fallback — загрузка blob с заголовками, если прямой URL не играет. */
+  /** URL исходного видео для <video>. fallback — загрузка blob с X-API-Key, если cookie-маршрут не играет. */
   videoSource(id: string): { url: string; fallback?: () => Promise<string> } | null;
+}
+
+function sessionFromJson(info: Record<string, unknown>, authenticated: boolean): SessionInfo {
+  const f = info.features;
+  const features: SessionInfo["features"] = typeof f === "object" && f !== null ? { ...(f as SessionInfo["features"]) } : {};
+  if (typeof info.copilot === "boolean") features.copilot = info.copilot;
+  const auth = typeof info.authenticated === "boolean" ? info.authenticated : authenticated;
+  return {
+    token: null,
+    reachable: true,
+    authenticated: auth,
+    features,
+    version: typeof info.version === "string" ? info.version : undefined,
+  };
+}
+
+async function readJson(res: Response): Promise<Record<string, unknown>> {
+  const ct = res.headers.get("content-type") ?? "";
+  if (!ct.includes("json")) return {};
+  try {
+    const j = (await res.json()) as unknown;
+    return typeof j === "object" && j !== null ? (j as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 export class HttpBackend implements Backend {
   kind = "http" as const;
+  /** Необязательный токен из тела ответа сессии (если A02 его отдаёт) — только в памяти. */
   private token: string | null = null;
   private features: SessionInfo["features"] = {};
+  private uiAvailable = true;
 
   private url(path: string): string {
     return `${settings.apiBase}${path}`;
@@ -116,7 +153,7 @@ export class HttpBackend implements Backend {
 
   private headers(path: string, extra?: Record<string, string>): Record<string, string> {
     const h: Record<string, string> = { Accept: "application/json", ...extra };
-    if (this.token) h["X-UI-Token"] = this.token;
+    if (this.token && path.startsWith("/ui/")) h["X-UI-Token"] = this.token;
     if (path.startsWith("/api/") && settings.apiKey) h["X-API-Key"] = settings.apiKey;
     return h;
   }
@@ -125,33 +162,70 @@ export class HttpBackend implements Backend {
     try {
       const res = await fetch(this.url(ENDPOINTS.session), {
         credentials: "same-origin",
-        headers: { Accept: "application/json" },
+        headers: this.headers(ENDPOINTS.session),
       });
       if (res.ok) {
-        const ct = res.headers.get("content-type") ?? "";
-        let token: string | null = null;
-        let info: Record<string, unknown> = {};
-        if (ct.includes("json")) {
-          info = (await res.json()) as Record<string, unknown>;
-          const t = info.token ?? info.ui_token ?? info.access_token;
-          token = typeof t === "string" ? t : null;
-        } else {
-          token = (await res.text()).trim() || null;
-        }
-        this.token = token;
-        const f = info.features;
-        this.features = typeof f === "object" && f !== null ? (f as SessionInfo["features"]) : {};
-        if (typeof info.copilot === "boolean") this.features.copilot = info.copilot;
-        return { token, features: this.features, version: typeof info.version === "string" ? info.version : undefined };
+        const s = sessionFromJson(await readJson(res), true);
+        this.features = s.features;
+        this.uiAvailable = true;
+        return s;
       }
+      if (res.status === 401 || res.status === 403) {
+        this.uiAvailable = true;
+        return { token: null, reachable: true, authenticated: !!settings.apiKey, features: {} };
+      }
+      // 404/405 — UI-маршруты выключены (ui_enabled: false): работаем только через API-ключ.
+      this.uiAvailable = false;
+      return { token: null, reachable: true, authenticated: !!settings.apiKey, features: {} };
     } catch {
-      /* сервер недоступен — работаем с API-ключом, если он задан */
+      return { token: null, reachable: false, authenticated: false, features: {} };
     }
-    this.token = null;
-    return { token: null, features: {} };
   }
 
-  /** GET/POST с автоповтором через /api/v1/*, если /ui/v1/* не реализован (404/405). */
+  async login(key: string): Promise<SessionInfo> {
+    const k = key.trim();
+    if (!k) throw new ApiError(401, "Введите ключ доступа.");
+    let res: Response;
+    try {
+      res = await fetch(this.url(ENDPOINTS.session), {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { Accept: "application/json", "Content-Type": "application/json", "X-API-Key": k },
+        body: JSON.stringify({ key: k }),
+      });
+    } catch {
+      throw new ApiError(0, messageForStatus(0));
+    }
+    if (res.status === 404 || res.status === 405) {
+      // UI-сессий нет — запасной путь: ключ в памяти вкладки для /api/v1/*.
+      settings.apiKey = k;
+      this.uiAvailable = false;
+      return { token: null, reachable: true, authenticated: true, features: {} };
+    }
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) throw new ApiError(res.status, "Неверный ключ доступа.");
+      throw new ApiError(res.status, messageForStatus(res.status, await errorText(res)));
+    }
+    const info = await readJson(res);
+    const t = info.token ?? info.ui_token;
+    this.token = typeof t === "string" ? t : null;
+    const s = sessionFromJson(info, true);
+    this.features = s.features;
+    this.uiAvailable = true;
+    return s;
+  }
+
+  async logout(): Promise<void> {
+    this.token = null;
+    settings.apiKey = "";
+    try {
+      await fetch(this.url(ENDPOINTS.session), { method: "DELETE", credentials: "same-origin" });
+    } catch {
+      /* noop */
+    }
+  }
+
+  /** /ui/v1/* (cookie); если UI-маршруты выключены или не реализованы — /api/v1/* с ключом из памяти. */
   private async fetchWithFallback(uiPath: string, apiPath: string, init: RequestInit = {}): Promise<Response> {
     const doFetch = (p: string) =>
       fetch(this.url(p), {
@@ -159,14 +233,10 @@ export class HttpBackend implements Backend {
         credentials: "same-origin",
         headers: this.headers(p, (init.headers as Record<string, string>) ?? {}),
       });
-    if (this.token || !settings.apiKey) {
-      let res = await doFetch(uiPath);
-      if (res.status === 401 && this.token) {
-        await this.init(); // токен мог протухнуть после перезапуска сервера
-        res = await doFetch(uiPath);
-      }
-      if (res.status !== 404 && res.status !== 405) return res;
-      if (!settings.apiKey && !this.token) return res;
+    if (this.uiAvailable || !settings.apiKey) {
+      const res = await doFetch(uiPath);
+      const tryApi = (res.status === 404 || res.status === 405 || res.status === 401) && !!settings.apiKey;
+      if (!tryApi) return res;
     }
     return doFetch(apiPath);
   }
@@ -178,6 +248,7 @@ export class HttpBackend implements Backend {
       new Promise((resolve, reject) => {
         xhr = new XMLHttpRequest();
         xhr.open("POST", this.url(path));
+        xhr.withCredentials = true;
         for (const [k, v] of Object.entries(this.headers(path))) xhr.setRequestHeader(k, v);
         xhr.upload.onprogress = (e) => {
           if (e.lengthComputable && e.total > 0) onProgress(Math.min(1, e.loaded / e.total));
@@ -191,9 +262,9 @@ export class HttpBackend implements Backend {
       });
     const promise = (async () => {
       let r: { status: number; body: string };
-      if (this.token || !settings.apiKey) {
+      if (this.uiAvailable || !settings.apiKey) {
         r = await send(ENDPOINTS.uiAnalyze);
-        if ((r.status === 404 || r.status === 405 || (r.status === 401 && !this.token)) && !aborted) {
+        if ((r.status === 404 || r.status === 405 || r.status === 401) && settings.apiKey && !aborted) {
           onProgress(0);
           r = await send(ENDPOINTS.apiAnalyze);
         }
@@ -210,7 +281,12 @@ export class HttpBackend implements Backend {
         }
         throw new ApiError(r.status, messageForStatus(r.status, detail));
       }
-      const j = JSON.parse(r.body) as { job_id?: unknown; id?: unknown };
+      let j: { job_id?: unknown; id?: unknown } = {};
+      try {
+        j = JSON.parse(r.body) as typeof j;
+      } catch {
+        /* noop */
+      }
       const id = j.job_id ?? j.id;
       if (typeof id !== "string" && typeof id !== "number") throw new ApiError(500, "Сервер не вернул job_id");
       onProgress(1);
@@ -226,7 +302,12 @@ export class HttpBackend implements Backend {
   }
 
   async getJob(id: string): Promise<{ job: JobResult; raw: unknown }> {
-    const res = await this.fetchWithFallback(ENDPOINTS.uiJob(id), ENDPOINTS.apiJob(id));
+    let res: Response;
+    try {
+      res = await this.fetchWithFallback(ENDPOINTS.uiJob(id), ENDPOINTS.apiJob(id));
+    } catch {
+      throw new ApiError(0, messageForStatus(0));
+    }
     if (!res.ok) throw new ApiError(res.status, messageForStatus(res.status, await errorText(res)));
     const raw: unknown = await res.json();
     return { job: normalizeJob(raw, id), raw };
@@ -243,7 +324,10 @@ export class HttpBackend implements Backend {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question, history }),
     });
-    if (res.status === 501) throw new CopilotUnavailable();
+    if (res.status === 501) {
+      this.features.copilot = false;
+      throw new CopilotUnavailable();
+    }
     if (!res.ok) throw new ApiError(res.status, messageForStatus(res.status, await errorText(res)));
     const j = (await res.json()) as Record<string, unknown>;
     const answer = j.answer ?? j.text ?? j.response ?? j.message;
@@ -251,21 +335,18 @@ export class HttpBackend implements Backend {
     return { answer: typeof answer === "string" ? answer : JSON.stringify(j), sources };
   }
 
-  copilotEnabled(): boolean {
-    return this.features.copilot !== false;
-  }
-
   videoSource(id: string): { url: string; fallback?: () => Promise<string> } {
-    const path = ENDPOINTS.video(id);
-    const q = this.token ? `?token=${encodeURIComponent(this.token)}` : "";
+    // Основной путь — cookie UI-маршрут с Range: <video> шлёт cookie сам, ключ в URL не попадает.
+    const apiPath = ENDPOINTS.apiVideo(id);
     return {
-      url: this.url(path) + q,
-      // <video> не умеет слать заголовки: если прямой URL отвергнут, тянем blob с X-UI-Token/X-API-Key.
-      fallback: async () => {
-        const res = await fetch(this.url(path), { headers: this.headers(path), credentials: "same-origin" });
-        if (!res.ok) throw new ApiError(res.status, messageForStatus(res.status));
-        return URL.createObjectURL(await res.blob());
-      },
+      url: this.url(ENDPOINTS.uiVideo(id)),
+      fallback: settings.apiKey
+        ? async () => {
+            const res = await fetch(this.url(apiPath), { headers: this.headers(apiPath), credentials: "same-origin" });
+            if (!res.ok) throw new ApiError(res.status, messageForStatus(res.status));
+            return URL.createObjectURL(await res.blob());
+          }
+        : undefined,
     };
   }
 }

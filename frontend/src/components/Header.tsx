@@ -56,7 +56,7 @@ export default function Header({ route }: { route: Route }) {
   );
 
   return (
-    <header className="no-print sticky top-0 z-40 border-b border-slate-200/70 bg-white/80 backdrop-blur-xl dark:border-white/[.06] dark:bg-ink-950/75">
+    <header className="no-print border-b border-slate-200/70 bg-white/80 backdrop-blur-xl dark:border-white/[.06] dark:bg-ink-950/75">
       <div className="mx-auto flex h-16 max-w-[1320px] items-center gap-3 px-4 sm:px-6 lg:px-8">
         <a href="#/" className="flex items-center gap-2.5" aria-label="Kassa Sentinel — на главную">
           <Logo className="h-9 w-9 shrink-0" />
@@ -66,8 +66,8 @@ export default function Header({ route }: { route: Route }) {
           </div>
         </a>
         {demo && (
-          <span className="chip border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-400/30 dark:bg-amber-400/10 dark:text-amber-300">
-            ДЕМО
+          <span className="chip hidden border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-400/30 dark:bg-amber-400/10 dark:text-amber-300 sm:inline-flex">
+            СИНТЕТИЧЕСКОЕ ДЕМО
           </span>
         )}
         <nav className="ml-2 flex items-center gap-1">

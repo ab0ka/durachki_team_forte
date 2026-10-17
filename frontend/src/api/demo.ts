@@ -266,8 +266,14 @@ export class DemoBackend implements Backend {
   private seq = 0;
 
   async init(): Promise<SessionInfo> {
-    return { token: "demo", features: { copilot: true }, version: "demo" };
+    return { token: null, reachable: true, authenticated: true, features: { copilot: true }, version: "demo" };
   }
+
+  async login(): Promise<SessionInfo> {
+    return this.init();
+  }
+
+  async logout(): Promise<void> {}
 
   upload(file: File, onProgress: (f: number) => void): UploadHandle {
     let timer: ReturnType<typeof setInterval> | undefined;

@@ -11,6 +11,19 @@ import AboutScreen from "./components/AboutScreen";
 import SettingsDialog from "./components/SettingsDialog";
 import { cx } from "./components/ui";
 
+/** Постоянная пометка: синтетическое демо не подменяет реальную загрузку/результат. */
+function DemoRibbon() {
+  return (
+    <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 bg-amber-400 px-4 py-1.5 text-center text-xs font-bold uppercase tracking-wider text-amber-950 print:static">
+      <span>Синтетическое демо</span>
+      <span className="font-medium normal-case tracking-normal">данные сгенерированы в браузере, сервер анализа не используется</span>
+      <a className="rounded bg-amber-950/10 px-2 py-0.5 font-semibold normal-case tracking-normal underline-offset-2 hover:underline" href="./#/">
+        выйти из демо
+      </a>
+    </div>
+  );
+}
+
 interface Toast {
   id: number;
   text: string;
@@ -38,12 +51,30 @@ export default function App() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  const applySession = useCallback(
+    (s: SessionInfo) => {
+      setSession(s);
+      setServerOk(demo || s.reachable);
+      setCopilotEnabled(s.features.copilot !== false);
+    },
+    [demo],
+  );
+
   const initSession = useCallback(async () => {
-    const s = await backend.init();
-    setSession(s);
-    setServerOk(demo || s.token !== null);
-    if (s.features.copilot === false) setCopilotEnabled(false);
-  }, [backend, demo]);
+    applySession(await backend.init());
+  }, [backend, applySession]);
+
+  const login = useCallback(
+    async (key: string) => {
+      applySession(await backend.login(key));
+    },
+    [backend, applySession],
+  );
+
+  const logout = useCallback(async () => {
+    await backend.logout();
+    await initSession();
+  }, [backend, initSession]);
 
   useEffect(() => {
     void initSession();
@@ -60,6 +91,9 @@ export default function App() {
     demo,
     session,
     serverOk,
+    authenticated: demo || !!session?.authenticated,
+    login,
+    logout,
     copilotEnabled,
     disableCopilot: () => setCopilotEnabled(false),
     toast,
@@ -71,7 +105,10 @@ export default function App() {
   return (
     <AppContext.Provider value={ctx}>
       <div className="flex min-h-screen flex-col">
-        <Header route={route} />
+        <div className="sticky top-0 z-40">
+          {demo && <DemoRibbon />}
+          <Header route={route} />
+        </div>
         <main className="mx-auto w-full max-w-[1320px] flex-1 px-4 pb-16 pt-6 sm:px-6 lg:px-8">
           {route.name === "upload" && <UploadScreen />}
           {route.name === "job" && <JobScreen key={route.id} jobId={route.id} />}

@@ -8,6 +8,10 @@ export interface AppContextValue {
   session: SessionInfo | null;
   /** null — ещё проверяем; false — сервер недоступен. */
   serverOk: boolean | null;
+  /** Есть сессия (cookie) или ключ в памяти вкладки. */
+  authenticated: boolean;
+  login: (key: string) => Promise<void>;
+  logout: () => Promise<void>;
   copilotEnabled: boolean;
   disableCopilot: () => void;
   toast: (text: string, tone?: "info" | "error" | "success") => void;

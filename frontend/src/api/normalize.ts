@@ -97,9 +97,8 @@ export function normalizeViolation(v: unknown): Violation | null {
   const frames = Array.isArray(v.evidence_frames)
     ? v.evidence_frames.map(normalizeFrame).filter((f): f is EvidenceFrame => f !== null)
     : [];
-  const rules = Array.isArray(v.rules)
-    ? v.rules.map(normalizeRule).filter((r): r is RuleRef => r !== null)
-    : [];
+  const rulesRaw: unknown[] = Array.isArray(v.rules) && v.rules.length ? v.rules : isObj(v.rule) ? [v.rule] : [];
+  const rules = rulesRaw.map(normalizeRule).filter((r): r is RuleRef => r !== null);
   const sources = strList(v.sources ?? v.source);
   const out: Violation = {
     type: str(v.type, "") || str(v.type_name, "") || str(v.type_id, "Возможное нарушение"),
@@ -167,7 +166,9 @@ export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
 /** image_base64 → src для <img>: распознаём JPEG/PNG/SVG/WebP, data-URI и URL. */
 export function imageSrc(b64: string): string {
   const s = b64.trim();
-  if (s.startsWith("data:") || s.startsWith("blob:") || /^(https?:)?\//.test(s)) return s;
+  if (s.startsWith("data:") || s.startsWith("blob:") || /^https?:\/\//.test(s)) return s;
+  // JPEG base64 начинается с "/9j/" — это НЕ путь. Путь — если есть символы вне алфавита base64.
+  if (s.startsWith("/") && !/^[A-Za-z0-9+/=\s]+$/.test(s)) return s;
   if (s.startsWith("iVBOR")) return `data:image/png;base64,${s}`;
   if (s.startsWith("PHN2") || s.startsWith("PD94")) return `data:image/svg+xml;base64,${s}`;
   if (s.startsWith("UklGR")) return `data:image/webp;base64,${s}`;
@@ -226,4 +227,35 @@ export function violationFacts(v: Violation, job: JobResult): string[] {
     .map((s) => s.trim())
     .filter((s) => s.length > 3)
     .slice(0, 5);
+}
+
+/**
+ * Анализ неполный (часть стадий пропущена по таймауту/ошибке)? Тогда «нарушений нет»
+ * нельзя показывать зелёным. Флаги — договорённость с A02/A03 (см. README → «Для интегратора»).
+ */
+export function isPartial(job: JobResult): boolean {
+  const m = job.meta as Obj;
+  if (m.partial === true || m.incomplete === true || m.degraded === true || m.timed_out === true) return true;
+  if (m.complete === false) return true;
+  for (const k of ["skipped_stages", "stages_skipped", "failed_stages"]) {
+    const v = m[k];
+    if (Array.isArray(v) && v.length > 0) return true;
+  }
+  const warnings = Array.isArray(m.warnings) ? m.warnings.map((w) => str(w).toLowerCase()) : [];
+  return warnings.some((w) => /partial|timeout|timed out|skipped|неполн|таймаут|пропущ|не заверш/.test(w));
+}
+
+/** Внешний JSON жюри: строго обязательные поля ТЗ (без timeline/meta/норм). */
+export function toJuryJson(job: JobResult): Record<string, unknown> {
+  return {
+    job_id: job.job_id,
+    status: job.status,
+    verdict: job.verdict ?? null,
+    violations: job.violations.map((v) => ({
+      type: v.type,
+      timecode_sec: v.timecode_sec,
+      description: v.description,
+      evidence_frames: v.evidence_frames.map((f) => ({ timestamp_sec: f.timestamp_sec, image_base64: f.image_base64 })),
+    })),
+  };
 }
