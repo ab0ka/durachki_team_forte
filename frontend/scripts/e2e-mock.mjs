@@ -177,7 +177,9 @@ try {
     await page.getByText("цитата не сверена").waitFor({ timeout: 3000 });
   });
   await step("Copilot: 501 → панель скрыта", async () => {
-    await page.getByRole("button", { name: "Почему это нарушение?" }).click();
+    // U08 заменил общие подсказки («Почему это нарушение?») на вопросы по эпизодам отчёта; проверка та же:
+    // после 501 от /ask панель скрывается.
+    await page.getByRole("button", { name: /^Объяснить эпизод 1\b/ }).first().click();
     await page.waitForTimeout(800);
     assert.equal(await page.getByText("Copilot проверяющего").count(), 0);
   });
