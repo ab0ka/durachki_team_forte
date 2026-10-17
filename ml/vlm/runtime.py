@@ -23,18 +23,19 @@ _backend: Optional[VLMBackend] = None
 _backend_key: Optional[tuple[Any, ...]] = None
 _backend_reason = ""
 _injected: Optional[VLMBackend] = None
-_gpu_lock: Any = threading.RLock()
-
-
 def set_gpu_lock(lock: Optional[Any]) -> None:
-    """A03 передаёт общий lock/семафор GPU (любой context manager). None — вернуть внутренний."""
-    global _gpu_lock
-    _gpu_lock = lock if lock is not None else threading.RLock()
+    """A03 передаёт общий lock/семафор GPU (любой context manager). None — без внешнего lock.
+    Внутри процесса VLM дополнительно арбитрирует анализ и чат приоритетным lock (ml.vlm.gpu)."""
+    from . import gpu
+
+    gpu.set_external_lock(lock)
 
 
 def gpu_guard() -> ContextManager[Any]:
-    lk = _gpu_lock
-    return lk if hasattr(lk, "__enter__") else contextlib.nullcontext()
+    """GPU для анализа (приоритет выше чата копилота)."""
+    from . import gpu
+
+    return gpu.guard(gpu.PRIO_ANALYSIS)
 
 
 def set_backend(backend: Optional[VLMBackend]) -> None:

@@ -33,13 +33,16 @@ presets:
     llamacpp: {model_file: Qwen3VL-2B-Instruct-Q8_0.gguf, mmproj_file: mmproj-Qwen3VL-2B-Instruct-F16.gguf}
 
 transformers:
-  device: cuda               # cuda | cpu
+  # Путь загрузки повторяет проверенный L1 на transformers 5.20.1 (tools/dataprep/vlm_smoke.py, ветка data/labels):
+  # AutoModelForImageTextToText + AutoProcessor, nf4 (LM) + bf16 (vision), local_files_only, cache_dir weights/hf/hub.
+  device: cuda:0             # cuda:0 | cpu
   allow_cpu: false           # на CPU 4B-модель — минуты на вызов; по умолчанию стадия пропускается
   dtype: bfloat16            # Qwen-VL обучены в bf16 (fp16 может переполняться); RTX 4060 (Ada) bf16 поддерживает
-  attn_implementation: sdpa
-  max_pixels: 200704         # 448*448 — процессор не будет апскейлить
-  min_pixels: 3136
-  skip_quant_modules: [visual, model.visual, lm_head]   # vision-энкодер не квантуем
+  attn_implementation: null  # null — по умолчанию transformers (как у L1); можно sdpa
+  max_pixels: null           # null — процессор не трогаем: кадры уже ужаты до frames.max_side
+  min_pixels: null
+  skip_quant_modules: [visual, lm_head]   # vision-энкодер и lm_head не квантуем (как у L1)
+  cache_dir: null            # null -> env SENTINEL_HF_CACHE -> <repo>/weights/hf/hub, если есть -> умолчание HF
   local_files_only: null     # null => берётся из HF_HUB_OFFLINE (прод: HF_HUB_OFFLINE=1, веса скачаны заранее)
   min_free_vram_mb: 0        # >0: не грузить модель, если свободной VRAM меньше (выставить по замеру bench)
   license_guard: warn        # strict | warn | off — license в README.md локального снапшота ∈ allowed_licenses
@@ -157,6 +160,18 @@ facts_filter:
 privacy:
   local_dump_dir: outputs/vlm   # куда CLI (try/bench) сохраняет кадры и ответы; null — не сохранять
   keep_raw_in_extra: false      # сырой текст ответа в Event.extra.vlm не кладём
+
+# ml.vlm.service — та же модель для чата копилота A14 (второй экземпляр не грузится). Анализ всегда раньше чата.
+service:
+  chat:
+    enabled: true
+    max_new_tokens: 384
+    max_new_tokens_cap: 768
+    timeout_s: 20.0           # потолок генерации одного ответа (generate max_time)
+    timeout_cap_s: 45.0
+    wait_s: 10.0              # сколько чат ждёт GPU (анализ — в приоритете); дальше честный ответ busy
+    max_input_chars: 12000
+    allow_cold_load: true     # можно ли чату загрузить модель, если анализ её ещё не грузил
 
 mock:
   latency_s: 0.0
