@@ -88,6 +88,8 @@ def classify_source(src: str) -> tuple[str, str, str, str]:
         s = s[5:]
     if s.startswith(("http://", "https://")):
         u = urllib.parse.urlparse(s)
+        if u.netloc in {"pypi.org", "www.pypi.org"}:
+            return "bundled", "", "", ""  # модель внутри pip-колеса (напр. mediapipe) — качать нечего
         if u.netloc in {"huggingface.co", "www.huggingface.co"}:
             parts = [p for p in u.path.split("/") if p]
             if len(parts) >= 2 and parts[0] not in {"datasets", "spaces"}:

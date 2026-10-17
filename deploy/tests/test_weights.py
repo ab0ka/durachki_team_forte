@@ -63,6 +63,7 @@ def test_load_specs_lenient_and_errors(tmp_path):
     ("https://huggingface.co/org/rep/resolve/main/m.onnx", "hf_file", "org/rep", "m.onnx"),
     ("https://github.com/x/y/releases/download/v1/rtm.onnx", "url", "", "rtm.onnx"),
     ("bundled:mediapipe", "bundled", "", ""),
+    ("https://pypi.org/project/mediapipe/", "bundled", "", ""),
 ])
 def test_classify_source(src, kind, repo, fname):
     k, r, f, _ = w.classify_source(src)
