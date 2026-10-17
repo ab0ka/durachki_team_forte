@@ -1,0 +1,17 @@
+# Kassa Sentinel (владелец A01). Установка: pip install pre-commit && pre-commit install
+# Репозиторий публичный: медиа, веса и файлы > 5 МБ не должны попасть в коммит.
+repos:
+  - repo: local
+    hooks:
+      - id: guard-media
+        name: "guard: видео, веса, кадры, файлы > 5 МБ"
+        entry: python scripts/guard_media.py
+        language: system
+        pass_filenames: true
+        stages: [pre-commit, pre-push]
+      - id: frozen-contract
+        name: "contracts/sentinel_contracts.py не изменён"
+        entry: python -m pytest contracts/tests/test_contract_frozen.py -q
+        language: system
+        pass_filenames: false
+        files: ^contracts/sentinel_contracts\.py$
