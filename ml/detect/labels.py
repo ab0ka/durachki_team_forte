@@ -65,6 +65,13 @@ ALIASES: dict[str, str] = {
 
 _LABEL_SET = frozenset(LABELS)
 
+# Отображения-«заместители»: исходный класс НЕ тождественен метке (книга ≠ документ, миска ≠ чашка).
+# Такие детекции помечаются в Detection.source суффиксом «~proxy»; отключаются closed_set.proxy_labels=false.
+# Важно: «bag» = любая сумка/рюкзак/чемодан (COCO), НЕ инкассаторская сумка; детектор не выводит
+# роли/полномочия людей из предметов — это делает (или не делает) downstream с учётом неопределённости.
+PROXY_SOURCES = frozenset({"book", "bowl", "paper", "papers", "documents", "drink", "key", "money",
+                           "banknote", "banknotes", "cash money", "collector bag", "cash bag"})
+
 
 def normalize_name(name: str) -> str:
     """'Cell_Phone ' → 'cell phone' (нижний регистр, '_'/'-' → пробел, схлопывание пробелов)."""
@@ -85,15 +92,27 @@ def map_label(name: str) -> Optional[str]:
     return ALIASES.get(n)
 
 
-def build_index_map(id2label: Mapping[int, str] | Iterable[str]) -> dict[int, str]:
+def is_proxy(name: str) -> bool:
+    """True, если имя класса модели лишь похоже на метку (а не является ею/её подвидом)."""
+    return normalize_name(name) in PROXY_SOURCES
+
+
+def build_index_map(id2label: Mapping[int, str] | Iterable[str], allow_proxy: bool = True) -> dict[int, str]:
     """id2label модели → {class_index: label из LABELS} только для нужных классов."""
     items = id2label.items() if isinstance(id2label, Mapping) else enumerate(id2label)
     out: dict[int, str] = {}
     for idx, name in items:
         lab = map_label(name)
-        if lab is not None:
-            out[int(idx)] = lab
+        if lab is None or (not allow_proxy and is_proxy(name)):
+            continue
+        out[int(idx)] = lab
     return out
+
+
+def source_tag(backend: str, orig_name: str) -> str:
+    """'rtdetr_v2_r18vd:book~proxy' — исходный класс модели сохраняется в Detection.source."""
+    n = normalize_name(orig_name)
+    return f"{backend}:{n}" + ("~proxy" if is_proxy(n) else "")
 
 
 def validate_label(label: str) -> str:

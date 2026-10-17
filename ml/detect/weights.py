@@ -1,7 +1,8 @@
-"""Кэш весов: SENTINEL_WEIGHTS (по умолчанию <repo>/weights), поддержка HF_HUB_OFFLINE.
+"""Кэш весов: SENTINEL_WEIGHTS (по умолчанию <repo>/weights).
 
-Однократная предзагрузка (с интернетом):  python -m ml.detect.weights --download
-Дальше всё работает офлайн:              HF_HUB_OFFLINE=1
+Скачивание — ТОЛЬКО на этапе setup (с интернетом):  python -m ml.detect.weights --download
+Импорт и инференс никогда не ходят в сеть (from_pretrained(..., local_files_only=True)); HF_HUB_OFFLINE=1
+рекомендуется выставлять в рантайме дополнительно.
 """
 from __future__ import annotations
 
@@ -39,19 +40,30 @@ def local_model_dir(model_id: str) -> Optional[Path]:
     return None
 
 
+def is_cached(model_id: str) -> bool:
+    """Есть ли модель локально (save_pretrained-папка или снапшот в weights/hf) — без сети."""
+    if local_model_dir(model_id) is not None:
+        return True
+    snap = hf_cache_dir() / ("models--" + model_id.replace("/", "--")) / "snapshots"
+    return snap.is_dir() and any(snap.iterdir())
+
+
 def resolve(path_rel: str) -> Path:
     p = Path(path_rel)
     return p if p.is_absolute() else weights_dir() / p
 
 
 def pretrained_kwargs() -> dict:
-    return {"cache_dir": str(hf_cache_dir()), "local_files_only": is_offline()}
+    """Для инференса: ТОЛЬКО локальные файлы. Скачивание — исключительно на этапе setup (download_all)."""
+    return {"cache_dir": str(hf_cache_dir()), "local_files_only": True}
 
 
-def model_ids() -> list[str]:
-    cfg = load_config()
+def model_ids(include_optional: bool = False) -> list[str]:
+    from .config import apply_env_extras
+
+    cfg = apply_env_extras(load_config())
     ids = [cfg["closed_set"]["hf_model_id"], *cfg["closed_set"].get("hf_fallback_ids", [])]
-    if cfg["open_vocab"].get("enabled", True):
+    if include_optional or cfg["open_vocab"].get("enabled", False):
         ids.append(cfg["open_vocab"]["hf_model_id"])
     return ids
 
@@ -61,7 +73,7 @@ def download_all(ids: Optional[list[str]] = None) -> list[Path]:
     from huggingface_hub import snapshot_download
 
     out = []
-    for mid in ids or model_ids():
+    for mid in ids or model_ids(include_optional=True):
         log.info("download %s → %s", mid, hf_cache_dir())
         out.append(Path(snapshot_download(mid, cache_dir=str(hf_cache_dir()),
                                           allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"])))
@@ -80,7 +92,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     else:
         print("weights_dir:", weights_dir(), "offline:", is_offline())
         for mid in model_ids():
-            print(mid, "local:", local_model_dir(mid))
+            print(mid, "local_dir:", local_model_dir(mid), "in_cache:", is_cached(mid))
 
 
 if __name__ == "__main__":

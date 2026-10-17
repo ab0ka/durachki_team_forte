@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from ..config import env_flag
 from ..labels import COCO_TO_LABEL
-from ..weights import resolve
+from ..weights import is_cached, resolve, weights_dir
 from .base import FrameDetector, resolve_device
 from .mock import MockColorDetector
 
@@ -40,18 +40,19 @@ def is_mock() -> bool:
     return env_flag("SENTINEL_MOCK")
 
 
-def _mock_backends(cfg: dict[str, Any], warnings: Optional[list[str]] = None, motion_only: bool = False) -> Backends:
-    """motion_only — аварийный режим на реальном видео без весов: палитру не ищем (серый сейф/белая бумага
-    дали бы ложные метки), только person по движущимся пятнам."""
+class DetectorUnavailable(RuntimeError):
+    """Нет ни одного рабочего бэкенда (нет локальных весов / зависимостей). Mock автоматически НЕ включается."""
+
+
+def _mock_backends(cfg: dict[str, Any]) -> Backends:
+    """Только явный тестовый режим SENTINEL_MOCK=1."""
     m = cfg["mock"]
-    palette = {} if motion_only else m["palette"]
-    common = dict(palette=palette, tolerance=m["tolerance"], min_area_px=m["min_area_px"], score=m["score"])
+    common = dict(palette=m["palette"], tolerance=m["tolerance"], min_area_px=m["min_area_px"], score=m["score"])
     closed = MockColorDetector(**common, motion_person=m.get("motion_person", True),
                                motion_person_min_area=m.get("motion_person_min_area", 0.02), name="mock")
     open_labels = {q["label"] for q in cfg["open_vocab"]["queries"]}
-    opn = (MockColorDetector(**common, labels=open_labels, name="mock:open")
-           if cfg["open_vocab"].get("enabled") and not motion_only else None)
-    return Backends(closed=[closed], open=opn, mock=True, warnings=list(warnings or []))
+    opn = MockColorDetector(**common, labels=open_labels, name="mock:open") if cfg["open_vocab"].get("enabled") else None
+    return Backends(closed=[closed], open=opn, mock=True)
 
 
 def _load_closed(cfg: dict[str, Any], warnings: list[str]) -> list[FrameDetector]:
@@ -68,17 +69,23 @@ def _load_closed(cfg: dict[str, Any], warnings: list[str]) -> list[FrameDetector
 
                 out.append(OnnxDetrBackend(p, lp, device=rt["device"], input_size=cs["input_size"],
                                            min_score=cs["min_score"], max_dets=cs["max_dets_per_frame"]))
-                if not cs.get("onnx_merge_with_hf", True):
-                    break
             except Exception as e:  # noqa: BLE001
                 warnings.append(f"detect: finetuned ONNX not loaded: {e}")
+                continue
+            if not cs.get("onnx_merge_with_hf", True):
+                break
         elif kind == "hf":
             from .hf_detr import HFDetrBackend
 
             for mid in [cs["hf_model_id"], *cs.get("hf_fallback_ids", [])]:
+                if not is_cached(mid):
+                    warnings.append(f"detect: weights for {mid} not found locally ({weights_dir()}); "
+                                    "run setup: python -m ml.detect.weights --download")
+                    continue
                 try:
                     out.append(HFDetrBackend(mid, device=rt["device"], fp16=rt["fp16"], input_size=cs["input_size"],
-                                             min_score=cs["min_score"], max_dets=cs["max_dets_per_frame"]))
+                                             min_score=cs["min_score"], max_dets=cs["max_dets_per_frame"],
+                                             allow_proxy=cs.get("proxy_labels", True)))
                     break
                 except Exception as e:  # noqa: BLE001
                     warnings.append(f"detect: closed-set {mid} not loaded: {type(e).__name__}: {e}")
@@ -88,6 +95,9 @@ def _load_closed(cfg: dict[str, Any], warnings: list[str]) -> list[FrameDetector
 def _load_open(cfg: dict[str, Any], warnings: list[str]) -> Optional[FrameDetector]:
     ov = cfg["open_vocab"]
     if not ov.get("enabled", True):
+        return None
+    if not is_cached(ov["hf_model_id"]):
+        warnings.append(f"detect: open-vocab weights {ov['hf_model_id']} not found locally — stage skipped")
         return None
     try:
         from .owlv2 import OwlV2Backend
@@ -124,15 +134,12 @@ def get_backends(cfg: dict[str, Any]) -> Backends:
             warnings: list[str] = []
             closed = _load_closed(cfg, warnings)
             opn = _load_open(cfg, warnings)
-            if not closed and cfg["runtime"].get("fallback_to_mock", True):
-                warnings.append("detect: closed-set unavailable → mock fallback (только person по движению)")
-                be = _mock_backends(cfg, warnings, motion_only=True)
-                be.open = opn
-                be.mock = False
-            else:
-                be = Backends(closed=closed, open=opn, mock=False, warnings=warnings)
             for w in warnings:
                 log.warning(w)
+            if not closed:
+                # не кэшируем: после setup (скачивания весов) следующий вызов подхватит модели
+                raise DetectorUnavailable("; ".join(warnings) or "no closed-set detector configured")
+            be = Backends(closed=closed, open=opn, mock=False, warnings=warnings)
         _CACHE[key] = be
         return be
 
@@ -142,4 +149,5 @@ def clear_cache() -> None:
         _CACHE.clear()
 
 
-__all__ = ["Backends", "CLOSED_SET_LABELS", "get_backends", "clear_cache", "is_mock", "resolve_device"]
+__all__ = ["Backends", "CLOSED_SET_LABELS", "DetectorUnavailable", "get_backends", "clear_cache", "is_mock",
+           "resolve_device"]

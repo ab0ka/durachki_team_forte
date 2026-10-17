@@ -9,7 +9,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 from ..boxes import RawDets, clip01, cxcywh_to_xyxy
-from ..labels import build_index_map
+from ..labels import build_index_map, source_tag
 
 log = logging.getLogger("ml.detect.onnx")
 
@@ -32,6 +32,7 @@ class OnnxDetrBackend:
         self.index_map = build_index_map(list(names))
         self._cls_idx = sorted(self.index_map)
         self._cls_labels = [self.index_map[i] for i in self._cls_idx]
+        self._cls_src = [source_tag(name, list(names)[i]) for i in self._cls_idx]
         providers = ["CPUExecutionProvider"]
         avail = ort.get_available_providers()
         if device != "cpu" and "CUDAExecutionProvider" in avail:
@@ -79,5 +80,5 @@ class OnnxDetrBackend:
                 continue
             qi, ki = order // k, order % k
             res.append(RawDets(clip01(cxcywh_to_xyxy(boxes[bi][qi])), flat[order].astype(np.float32),
-                               [self._cls_labels[j] for j in ki], [self.name] * len(order)))
+                               [self._cls_labels[j] for j in ki], [self._cls_src[j] for j in ki]))
         return res

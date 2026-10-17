@@ -22,7 +22,7 @@ try:
 except ImportError:  # пока ветка A01 не смерджена
     from ._contract_fallback import Detection, VideoClip  # noqa
 
-from .backends import Backends, get_backends, is_mock
+from .backends import Backends, DetectorUnavailable, get_backends, is_mock
 from .boxes import (RawDets, classwise_nms, hflip_boxes, make_tiles, suppress_contained, tile_to_frame,
                     touches_inner_edge, weighted_boxes_fusion)
 from .config import label_threshold, load_config
@@ -119,8 +119,9 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
     budget = _Budget(soft, max(soft, float(rt["hard_budget_s"])))
     times = [float(t) for t in getattr(clip, "times", [])]
     n = len(times)
-    stats: dict[str, Any] = {"n_sampled": n, "n_processed": 0, "n_keyframes": 0, "n_flip": 0, "n_tiles": 0,
-                             "n_open": 0, "timings": {}, "warnings": [], "backends": [], "mock": is_mock()}
+    stats: dict[str, Any] = {"status": "ok", "n_sampled": n, "n_processed": 0, "n_keyframes": 0, "n_flip": 0,
+                             "n_tiles": 0, "n_open": 0, "timings": {}, "warnings": [], "backends": [],
+                             "mock": is_mock()}
     _LAST_STATS.clear()
     _LAST_STATS.update(stats)
     if n == 0:
@@ -131,15 +132,19 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
         tm[key] = round(tm.get(key, 0.0) + time.perf_counter() - t_start, 4)
 
     t_load = time.perf_counter()
-    be: Backends = get_backends(cfg)
-    tick("load", t_load)
     warnings: list[str] = stats["warnings"]
+    try:
+        be: Backends = get_backends(cfg)
+    except DetectorUnavailable as e:
+        stats["status"] = "unavailable"
+        warnings.append(f"detect: unavailable: {e}")
+        _LAST_STATS.update(stats)
+        if str(rt.get("on_unavailable", "raise")) == "empty":
+            return []
+        raise
+    tick("load", t_load)
     warnings.extend(be.warnings)
     stats["backends"] = be.names
-    if not be.closed and be.open is None:
-        warnings.append("detect: no detector backends available — returning []")
-        _LAST_STATS.update(stats)
-        return []
 
     mock = be.mock or is_mock()
     hflip = bool(tta.get("hflip", True)) and not mock  # для цветовых масок флип бессмысленен
@@ -172,6 +177,8 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
                 warnings.append(f"detect: frame {j} decode failed: {e}")
                 f = None
             if f is None or not hasattr(f, "shape") or f.ndim != 3 or f.size == 0:
+                if len(warnings) < 50:
+                    warnings.append(f"detect: frame {j} (t={times[j]:.2f}s) empty/invalid — skipped")
                 continue
             frames.append(np.ascontiguousarray(f))
             fidx.append(j)
@@ -183,8 +190,10 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
         # --- activity gating / ключевые кадры ---
         t_g = time.perf_counter()
         key_flags: list[bool] = []
+        energies: list[float] = []
         for f, j in zip(frames, fidx):
             e = quality_motion[j] if quality_motion is not None else meter.update(f)
+            energies.append(float(e))
             key_flags.append(selector.offer(times[j], e)[0])
         stats["n_keyframes"] += sum(key_flags)
         tick("gating", t_g)
@@ -228,7 +237,7 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
             for k, f in enumerate(frames):
                 if tl.get("on", "keyframes") == "keyframes" and not key_flags[k]:
                     continue
-                if min_motion > 0 and (quality_motion[fidx[k]] if quality_motion else meter_last(meter)) < min_motion:
+                if min_motion > 0 and energies[k] < min_motion:
                     continue
                 h, w = f.shape[:2]
                 tiles = make_tiles(w, h, tl.get("tile_frac", 1.0), tl.get("overlap", 0.15))
@@ -286,27 +295,33 @@ def detect(clip: VideoClip, every_n: int = 1, *, config: Optional[dict[str, Any]
             warnings.append(f"detect: over budget → stride {stride} from t={times[min(i, n - 1)]:.1f}s")
 
     tm["total"] = round(budget.elapsed, 4)
+    if broken or stride != base_stride or (stats["extras_cut"] if "extras_cut" in stats else False):
+        stats["status"] = "degraded"
+    stats["broken_stages"] = sorted(broken)
     stats["stride_final"] = stride
     stats["n_detections"] = len(out)
     stats["extras_cut"] = not budget.extras_allowed()
+    if stats["extras_cut"] and stats["status"] == "ok":
+        stats["status"] = "degraded"
     _LAST_STATS.update(stats)
     out.sort(key=lambda d: (d.t, d.label, -d.score))
     return out
 
 
-def meter_last(meter: MotionMeter) -> float:  # совместимость: нет доступа к последнему значению — не гейтим
-    return float("inf")
-
-
 def warmup(config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Загружает модели и делает пустой прогон (держим тёплыми). Возвращает {backends, warnings, seconds}."""
+    """Загружает модели и делает пустой прогон (держим тёплыми). Возвращает {status, backends, warnings, seconds}.
+    Не бросает: при отсутствии весов status=unavailable (сеть не трогается)."""
     t0 = time.perf_counter()
     cfg = load_config(config)
-    be = get_backends(cfg)
+    try:
+        be = get_backends(cfg)
+    except DetectorUnavailable as e:
+        return {"status": "unavailable", "backends": [], "warnings": [str(e)],
+                "seconds": round(time.perf_counter() - t0, 3)}
     dummy = np.zeros((848, 464, 3), np.uint8)
     w: list[str] = list(be.warnings)
     for b in be.closed:
         _safe_predict(b, [dummy], "warmup", w)
     if be.open is not None:
         _safe_predict(be.open, [dummy], "warmup-open", w)
-    return {"backends": be.names, "warnings": w, "seconds": round(time.perf_counter() - t0, 3)}
+    return {"status": "ok", "backends": be.names, "warnings": w, "seconds": round(time.perf_counter() - t0, 3)}

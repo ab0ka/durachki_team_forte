@@ -10,15 +10,18 @@ runtime:
   hard_budget_s: 60.0     # после этого — только closed-set с удвоенным шагом
   batch_size: 16          # closed-set батч (RTX 4060 8 GB, fp16)
   max_frames_in_memory: 32
-  fallback_to_mock: true  # нет весов → mock (person по движению) вместо пустого результата; warning в last_stats()
+  # Нет весов/бэкендов → detect() бросает DetectorUnavailable (production сообщает unavailable).
+  # Mock НИКОГДА не включается автоматически — только явный тестовый режим SENTINEL_MOCK=1.
+  on_unavailable: raise   # raise | empty  (empty: вернуть [] и status=unavailable в last_stats())
 
 # ---------------- бэкенд A: closed-set (каждый сэмпл) ----------------
 closed_set:
   enabled: true
   # порядок попыток: первый доступный бэкенд выигрывает
-  backends: [onnx_finetuned, hf]
+  backends: [hf]            # baseline. Дообученный ONNX — опционально: [onnx_finetuned, hf] (или SENTINEL_DETECT_EXTRAS=finetuned)
   hf_model_id: PekingU/rtdetr_v2_r18vd          # Apache-2.0; альтернатива: ustc-community/dfine-small-coco
-  hf_fallback_ids: [ustc-community/dfine-small-coco]
+  hf_fallback_ids: []                           # опц.: [ustc-community/dfine-small-coco] (проверить лицензию веса!)
+  proxy_labels: true        # COCO-классы-заместители (book→document, handbag→bag, bowl→cup...) — с исходным именем в source
   onnx_path: detect/finetuned/model.onnx       # относительно SENTINEL_WEIGHTS
   onnx_labels: detect/finetuned/labels.json    # список имён классов (из LABELS)
   onnx_merge_with_hf: true                      # дообученная модель (cash, cash_bag, ...) + COCO-модель (person, ...)
@@ -43,8 +46,10 @@ closed_set:
   max_dets_per_frame: 60
 
 # ---------------- TTA ----------------
+# Всё ниже (TTA, тайлы, open-vocab) — ОПЦИОНАЛЬНО, по умолчанию выключено (критический путь = baseline).
+# Включение: здесь, через SENTINEL_DETECT_CONFIG или env SENTINEL_DETECT_EXTRAS=tta,tiles,open_vocab
 tta:
-  hflip: true               # горизонтальный флип
+  hflip: false              # горизонтальный флип
   hflip_on: keyframes       # all | keyframes  (keyframes — экономия ~2× времени)
   merge: wbf                # wbf | nms
   iou_thr: 0.55
@@ -52,7 +57,7 @@ tta:
 
 # ---------------- SAHI-стиль: слайсинг на тайлы ----------------
 tiling:
-  enabled: true
+  enabled: false
   on: keyframes             # all | keyframes | off
   tile_frac: 1.0            # сторона квадратного тайла = доля короткой стороны (1.0 → портрет 464×848 даёт 2 тайла)
   overlap: 0.15
@@ -64,7 +69,7 @@ tiling:
 
 # ---------------- бэкенд B: open-vocab (ключевые кадры) ----------------
 open_vocab:
-  enabled: true
+  enabled: false
   hf_model_id: google/owlv2-base-patch16-ensemble   # Apache-2.0
   input_size: 960           # родной размер OWLv2; меньше (768) → быстрее, с интерполяцией позиционных эмбеддингов
   batch_size: 4
@@ -131,4 +136,4 @@ mock:
     cash_bag:      [0, 110, 0]
     bag:           [20, 70, 140]
     document:      [245, 245, 245]
-    keys:          [0, 200, 200]
+    keys:          [120, 120, 0]

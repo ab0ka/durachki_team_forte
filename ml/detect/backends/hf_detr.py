@@ -7,7 +7,7 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from ..boxes import RawDets, clip01, cxcywh_to_xyxy
-from ..labels import build_index_map
+from ..labels import build_index_map, source_tag
 from ..weights import local_model_dir, pretrained_kwargs
 from .base import group_by_shape, resolve_device, torch_preprocess
 
@@ -15,14 +15,23 @@ log = logging.getLogger("ml.detect.hf_detr")
 
 
 def _size_from_processor(proc: Any, default: int) -> tuple[int, int]:
-    size = getattr(proc, "size", None) or {}
-    if isinstance(size, dict):
-        h = size.get("height") or size.get("shortest_edge") or default
-        w = size.get("width") or size.get("shortest_edge") or default
-        return int(h), int(w)
+    """size бывает dict (transformers 4.x) или SizeDict (5.x) — читаем терпимо к обоим."""
+    size = getattr(proc, "size", None)
     if isinstance(size, int):
         return size, size
-    return default, default
+
+    def get(key: str) -> Any:
+        if size is None:
+            return None
+        try:
+            v = size[key] if isinstance(size, dict) else getattr(size, key, None)
+        except (KeyError, TypeError):
+            v = None
+        return v
+
+    h = get("height") or get("shortest_edge") or default
+    w = get("width") or get("shortest_edge") or default
+    return int(h), int(w)
 
 
 class HFDetrBackend:
@@ -34,7 +43,7 @@ class HFDetrBackend:
 
     def __init__(self, model_id: str, device: str = "auto", fp16: bool = True, input_size: int = 640,
                  min_score: float = 0.15, max_dets: int = 100, name: Optional[str] = None,
-                 model: Any = None, processor: Any = None):
+                 model: Any = None, processor: Any = None, allow_proxy: bool = True):
         import torch
 
         self.device = resolve_device(device)
@@ -65,12 +74,13 @@ class HFDetrBackend:
         do_norm = bool(getattr(processor, "do_normalize", False)) if processor is not None else False
         self.mean = getattr(processor, "image_mean", None) if do_norm else None
         self.std = getattr(processor, "image_std", None) if do_norm else None
-        id2label = getattr(self.model.config, "id2label", {}) or {}
-        self.index_map = build_index_map(id2label)
+        id2label = {int(k): v for k, v in (getattr(self.model.config, "id2label", {}) or {}).items()}
+        self.index_map = build_index_map(id2label, allow_proxy=allow_proxy)
         if not self.index_map:
             raise RuntimeError(f"{model_id}: ни один класс id2label не отображается в LABELS")
         self._cls_idx = sorted(self.index_map)
         self._cls_labels = [self.index_map[i] for i in self._cls_idx]
+        self._cls_src = [source_tag(self.name, id2label[i]) for i in self._cls_idx]
 
     def _forward(self, frames: Sequence[np.ndarray]) -> list[RawDets]:
         import torch
@@ -98,7 +108,7 @@ class HFDetrBackend:
                 continue
             xyxy = clip01(cxcywh_to_xyxy(boxes_np[bi][qi]))
             res.append(RawDets(xyxy, top_s[bi][keep].astype(np.float32),
-                               [self._cls_labels[j] for j in ki], [self.name] * int(keep.sum())))
+                               [self._cls_labels[j] for j in ki], [self._cls_src[j] for j in ki]))
         return res
 
     def predict(self, frames: Sequence[np.ndarray]) -> list[RawDets]:

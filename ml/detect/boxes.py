@@ -138,7 +138,7 @@ def weighted_boxes_fusion(views: Sequence[RawDets], iou_thr: float = 0.55,
     score = среднее по видам (отсутствие в виде = 0), но не ниже max*single_view_penalty —
     чтобы TTA не «убивал» объекты, видимые только в одном виде (важно для полноты).
     """
-    n_views = max(1, len([v for v in views]))
+    n_views = max(1, len(views))
     allb = RawDets.concat(list(views))
     if len(allb) == 0:
         return RawDets()
@@ -173,8 +173,10 @@ def weighted_boxes_fusion(views: Sequence[RawDets], iou_thr: float = 0.55,
                 v = int(view_ids[m])
                 per_view[v] = max(per_view.get(v, 0.0), float(allb.scores[m]))
             mean_score = sum(per_view.values()) / n_views
-            score = max(mean_score, float(sc.max()) * (single_view_penalty if len(per_view) < n_views else 1.0))
-            score = min(score, float(sc.max()))
+            if len(per_view) < n_views:  # виден не во всех видах: не ниже max*penalty (полнота важнее)
+                score = min(max(mean_score, float(sc.max()) * single_view_penalty), float(sc.max()))
+            else:
+                score = mean_score
             out_boxes.append(fb)
             out_scores.append(score)
             out_labels.append(lab)
