@@ -10,6 +10,7 @@ import Header from "./components/Header";
 import UploadScreen from "./components/UploadScreen";
 import JobScreen from "./components/JobScreen";
 import AboutScreen from "./components/AboutScreen";
+import ReplayScreen from "./components/ReplayScreen";
 import SettingsDialog from "./components/SettingsDialog";
 
 /** Постоянная пометка: синтетическое демо не подменяет реальную загрузку/результат. */
@@ -133,6 +134,7 @@ export default function App() {
           {route.name === "upload" && <UploadScreen />}
           {route.name === "job" && <JobScreen key={route.id} jobId={route.id} />}
           {route.name === "about" && <AboutScreen />}
+          {route.name === "replay" && <ReplayScreen />}
         </main>
         <footer className="ks-footer no-print py-6 text-center text-xs">
           <div className="ks-container">
