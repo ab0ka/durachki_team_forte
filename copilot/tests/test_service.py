@@ -140,3 +140,39 @@ def test_accepts_dataclass_result(cfg, corpus) -> None:
                   description="Телефон в руке", evidence_frames=[EvidenceFrame(10.0, "QQ==")], type_id="V05")])
     r = _svc(cfg, corpus).answer(res, "Когда?", [])
     assert r["error"] is None and "00:10" in r["answer"]
+
+
+def test_stream_consumed_from_different_threads_with_rlock(cfg, corpus, job_violation) -> None:
+    """Starlette вызывает next() из разных потоков: замки должны браться/отпускаться в одном потоке."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    class _FakeLlamaCpp(ScriptedLLM):
+        name = "llama_cpp"
+
+    svc = _svc(cfg, corpus, _FakeLlamaCpp(["Пользоваться телефоном запрещено [N1]."], delay_s=0.01))
+    svc.gpu_lock = threading.RLock()  # RLock упал бы при освобождении из чужого потока
+    gen = svc.stream(job_violation, "Почему?", [])
+    events = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        while True:
+            ev = pool.submit(next, gen, None).result(timeout=5)
+            if ev is None:
+                break
+            events.append(ev)
+    assert events[-1]["event"] == "done" and events[-1]["citations"]
+    assert svc.gpu_lock.acquire(blocking=False)  # замок освобождён
+    svc.gpu_lock.release()
+
+
+def test_unavailable_rechecked_later(cfg, corpus, monkeypatch) -> None:
+    cfg2 = load_config({**cfg, "llm": {**cfg["llm"], "backend": "auto", "model_candidates": []}})
+    svc = CopilotService(cfg=cfg2, corpus=corpus)
+    assert svc.status()["available"] is False
+    calls = []
+    import copilot.service as service_mod
+
+    monkeypatch.setattr(service_mod, "make_llm", lambda c, w: calls.append(1) or ScriptedLLM(["ok"]))
+    assert svc.status()["available"] is False and not calls  # кэш в пределах RETRY_UNAVAILABLE_S
+    svc._resolved_at -= svc.RETRY_UNAVAILABLE_S + 1
+    assert svc.status()["available"] is True and calls

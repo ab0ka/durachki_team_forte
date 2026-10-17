@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import re
 import threading
 import time
@@ -45,6 +46,8 @@ class CopilotService:
         self.cfg = cfg or default_config()
         self._llm = llm
         self._llm_resolved = llm is not None
+        self._llm_injected = llm is not None
+        self._resolved_at = 0.0
         self._corpus = corpus
         self._retriever = retriever
         self._lock = threading.RLock()
@@ -52,12 +55,18 @@ class CopilotService:
         self.gpu_lock: Any = None  # общий замок GPU от A03 (acquire(timeout=...)/release())
 
     # ------------------------------------------------------------------ lazy resources
+    RETRY_UNAVAILABLE_S = 30.0  # модель/llama-server могли появиться позже старта API
+
     @property
     def llm(self) -> Any:
         with self._lock:
-            if not self._llm_resolved:
+            stale = (self._llm is None and not self._llm_injected
+                     and time.monotonic() - self._resolved_at > self.RETRY_UNAVAILABLE_S)
+            if not self._llm_resolved or stale:
+                self.warnings = []
                 self._llm = make_llm(self.cfg, self.warnings) if copilot_enabled(self.cfg) else None
                 self._llm_resolved = True
+                self._resolved_at = time.monotonic()
             return self._llm
 
     @property
@@ -271,6 +280,8 @@ class CopilotService:
         """События: {"event":"token","text"} … {"event":"done", <ответ как answer()>} | {"event":"error", …}.
 
         Токены идут ДО пост-проверки: UI обязан заменить текст на ``done.answer``.
+        Генерация идёт в отдельном потоке-производителе: замки модели/GPU берутся и отпускаются
+        в одном потоке, даже если потребитель (Starlette) дёргает next() из разных потоков.
         """
         t0 = time.monotonic()
         p = self._prepare(job_result, question, history)
@@ -279,24 +290,51 @@ class CopilotService:
             return
         deadline = t0 + float(self.cfg.get("llm", {}).get("timeout_s", 45))
         backend = str(getattr(p["llm"], "name", "llm"))
+        q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        cancel = threading.Event()
+
+        def produce() -> None:
+            try:
+                for piece in self._generate(p, deadline):
+                    if cancel.is_set():
+                        return
+                    q.put(("piece", piece))
+                q.put(("end", None))
+            except BaseException as exc:  # передаём потребителю
+                q.put(("exc", exc))
+
+        worker = threading.Thread(target=produce, name="copilot-stream", daemon=True)
+        worker.start()
         parts: list[str] = []
         flt = ThinkFilter()
         try:
-            for piece in self._generate(p, deadline):
-                parts.append(piece)
-                visible = flt.feed(piece)
-                if visible:
-                    yield {"event": "token", "text": visible}
-        except (LLMTimeout, TimeoutError):
-            yield {"event": "error", **self._error("timeout", p["job_id"], backend=backend)}
-            return
-        except _Busy:
-            yield {"event": "error", **self._error("busy", p["job_id"], backend=backend)}
-            return
-        except Exception as exc:
-            log.exception("copilot LLM error")
-            yield {"event": "error", **self._error("llm_error", p["job_id"], backend=backend, detail=type(exc).__name__)}
-            return
+            while True:
+                try:
+                    kind, val = q.get(timeout=max(0.05, deadline - time.monotonic() + 1.0))
+                except queue.Empty:
+                    yield {"event": "error", **self._error("timeout", p["job_id"], backend=backend)}
+                    return
+                if kind == "piece":
+                    parts.append(val)
+                    visible = flt.feed(val)
+                    if visible:
+                        yield {"event": "token", "text": visible}
+                    continue
+                if kind == "exc":
+                    if isinstance(val, (LLMTimeout, TimeoutError)):
+                        code = "timeout"
+                    elif isinstance(val, _Busy):
+                        code = "busy"
+                    else:
+                        log.error("copilot LLM error: %r", val)
+                        yield {"event": "error", **self._error("llm_error", p["job_id"], backend=backend,
+                                                               detail=type(val).__name__)}
+                        return
+                    yield {"event": "error", **self._error(code, p["job_id"], backend=backend)}
+                    return
+                break
+        finally:
+            cancel.set()
         yield {"event": "done", **self._finish(p, "".join(parts), backend, t0)}
 
 

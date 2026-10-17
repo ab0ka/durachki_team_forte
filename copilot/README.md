@@ -122,7 +122,7 @@ COPILOT_ENABLED=1 COPILOT_MODEL_PATH=weights/copilot/Qwen3-4B-Instruct-2507-Q4_K
 Размеры приблизительные: HF API из этой среды был недоступен.
 
 ## Проверки (реально выполнены в этой сессии)
-`python -m pytest copilot/tests -q` даёт **73 passed** (Python 3.11, CPU, без весов, ещё раз с
+`python -m pytest copilot/tests -q` даёт **76 passed** (Python 3.11, CPU, без весов, ещё раз с
 `HTTPS_PROXY` в окружении). Что покрыто:
 - выдуманные `[N9]`, «п. 999/404», «Закон «…»», неизвестные URL и таймкоды удаляются, `grounded=false`;
 - нормы, приложенные к результату, но отсутствующие в каталоге, не цитируются ни в ответе, ни в отчёте;
@@ -132,7 +132,9 @@ COPILOT_ENABLED=1 COPILOT_MODEL_PATH=weights/copilot/Qwen3-4B-Instruct-2507-Q4_K
   не попадают в `sys.modules`; конструкторы не трогают LLM и корпус;
 - **соблюдается таймаут**: обычный и SSE-ответ дают `error=timeout` (504) за ≤2 с при бюджете 0.1–0.2 с;
   llama.cpp-бэкенд (через фейковый модуль `llama_cpp`) прерывается по дедлайну;
-- 501 при `enabled=false` и при отсутствии GGUF; 409/404/422; SSE заканчивается `done`; API-ключ A02 через `dependencies`;
+- 501 при `enabled=false` и при отсутствии GGUF (в том числе для SSE: ошибка до первого токена отдаётся HTTP-кодом, а не 200); 409/404/422; SSE заканчивается `done`; API-ключ A02 через `dependencies`;
+- SSE-генерация идёт в потоке-производителе, поэтому замки модели и GPU (даже RLock) не освобождаются из чужого потока, когда Starlette вызывает `next()` из разных воркеров;
+- недоступная модель перепроверяется раз в 30 с: llama-server может подняться позже API;
 - частичный offload (`plan_gpu_layers`), ленивая загрузка и выгрузка llama.cpp, think-фильтр;
 - без `SENTINEL_MOCK`/`COPILOT_ALLOW_FIXTURE` тестовая фикстура норм не используется.
 

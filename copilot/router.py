@@ -97,8 +97,19 @@ def make_router(get_job: Optional[JobProvider] = None, service: Any = None, pref
         want_sse = stream or "text/event-stream" in request.headers.get("accept", "")
         svc = _svc()
         if want_sse:
+            gen = svc.stream(job, body.question, history)
+            first = await run_in_threadpool(next, gen, None)
+            if first is None or first.get("event") == "error":
+                # ошибка до первого токена (выключен / нет модели / не готово) — обычный HTTP-код, не 200
+                detail = dict(first or {"error": "llm_error"})
+                detail.pop("event", None)
+                return JSONResponse(status_code=ERROR_STATUS.get(str(detail.get("error")), 500),
+                                    content={"detail": detail})
+
             def events() -> Any:
-                for ev in svc.stream(job, body.question, history):
+                ev = dict(first)
+                yield _sse(ev.pop("event", "message"), ev)
+                for ev in gen:
                     name = ev.pop("event", "message")
                     yield _sse(name, ev)
             return StreamingResponse(events(), media_type="text/event-stream",

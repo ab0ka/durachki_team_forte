@@ -190,7 +190,8 @@ class LlamaCppBackend:
         self.cfg = (cfg or default_config()).get("llm", {})
         self.model_path = str(model_path)
         self._llm: Any = None
-        self._lock = threading.RLock()
+        # обычный Lock (не RLock): допускает освобождение из другого потока
+        self._lock = threading.Lock()
         self._last_used = 0.0
         self._timer: Optional[threading.Timer] = None
         self.n_gpu_layers: Optional[int] = None
@@ -257,6 +258,10 @@ class LlamaCppBackend:
     def release(self) -> None:
         """Выгрузить модель (освободить VRAM для VLM/детектора)."""
         acquired = self._lock.acquire(timeout=5)
+        if not acquired:  # идёт генерация — не освобождаем модель из-под неё, повторим по таймеру
+            log.warning("copilot LLM busy, unload postponed")
+            self._schedule_unload()
+            return
         try:
             if self._llm is not None:
                 try:
@@ -267,8 +272,7 @@ class LlamaCppBackend:
                     self._llm = None
                     gc.collect()
         finally:
-            if acquired:
-                self._lock.release()
+            self._lock.release()
 
     def warmup(self) -> None:
         with self._lock:

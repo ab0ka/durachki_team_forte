@@ -88,6 +88,11 @@ def result_times(result: dict[str, Any]) -> list[float]:
                 times.append(float(f.get("timestamp_sec")))
             except (TypeError, ValueError):
                 pass
+        try:  # длительность эпизода («около 5 секунд») — тоже факт результата
+            if v.get("t_end") is not None and v.get("t_start") is not None:
+                times.append(float(v["t_end"]) - float(v["t_start"]))
+        except (TypeError, ValueError):
+            pass
     meta = result.get("meta") or {}
     for key in ("duration", "duration_s", "video_duration"):
         try:

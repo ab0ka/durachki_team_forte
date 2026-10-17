@@ -120,3 +120,9 @@ def test_module_router_without_provider_is_503(cfg, corpus) -> None:
     app.include_router(router_mod.router)
     r = TestClient(app).post("/api/v1/jobs/x/ask", json={"question": "Почему?"})
     assert r.status_code == 503
+
+
+def test_sse_disabled_returns_http_501_not_200(cfg, corpus, jobs) -> None:
+    svc = CopilotService(cfg=load_config({**cfg, "enabled": False}), corpus=corpus)
+    r = _client(svc, jobs).post("/api/v1/jobs/job-test-1/ask?stream=1", json={"question": "Почему?"})
+    assert r.status_code == 501 and r.json()["detail"]["error"] == "disabled"
