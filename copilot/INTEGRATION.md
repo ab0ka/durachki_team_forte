@@ -130,7 +130,7 @@ coverage < 1) никогда не превращается в «нарушени
 | `llm.no_model_mode` | `retrieval` | `unavailable` возвращает прежнее поведение 501 |
 | `llm.busy_policy` | `retrieval` | `error` → 503 |
 | `llm.retrieval_notice_in_answer` | `true` | пометка режима первой строкой `answer` |
-| `vlm_service.{module,function,priority,wait_s}` | `ml.vlm.service`, `chat`, `low`, `10` | привязка к A11 |
+| `vlm_service.{module,function,priority,wait_s}` (`COPILOT_VLM_MODULE`) | `ml.vlm.service`, `chat`, `low`, `10` | привязка к A11 |
 | `vlm_service.runtime_adapter` | `false` | временный адаптер к `ml.vlm.runtime` (только тёплая VLM) |
 | `COPILOT_TIMEOUT_S` | `45` | бюджет ответа |
 | `embed.hf_cache_dir` | `weights/hf/hub` | офлайн-кэш L1 для `intfloat/multilingual-e5-small` (только `local_files_only`) |
@@ -169,10 +169,15 @@ python -m copilot.eval_grounding --compare outputs/copilot/grounding_retrieval.j
   время анализа. Не измерено.
 
 ## 6. Что проверено и что требует GPU
-**Проверено здесь** (Python 3.11, CPU, без весов/сети): `pytest copilot/tests` → **218 passed**,
+**Проверено здесь** (Python 3.11, CPU, без весов/сети): `pytest copilot/tests` → **221 passed**,
 `ruff check copilot` (A01) → чисто. Синтетический eval: mock и retrieval — 100% проверок, guard ничего
 не режет. Скриптовая «плохая модель» (выдумывает пункт, сумму, ссылку, отрицание): safety 100%,
 guard урезает 89% ответов.
+
+Синтетический eval также прогнан на **реальном каталоге и источниках A13** из ветки интеграции
+(14 фрагментов): retrieval — 100% проверок, guard ничего не режет; «плохая модель» — safety 100%.
+Нерелевантные найденные поиском фрагменты не предлагаются: нужно ≥2 необщих слова вопроса или
+достаточная близость.
 
 Покрыто тестами:
 - разбор реального формата A13;

@@ -57,7 +57,8 @@ _ANSWER_VOCAB = {w[:4] for w in """признак возможного нару�
 согласно требование запрещено допускается указано видно отмечено зафиксировано обнаружено рекомендуется
 сверить подтвердить отклонить алгоритм оценка вероятность человек определяется является случае ответ
 информация относящиеся найденные данных имеющимся момент означает пайплайн сообщил проанализировано целиком
-полнота неполный неизвестно каталог исключения описаны поиском пункта сверки""".split()}
+полнота неполный неизвестно каталог исключения описаны поиском пункта сверки роли кассир посетитель
+инкассатор зоне поведению предметам""".split()}
 
 # утверждения «нарушений нет» / «нарушение есть» — сверяются с вердиктом и полнотой анализа
 _CLAIM_NONE_RE = re.compile(
@@ -225,6 +226,11 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
     for turn in history:
         allowed_times += _times_in(str(turn.get("content") or ""))
     ref_clauses = {norm_clause(r.chunk.clause) for r in refs if r.chunk.clause}
+    if corpus is not None:  # пункты, упомянутые в пояснениях/исключениях каталога для типов событий (тоже контекст)
+        for v in viols.values():
+            info = corpus.type_info(str(v.get("type_id") or ""))
+            for txt in [str(info.get("legal_note") or "")] + [str(x) for x in info.get("exclusions") or []]:
+                ref_clauses |= {norm_clause(cm.group(0)) for cm in _CLAUSE_RE.finditer(txt)}
     known_urls = {norm_url(r.chunk.url) for r in refs if r.chunk.url}
     if corpus is not None:
         known_urls |= corpus.known_urls()

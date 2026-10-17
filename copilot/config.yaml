@@ -39,6 +39,10 @@ rag:
   min_score_e5: 0.78
   hybrid_lexical_weight: 0.35   # доля лексического (BM25-подобного) скора в гибридном ранжировании
   boost_violation_types: 0.15   # бонус нормам по type_id нарушений из результата
+  # «найдено поиском» (не каталог) показываем, только если фрагмент реально похож на вопрос:
+  retrieved_min_overlap: 2      # ≥ N необщих слов вопроса во фрагменте
+  retrieved_min_dense: 0.25     # или косинус hashing ≥
+  retrieved_min_dense_e5: 0.82  # или косинус e5 ≥ (не тюнилось на реальных данных)
 
 llm:
   # auto: общая Qwen3-VL-4B через ml.vlm.service.chat (A11) -> локальный llama.cpp server, если задан.

@@ -235,9 +235,13 @@ class CopilotService:
         except Exception as exc:  # RAG не должен ронять ответ
             warnings.append(f"поиск по нормам недоступен: {type(exc).__name__}")
             hits = []
-        # фрагмент источника, связанный с типом события через каталог (тот же URL+пункт), — тоже «каталог»
-        chunks.extend((h.chunk, h.score, "catalog" if set(h.chunk.type_ids) & set(type_ids) else "retrieved")
-                      for h in hits)
+        # фрагмент источника, связанный с типом события через каталог (тот же URL+пункт), — тоже «каталог»;
+        # просто найденное поиском показываем, только если оно действительно похоже на вопрос
+        for h in hits:
+            relation = "catalog" if set(h.chunk.type_ids) & set(type_ids) else "retrieved"
+            if relation == "retrieved" and hasattr(self.retriever, "relevant") and not self.retriever.relevant(h):
+                continue
+            chunks.append((h.chunk, h.score, relation))
         refs: list[NormRef] = []
         seen: set[Any] = set()
         for c, score, relation in chunks:

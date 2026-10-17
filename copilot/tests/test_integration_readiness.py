@@ -115,7 +115,8 @@ print(json.dumps({"available": st["available"], "reason": st["reason"], "error":
                   "answer": r["answer"], "heavy": heavy}))
 """
     env = {"PATH": "/usr/bin:/bin", "COPILOT_ENABLED": "1", "COPILOT_MODEL_PATH": str(tmp_path / "none.gguf"),
-           "COPILOT_CACHE_DIR": str(tmp_path / "cache"), "HF_HUB_OFFLINE": "1", "COPILOT_EMBED_BACKEND": "hashing"}
+           "COPILOT_CACHE_DIR": str(tmp_path / "cache"), "HF_HUB_OFFLINE": "1", "COPILOT_EMBED_BACKEND": "hashing",
+           "COPILOT_VLM_MODULE": "copilot._no_vlm_service_for_test"}  # «модели нет» и после мерджа A11
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60, env=env)
     assert out.returncode == 0, out.stderr
     res = json.loads(out.stdout.strip().splitlines()[-1])

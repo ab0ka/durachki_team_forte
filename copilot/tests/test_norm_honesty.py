@@ -84,3 +84,26 @@ def test_report_shows_status_note_exclusions_and_without_clause(a13_cfg, a13_cor
     assert "без пункта" in md
     assert "Пояснение каталога (не текст нормы)" in md
     assert "Когда это не нарушение (каталог):" in md and "руки перекрыты счётчиком" in md
+
+
+def test_irrelevant_search_hits_not_offered(a13_cfg, a13_corpus) -> None:
+    """Нет нормы про телефон — нельзя подсовывать нерелевантные фрагменты как «возможно относится»."""
+    job = {"job_id": "p", "status": "done", "verdict": "violation", "meta": {"completeness": {"complete": True}},
+           "violations": [{"type": "Использование мобильного телефона при работе с ценностями", "type_id": "V05",
+                           "timecode_sec": 5.0, "description": "телефон у уха", "evidence_frames": []}]}
+    r = CopilotService(cfg=a13_cfg, corpus=a13_corpus).answer(job, "Какая норма применяется к телефону?", [])
+    assert r["answer"].startswith(NO_DATA) and "без пункта" in r["answer"] and r["citations"] == []
+
+
+def test_relevant_search_hit_still_offered(a13_cfg, a13_corpus) -> None:
+    job = {"job_id": "p", "status": "done", "verdict": "violation", "meta": {"completeness": {"complete": True}},
+           "violations": [{"type": "Иное", "type_id": "V99", "timecode_sec": 5.0, "description": "x",
+                           "evidence_frames": []}]}
+    r = CopilotService(cfg=a13_cfg, corpus=a13_corpus).answer(job, "Где норма про изоляцию кассы от других помещений?", [])
+    assert any(c["relation"] == "retrieved" and c["clause"] == "п. 8" for c in r["citations"])
+
+
+def test_exclusions_answer_keeps_catalog_clause_mentions(a13_cfg, a13_corpus, job_v08_v01) -> None:
+    r = CopilotService(cfg=a13_cfg, corpus=a13_corpus).answer(job_v08_v01, "Когда пересчёт не нарушение?", [])
+    assert "не считается нарушением" in r["answer"] and "руки перекрыты счётчиком" in r["answer"]
+    assert r["removed_citations"] == []

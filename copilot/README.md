@@ -68,7 +68,7 @@ Qwen3-VL-4B через `ml.vlm.service.chat` (A11), низкий приорит�
     `python -m copilot.train.lora --base <снапшот Qwen3-VL-4B> --load-4bit`.
 
 ## Проверки (реально выполнены)
-- `python -m pytest copilot/tests -q` → **218 passed, 1 skipped** (Python 3.11, CPU, без весов и сети).
+- `python -m pytest copilot/tests -q` → **221 passed, 1 skipped** (Python 3.11, CPU, без весов и сети).
   Пропущенный тест — на реальном `norms/`, он запускается, если папка есть в ветке.
 - `ruff check copilot` по правилам A01 → чисто.
 - Синтетический `eval_grounding`: mock/retrieval 100%, guard ничего не режет. «Плохая модель» (скрипт):
