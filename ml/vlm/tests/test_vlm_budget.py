@@ -138,3 +138,50 @@ def test_failed_load_has_cooldown(clip, cfg, clock):
         out = verify_events(clip, ev, 100.0, cfg=cfg, backend=be, clock=clock)
         assert out[0].extra["vlm"]["status"] == "unavailable" and out[0].confidence == 0.6
     assert be.load_calls == 1  # повторно не грузим в течение load_retry_cooldown_s
+
+
+def test_regex_fallback_only_after_retry():
+    from ml.vlm.parsing import regex_fallback_verify
+    clk = FakeClock()
+    good = '{"visible": true, "type_id": "V05", "observed_facts": ["Кассир держит телефон"], "confidence": 0.9}'
+    be = MockBackend(responses=["visible: yes, confidence 0.7 (broken", good], clock=clk)
+    b = Budget(30.0, VLMLimits(est_call_s=0.5), clock=clk)
+    out = call_json(be, _imgs(), "s", "u", b, normalize=lambda d: normalize_verify(d), max_new_tokens=100,
+                    fallback=regex_fallback_verify)
+    assert out.ok and out.attempts == 2 and out.data["observed_facts"]  # ретрай дал полноценный JSON
+    be = MockBackend(responses=["visible: yes, confidence 0.7 (broken", "still broken"], clock=clk)
+    out = call_json(be, _imgs(), "s", "u", Budget(30.0, VLMLimits(est_call_s=0.5), clock=clk),
+                    normalize=lambda d: normalize_verify(d), max_new_tokens=100, fallback=regex_fallback_verify)
+    assert out.ok and out.attempts == 2 and "regex_fallback" in out.data["flags"]
+
+
+def test_partial_answer_on_timeout_not_retried():
+    from ml.vlm.backends.base import GenResult
+
+    class Partial(MockBackend):
+        def generate(self, images, system, prompt, **kw):
+            self.calls.append(prompt)
+            return GenResult(text='{"type_id": "V05", "observ', latency_s=5.0, timed_out=True)
+
+    be = Partial()
+    out = call_json(be, _imgs(), "s", "u", Budget(60.0, VLMLimits(est_call_s=0.5), clock=FakeClock()),
+                    normalize=lambda d: normalize_verify(d), max_new_tokens=100)
+    assert out.status == "timeout" and len(be.calls) == 1
+
+
+def test_budget_rechecked_after_gpu_wait():
+    clk = FakeClock()
+
+    class SlowLock:
+        def __enter__(self):
+            clk.advance(29.0)  # другой поток держал GPU 29 с
+
+        def __exit__(self, *a):
+            return False
+
+    from ml.vlm import runtime
+    runtime.set_gpu_lock(SlowLock())
+    be = MockBackend(clock=clk)
+    out = call_json(be, _imgs(), "s", "u", Budget(30.0, VLMLimits(est_call_s=2.0), clock=clk),
+                    normalize=lambda d: normalize_verify(d), max_new_tokens=100)
+    assert out.status == "skipped_budget" and not be.calls

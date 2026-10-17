@@ -169,10 +169,21 @@ def call_json(be: VLMBackend, images: list[Any], system: str, prompt: str, budge
               max_new_tokens: int, schema: Optional[dict[str, Any]] = None, retry_suffix: str = "",
               temperature: float = 0.0,
               fallback: Optional[Callable[[str], Optional[dict[str, Any]]]] = None) -> CallOutcome:
-    """Вызов VLM -> JSON -> нормализация. 1 ретрай (в пределах бюджета) только при невалидном JSON."""
+    """Вызов VLM -> JSON -> нормализация.
+
+    1 ретрай (в пределах бюджета) — только при невалидном JSON; таймаут не ретраится. Регэксп-fallback
+    (без фактов) — лишь последний шанс, если ретрай не дал валидного JSON или не поместился в бюджет.
+    """
     out = CallOutcome()
     lim = budget.limits
     vis = sum(visual_tokens(getattr(im, "size", (448, 448)), budget.px_per_token) for im in images)
+    fb_data: Optional[dict[str, Any]] = None
+
+    def _finish_with_fallback() -> CallOutcome:
+        if fb_data is not None:
+            out.ok, out.status, out.data, out.repaired = True, "ok", fb_data, True
+        return out
+
     for attempt in range(1 + max(0, lim.max_retries_per_item)):
         retry = attempt > 0
         if not budget.can_call(len(images), vis, retry=retry):
@@ -185,25 +196,30 @@ def call_json(be: VLMBackend, images: list[Any], system: str, prompt: str, budge
             out.status = out.status if retry else "skipped_budget"
             break
         p = prompt if not retry else f"{prompt}\n\n{retry_suffix}".strip()
+        res = None
         try:
             with gpu_guard():
-                res = be.generate(images, system, p, max_new_tokens=mnt, timeout_s=budget.call_timeout(),
-                                  json_schema=schema, temperature=temperature)
+                # пока ждали общий GPU-lock (другое видео/детектор), бюджет мог закончиться
+                if budget.remaining() < budget.est_call_s() * lim.safety:
+                    budget.stop_reason = budget.stop_reason or "time_after_gpu_wait"
+                else:
+                    res = be.generate(images, system, p, max_new_tokens=mnt, timeout_s=budget.call_timeout(),
+                                      json_schema=schema, temperature=temperature)
         except Exception as e:  # noqa: BLE001 — сбой бэкенда не роняет пайплайн
             budget.record(0.0, vis, 0, 0, retry)
             out.attempts += 1
             out.status, out.error = "error", f"{type(e).__name__}"
             log.warning("VLM generate failed: %s", type(e).__name__)
             break
+        if res is None:
+            out.status = out.status if retry else "skipped_budget"
+            break
         out.attempts += 1
         out.latency_s += res.latency_s
         budget.record(res.latency_s, vis, res.completion_tokens, mnt, retry)
         out.raw.append(res.text)
-        if res.timed_out and not res.text.strip():
-            out.status, out.error = "timeout", res.error or "timeout"
-            break  # таймаут не ретраим — дорого
-        if res.error and not res.text.strip():
-            out.status, out.error = "error", res.error
+        if not res.text.strip():
+            out.status, out.error = ("timeout", res.error or "timeout") if res.timed_out else ("error", res.error or "empty")
             break
         pr = extract_json(res.text)
         if pr.ok:
@@ -215,9 +231,9 @@ def call_json(be: VLMBackend, images: list[Any], system: str, prompt: str, budge
         else:
             out.error = pr.error
             if fallback is not None:
-                fb = fallback(res.text)
-                if fb is not None:
-                    out.ok, out.status, out.data, out.repaired = True, "ok", fb, True
-                    return out
+                fb_data = fallback(res.text) or fb_data
         out.status = "parse_failed"
-    return out
+        if res.timed_out:  # обрезанный по времени ответ не ретраим — дорого
+            out.status = "timeout"
+            break
+    return _finish_with_fallback()
