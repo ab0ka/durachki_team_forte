@@ -87,6 +87,11 @@ policies:
     enabled: false
     weight: 0.5
 
+# Таймкод нарушения: peak — t_peak самого весомого события (A09: фактический кадр доказательства);
+# onset — начало слитого кластера (переход). Политика выбирается ЗАМЕРОМ (python -m ml.fusion.ab), не на глаз.
+timecode:
+  policy: peak            # peak | onset
+
 output:
   max_violations: 10
   timeline_step_s: 0.5

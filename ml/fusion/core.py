@@ -806,7 +806,11 @@ def fuse_scores(
 
     ocfg = cfg.get("output") or {}
     nd = int(_f(ocfg.get("timecode_round", 1), 1))
+    tc_policy = str((cfg.get("timecode") or {}).get("policy", "peak")).lower()
     for c in cands:
+        c.extra.setdefault("t_peak_source", round(c.t_peak, 3))
+        if tc_policy == "onset" and c.origin == "events":
+            c.t_peak = c.t_start   # момент начала (переход: отошла, вошёл, поднесла)
         c.t_peak = timecode(c.t_peak, duration, nd)
         c.t_start = timecode(min(c.t_start, c.t_peak), duration, nd)
         c.t_end = timecode(max(c.t_end, c.t_peak), duration, nd)

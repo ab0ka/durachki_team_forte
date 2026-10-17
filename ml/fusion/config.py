@@ -61,6 +61,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "v01_client_side": {"enabled": False},
         "negative_evidence": {"enabled": False, "weight": 0.5},
     },
+    "timecode": {"policy": "peak"},
     "output": {
         "max_violations": 10,
         "timeline_step_s": 0.5,
