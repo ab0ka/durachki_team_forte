@@ -20,6 +20,7 @@ class Sample:
     label: int
     times: list[float]                      # размеченные секунды (может быть несколько у дубликатов)
     type_id: str = ""                        # только проверенная локальная разметка типа, иначе ""
+    pseudo_type_id: str = ""                 # предварительный тип (VLM) — только по флагу train.use_pseudo_types
     md5: str = ""
     sources: list[dict] = field(default_factory=list)          # исходные метки файлов группы дубликатов
     conflict: bool = False
@@ -258,6 +259,13 @@ def type_index(type_id: str) -> int:
     return TYPE_IDS.index(type_id) if type_id in TYPE_IDS else -1
 
 
+def train_type_id(s: "Sample", cfg: dict) -> str:
+    """Тип для обучения головы: подтверждённый; предварительный (VLM) — только если use_pseudo_types."""
+    if s.type_id:
+        return s.type_id
+    return s.pseudo_type_id if cfg["train"].get("use_pseudo_types", False) else ""
+
+
 # ----------------------------------------------------------------------------- windows / augs
 def time_warp(X: np.ndarray, y: np.ndarray, w: np.ndarray, factor: float) -> tuple[np.ndarray, ...]:
     T = len(X)
@@ -300,7 +308,7 @@ def sample_window(s: Sample, cfg: dict, rng: np.random.Generator, use_aug: bool,
         X = X.copy()
         X[:, view_cols[int(rng.integers(0, len(view_cols)))]] = 0.0
     return {"X": X, "y": y, "w": w, "label": float(s.label if contains else 0),
-            "mil_mask": float(1.0 if (not s.label or contains) else 0.0), "type": type_index(s.type_id)}
+            "mil_mask": float(1.0 if (not s.label or contains) else 0.0), "type": type_index(train_type_id(s, cfg))}
 
 
 def collate(items: list[dict]) -> dict:

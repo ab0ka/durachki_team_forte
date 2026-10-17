@@ -103,6 +103,7 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
     risk, events = temporal.score(clip)
     st = temporal.status()
     assert st["status"] == "ok" and st["kind"] == "baseline"
+    assert st["coverage"]["complete"] and st["coverage"]["fraction"] >= 0.98
     ts = [t for t, _ in risk]
     assert np.allclose(np.diff(ts), 0.5) and all(0.0 <= r <= 1.0 for _, r in risk)
     cands = temporal.propose(clip)                          # с чекпоинтом: кандидаты из риска + изменений

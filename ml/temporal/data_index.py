@@ -32,7 +32,8 @@ def load_samples(cfg: dict, path: Optional[str] = None, max_aug: Optional[int] =
     entries = {v["name"]: v for v in idx["videos"]}
     labs = {n: VideoLabel(name=n, label=int(v["label"]), times=list(v.get("times", [])),
                           type_id=v.get("type_id", ""), files=[v.get("file", n)], group=v.get("group", n),
-                          md5=v.get("md5", "")) for n, v in entries.items()}
+                          md5=v.get("md5", ""), pseudo_type_id=v.get("pseudo_type_id", ""))
+            for n, v in entries.items()}
     merged = merge_duplicates(labs, cfg["labels"].get("conflict_policy", "positive"),
                               cfg["labels"].get("time_conflict_policy", "both"))
     samples: list[Sample] = []
@@ -51,7 +52,8 @@ def load_samples(cfg: dict, path: Optional[str] = None, max_aug: Optional[int] =
                         [(s["name"], s["label"], s["times"]) for s in lab.sources])
         samples.append(Sample(name=g, group=g, label=lab.label, times=lab.times, type_id=lab.type_id,
                               md5=lab.md5, sources=lab.sources, conflict=lab.conflict,
-                              time_conflict=lab.time_conflict, versions=versions))
+                              time_conflict=lab.time_conflict, pseudo_type_id=lab.pseudo_type_id,
+                              versions=versions))
     return samples, idx
 
 

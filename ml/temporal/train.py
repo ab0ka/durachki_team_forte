@@ -18,7 +18,7 @@ from typing import Optional, Sequence
 from .config import load_config, reports_dir, weights_dir
 from .dataset import Sample, fit_spec, prepare_samples
 from .features import TextBank
-from .predictors import fit_predictor, has_type_labels, save_checkpoint
+from .predictors import fit_predictor, has_type_labels, save_checkpoint, type_head_source
 
 log = logging.getLogger("sentinel.temporal")
 
@@ -48,6 +48,7 @@ def train_all(samples: Sequence[Sample], bank: TextBank, cfg: dict, kinds: Seque
         meta = {"threshold": thr, "threshold_source": src, "n_train": len(samples),
                 "train_groups": sorted(s.group for s in samples),
                 "pooling": pooling, "null": cal["null"],
+                "type_head_source": type_head_source(samples, cfg) if model.type_trained else None,
                 "calibration": {k: cal[k] for k in ("n_inner", "n_null_blocks", "oof_auc")},
                 "prompts": {"en": bank.texts_en, "ru": bank.texts_ru, "owner": bank.owner},
                 "cv": ({k: cv_report[kind][k] for k in ("threshold_free", "nested", "protocol", "outer", "inner")}

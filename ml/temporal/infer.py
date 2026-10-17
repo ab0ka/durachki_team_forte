@@ -153,11 +153,21 @@ def score(clip: Any, zones: Any = None, budget_s: Optional[float] = None
             pk["confidence"] = vscore * pk["peak"] / max(rmax, 1e-9)
             pk["t_peak"] = _apply_policy(t_curve, r_curve, pk, pcfg)
             events.append(_make_event(pk, model, meta, grid, tprobs, fs, zs, zs_keys, bank))
+    _LAST.update(coverage=_coverage(fs, duration))
     _LAST.update(status="ok", kind=model.kind, threshold=thr, n_events=len(events), video_score=round(vscore, 4),
                  pooling=pcfg["infer"].get("pooling"), max_risk=float(r_curve.max()) if len(r_curve) else 0.0,
                  elapsed_s=round(time.monotonic() - t0, 3), n_frames=len(fs), fps=fs.meta.get("fps"),
                  views=fs.views, truncated_at=fs.meta.get("truncated_at"))
     return [(round(float(t), 2), round(float(r), 4)) for t, r in zip(t_curve, r_curve)], events
+
+
+def _coverage(fs: FeatureSet, duration: float) -> dict:
+    """Полнота анализа: неполный анализ — не «нарушений нет». complete=False при обрезке по бюджету."""
+    until = float(fs.meta.get("truncated_at") or (fs.times[-1] if len(fs.times) else 0.0))
+    step = 1.0 / max(float(fs.meta.get("fps", 4.0)), 1e-6)
+    frac = min(1.0, (until + step) / max(duration, 1e-6)) if duration else 0.0
+    return {"analyzed_until_s": round(until, 2), "duration_s": round(float(duration), 2),
+            "fraction": round(frac, 3), "complete": bool(frac >= 0.98 and not fs.meta.get("truncated_at"))}
 
 
 def _apply_policy(t: np.ndarray, r: np.ndarray, pk: dict, cfg: dict) -> float:
@@ -189,7 +199,8 @@ def _make_event(pk: dict, model: Any, meta: dict, grid: np.ndarray, tprobs: Opti
         tp_mean = tprobs[_window(grid, tp, 1.5)].mean(axis=0)
         k = int(np.argmax(tp_mean))
         type_id = TYPE_IDS[k] if k < len(TYPE_IDS) else "V99"
-        extra["type_source"] = "trained_type_head"
+        extra["type_source"] = ("pseudo_type_head (предварительно: обучено на псевдометках VLM)"
+                                if meta.get("type_head_source") == "pseudo" else "trained_type_head")
         extra["type_probs"] = {TYPE_IDS[i]: round(float(v), 4) for i, v in enumerate(tp_mean) if i < len(TYPE_IDS)}
     else:
         extra["type_source"] = "none"  # тип должен прийти от rules/vlm; ниже — только подсказка
@@ -305,6 +316,7 @@ def propose(clip: Any, zones: Any = None, budget_s: Optional[float] = None, n_ma
         events.append(Event(type_id="V99", t_start=round(max(0.0, t - pw), 2), t_end=round(min(duration, t + pw), 2),
                             t_peak=round(t, 2), confidence=round(float(c["salience"]), 4), source="temporal",
                             facts=[fact], bboxes=bboxes, extra=extra))
+    _LAST_PROPOSE.update(coverage=_coverage(fs, duration))
     _LAST_PROPOSE.update(status="ok", n=len(events), checkpoint=model is not None, warning=warn,
                          elapsed_s=round(time.monotonic() - t0, 3), n_frames=len(fs), views=fs.views)
     return events

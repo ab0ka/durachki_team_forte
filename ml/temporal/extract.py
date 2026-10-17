@@ -98,7 +98,8 @@ def extract_dataset(videos_dir: str, labels_csv: str, cfg: dict, n_aug: Optional
                 feats.append(str(p.relative_to(cache_dir(cfg))) if p.is_relative_to(cache_dir(cfg)) else str(p))
             by_md5[h] = feats
         entries.append({"name": n, "file": vids[n].name, "md5": h, "label": lab.label, "times": lab.times,
-                        "type_id": lab.type_id, "group": lab.group, "features": feats})
+                        "type_id": lab.type_id, "pseudo_type_id": lab.pseudo_type_id, "group": lab.group,
+                        "features": feats})
     idx = {"version": 1, "backend": backend.name, "model_id": sig["model_id"], "fps": fps, "views": views,
            "n_aug": n_aug, "on_cuda": on_cuda, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
            "videos": entries, "missing_videos": missing, "unlabeled_videos": unlabeled,

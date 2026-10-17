@@ -97,6 +97,7 @@ train:
   mil_weight: 0.5                  # вес MIL-потери уровня видео
   mil_topk_frac: 0.04
   type_weight: 0.3                 # голова типа учится ТОЛЬКО если в labels.csv есть проверенный type_id
+  use_pseudo_types: false          # псевдометки типа (type_status=vlm/pseudo) — только явно; помечаются «предварительно»
   aug_prob: 0.7                    # доля батчей, где берём аугментированную копию признаков
   time_warp: [0.8, 1.25]
   time_warp_prob: 0.5
