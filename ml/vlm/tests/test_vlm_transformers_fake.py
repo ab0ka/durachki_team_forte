@@ -158,7 +158,7 @@ def test_option_probs_letters_when_first_tokens_collide(be):
     be._model = Model([], logits=logits)
     sc = be.option_probs([], "s", "Вопрос?", {"yes": ["Не знаю"], "no": ["Нет"], "unknown": ["Не видно"]})
     assert sc.mode == "letters" and max(sc.probs, key=sc.probs.get) == "no"
-    assert "Ответь одной буквой" in be._processor.seen[-1][-1]["content"][-1]["text"]
+    assert "Вместо слова ответь одной буквой" in be._processor.seen[-1][-1]["content"][-1]["text"]
 
 
 def test_chat_converts_openai_messages(be):
