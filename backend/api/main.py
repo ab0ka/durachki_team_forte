@@ -376,6 +376,44 @@ def build_jobs_router(auth: Callable[[str], Callable[..., Any]], ui: bool) -> AP
     return r
 
 
+def job_for_copilot(app: FastAPI, job_id: str) -> Optional[dict[str, Any]]:
+    """Провайдер для copilot.make_router (A14): JSON ответа ТЗ, None если задачи нет."""
+    ctx = getattr(app.state, "ctx", None)
+    if ctx is None or not _JOB_ID.match(job_id or ""):
+        return None
+    row = ctx.store.get(job_id)
+    if not row:
+        return None
+    if row["status"] in ("queued", "running"):
+        return {"job_id": job_id, "status": "processing", "stage": row.get("stage")}
+    if row["status"] == "done" and row.get("result_path"):
+        try:
+            return json.loads(_result_bytes(ctx, row))
+        except (OSError, ValueError):
+            pass
+    return {"job_id": job_id, "status": "failed", "verdict": None, "violations": [],
+            "error": row.get("error") or "analysis failed"}
+
+
+def _mount_copilot(app: FastAPI) -> bool:
+    """A14 отдаёт фабрику copilot.router.make_router(get_job, prefix, dependencies).
+    Монтируем её дважды: /api/v1 под X-API-Key и /ui/v1 под cookie+CSRF. Нет модуля — 501."""
+    try:
+        from copilot.router import make_router  # type: ignore
+    except Exception:
+        return False
+    provider = lambda job_id: job_for_copilot(app, job_id)  # noqa: E731
+    try:
+        app.include_router(make_router(get_job=provider, prefix="/api/v1",
+                                       dependencies=[Depends(require_api_key)]))
+        app.include_router(make_router(get_job=provider, prefix="/ui/v1",
+                                       dependencies=[Depends(_ui_dependency("ask"))]))
+    except Exception as e:
+        log.warning("copilot router not mounted", extra={"error": f"{type(e).__name__}: {e}"[:200]})
+        return False
+    return True
+
+
 # ------------------------------------------------------------------ app factory
 def create_app(settings: Optional[Settings] = None,
                pipeline: Optional[PipelineSpec | Callable[[], PipelineSpec]] = None) -> FastAPI:
@@ -427,6 +465,7 @@ def create_app(settings: Optional[Settings] = None,
     app.add_middleware(RequestContextMiddleware, ip_resolver=_scope_ip)
 
     api_auth = lambda bucket: require_api_key  # noqa: E731
+    _mount_copilot(app)  # до наших ручек: его /jobs/{id}/ask приоритетнее нашего 501-fallback
     app.include_router(build_jobs_router(api_auth, ui=False), prefix="/api/v1")
     app.include_router(build_jobs_router(_ui_dependency, ui=True), prefix="/ui/v1")
 

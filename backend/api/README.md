@@ -46,7 +46,7 @@ curl http://localhost:8000/api/v1/jobs/0f3c... -H "X-API-Key: $SENTINEL_API_KEYS
 | `GET /jobs` | Последние задачи (история) |
 | `GET/HEAD /jobs/{id}/video` | Исходник с **HTTP Range** (206/416). Если в папке задачи есть `preview.mp4`, отдаётся он; `?original=1` — принудительно исходник |
 | `GET /jobs/{id}/frames/{i}.jpg` | Кадр-доказательство №`i`. Нумерация сквозная по `violations[*].evidence_frames[*]` (см. `meta.api.frames`) |
-| `POST /jobs/{id}/ask` | `{"question": "..."}` → `copilot.router` (A14). Если он недоступен — **501** |
+| `POST /jobs/{id}/ask` | `{"question": "..."}` → роутер A14 (`copilot.router.make_router`, вместе с `GET /copilot/status` и `GET /jobs/{id}/report`) под той же авторизацией. Нет модуля `copilot` — **501** |
 | `GET /catalog` | `norms.load_catalog()` (A13). Если недоступен — 503 |
 | `GET /healthz` | Liveness, без ключа |
 | `GET /readyz` | **200 только если пайплайн импортирован и прогрет.** Иначе **503** с полем `state`: `loading`, `warming`, `unavailable` (нет `backend.pipeline` или весов) или `warmup_failed` |
@@ -138,7 +138,7 @@ fetch(`/ui/v1/jobs/${id}`)
 python -m pytest backend/api/tests -q
 ```
 
-Всего 42 теста:
+Всего 44 теста:
 - **Авторизация.** 401 без ключа и с неверным ключом на всех ручках. `/ui/v1` закрыт без cookie, даже с same-origin-заголовками. Вход по ключу или паролю ставит HttpOnly/SameSite cookie. Без CSRF и с чужим Origin — 403. Подделанный или просроченный токен отклоняется. Rate-limit входа → 429. Ключей нет в логах.
 - **Состояния пайплайна.** Нет модели → `readyz=503`, задача `failed` (а не фейк). Ошибка `warmup` → `readyz=503`. Исключение инференса → `failed`. Таймаут → `failed`, `partial` только в UI, `run()` отменяется через `progress()`. Зависший `run()` не блокирует очередь.
 - **Очередь и хранение.** Полный цикл со сверкой со схемой ТЗ. 5 параллельных загрузок. Backlog → 503. Честная доля deadline. Рестарт заново ставит задачи в очередь. Очистка по TTL.
@@ -157,7 +157,9 @@ python -m pytest backend/api/tests -q
 - Сессия UI stateless (HMAC): отозвать её можно только TTL или сменой `SENTINEL_UI_SECRET`.
 
 ## Для интегратора
-1. **Запуск одним процессом**: `python -m backend.api` (A17: служба Windows или CMD в Docker). Задать `SENTINEL_API_KEYS` (или `data/api_keys.txt`), опционально `SENTINEL_UI_PASSWORD`. **`SENTINEL_FAKE_PIPELINE` в проде не ставить.** cloudflared → `http://127.0.0.1:8000`; `SENTINEL_TRUSTED_PROXIES=127.0.0.1,::1` оставить (нужно для IP за туннелем и флага Secure у cookie).
+1. **Запуск одним процессом**: `python -m backend.api` или, как в PR A17, `uvicorn backend.api.main:app --workers 1`. Это совместимо: `POST /analyze` отвечает сразу после сохранения файла.
+   - Синонимы env из `deploy/`: `SENTINEL_FRONTEND_DIST` → `frontend_dir`, `SENTINEL_DEADLINE_S` → `budget_s` (если `SENTINEL_BUDGET_S` не задан), `SENTINEL_API_KEY` добавляется к `SENTINEL_API_KEYS`.
+   - Если cloudflared в другом контейнере (не localhost), добавьте его адрес в `SENTINEL_TRUSTED_PROXIES` или uvicorn `--forwarded-allow-ips` — иначе cookie останется без флага `Secure`. Задать `SENTINEL_API_KEYS` (или `data/api_keys.txt`), опционально `SENTINEL_UI_PASSWORD`. **`SENTINEL_FAKE_PIPELINE` в проде не ставить.** cloudflared → `http://127.0.0.1:8000`; `SENTINEL_TRUSTED_PROXIES=127.0.0.1,::1` оставить (нужно для IP за туннелем и флага Secure у cookie).
 2. **A03 (`backend.pipeline`)**: API вызывает `run(video_path, job_id, progress, deadline_s)` в потоке-воркере, а `warmup()` — один раз в фоне при старте.
    - `video_path` = `data/jobs/<id>/video.mov`.
    - `partial.json` класть в **`Path(video_path).parent`**: это неполный результат только для UI, в `done` он не превратится.
@@ -166,6 +168,11 @@ python -m pytest backend/api/tests -q
    - `preview.mp4` (H.264) в папке задачи будет отдаваться плееру UI вместо исходного `.mov`.
 3. **A01**: если есть `contracts.serialize.result_to_api`, используется он, иначе встроенный сериализатор. После мерджа удалить `backend/api/_contract_fallback.py` (импорт уже идёт с fallback).
 4. **A15 (frontend)**: использовать только `/ui/v1/*` с cookie-авторизацией (см. раздел «Веб-UI» выше). Плеер — `<video src="/ui/v1/jobs/ID/video">`. API-ключ нигде не запрашивать сверх формы входа и не хранить — ни в бандле, ни в URL, ни в localStorage. Эталон — `backend/api/static/index.html`. Для Vite dev: `SENTINEL_CORS_ORIGINS=http://localhost:5173` + `credentials: "include"`, а лучше Vite-proxy на `/ui`.
-5. **A14 (copilot)**: экспортировать из `copilot/router.py` callable `ask` (или `answer` / `handle_ask` / `answer_question`). API передаёт только те аргументы, которые функция принимает, из набора: `job_id, question, history, result (JSON ТЗ или None), job_dir, video_path`. Вернуть `dict` или `str`. Таймаут — `copilot_timeout_s=60`.
+   - Сверено с PR A15 (`frontend/src/api/client.ts`). Совпадает: `POST /ui/v1/session {api_key, password}`, `csrf_token` из ответа, `password_login` в ответе 401 на `GET /ui/v1/session`, `X-CSRF-Token` на POST, `<video src=/ui/v1/jobs/ID/video>`, `GET /ui/v1/jobs`.
+   - `X-UI-Token` API не выдаёт: токен существует только в HttpOnly cookie, поэтому ветка A15 с ним просто не сработает.
+   - Запасной путь A15 `settings.apiKey` → `X-API-Key` с A02 не нужен: ключ не стоит сохранять в настройках или localStorage.
+5. **A14 (copilot)**: подключено под интерфейс из PR A14. Если импортируется `copilot.router.make_router`, API монтирует его **дважды**: `prefix="/api/v1"` с `Depends(require_api_key)` и `prefix="/ui/v1"` с cookie+CSRF. Провайдер задач `get_job(job_id)` отдаёт JSON ответа ТЗ (`processing` / `done` / `failed`) или `None` (→ 404). Роутер A14 регистрируется раньше ручек API, поэтому его `/jobs/{id}/ask` приоритетнее встроенного.
+   - Проверено на ветке A14 (извлечение во временную папку): status 401 без ключа и 200 с ключом; ask 501 `disabled` при `COPILOT_ENABLED=0`; report 200; неизвестная задача — 404.
+   - Если `make_router` нет, встроенный `/ask` ищет callable `ask` / `answer` / `handle_ask` / `answer_question` и вызывает его, иначе отдаёт 501.
 6. **A16 (eval)**: `meta.api.video.filename_normalized` (Х→X) — для сопоставления с разметкой; `meta.api.total_s` / `queue_wait_s` / `deadline_s` — тайминги.
 7. Цель — Python 3.11: синтаксиса 3.12+ в коде нет. Проверено на Python 3.13, FastAPI 0.143, Starlette 1.6.

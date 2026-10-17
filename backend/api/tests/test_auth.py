@@ -141,3 +141,15 @@ def test_make_key_cli(capsys):
     assert main(["--quiet"]) == 0
     out = capsys.readouterr().out.strip()
     assert out.startswith("ks_") and len(out) > 30
+
+
+def test_deploy_env_aliases(tmp_path):
+    """Имена переменных из deploy/ (A17) тоже понимаются."""
+    from backend.api.config import Settings
+    s = Settings.from_env(env={"SENTINEL_FRONTEND_DIST": str(tmp_path / "dist"),
+                               "SENTINEL_DEADLINE_S": "240", "SENTINEL_API_KEY": "single",
+                               "SENTINEL_API_KEYS": "a,b", "SENTINEL_DATA_DIR": str(tmp_path)})
+    assert s.frontend_dir == tmp_path / "dist" and s.budget_s == 240.0
+    assert s.api_keys == ["a", "b", "single"]
+    s2 = Settings.from_env(env={"SENTINEL_DEADLINE_S": "240", "SENTINEL_BUDGET_S": "200"})
+    assert s2.budget_s == 200.0

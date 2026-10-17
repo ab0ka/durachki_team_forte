@@ -90,10 +90,17 @@ class Settings:
         path = Path(config_path or env.get("SENTINEL_API_CONFIG") or DEFAULT_CONFIG)
         raw.update(_load_yaml(path))
         names = {f.name: f for f in fields(cls)}
+        # синонимы из deploy/ (A17): применяются, только если основной ключ не задан
+        for alias, name in _ALIASES.items():
+            if env.get(alias) and not env.get("SENTINEL_" + name.upper()):
+                raw[name] = env[alias]
         for name in names:
             key = "SENTINEL_" + name.upper()
             if key in env and env[key] != "":
                 raw[name] = env[key]
+        single = env.get("SENTINEL_API_KEY", "").strip()  # A17 healthcheck: один ключ
+        if single:
+            raw["api_keys"] = _split(raw.get("api_keys")) + [single]
         raw.update(overrides)
         kwargs = {k: _coerce(names[k].type, v, k) for k, v in raw.items() if k in names}
         s = cls(**kwargs)
@@ -110,6 +117,12 @@ class Settings:
         if s.video_validation not in ("required", "best_effort", "off"):
             s.video_validation = "required"
         return s
+
+
+_ALIASES = {
+    "SENTINEL_FRONTEND_DIST": "frontend_dir",   # deploy/.env.example, Dockerfile.gpu, start.ps1
+    "SENTINEL_DEADLINE_S": "budget_s",          # deploy/.env.example (240): общий бюджет задачи
+}
 
 
 def _abs(p: Path | str) -> Path:

@@ -115,3 +115,41 @@ def test_request_id_and_no_cors_by_default(client_factory):
     with client_factory(spec(ok_run), cors_origins=["http://localhost:5173"]) as c:
         r = c.get("/healthz", headers={"Origin": "http://localhost:5173"})
         assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+def test_copilot_make_router_from_a14(client_factory, monkeypatch):
+    """Интерфейс A14: copilot.router.make_router(get_job, prefix, dependencies) -> APIRouter."""
+    from fastapi import APIRouter
+
+    def make_router(get_job=None, service=None, prefix="/api/v1", dependencies=None):
+        r = APIRouter(prefix=prefix, dependencies=list(dependencies or []))
+
+        @r.post("/jobs/{job_id}/ask")
+        async def ask(job_id: str):
+            job = get_job(job_id)
+            if job is None:
+                return {"error": "job_not_found"}
+            return {"answer": "ok", "status": job["status"], "verdict": job.get("verdict")}
+
+        @r.get("/copilot/status")
+        async def status():
+            return {"available": True}
+        return r
+
+    pkg = types.ModuleType("copilot")
+    mod = types.ModuleType("copilot.router")
+    mod.make_router = make_router
+    pkg.router = mod
+    monkeypatch.setitem(sys.modules, "copilot", pkg)
+    monkeypatch.setitem(sys.modules, "copilot.router", mod)
+    with client_factory(spec(ok_run)) as c:
+        jid = _job(c)
+        assert c.post(f"/api/v1/jobs/{jid}/ask", json={"question": "?"}).status_code == 401
+        r = c.post(f"/api/v1/jobs/{jid}/ask", headers=H, json={"question": "?"})
+        assert r.status_code == 200 and r.json() == {"answer": "ok", "status": "done", "verdict": "violation"}
+        assert c.get("/api/v1/copilot/status", headers=H).json()["available"] is True
+        assert c.get("/ui/v1/copilot/status").status_code == 401
+        csrf = c.post("/ui/v1/session", json={"api_key": KEY}).json()["csrf_token"]
+        assert c.post(f"/ui/v1/jobs/{jid}/ask", json={"question": "?"}).status_code == 403  # без CSRF
+        r = c.post(f"/ui/v1/jobs/{jid}/ask", json={"question": "?"}, headers={"X-CSRF-Token": csrf})
+        assert r.status_code == 200 and r.json()["status"] == "done"
