@@ -407,6 +407,29 @@ try {
     await c.close();
   }
 
+  // ---------- сценарий 1ж: replay сохранённого отчёта — помечен, без запросов к серверу задач ----------
+  {
+    const c = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const pg = await c.newPage();
+    const jobReqs = [];
+    await pg.route("**/ui/v1/**", (route) => {
+      const p = new URL(route.request().url()).pathname;
+      if (p.includes("/jobs")) jobReqs.push(p);
+      if (p.endsWith("/session")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ authenticated: true, csrf_token: CSRF }) });
+      return route.fulfill({ status: 404, body: "" });
+    });
+    await pg.goto(`${url}#/replay`);
+    await step("replay: JSON-отчёт открывается с пометкой, к серверу задач не обращается", async () => {
+      await pg.getByText("Повторный просмотр сохранённого отчёта.", { exact: false }).waitFor({ timeout: 5000 });
+      await pg.getByLabel("Отчёт JSON").setInputFiles({ name: "saved.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(doneJob("saved-1"))) });
+      await pg.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 5000 });
+      await pg.getByText("ПОВТОРНЫЙ ПРОСМОТР: сохранённый отчёт", { exact: false }).waitFor({ timeout: 2000 });
+      assert.equal(await pg.getByText("Copilot проверяющего").count(), 0, "Copilot в replay не нужен");
+      assert.deepEqual(jobReqs, [], `запросы к задачам: ${jobReqs.join(",")}`);
+    });
+    await c.close();
+  }
+
   // ---------- сценарий 2: failed и неполный анализ не зелёные ----------
   for (const [name, body, expectText] of [
     ["failed", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "синтетическая ошибка" }, "Анализ не завершён"],

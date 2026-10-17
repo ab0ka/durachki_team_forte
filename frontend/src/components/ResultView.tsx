@@ -52,13 +52,25 @@ export const NOT_CHECKED = [
   "события вне поля зрения камеры и звук",
 ];
 
-export default function ResultView({ job, raw, fileName }: { job: JobResult; raw: unknown; fileName?: string }) {
+export default function ResultView({
+  job,
+  raw,
+  fileName,
+  replay,
+}: {
+  job: JobResult;
+  raw: unknown;
+  fileName?: string;
+  /** Повторный просмотр сохранённого отчёта: без запросов к серверу, с явной пометкой. */
+  replay?: boolean;
+}) {
   const { backend, demo, toast } = useApp();
   const player = useRef<PlayerHandle>(null);
   const playerBox = useRef<HTMLDivElement>(null);
   const [t, setT] = useState(0);
   const completeness = useMemo(() => analyzeCompleteness(job), [job]);
-  const view = verdictView(job, completeness.state, completeness.mock);
+  const baseView = verdictView(job, completeness.state, completeness.mock);
+  const view = replay ? { ...baseView, flags: ["ПОВТОРНЫЙ ПРОСМОТР: сохранённый отчёт", ...baseView.flags] } : baseView;
   const duration = inferDuration(job);
   const candidates = job.candidates ?? [];
   // Эпизоды для просмотра: нарушения; у упавшего анализа без нарушений — кандидаты A01 (не вошли в вердикт).
@@ -72,13 +84,13 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
       : []),
   ].sort((a, b) => a.timecode_sec - b.timecode_sec);
   const source = useMemo(() => {
-    const server = backend.videoSource(job.job_id);
+    const server = replay ? null : backend.videoSource(job.job_id);
     const local = localVideo(job.job_id);
     // Только что загруженный файл играет сразу локально; если браузер его не декодирует (напр. HEVC) —
     // пробуем серверный маршрут (может отдать перекодированный preview.mp4), затем запасные пути.
     if (local) return { url: local, fallbacks: server ? [async () => server.url, ...(server.fallbacks ?? [])] : [] };
     return server;
-  }, [backend, job.job_id]);
+  }, [backend, job.job_id, replay]);
   const onTime = useCallback((x: number) => setT(x), []);
   const [current, setCurrent] = useState(0);
   const [reviewed, setReviewed] = useState<Set<number>>(() => loadReviewed(job.job_id));
@@ -155,7 +167,10 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             <Icon className="h-8 w-8" />
           </span>
           <div className="min-w-0 flex-1">
-            <div className="text-xs font-semibold uppercase tracking-[.14em] opacity-75">Вердикт системы{demo ? " · синтетическое демо" : ""}</div>
+            <div className="text-xs font-semibold uppercase tracking-[.14em] opacity-75">
+              Вердикт системы{demo ? " · синтетическое демо" : ""}
+              {replay ? " · сохранённый отчёт" : ""}
+            </div>
             <h1 className="mt-1 text-2xl font-extrabold leading-tight sm:text-[32px]">{view.title}</h1>
             <p className="mt-2 max-w-3xl text-sm opacity-90 sm:text-[15px]">{view.subtitle}</p>
             {view.flags.length > 0 && (
@@ -185,7 +200,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
           <button className="btn bg-white/15 text-current ring-1 ring-white/25 hover:bg-white/25" onClick={() => download(`kassa-sentinel_${job.job_id}_full.json`, raw)} title="Полный ответ: нормы, timeline, meta">
             <Download className="h-4 w-4" /> Полный отчёт JSON
           </button>
-          {backend.report && job.status === "done" && (
+          {!replay && backend.report && job.status === "done" && (
             <button
               className="btn bg-white/15 text-current ring-1 ring-white/25 hover:bg-white/25"
               title="Текстовое заключение для проверяющего (Markdown, формирует сервер)"
@@ -217,7 +232,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             ? "Ниже — только то, что система успела найти; в вердикт это не вошло, остальная часть записи могла остаться непроверенной."
             : "Вывод об отсутствии нарушений сделать нельзя — нужен ручной просмотр."}
           <div className="mt-2">
-            <RetryUpload jobId={job.job_id} className="btn-ghost px-3 py-1.5 text-xs" />
+            {!replay && <RetryUpload jobId={job.job_id} className="btn-ghost px-3 py-1.5 text-xs" />}
           </div>
         </div>
       )}
@@ -342,7 +357,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             </section>
           )}
 
-          {job.status === "done" && <CopilotPanel jobId={job.job_id} />}
+          {!replay && job.status === "done" && <CopilotPanel jobId={job.job_id} />}
 
           <CompletenessPanel report={completeness} />
 

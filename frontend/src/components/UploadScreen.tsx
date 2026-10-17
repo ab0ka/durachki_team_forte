@@ -335,6 +335,9 @@ export default function UploadScreen() {
             <a className="btn-ghost" href="#/about">
               Архитектура и модели
             </a>
+            <a className="btn-ghost" href="#/replay" title="Просмотр сохранённого JSON-отчёта (повторный просмотр, не новый анализ)">
+              Открыть сохранённый отчёт
+            </a>
           </div>
         </section>
       </div>
