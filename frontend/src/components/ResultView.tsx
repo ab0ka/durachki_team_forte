@@ -55,9 +55,12 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
   const view = verdictView(job, partial);
   const duration = inferDuration(job);
   const source = useMemo(() => {
+    const server = backend.videoSource(job.job_id);
     const local = localVideo(job.job_id);
-    if (local) return { url: local };
-    return backend.videoSource(job.job_id);
+    // Только что загруженный файл играет сразу локально; если браузер его не декодирует (напр. HEVC) —
+    // пробуем серверный маршрут (может отдать перекодированный preview.mp4), затем запасные пути.
+    if (local) return { url: local, fallbacks: server ? [async () => server.url, ...(server.fallbacks ?? [])] : [] };
+    return server;
   }, [backend, job.job_id]);
   const onTime = useCallback((x: number) => setT(x), []);
 

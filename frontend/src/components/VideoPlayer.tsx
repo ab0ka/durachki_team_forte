@@ -10,8 +10,14 @@ export interface PlayerHandle {
   seek: (t: number, play?: boolean) => void;
 }
 
+export interface VideoSource {
+  url: string;
+  /** Запасные источники по порядку (напр. серверный маршрут с перекодированным preview.mp4, затем blob по ключу). */
+  fallbacks?: (() => Promise<string>)[];
+}
+
 interface Props {
-  source: { url: string; fallback?: () => Promise<string> } | null;
+  source: VideoSource | null;
   /** Синтетическая сцена вместо видео (только демо). */
   synthetic?: boolean;
   duration: number;
@@ -28,7 +34,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [src, setSrc] = useState<string | null>(source?.url ?? null);
-  const [fallbackTried, setFallbackTried] = useState(false);
+  const [fallbackIdx, setFallbackIdx] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(!!source);
   const [t, setT] = useState(0);
@@ -40,7 +46,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
 
   useEffect(() => {
     setSrc(source?.url ?? null);
-    setFallbackTried(false);
+    setFallbackIdx(0);
     setError(null);
     setLoading(!!source);
   }, [source]);
@@ -128,17 +134,24 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
   toggleRef.current = toggle;
 
   const onVideoError = async () => {
-    if (source?.fallback && !fallbackTried) {
-      setFallbackTried(true);
+    const list = source?.fallbacks ?? [];
+    for (let i = fallbackIdx; i < list.length; i++) {
+      setFallbackIdx(i + 1);
       try {
-        setSrc(await source.fallback());
-        return;
+        const next = await list[i]();
+        if (next && next !== src) {
+          setLoading(true);
+          setSrc(next);
+          return;
+        }
       } catch {
-        /* ниже — сообщение */
+        /* следующий источник */
       }
     }
     setLoading(false);
-    setError("Не удалось загрузить исходное видео. Кадры-доказательства доступны в карточках эпизодов.");
+    setError(
+      "Браузер не смог воспроизвести видео (возможно, кодек HEVC или файл недоступен). Кадры-доказательства и таймкоды доступны в карточках эпизодов.",
+    );
   };
 
   const active = violations.findIndex(

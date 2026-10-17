@@ -86,7 +86,9 @@ export function messageForStatus(status: number, fallback = ""): string {
   if (status === 404) return "Задача не найдена на сервере (возможно, сервер перезапускался).";
   if (status === 413) return "Файл слишком большой для сервера.";
   if (status === 415 || status === 422) return fallback || "Сервер не принял файл: нужен видеофайл .mov или .mp4.";
-  if (status === 429) return "Сервер занят: слишком много задач. Повторите через минуту.";
+  if (status === 429) return "Слишком много запросов. Повторите через минуту.";
+  if (status === 503) return fallback || "Сервер перегружен: очередь задач заполнена или модели ещё загружаются. Повторите позже.";
+  if (status === 507) return "На сервере недостаточно места для загрузки.";
   if (status >= 500) return fallback || "Ошибка сервера при обработке запроса.";
   if (status === 0) return "Нет связи с сервером.";
   return fallback || `Ошибка запроса (HTTP ${status}).`;
@@ -123,8 +125,8 @@ export interface Backend {
   /** Текстовое заключение (Markdown) от A14; бросает ApiError, если недоступно. */
   report?(id: string): Promise<string>;
   ask(id: string, question: string, history: { role: "user" | "assistant"; text: string }[]): Promise<AskResponse>;
-  /** URL исходного видео для <video>. fallback — загрузка blob с X-API-Key, если cookie-маршрут не играет. */
-  videoSource(id: string): { url: string; fallback?: () => Promise<string> } | null;
+  /** URL исходного видео для <video>; fallbacks — запасные источники (blob с X-API-Key и т. п.). */
+  videoSource(id: string): { url: string; fallbacks?: (() => Promise<string>)[] } | null;
 }
 
 function sessionFromJson(info: Record<string, unknown>, authenticated: boolean): SessionInfo {
@@ -416,18 +418,21 @@ export class HttpBackend implements Backend {
     return { answer: typeof answer === "string" ? answer : JSON.stringify(j), sources };
   }
 
-  videoSource(id: string): { url: string; fallback?: () => Promise<string> } {
+  videoSource(id: string): { url: string; fallbacks?: (() => Promise<string>)[] } {
     // Основной путь — cookie UI-маршрут с Range: <video> шлёт cookie сам, ключ в URL не попадает.
+    // A02 отдаёт по нему preview.mp4 (если пайплайн перекодировал исходник), иначе оригинал.
     const apiPath = ENDPOINTS.apiVideo(id);
     return {
       url: this.url(ENDPOINTS.uiVideo(id)),
-      fallback: settings.apiKey
-        ? async () => {
-            const res = await fetch(this.url(apiPath), { headers: this.headers(apiPath), credentials: "same-origin" });
-            if (!res.ok) throw new ApiError(res.status, messageForStatus(res.status));
-            return URL.createObjectURL(await res.blob());
-          }
-        : undefined,
+      fallbacks: settings.apiKey
+        ? [
+            async () => {
+              const res = await fetch(this.url(apiPath), { headers: this.headers(apiPath), credentials: "same-origin" });
+              if (!res.ok) throw new ApiError(res.status, messageForStatus(res.status));
+              return URL.createObjectURL(await res.blob());
+            },
+          ]
+        : [],
     };
   }
 }
