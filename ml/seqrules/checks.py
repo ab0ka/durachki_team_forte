@@ -25,8 +25,8 @@ class Checker:
         self.enabled = bool(cfg.get("enabled", True)) and clip is not None
         self.budget_s = float(cfg.get("budget_s", 25.0))
         self.spent_s = 0.0
-        self.counts = {"phone_contrast": 0, "safe_state": 0}
-        self.skipped = {"phone_contrast": 0, "safe_state": 0}
+        self.counts = {"phone_contrast": 0, "safe_state": 0, "site_state": 0, "site_appearance": 0}
+        self.skipped = {"phone_contrast": 0, "safe_state": 0, "site_state": 0, "site_appearance": 0}
         self.warnings: list[str] = []
         self._scorer: Any = None
         self._scorer_err: Optional[str] = None
@@ -48,9 +48,12 @@ class Checker:
     def _override(self) -> dict:
         """Один и тот же набор запросов для телефона и сейфа → один экземпляр OWLv2 на процесс."""
         pc = self.cfg.get("phone_contrast", {}) or {}
+        ss = self.cfg.get("site_state", {}) or {}
         return {"inventory": {"mode": "rare_open_vocab", "rare_open_vocab": {"queries": {
             "seq_phone": list(pc.get("phone_queries", ["mobile phone", "smartphone"])),
-            "seq_not_phone": list(pc.get("not_phone_queries", ["desk telephone", "landline phone"]))}}}}
+            "seq_not_phone": list(pc.get("not_phone_queries", ["desk telephone", "landline phone"])),
+            "seq_open": list(ss.get("open_queries", ["open safe", "open drawer"])),
+            "seq_closed": list(ss.get("closed_queries", ["closed safe", "closed drawer"]))}}}}
 
     def _detect_cfg(self) -> dict:
         if self._det_cfg is None:
@@ -140,6 +143,90 @@ class Checker:
                     "owl_box": [round(float(v), 5) for v in fb[j]], "source": getattr(scorer, "name", "owlv2")}
         except Exception as exc:  # noqa: BLE001 — сбой проверки = нет свидетельства
             return {"t": round(float(t), 4), "state": "error", "reason": f"{type(exc).__name__}: {exc}"}
+        finally:
+            self.spent_s += time.perf_counter() - t0
+
+    # ---------------------------------------------------------------- место хранения (найдено по рукам)
+    @staticmethod
+    def _site_crop(frame: np.ndarray, box: Sequence[float], min_side_rel: float) -> np.ndarray:
+        H, W = frame.shape[:2]
+        b = np.asarray(box, np.float32) * np.array([W, H, W, H], np.float32)
+        side = min(max(float(b[2] - b[0]), float(b[3] - b[1]), min_side_rel * min(W, H)), float(min(W, H)))
+        cx, cy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+        x0 = int(round(min(max(cx - side / 2.0, 0.0), W - side)))
+        y0 = int(round(min(max(cy - side / 2.0, 0.0), H - side)))
+        s = int(round(side))
+        return np.ascontiguousarray(frame[y0:y0 + s, x0:x0 + s])
+
+    def site_state(self, t: float, box: Sequence[float]) -> dict[str, Any]:
+        """Увеличенная вырезка места: «открыто» против «закрыто» (OWLv2, боксы в центральной части вырезки)."""
+        why = self._allowed("site_state")
+        if why:
+            self.skipped["site_state"] += 1
+            return {"t": round(float(t), 4), "state": "skipped", "reason": why}
+        scorer = self._get_scorer()
+        if scorer is None:
+            self.skipped["site_state"] += 1
+            return {"t": round(float(t), 4), "state": "unavailable", "reason": self._scorer_err}
+        from ml.detect.inventory import get_frame
+
+        t0 = time.perf_counter()
+        sub = self.cfg.get("site_state", {}) or {}
+        try:
+            frame = get_frame(self.clip, float(t))
+            if frame is None:
+                return {"t": round(float(t), 4), "state": "unknown", "reason": "кадр не декодирован"}
+            crop = self._site_crop(frame, box, float(sub.get("crop_min_side_rel", 0.18)))
+            boxes, probs = scorer.score([crop])[0]
+            self.counts["site_state"] += 1
+            q = self._override()["inventory"]["rare_open_vocab"]["queries"]
+            col = {tx: i for i, tx in enumerate(scorer.texts)}
+            oc = [col[x] for x in q["seq_open"] if x in col]
+            cc = [col[x] for x in q["seq_closed"] if x in col]
+            if len(boxes) == 0 or not oc or not cc:
+                return {"t": round(float(t), 4), "state": "unknown", "reason": "OWLv2 не дал боксов"}
+            cxy = (boxes[:, :2] + boxes[:, 2:]) / 2.0
+            central = (np.abs(cxy - 0.5) <= float(sub.get("central", 0.35))).all(axis=1)
+            if not central.any():
+                return {"t": round(float(t), 4), "state": "unknown", "reason": "в центре вырезки нет предмета"}
+            op = np.where(central, probs[:, oc].max(axis=1), -1.0)
+            cl = np.where(central, probs[:, cc].max(axis=1), -1.0)
+            so, scl = float(op.max()), float(cl.max())
+            margin, thr = float(sub.get("margin", 0.05)), float(sub.get("min_score", 0.2))
+            state = "unsure"
+            if so >= thr and so - scl >= margin:
+                state = "open"
+            elif scl >= thr and scl - so >= margin:
+                state = "closed"
+            return {"t": round(float(t), 4), "state": state, "open": round(so, 4), "closed": round(scl, 4),
+                    "bbox": [round(float(v), 5) for v in box], "source": getattr(scorer, "name", "owlv2")}
+        except Exception as exc:  # noqa: BLE001
+            return {"t": round(float(t), 4), "state": "error", "reason": f"{type(exc).__name__}: {exc}"}
+        finally:
+            self.spent_s += time.perf_counter() - t0
+
+    def site_appearance(self, t: float, box: Sequence[float]) -> Optional[np.ndarray]:
+        """Вид места для сравнения «до / после»: 32×32 серый, нормированный (без цвета и абсолютной яркости).
+        Возвращается только в правило, в наблюдения не пишется."""
+        if self._allowed("site_appearance"):
+            self.skipped["site_appearance"] += 1
+            return None
+        import cv2
+        from ml.detect.inventory import get_frame
+
+        t0 = time.perf_counter()
+        try:
+            frame = get_frame(self.clip, float(t))
+            if frame is None:
+                return None
+            crop = self._site_crop(frame, box, float((self.cfg.get("site_state", {}) or {}).get("crop_min_side_rel", 0.18)))
+            g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+            v = cv2.resize(g, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
+            self.counts["site_appearance"] += 1
+            sd = float(v.std())
+            return (v - float(v.mean())) / sd if sd > 1e-6 else None
+        except Exception:  # noqa: BLE001
+            return None
         finally:
             self.spent_s += time.perf_counter() - t0
 

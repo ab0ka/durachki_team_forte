@@ -45,6 +45,27 @@ entry:                            # правило В — вход в рабоч
   max_gap_s: 0.6
   confidence: 0.35
 
+storage:                          # правило Б2 — место хранения, найденное по рукам (два прохода; экспериментальное)
+  enabled: false                  # включается профилем pose_rules_storage (eval/configs/l2/seqrules_storage.yaml)
+  type_id: V03
+  reach_ext: 2.0                  # рука вытянута: |запястье − центр плеч| ≥ 2 ширины плеч ...
+  reach_delta: 0.6                # ... и на 0,6 ширины плеч дальше обычного положения рук этого человека (медиана)
+  max_reach_s: 8.0                # дольше — это поза, а не движение к месту
+  wrist_min: 0.30
+  shoulder_min: 0.30
+  min_reach_s: 0.4
+  max_gap_s: 0.6
+  exclude_zones: [desk, client_area]   # работа за столом и передача клиенту — не «место хранения»
+  site_radius_rel: 0.06           # цели вытягиваний ближе (доля высоты кадра) — одно место
+  crop_scale: 3.0                 # сторона вырезки места = 3 ширины плеч
+  max_sites: 3
+  visits_per_site: 2              # проверяются последние касания места
+  baseline_before_s: 1.0          # вид места до касания
+  checks_after_s: [2, 4, 7, 10]   # проверки после ухода руки (пока рука не вернулась)
+  min_open_checks: 2              # подряд «open» без «closed»; без вида «до» — на одну больше
+  revert_dist: 0.25               # 1 − корреляция вырезок «до / после»: меньше — место вернулось к исходному
+  confidence: {base: 0.55, per_check: 0.05, max: 0.8}
+
 hand_cash:                        # «рука — деньги»: только наблюдение; включать, когда детектор денег подтверждён
   enabled: false
   labels: [cash]
@@ -71,6 +92,18 @@ checks:                           # ограниченные проверки п
     enabled: true
     max_checks: 12
     per_interval: 4
+  site_state:                     # место хранения: «открыто» против «закрыто» на увеличенной вырезке
+    enabled: true
+    max_checks: 24
+    open_queries: ["open safe", "open safe door", "open drawer", "open cabinet door"]
+    closed_queries: ["closed safe", "closed metal safe", "closed drawer", "closed cabinet door"]
+    min_score: 0.2
+    margin: 0.05
+    central: 0.35                 # бокс OWLv2 засчитывается, если его центр в центральной части вырезки
+    crop_min_side_rel: 0.18
+  site_appearance:
+    enabled: true
+    max_checks: 30
 
 merge_gap_s: 2.0                  # повторы одного правила одного человека ближе — одно событие
 max_observation_frames: 2500      # потолок кадров в observations (для UI); лишнее равномерно прореживается

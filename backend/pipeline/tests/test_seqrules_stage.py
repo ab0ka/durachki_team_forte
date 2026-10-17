@@ -34,7 +34,8 @@ def test_real_seqrules_over_mock_cv_writes_observations(fake_ml, synth_video):
     assert res.status == "done" and res.meta["complete"] is True
     data = json.loads(_obs_path("job-seq").read_text(encoding="utf-8"))
     assert data["job_id"] == "job-seq" and data["items"][0]["kind"] == "meta"
-    assert set(data["items"][0]["rules"]) == {"phone", "safe", "entry", "hand_cash"}
+    assert set(data["items"][0]["rules"]) == {"phone", "safe", "storage", "entry", "hand_cash"}
+    assert data["items"][0]["rules"]["storage"]["status"] == "disabled"     # экспериментальное — только по профилю
 
 
 def test_rule_error_makes_analysis_incomplete_not_no_violation(fake_ml, synth_video):

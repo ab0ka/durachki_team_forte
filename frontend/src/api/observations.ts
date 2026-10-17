@@ -168,6 +168,7 @@ export const trackColor = (tid: number | null | undefined) => (tid === null || t
 export const RULE_RU: Record<string, string> = {
   phone: "Телефон у руки или головы",
   safe: "Открытый сейф, рабочая зона пуста",
+  storage: "Место хранения оставлено открытым (найдено по рукам)",
   entry: "Вход в рабочую зону",
   hand_cash: "Рука рядом с деньгами",
 };

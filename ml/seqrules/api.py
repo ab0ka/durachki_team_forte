@@ -7,9 +7,10 @@ from typing import Any, Mapping, Optional, Sequence
 from .checks import Checker
 from .config import config_hash, load_config
 from .observe import Frames, PoseIndex, frames_from, get, person_tracks, zone_polygon
-from .rules import Ctx, merge_events, obs_hand_cash, rule_entry, rule_phone, rule_safe
+from .rules import Ctx, merge_events, obs_hand_cash, rule_entry, rule_phone, rule_safe, rule_storage
 
-RULES = (("phone", rule_phone), ("safe", rule_safe), ("entry", rule_entry), ("hand_cash", obs_hand_cash))
+RULES = (("phone", rule_phone), ("safe", rule_safe), ("storage", rule_storage), ("entry", rule_entry),
+         ("hand_cash", obs_hand_cash))
 
 
 def _catalog_types(catalog: Any) -> Optional[set[str]]:

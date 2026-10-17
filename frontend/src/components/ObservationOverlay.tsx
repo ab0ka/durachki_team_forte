@@ -142,7 +142,7 @@ export default function ObservationOverlay({ obs, episodes, selectedIds, t, widt
         <g key={`s-${ep.id}-${c.t}`} data-check="safe">
           <rect x={X(c.bbox![0])} y={Y(c.bbox![1])} width={X(c.bbox![2] - c.bbox![0])} height={Y(c.bbox![3] - c.bbox![1])} fill="none" stroke="#f87171" strokeWidth={2} strokeDasharray="4 3" />
           <text x={X(c.bbox![0]) + 3} y={Y(c.bbox![1]) - 4} fontSize={11} fill="#fecaca" paintOrder="stroke" stroke="rgba(2,6,23,0.85)" strokeWidth={3}>
-            {`сейф: открыт (проверка ${c.t.toFixed(1)} с)`}
+            {`${ep.rule === "storage" ? "место хранения: открыто" : "сейф: открыт"} (проверка ${c.t.toFixed(1)} с)`}
           </text>
         </g>
       ))}

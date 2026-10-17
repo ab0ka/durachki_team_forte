@@ -36,9 +36,18 @@ class Clip:
 
 
 class FakeChecker:
-    def __init__(self, safe="open", phone="unsure"):
-        self.safe, self.phone = safe, phone
-        self.calls = {"safe": 0, "phone": 0}
+    def __init__(self, safe="open", phone="unsure", site="open", app=None):
+        self.safe, self.phone, self.site, self.app = safe, phone, site, app
+        self.calls = {"safe": 0, "phone": 0, "site": 0, "app": 0}
+
+    def site_state(self, t, box):
+        self.calls["site"] += 1
+        st = self.site(t) if callable(self.site) else self.site
+        return {"t": round(t, 4), "state": st, "bbox": list(box)}
+
+    def site_appearance(self, t, box):
+        self.calls["app"] += 1
+        return None if self.app is None else self.app(t)
 
     def phone_contrast(self, t, box):
         self.calls["phone"] += 1
@@ -423,3 +432,104 @@ def test_no_work_zone_rules_b_c_unavailable():
     events, obs = run(Clip(sc.times), [], [], dets_zones, [], None, checker=FakeChecker())
     assert obs[0]["rules"]["safe"]["status"] == "unavailable" and obs[0]["rules"]["entry"]["status"] == "unavailable"
     assert any("cashier_area не построена" in w for w in obs[0]["warnings"])
+
+
+# ------------------------------------------------------------------ правило Б2: место хранения по рукам (два прохода)
+
+DESK = [[0.1, 0.56], [0.45, 0.56], [0.45, 0.7], [0.1, 0.7]]
+CLIENT = [[0.0, 0.72], [0.55, 0.72], [0.55, 1.0], [0.0, 1.0]]
+STORAGE_ZONES = ZONES + [{"name": "desk", "polygon": DESK, "conf": 0.9}, {"name": "client_area", "polygon": CLIENT, "conf": 0.9}]
+SIDE = (0.583, 0.2125)          # ≈ 2,2 ширины плеч вправо от центра плеч кассира, вне стола и зоны клиента
+ON = {"storage": {"enabled": True}}
+_rng = np.random.default_rng(5)
+A0, A1 = _rng.standard_normal(1024), _rng.standard_normal(1024)
+
+
+def _norm(v):
+    return (v - v.mean()) / v.std()
+
+
+def app_changed(t):             # вид места после касания другой (не вернулся к исходному)
+    return _norm(A0) if t < 2.0 else _norm(A1)
+
+
+def app_same(t):
+    return _norm(A0)
+
+
+REST_DESK_R, REST_DESK_L = (0.28, 0.3475), (0.22, 0.3475)     # руки в покое — на столе перед собой (≈1,6 ширины плеч)
+
+
+def storage_scene(reach=(2.0, 3.0), target=SIDE, role="cashier", wrist_vis=0.9, tail=12.0):
+    sc = Scene(grid(0, tail))
+    sc.person(1, role, lambda t: CASHIER,
+              lambda t, b: kp_for(b, rw=target if reach[0] <= t <= reach[1] else REST_DESK_R, lw=REST_DESK_L,
+                                  wrist_vis=wrist_vis))
+    return sc
+
+
+def run_storage(sc, ck):
+    dets_zones = STORAGE_ZONES
+    times = sc.times
+    dets = [{"t": t, "label": "laptop", "bbox": [0.2, 0.57, 0.4, 0.62], "score": 0.9, "source": "rtdetr_v2_r18vd"} for t in times]
+    tracks = [{k: v for k, v in p.items() if k != "_poses"} for p in sc.persons.values()]
+    for p in sc.persons.values():
+        dets += [{"t": t, "label": "person", "bbox": list(b), "score": 0.8, "source": "rtdetr_v2_r18vd"} for t, b in p["boxes"]]
+    poses = [x for p in sc.persons.values() for x in p["_poses"]]
+    return run(Clip(times), dets, tracks, dets_zones, poses, None, config=ON, checker=ck)
+
+
+def storage_eps(obs):
+    return [e for e in obs[1:] if e["rule"] == "storage"]
+
+
+def test_storage_left_open_after_reach_gives_event_at_hand_leave():
+    ck = FakeChecker(site="open", app=app_changed)
+    events, obs = run_storage(storage_scene(), ck)
+    ev = [e for e in events if e.extra.get("rule") == "B2_storage"]
+    assert len(ev) == 1 and ev[0].type_id == "V03" and ev[0].t_start == pytest.approx(3.0)
+    assert ev[0].extra["assessment"] == "candidate_violation" and ev[0].track_ids == [1]
+    assert any("не утверждает" in f for f in ev[0].facts)
+    ep = storage_eps(obs)[0]
+    assert ep["status"] == "event" and ep["appearance_baseline"] is True and ck.calls["site"] >= 2
+    assert all(c["t"] > 3.0 for c in ep["safe_checks"])              # проверки — только после ухода руки
+
+
+def test_storage_closed_or_reverted_gives_no_event():
+    _ev, obs = run_storage(storage_scene(), FakeChecker(site="closed", app=app_changed))
+    assert storage_eps(obs)[0]["status"] == "closed"
+    events, obs = run_storage(storage_scene(), FakeChecker(site="open", app=app_same))
+    assert not [e for e in events if e.extra.get("rule") == "B2_storage"]
+    assert storage_eps(obs)[0]["status"] == "reverted"
+
+
+def test_reach_into_desk_or_by_visitor_or_hidden_is_not_a_site():
+    for sc in (storage_scene(target=(0.3, 0.62)),                    # тянется в стол — обычная работа
+               storage_scene(role="visitor"),                          # не сотрудник
+               storage_scene(wrist_vis=0.1)):                          # запястье не видно — вывода нет
+        events, obs = run_storage(sc, FakeChecker(site="open", app=app_changed))
+        assert not [e for e in events if e.extra.get("rule") == "B2_storage"] and storage_eps(obs) == []
+
+
+def test_without_baseline_view_one_more_open_check_is_needed():
+    seq = ["open", "open", "closed", "closed"]
+    it = iter(seq)
+    events, obs = run_storage(storage_scene(reach=(0.2, 1.2)), FakeChecker(site=lambda t: next(it), app=app_changed))
+    assert storage_eps(obs)[0]["appearance_baseline"] is False
+    assert not [e for e in events if e.extra.get("rule") == "B2_storage"]
+    events, obs = run_storage(storage_scene(reach=(0.2, 1.2)), FakeChecker(site="open", app=app_changed))
+    assert [e for e in events if e.extra.get("rule") == "B2_storage"]
+
+
+def test_storage_disabled_by_default():
+    sc = storage_scene()
+    _ev, obs = sc.run()
+    assert obs[0]["rules"]["storage"]["status"] == "disabled"
+
+
+def test_hanging_arms_posture_is_not_a_reach():
+    # стоящий человек с опущенными руками: запястья далеко от плеч весь ролик — это поза, а не движение к месту
+    sc = Scene(grid(0, 12))
+    sc.person(1, "cashier", lambda t: CASHIER, lambda t, b: kp_for(b))
+    events, obs = run_storage(sc, FakeChecker(site="open", app=app_changed))
+    assert storage_eps(obs) == [] and obs[0]["rules"]["storage"]["reaches"] == 0
