@@ -132,7 +132,7 @@ def test_partial_never_done_or_no_violation(fake_ml, synth_video, tmp_path):
     assert res.meta["partial_written"] == ["after_core"]
     p = Path(tmp_path / "data" / "jobs" / "job_partial_1" / "partial.json")
     data = json.loads(p.read_text(encoding="utf-8"))
-    assert data["status"] == "processing" and data["verdict"] is None
+    assert data["status"] == "processing" and data["verdict"] is None and data["partial_verdict"] is None
     assert data["meta"]["partial"] is True and data["meta"]["complete"] is False
 
 
@@ -140,7 +140,8 @@ def test_partial_with_violation(fake_ml, synth_video, tmp_path):
     fake_ml({"ml.temporal.score": _temporal_with_event})
     run(synth_video, "jp2", None, 60)
     data = json.loads((tmp_path / "data" / "jobs" / "jp2" / "partial.json").read_text(encoding="utf-8"))
-    assert data["status"] == "processing" and data["verdict"] == "violation"
+    assert data["status"] == "processing" and data["verdict"] is None      # промежуточный — без вердикта
+    assert data["partial_verdict"] == "violation" and data["partial_violations"]
 
 
 def test_progress_monotonic_russian(fake_ml, synth_video):

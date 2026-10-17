@@ -76,9 +76,14 @@ class Runtime:
         from .media import LockedClip, SimpleClip
         from .stages import ModuleMissing, resolve
 
-        key = (path, float(sample_fps))
-        if self.clip is not None and self.clip_key == key:
-            return self._clip_info(self.clip, getattr(self, "_clip_source", "ml.ingest"), [])
+        try:
+            st = os.stat(path)
+            key = (path, float(sample_fps), st.st_size, st.st_mtime_ns)
+        except OSError:
+            key = (path, float(sample_fps), None, None)
+        if self.clip is not None and self.clip_key == key:  # тот же файл/fps — клип переиспользуется
+            return self._clip_info(self.clip, getattr(self, "_clip_source", "ml.ingest"),
+                                   list(getattr(self, "_clip_warnings", [])))
         self.clip = None
         gc.collect()
         warnings: list[str] = []
@@ -104,6 +109,7 @@ class Runtime:
         self.clip = LockedClip(clip, cache_mb=self.frame_cache_mb)
         self.clip_key = key
         self._clip_source = source
+        self._clip_warnings = list(warnings)
         return self._clip_info(self.clip, source, warnings)
 
     @staticmethod

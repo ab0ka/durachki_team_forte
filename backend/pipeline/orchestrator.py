@@ -24,6 +24,7 @@ from .budget import TimeBudget, choose_sample_fps
 from .cache import STAGE_FILES, StageCache, sha256_file, stable_hash
 from .config import STAGE_ORDER, cache_root, cfg_get, data_root, load_config
 from .contract import AnalysisResult, Event
+from .coverage import completeness, coverage_gate, reference_duration, stage_coverage
 from .fallbacks import EvidenceClip, derive_risk, fallback_fuse, states_from_detections
 from .media import ascii_safe_path, probe_video
 from .registry import ModelRegistry
@@ -81,6 +82,8 @@ class RunContext:
     evidence_clip: Any = None
     work_path: str = ""
     ingest_identity: dict = field(default_factory=dict)
+    probe: dict = field(default_factory=dict)
+    identities: dict = field(default_factory=dict)
     _progress_done: float = 0.0
     partial_written: list[str] = field(default_factory=list)
 
@@ -237,7 +240,7 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
     ctx.budget.device = ctx.device
 
     # ---- адаптивный sample_fps
-    probe = probe_video(ctx.video_path)
+    ctx.probe = probe = probe_video(ctx.video_path)
     ctx.sample_fps = choose_sample_fps(probe.get("duration"), ctx.budget.remaining(), ctx.device, cfg)
     ctx.work_path = ascii_safe_path(ctx.video_path, data_root() / "jobs" / _safe_id(ctx.job_id),
                                     str(cfg_get(cfg, "paths.ascii_safe", "auto")))
@@ -362,6 +365,7 @@ def _stage(ctx: RunContext, stage: str, calls: list[tuple[str, str, tuple, dict]
     except Exception as exc:  # noqa: BLE001
         ident = {"origin": "unknown", "error": str(exc)}
     rec.version = str(ident.get("version", ident.get("origin", "")))
+    ctx.identities[stage] = ident
     key = stable_hash(stage, ctx.keys.get("ingest"), ident, stage_cfg or {}, bool(cfg.get("mock")),
                       [ctx.keys.get(u, "") for u in upstream])
     ctx.keys[stage] = key
@@ -515,19 +519,31 @@ def _partial(ctx: RunContext, events: list[Event], risk: list, milestone: str) -
         return
     try:
         res = fallback_fuse(ctx.evidence_clip, events, risk, ctx.catalog, ctx.job_id, ctx.cfg)
+        found = "violation" if res.violations else None
         res.status = "processing"  # незавершённый результат никогда не выдаётся за done
-        res.verdict = "violation" if res.violations else None  # и никогда — за no_violation
-        res.meta = {**_meta(ctx), "partial": True, "complete": False, "milestone": milestone}
+        res.verdict = None         # ...и не несёт вердикта (ни no_violation, ни violation)
+        res.meta = {**_meta(ctx), "partial": True, "complete": False, "milestone": milestone,
+                    "partial_verdict": found}
+        res.meta["completeness"]["complete"] = False
+        res.meta["completeness"]["reason"] = f"промежуточный результат ({milestone})"
+        data = serde.result_to_dict(res)
+        data.update({"partial": True, "partial_verdict": found,
+                     "partial_violations": [{"type_id": v.type_id, "type": v.type, "timecode_sec": v.timecode_sec,
+                                             "confidence": v.confidence} for v in res.violations]})
         path = data_root() / "jobs" / _safe_id(ctx.job_id) / "partial.json"
-        serde.write_json(path, serde.result_to_dict(res))
+        serde.write_json(path, data)
         ctx.partial_written.append(milestone)
     except Exception as exc:  # noqa: BLE001
         ctx.warn(f"partial.json не записан: {type(exc).__name__}: {exc}")
 
 
 def _finalize(ctx: RunContext, result: Optional[AnalysisResult]) -> AnalysisResult:
+    cov = stage_coverage(ctx.records, ctx.outputs, ctx.clip_info, ctx.probe, ctx.cfg)
+    ok_required = [s for s in _required(ctx) if s in ctx.records and ctx.records[s].status in OK_STATUSES]
+    for reason in coverage_gate(cov, ok_required, ctx.cfg):
+        ctx.incomplete.append(f"покрытие — {reason}")
     meta = _meta(ctx)
-    complete = not ctx.incomplete
+    complete = meta["completeness"]["complete"]
     policy = str(cfg_get(ctx.cfg, "on_required_failure", "violation_only"))
     if result is None:
         result = AnalysisResult(job_id=ctx.job_id, status="failed", verdict=None)
@@ -552,6 +568,26 @@ def _finalize(ctx: RunContext, result: Optional[AnalysisResult]) -> AnalysisResu
     return result
 
 
+def _required(ctx: RunContext) -> list[str]:
+    return [s for s in STAGE_ORDER if is_required(s, ctx.cfg)]
+
+
+def _is_complete(ctx: RunContext) -> bool:
+    return not ctx.incomplete and all(s in ctx.records and ctx.records[s].status in OK_STATUSES
+                                      for s in _required(ctx))
+
+
+def _provenance(ctx: RunContext) -> dict:
+    models: dict[str, dict] = {}
+    for stage, ident in ctx.identities.items():
+        for m in ident.get("models", []) or []:
+            if isinstance(m, dict) and m.get("name"):
+                models.setdefault(str(m["name"]), {**m, "stage": stage})
+    sources = sorted({getattr(e, "source", "") for e in ctx.outputs.get("events_all", []) if getattr(e, "source", "")})
+    return {"pipeline_version": str(cfg_get(ctx.cfg, "pipeline_version", "1.0.0")), "contract_version": "1",
+            "mock": bool(ctx.cfg.get("mock")), "models": list(models.values()), "sources": sources}
+
+
 def _meta(ctx: RunContext) -> dict:
     reg = ModelRegistry.peek()
     timings = {name: round(r.seconds, 3) for name, r in ctx.records.items()}
@@ -572,9 +608,22 @@ def _meta(ctx: RunContext) -> dict:
                    if r.origin and r.origin not in ("cache",)},
         "cache": {"mode": ctx.cache.mode if ctx.cache else "off", "hits": list(ctx.cache.hits) if ctx.cache else [],
                   "dir": str(ctx.cache.dir) if ctx.cache else None},
-        "required_stages": [s for s in STAGE_ORDER if is_required(s, ctx.cfg)],
+        "required_stages": _required(ctx),
         "partial_written": list(ctx.partial_written),
     }
+    # ---- полнота (contracts/extensions.py, A01) + покрытие по стадиям
+    cov = stage_coverage(ctx.records, ctx.outputs, ctx.clip_info, ctx.probe, ctx.cfg)
+    duration = reference_duration(ctx.clip_info, ctx.probe)
+    times = ctx.clip_info.get("times") or []
+    complete = _is_complete(ctx)
+    reason = None if complete else ("Базовый анализ не завершён: " + "; ".join(ctx.incomplete) if ctx.incomplete
+                                    else "обязательные стадии не выполнены")
+    meta["coverage"] = cov
+    meta["duration_sec"] = round(duration, 3) if duration else None
+    meta["completeness"] = completeness(ctx.records, _required(ctx), complete, meta["duration_sec"],
+                                        round(max(times), 3) if times else None, reason, bool(ctx.cfg.get("mock")))
+    meta["provenance"] = _provenance(ctx)
+    meta["complete"] = complete
     if ctx.executor is not None:
         meta["executor"] = ctx.executor.stats()
     if ctx.outputs.get("vram_events"):
