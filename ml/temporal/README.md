@@ -107,8 +107,9 @@ python -m ml.temporal.bench --experiments E0,E1,E2 --folds 5 --repeats 3 --inner
   `model.input_groups`) и обучать прод-чекпоинт (`python -m ml.temporal.train --kind baseline|temporal`)
   только при измеренной пользе. Обязательные условия: без роста FN и без предупреждения сторожа
   длительности. Пока checkpoint нет, `score()` отдаёт `([], [])`.
-- **Стоимость:** не мерилась. Синтетическая оценка на CPU контейнера: E0/E1 ≈ 2–3 мин,
-  E2 ≈ 15 мин (60 обучений TCN по ~15 с). На RTX 4060 не мерилось.
+- **Стоимость** (замер на CPU контейнера, 4 потока, синтетика реального размера: 40 групп, 3 версии,
+  D=768): E0 — 51 с, E1 — 55 с на один повтор 5×(3+1); при 3 повторах примерно 2.5–3 мин каждая.
+  Цифра для E2 — в итоге PR. На RTX 4060 и реальных данных не мерилось.
 
 ## Публичные функции
 ```python
@@ -138,9 +139,9 @@ from ml.temporal.infer import propose_status            # диагностика
 | `train.use_pseudo_types` | `false` | псевдометки VLM — только явно |
 
 ## Что реально проверено (контейнер без GPU)
-- `pytest ml/temporal/tests`: **49 passed** на Python 3.13 (numpy 2.5, torch 2.14 CPU, transformers 5.20.1).
-- На Python 3.11.15 с версиями из lock L1 (numpy 2.4.6, pyyaml 6.0.3, opencv-python-headless 4.14.0.94)
-  без torch: 46 passed, 3 skipped. С torch 2.11.0 + transformers 5.20.1 — см. итог фазы 2 в PR.
+- `pytest ml/temporal/tests`: **50 passed** на Python 3.13 (numpy 2.5, torch 2.14 CPU, transformers 5.20.1).
+- **50 passed на Python 3.11.15 со стеком из lock L1:** torch 2.11.0, transformers 5.20.1, numpy 2.4.6,
+  opencv-python-headless 4.14.0.94, pyyaml 6.0.3, Pillow 13.0.0, torchvision 0.26.0 (CPU).
 - Сквозной mock-сценарий: синтетические видео (X/Х, md5-дубликат с конфликтом) → `extract` →
   `bench` (E0, E1) → `check_split` → `cv` → `train` → `predict`/`score`/`propose`.
 - Путь SigLIP-бэкенда проверен только на крошечной случайной модели. Настоящие веса не запускались.
