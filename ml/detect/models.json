@@ -1,0 +1,50 @@
+[
+  {
+    "name": "RT-DETRv2-S (r18vd), COCO",
+    "hf_id_or_url": "PekingU/rtdetr_v2_r18vd",
+    "license": "apache-2.0",
+    "license_status": "declared_unverified",
+    "license_source": "https://huggingface.co/PekingU/rtdetr_v2_r18vd (model card metadata); code: https://github.com/lyuwenyu/RT-DETR/blob/main/LICENSE",
+    "size_mb": 80,
+    "size_status": "approximate",
+    "purpose": "BASELINE closed-set детектор на каждом сэмпле (person, cell_phone, cup, bottle, food, laptop, bag, document)",
+    "role": "baseline",
+    "notes": "Лицензию ВЕСА проверить на этапе setup: python -m ml.detect.licenses --check (сверяет card_data.license и LICENSE в снапшоте). Название семейства не заменяет проверку конкретного чекпойнта."
+  },
+  {
+    "name": "D-FINE-S, COCO",
+    "hf_id_or_url": "ustc-community/dfine-small-coco",
+    "license": "apache-2.0",
+    "license_status": "declared_unverified",
+    "license_source": "https://huggingface.co/ustc-community/dfine-small-coco (model card metadata); code: https://github.com/Peterande/D-FINE/blob/master/LICENSE",
+    "size_mb": 40,
+    "size_status": "approximate",
+    "purpose": "Опциональная замена baseline (closed_set.hf_fallback_ids), по умолчанию выключена",
+    "role": "optional",
+    "notes": "Не скачивается и не используется, пока не добавлен в config. Проверить лицензию веса перед включением."
+  },
+  {
+    "name": "OWLv2 base patch16 ensemble",
+    "hf_id_or_url": "google/owlv2-base-patch16-ensemble",
+    "license": "apache-2.0",
+    "license_status": "declared_unverified",
+    "license_source": "https://huggingface.co/google/owlv2-base-patch16-ensemble (model card metadata); code: https://github.com/google-research/scenic/blob/main/LICENSE",
+    "size_mb": 620,
+    "size_status": "approximate",
+    "purpose": "ОПЦИОНАЛЬНЫЙ open-vocab на ключевых кадрах (cash, safe, safe_open, door, door_open, cash_bag, money_counter, keys) и предложения разметки (autolabel.py)",
+    "role": "optional",
+    "notes": "Включается SENTINEL_DETECT_EXTRAS=open_vocab. Метки open-vocab — визуальное сходство с текстовым запросом (напр. 'green canvas bag'), не доказательство назначения предмета."
+  },
+  {
+    "name": "Дообученный RT-DETRv2 (ONNX), классы домена",
+    "hf_id_or_url": "local:weights/detect/finetuned/model.onnx",
+    "license": "apache-2.0 (наследует базовый чекпойнт; датасет — внутренний)",
+    "license_status": "derived",
+    "license_source": "наследуется от PekingU/rtdetr_v2_r18vd",
+    "size_mb": 80,
+    "size_status": "approximate",
+    "purpose": "ОПЦИОНАЛЬНО: cash, cash_bag, safe_open, money_counter, cell_phone на каждом сэмпле. Обучается только на ПРОВЕРЕННОЙ человеком разметке (finetune.py)",
+    "role": "optional",
+    "notes": "Не существует, пока команда не разметила и не проверила данные локально. В git не коммитится."
+  }
+]
