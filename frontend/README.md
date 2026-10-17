@@ -49,7 +49,7 @@ ML-моделей во фронтенде нет: `models.json` = `[]`.
 | `episodePrerollS` / `episodePostrollS` | `2` / `1` | «Смотреть эпизод»: проиграть с запасом до и после |
 | `beforeAfterTypes` | `["V02","V03","V07"]` | для каких типов показывать «до / после» |
 | `beforeOffsetS` | `2` | «до» = `t_start − N` |
-| `highlightMaxDtS` | `0.6` | рамки только на кадрах не дальше N с от пика |
+| `highlightMaxDtS` | `0.1` | рамки A12 (bboxes для кадра t_peak) рисуются только на кадре не дальше N с от `t_peak` (аудит 2055fc4: было 0.6) |
 | `ptsOffsetMode` | **`"none"`** | ГИПОТЕЗА: `"meta_t0"` прибавляет `meta.video.t0_pts_sec` при перемотке. **Выключена до замера L2** |
 | `showReviewHints` | `true` | пограничные моменты и кандидаты — отдельным блоком, вне вердикта |
 | `pollIntervalMs` / `pollMaxIntervalMs` | `1500` / `10000` | опрос; потолок экспоненциальной паузы при сбоях сети (опрос не обрывается) |
@@ -90,7 +90,38 @@ PLAYWRIGHT_MODULE=<путь к playwright> node scripts/e2e-real.mjs
 - **Проверено на интеграционной ветке** (A02 fake-пайплайн, синтетические ролики ffmpeg, в том числе `Х-3.mp4`):
   2/2 ролика, лучший δ = 0 у обоих кадров, видео-маршрут 206, часы плеера после перехода = таймкоду, ошибок JS 0.
 
-### Находки по интеграции (ветка `claude/integration-cloud` @ 87ccab4, не мой код — для интегратора)
+### Аудит интеграции 2055fc4 (что воспроизведено и исправлено в `frontend/`)
+Проверено на живом A02 из `claude/integration-cloud` @ 2055fc4 с этим `dist` и синтетическими роликами ffmpeg
+(fake-пайплайн A02 и mock-пайплайн A03):
+- **Обёртка `partial` у `failed`.** A02 теперь отдаёт `partial = {code, complete, partial: <partial.json A03>,
+  rejected_result: <отвергнутый отчёт>}`, а `image_base64` заменяет на `"<jpeg omitted>"`.
+  - Раньше UI принимал обёртку за отчёт (голая карточка ошибки), а заглушку показал бы битой картинкой.
+  - Теперь отчёт берётся из `rejected_result`, затем из `partial.partial`. Кадр без изображения — плашка
+    «кадр не передан» с моментом, без подмены; в лайтбокс, «до/после» и JSON жюри он не попадает.
+- **«До/после».** «После» больше не подставляет кадр раньше начала эпизода.
+- **Подсветка.** Рамки A12 рисуются только на кадре `t_peak` (`overlay.timecode_sec`, допуск 0,1 с), а не на соседних
+  кадрах.
+- **«Недавние проверки».** Раньше там был зелёный «без нарушений» для неизвестной полноты и mock. Теперь история
+  хранит `completeness`/`mock`; зелёный — только для полного не-mock результата.
+- **Полнота и подписи.** Канонический `meta.coverage` A01/A03: доли стадий из `by_stage`, `coverage.complete=false` →
+  неполный. Добавлена подпись стадии `refine` («Уточнение окон»).
+- **Сверено с A02 2055fc4.**
+  - Сессия: `POST /ui/v1/session {api_key|password}` → cookie `ks_session` (HttpOnly, Path=/ui/v1);
+    `GET /ui/v1/session` → `csrf_token`.
+  - Запросы: POST с `X-CSRF-Token` (analyze 200, ask 501 при выключенном Copilot); профиль `ui` у `/ui/v1/jobs/{id}`;
+    видео `/ui/v1/jobs/{id}/video` → 206; `copilot/status` (available:false → панель скрыта).
+
+### Находки по интеграции (не мой код — для L2)
+0. **A02 @ 2055fc4: полнота коротких роликов.**
+   - `backend/api/results.py::analysis_complete` голосует по `meta.completeness.analyzed_until_sec / duration_sec ≥ 0.95`.
+     `analyzed_until_sec` — время последнего сэмпла, то есть примерно длительность минус 1/sample_fps.
+   - Синтетический ролик 6 с: 5,5/6 = 0,92 → «no_violation is not issued» (`failed`), хотя канонический
+     `meta.coverage.ratio` A01/A03 = 1.0 и `analysis_complete=true` у сериализатора A01. На реальных роликах около 10 с
+     это на грани порога.
+   - Вход: `python -m backend.api` с `SENTINEL_MOCK=1 SENTINEL_ALLOW_MOCK=1`, загрузка 6-секундного ролика.
+     Ожидается: решение по `meta.coverage.ratio` (A01) или допуск на шаг сэмплирования.
+
+(Ниже — находки фазы 2 @ 87ccab4. Находка 1 в 2055fc4 исправлена: A03 пишет канонический `meta.coverage`.)
 1. **A01 ↔ A03: формат `meta.coverage`.**
    - A03 (`backend/pipeline/coverage.py`) пишет словарь «стадия → доля|null».
    - `contracts.extensions.coverage_problem` (A01) ждёт число или `{ratio, complete, stages, required}` и отвечает
@@ -111,7 +142,7 @@ PLAYWRIGHT_MODULE=<путь к playwright> node scripts/e2e-real.mjs
 cd frontend
 npm ci                 # один раз, нужен интернет (потом офлайн); Node ≥ 18.18
 npm run build          # tsc --noEmit + vite build → frontend/dist (A02 раздаёт его на "/")
-npm test               # vitest: 80 тестов, без браузера и без бэкенда
+npm test               # vitest: 91 тест, без браузера и без бэкенда
 npm run dev            # :5173, прокси /api/ и /ui/v1/ → VITE_PROXY_TARGET (по умолчанию http://127.0.0.1:8000)
 npm run preview        # раздать собранный dist локально
 ```
@@ -126,7 +157,7 @@ Chromium — `CHROMIUM_PATH`):
 | Скрипт | Что делает |
 |---|---|
 | `npm run screenshots` | Скриншоты **только синтетического демо** → `screenshots/*.png` (для питча) |
-| `npm run e2e:mock` | e2e реального (не демо) HTTP-пути, бэкенд подменён синтетическими ответами в формате A02 — 31 проверка |
+| `npm run e2e:mock` | e2e реального (не демо) HTTP-пути, бэкенд подменён синтетическими ответами в формате A02 — 36 проверок |
 | `npm run e2e:real` | команда замера для L2 против живого сервера (см. «Фаза 2»). Скриншоты — только при `E2E_SHOTS=<папка>`. **С реальными видео скриншоты не коммитить и никуда не отправлять** |
 
 ## Путь пользователя
@@ -236,11 +267,11 @@ screenshots/          снимки синтетического демо и мо
 ## Проверки, которые реально выполнены
 
 - `npm run build` (в т. ч. из чистого клона после `npm ci`) — без ошибок TS, бандл ≈ 337 КБ JS (102 КБ gzip) + 54 КБ CSS + локальные шрифты.
-- `npm test` — 80 тестов: форматтеры, нормализатор (формы A01 `contracts/examples`, UI-report, `partial` A02),
+- `npm test` — 91 тест: форматтеры, нормализатор (формы A01 `contracts/examples`, UI-report, `partial` A02),
   полнота (complete/partial/unknown, coverage A01 и A03, mock), вердикт (зелёный только при подтверждённой полноте),
   стадии (русские подписи A03), оверлеи A12 (рамки, `status_ru`, VLM), каталог A13 + V09, `ui-config.json`, валидация,
   роутинг, демо, SSR-рендер экранов (в т. ч. failed с кандидатами и с `partial.json`), очередь пакета.
-- `npm run e2e:mock` — 31 проверка: вход (неверный и верный ключ), ключ не попадает в localStorage и URL,
+- `npm run e2e:mock` — 36 проверок: вход (неверный и верный ключ), ключ не попадает в localStorage и URL,
   CSRF на всех POST, очередь и реальный прогресс, результат, перемотка по таймкоду, горячие клавиши, лайтбокс, норма,
   Copilot 501 и `copilot/status` available=false, скачивание «Заключение .md», истечение сессии во время обработки,
   серверная история, пакет из 3 файлов (1 отбракован), выключенный /ui/v1 (вход по API-ключу с проверкой ключа),
