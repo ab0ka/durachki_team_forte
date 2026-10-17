@@ -142,6 +142,8 @@ def _detect(clip: VideoClip, every_n: int, config: Optional[dict[str, Any]]) -> 
     _stats().clear()
     _stats().update(stats)
     if n == 0:
+        stats["coverage"] = coverage([], every_n, [])
+        _stats().update(stats)
         return []
     tm = stats["timings"]
 
@@ -173,6 +175,8 @@ def _detect(clip: VideoClip, every_n: int, config: Optional[dict[str, Any]]) -> 
                                 rel_k=gt.get("motion_rel_k", 2.5), min_gap_s=gt.get("min_gap_s", 0.4),
                                 window=gt.get("window", 25), max_frames=ov.get("max_frames", 240))
     broken: set[str] = set()
+    closed_names = {getattr(b, "name", "closed") for b in be.closed}
+    processed: list[int] = []
     out: list[Detection] = []
     base_stride = max(1, int(every_n))
     stride = base_stride
@@ -220,6 +224,11 @@ def _detect(clip: VideoClip, every_n: int, config: Optional[dict[str, Any]]) -> 
         t_c = time.perf_counter()
         orig = _closed_views(be.closed, frames, "closed", warnings, broken)
         tick("closed", t_c)
+        if closed_names and closed_names <= broken:
+            # все closed-set бэкенды отказали: эти и дальнейшие кадры НЕ проанализированы (partial, а не «пусто»)
+            warnings.append(f"detect: all closed-set backends failed at t={times[fidx[0]]:.2f}s — stopping")
+            break
+        processed.extend(fidx)
 
         # --- 2. TTA флип ---
         flip_views: dict[int, RawDets] = {}
@@ -317,11 +326,41 @@ def _detect(clip: VideoClip, every_n: int, config: Optional[dict[str, Any]]) -> 
     stats["n_detections"] = len(out)
     # «срезаны» только реально включённые опции (в baseline-режиме резать нечего)
     stats["extras_cut"] = bool(hflip or tiling_on or open_on) and not budget.extras_allowed()
-    if broken or stride != base_stride or stats["extras_cut"]:
-        stats["status"] = "degraded"
+    stats["coverage"] = coverage(times, base_stride, processed)
+    if stats["coverage"]["fraction"] < 1.0:
+        stats["status"] = "partial"      # часть кадров не проанализирована: «нет детекций» там = неизвестно
+    elif broken or stats["extras_cut"]:
+        stats["status"] = "degraded"     # кадры покрыты, но часть стадий отключена
     _stats().update(stats)
     out.sort(key=lambda d: (d.t, d.label, -d.score))
     return out
+
+
+def coverage(times: Sequence[float], base_stride: int, processed: Sequence[int]) -> dict[str, Any]:
+    """Полнота анализа (для meta.coverage у A03): какие из запланированных кадров реально прошли closed-set.
+
+    gaps_s — интервалы времени без анализа (битые кадры, увеличенный из-за бюджета шаг, отказ бэкенда).
+    В этих интервалах отсутствие детекций означает «неизвестно», а не «объектов нет».
+    """
+    planned = list(range(0, len(times), max(1, int(base_stride))))
+    done = set(processed)
+    gaps: list[list[float]] = []
+    start: Optional[float] = None
+    prev_t: Optional[float] = None
+    for j in planned:
+        if j in done:
+            if start is not None:
+                gaps.append([round(start, 3), round(float(prev_t), 3)])
+                start = None
+        else:
+            if start is None:
+                start = float(times[j])
+            prev_t = float(times[j])
+    if start is not None:
+        gaps.append([round(start, 3), round(float(prev_t), 3)])
+    n_done = sum(1 for j in planned if j in done)
+    return {"frames_planned": len(planned), "frames_processed": n_done,
+            "fraction": round(n_done / len(planned), 4) if planned else 0.0, "gaps_s": gaps}
 
 
 def warmup(config: Optional[dict[str, Any]] = None) -> dict[str, Any]:

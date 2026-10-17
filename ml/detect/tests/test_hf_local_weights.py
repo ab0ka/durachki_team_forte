@@ -1,6 +1,8 @@
 """Реальный путь загрузки (transformers) без сети: крошечная случайная RT-DETRv2 в SENTINEL_WEIGHTS/detect/."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("torch")
@@ -25,14 +27,31 @@ def _tiny_rtdetr(dst):
     RTDetrImageProcessor(size={"height": 320, "width": 320}).save_pretrained(dst)
 
 
-def test_detect_with_local_tiny_rtdetr(tmp_path, monkeypatch, no_network):
+def _hub_snapshot(cache: "Path", model_id: str) -> "Path":
+    """Раскладка HF hub-кэша, как у L1: <cache>/models--org--name/{refs/main, snapshots/<rev>/...}."""
+    root = cache / ("models--" + model_id.replace("/", "--"))
+    (root / "refs").mkdir(parents=True)
+    (root / "refs" / "main").write_text("0123456789abcdef")
+    snap = root / "snapshots" / "0123456789abcdef"
+    snap.mkdir(parents=True)
+    return snap
+
+
+@pytest.mark.parametrize("layout", ["hf_hub", "save_pretrained_dir"])
+def test_detect_with_local_tiny_rtdetr(tmp_path, monkeypatch, no_network, layout):
     from ml.detect import available, detect, last_stats, warmup
     from contracts.sentinel_contracts import LABELS
     from ml.detect.synth import synth_clip
+    from ml.detect.weights import find_cache_dir
 
     wdir = tmp_path / "w"
-    _tiny_rtdetr(wdir / "detect" / "rtdetr_v2_r18vd")
+    if layout == "hf_hub":   # weights/hf/hub — как скачал L1 (deploy/weights.py)
+        _tiny_rtdetr(_hub_snapshot(wdir / "hf" / "hub", "PekingU/rtdetr_v2_r18vd"))
+    else:
+        _tiny_rtdetr(wdir / "detect" / "rtdetr_v2_r18vd")
     monkeypatch.setenv("SENTINEL_WEIGHTS", str(wdir))
+    if layout == "hf_hub":
+        assert find_cache_dir("PekingU/rtdetr_v2_r18vd") == wdir / "hf" / "hub"
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     assert available()["ready"] is True
     assert warmup(config={"runtime": {"device": "cpu"}})["status"] == "ok"

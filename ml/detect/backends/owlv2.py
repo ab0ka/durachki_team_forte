@@ -44,7 +44,7 @@ class OwlV2Backend:
             from transformers import Owlv2ForObjectDetection, Owlv2Processor
 
             src = str(local_model_dir(model_id) or model_id)
-            kw = {} if local_model_dir(model_id) else pretrained_kwargs()
+            kw = {} if local_model_dir(model_id) else pretrained_kwargs(model_id)
             model = model or Owlv2ForObjectDetection.from_pretrained(src, **kw)
             processor = processor or Owlv2Processor.from_pretrained(src, **kw)
         self.model = model.eval().to(self.device)

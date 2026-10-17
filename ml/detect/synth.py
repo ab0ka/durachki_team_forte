@@ -122,28 +122,37 @@ class ArrayClip:
 
     @classmethod
     def from_file(cls, path: str | Path, sample_fps: float = 5.0, max_side: Optional[int] = None) -> "ArrayClip":
-        """Простое чтение через cv2 (OpenCV сам применяет rotation из метаданных). Для продакшна — ml.ingest."""
+        """Простое чтение через cv2 (rotation из метаданных применяет OpenCV; время — из PTS). Для продакшна — ml.ingest."""
         import cv2
 
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
             raise RuntimeError(f"не удалось открыть {path}")
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        step = max(1, int(round(fps / float(sample_fps))))
+        period = 1.0 / float(sample_fps)
         frames, times, k = [], [], 0
+        next_t, last_pts, pts_ok = 0.0, -1.0, True
         while True:
             ok, f = cap.read()
             if not ok:
                 break
-            if k % step == 0:
+            # время — из PTS (переменный fps); если бэкенд не отдаёт PTS — k/fps
+            pts = float(cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
+            if pts_ok and k > 0 and pts <= last_pts:
+                pts_ok = False
+            t = pts if pts_ok else k / fps
+            last_pts = pts
+            if t + 1e-6 >= next_t:
                 if max_side and max(f.shape[:2]) > max_side:
                     s = max_side / max(f.shape[:2])
                     f = cv2.resize(f, (int(f.shape[1] * s), int(f.shape[0] * s)), interpolation=cv2.INTER_AREA)
                 frames.append(f)
-                times.append(k / fps)
+                times.append(round(t, 4))
+                next_t += period * max(1, int((t + 1e-6 - next_t) // period) + 1)
             k += 1
         cap.release()
-        return cls(frames=frames, times=times, path=str(path), fps=float(fps), duration=k / fps if fps else 0.0)
+        dur = (times[-1] + period) if times else 0.0
+        return cls(frames=frames, times=times, path=str(path), fps=float(fps), duration=max(dur, k / fps if fps else 0.0))
 
 
 def synth_clip(duration_s: float = 4.0, sample_fps: float = 5.0, width: int = 464, height: int = 848,

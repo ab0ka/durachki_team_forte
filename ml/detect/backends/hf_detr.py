@@ -57,7 +57,7 @@ class HFDetrBackend:
             from transformers import AutoModelForObjectDetection
 
             src = str(local_model_dir(model_id) or model_id)
-            kw = {} if local_model_dir(model_id) else pretrained_kwargs()
+            kw = {} if local_model_dir(model_id) else pretrained_kwargs(model_id)
             model = AutoModelForObjectDetection.from_pretrained(src, **kw)
             if processor is None:
                 try:
