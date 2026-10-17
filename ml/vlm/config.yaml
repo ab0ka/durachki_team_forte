@@ -87,6 +87,11 @@ budget:
     max_visual_tokens_total: 6000
     max_output_tokens_total: 1400
     max_retries_total: 2
+  verify_qa:                  # один вызов = один forward без генерации (1 выходной «токен»)
+    max_calls: 24
+    max_visual_tokens_total: 8000
+    max_output_tokens_total: 64
+    max_retries_total: 0
   discover:
     max_calls: 4
     max_visual_tokens_total: 3600
@@ -106,6 +111,7 @@ frames:
   jpeg_quality: 85           # для llama.cpp (data:image/jpeg;base64)
 
 verify:
+  mode: json                  # json (фаза 1, по умолчанию) | qa (фаза 2: нейтральные вопросы + логиты; ВЫКЛ до замера L2)
   # Логит-пулинг: logit(p) = logit(p0) + w * logit(p_vlm); p_vlm = c если visible, иначе 1-c
   vlm_weight: 0.6
   p_vlm_clip: [0.05, 0.95]
@@ -122,6 +128,13 @@ verify:
   max_facts: 4
   dedupe_iou_s: 0.6           # совпадающие по времени события одного типа проверяем один раз
   priority: uncertain_first   # uncertain_first | confidence_desc | time
+
+# Режим verify.mode=qa: вопросы/кадры/пороги — в ml/vlm/qa_spec.yaml (меняет L2 по замерам).
+qa:
+  spec_path: null             # null — ml/vlm/qa_spec.yaml
+  vlm_weight: 0.6             # вес умножается на «доказательность» ответов (p_support + p_contra)
+  crop_pad: 0.1               # поля вокруг зоны для кропа (доля размера зоны)
+  refine_t_peak: false        # подменять t_peak моментом смены ответа (t_transition) — только после замера L2
 
 discover:
   enabled: false              # выключен до локального бенчмарка (скорость/FP); включает A03/конфиг
