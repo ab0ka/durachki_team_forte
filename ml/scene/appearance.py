@@ -1,0 +1,256 @@
+"""Двухсостоятельная модель вида ROI (сейф / дверь) без допущения «первый кадр = закрыто».
+
+1. Эталон A — маскированная медиана первых N чистых кадров (без людей у ROI, хорошее качество).
+   Его состояние НЕИЗВЕСТНО: это просто «как выглядело в начале».
+2. Изменение вида d(t) = 1 − CS-SSIM(ROI_t, A) на z-нормированных кропах (инвариантно к общему
+   освещению/экспозиции; люди маскируются, сильная окклюзия → кадр не используется).
+3. Если есть устойчивый (≥ min_state_s) и внутренне согласованный альтернативный вид B —
+   считаем, что объект менял состояние. Короткие/несогласованные изменения (тень, проход, шум)
+   состоянием не считаются.
+4. Какое из состояний «открыто», решают абсолютные свидетельства: детекции safe_open/door_open
+   против safe/door в кадрах каждого состояния, проходы людей через дверь, и слабый априор вида
+   (у открытого сейфа больше тёмного проёма/кромок, дверца выступает за контур).
+   Нет свидетельств → уверенность 0 (неизвестно), а не «закрыто».
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+import numpy as np
+
+from . import roi as R
+from .geometry import BBox, expand_bbox
+from .smoothing import logit, sigmoid
+
+
+@dataclass
+class AppearanceResult:
+    p_open: np.ndarray                 # покадровая P(open) от вида+детекций (до HMM)
+    conf: np.ndarray                   # 0..1 сила свидетельства
+    visibility: np.ndarray             # 1 − окклюзия ROI
+    change: np.ndarray                 # d(t) относительно эталона A (nan — кадр не использован)
+    state_b: np.ndarray                # P(вид B) по кадрам
+    p_a_open: float = 0.5              # P(эталон A = открыто)
+    label_conf: float = 0.0            # |2·P − 1| — насколько понятно, какое состояние «открыто»
+    has_two_states: bool = False
+    roi: Optional[BBox] = None
+    provenance: list[str] = field(default_factory=list)
+    info: dict[str, Any] = field(default_factory=dict)
+
+
+def analyze_roi(
+    frames: Callable[[int], Optional[np.ndarray]],
+    idxs: list[int],
+    n: int,
+    times: np.ndarray,
+    roi_box: BBox,
+    person_boxes: list[list[BBox]],
+    quality: np.ndarray,
+    shifts: list[tuple[float, float]],
+    det_logodds: np.ndarray,
+    det_conf: np.ndarray,
+    cfg_roi: dict[str, Any],
+    cfg_obj: dict[str, Any],
+    extra_open_votes: Optional[np.ndarray] = None,
+    use_shape_prior: bool = True,
+) -> AppearanceResult:
+    """idxs — индексы сэмплов, для которых читаются кадры (stride); результат — на все n сэмплов."""
+    size = int(cfg_roi["size"])
+    pad = float(cfg_roi["person_pad"])
+    inner = expand_bbox(roi_box, float(cfg_roi["margin"]))
+    outer = expand_bbox(roi_box, float(cfg_roi["ring"]))
+    occ_max = float(cfg_roi["occlusion_max"])
+    blur = 3
+
+    vis = np.ones(n)
+    for i in range(n):
+        vis[i] = 1.0 - R.occlusion_fraction(inner, person_boxes[i], pad)
+
+    # --- эталон A: первые N чистых кадров (сначала в первых ref_search_s секундах) ---
+    ref_max_occ = float(cfg_roi["ref_max_occlusion"])
+    n_ref = int(cfg_roi["ref_frames"])
+    clean = [i for i in idxs if 1.0 - vis[i] <= ref_max_occ and quality[i] >= 0.4]
+    early = [i for i in clean if times[i] <= float(cfg_roi["ref_search_s"])]
+    ref_idx = (early if len(early) >= max(3, n_ref // 2) else clean)[:n_ref]
+
+    import cv2
+
+    def crops(i: int) -> Optional[tuple[np.ndarray, ...]]:
+        fr = frames(i)
+        if fr is None:
+            return None
+        g = R.to_gray(fr)
+        ci = cv2.GaussianBlur(R.crop(g, inner, shifts[i], (size, size)), (blur, blur), 0)
+        co = cv2.GaussianBlur(R.crop(g, outer, shifts[i], (size, size)), (blur, blur), 0)
+        mi = R.mask_from_boxes(inner, person_boxes[i], (size, size), pad)
+        mo = R.mask_from_boxes(outer, person_boxes[i], (size, size), pad) * R.ring_mask(outer, inner, (size, size))
+        return R.znorm(ci, mi), mi, R.znorm(co, mo), mo, ci, co
+
+    res = AppearanceResult(p_open=np.full(n, 0.5), conf=np.zeros(n), visibility=vis, change=np.full(n, np.nan), state_b=np.zeros(n), roi=roi_box)
+    if len(ref_idx) < 3:
+        res.info["reason"] = "no clean reference frames"
+        res.provenance.append("no_reference")
+        return _with_dets(res, det_logodds, det_conf, cfg_obj)
+
+    ref_c = [crops(i) for i in ref_idx]
+    ref_c = [c for c in ref_c if c is not None]
+    if len(ref_c) < 3:
+        res.info["reason"] = "frames unavailable"
+        return _with_dets(res, det_logodds, det_conf, cfg_obj)
+    ref_a = R.masked_median([c[0] for c in ref_c], [c[1] for c in ref_c])
+
+    cur: dict[int, tuple[np.ndarray, ...]] = {}
+    d_a = np.full(n, np.nan)
+    win = int(cfg_roi["ssim_win"])
+    for i in idxs:
+        if 1.0 - vis[i] > occ_max:
+            continue
+        c = crops(i)
+        if c is None:
+            continue
+        cur[i] = c
+        d_a[i] = 1.0 - R.cs_ssim(c[0], ref_a, c[1], win)
+    res.change = d_a
+
+    center, scale = float(cfg_obj["roi_center"]), float(cfg_obj["roi_scale"])
+    d_hi, d_lo = center + scale, center - scale
+    good = np.array([i in cur and np.isfinite(d_a[i]) and quality[i] >= float(cfg_obj.get("min_quality", 0.35)) for i in range(n)])
+
+    # --- альтернативный вид B: устойчивые участки с d > d_hi ---
+    min_state_s = float(cfg_obj.get("min_state_s", 1.0))
+    b_cand = good & (np.nan_to_num(d_a, nan=0.0) > d_hi)
+    b_idx = _long_runs(b_cand, times, min_state_s, max_gap_s=0.6)
+    has_b = len(b_idx) >= 3
+    ref_b = None
+    if has_b:
+        ref_b = R.masked_median([cur[i][0] for i in b_idx], [cur[i][1] for i in b_idx])
+        d_bb = np.array([1.0 - R.cs_ssim(cur[i][0], ref_b, cur[i][1], win) for i in b_idx])
+        if not np.isfinite(d_bb).any() or np.nanmedian(d_bb) > d_hi:
+            has_b = False  # B несогласован (люди/шум/тени) — не считаем это состоянием
+            res.provenance.append("inconsistent_change")
+    res.has_two_states = bool(has_b)
+
+    p_b = np.zeros(n)
+    a_conf = np.zeros(n)
+    for i in range(n):
+        if not good[i]:
+            continue
+        da = d_a[i]
+        if has_b and ref_b is not None:
+            db = 1.0 - R.cs_ssim(cur[i][0], ref_b, cur[i][1], win)
+            if not np.isfinite(db):
+                continue
+            p_b[i] = float(sigmoid((da - db) / max(scale, 1e-3)))
+            close = min(da, db)
+        else:
+            p_b[i] = 0.0
+            close = da
+        fit = 1.0 if close < d_hi else 0.3   # ни на A, ни на B не похоже — слабое свидетельство
+        a_conf[i] = fit * vis[i] * float(quality[i])
+    res.state_b = p_b
+
+    # --- какое состояние «открыто»: абсолютные свидетельства ---
+    in_a = good & (p_b < 0.5)
+    in_b = good & (p_b >= 0.5)
+    lo_a = _state_det_logodds(det_logodds, det_conf, in_a)
+    lo_b = _state_det_logodds(det_logodds, det_conf, in_b) if has_b else 0.0
+    lo = lo_a - lo_b
+    prov = []
+    if lo_a != 0.0 or lo_b != 0.0:
+        prov.append("det")
+    if extra_open_votes is not None:
+        va = float(np.sum(extra_open_votes[in_a])) if in_a.any() else 0.0
+        vb = float(np.sum(extra_open_votes[in_b])) if has_b and in_b.any() else 0.0
+        if va or vb:
+            lo += float(np.clip(va - vb, -3.0, 3.0))
+            prov.append("traffic")
+    if has_b and use_shape_prior:
+        prior = _shape_prior(cur, in_a, in_b, cfg_obj)
+        if prior != 0.0:
+            lo -= prior  # prior > 0 → B больше похоже на открытое → A закрыто
+            prov.append("geom")
+        res.info["shape_prior_b_open"] = prior
+    p_a_open = float(sigmoid(lo))
+    res.p_a_open = p_a_open
+    res.label_conf = float(abs(2.0 * p_a_open - 1.0))
+    p_app = p_a_open * (1.0 - p_b) + (1.0 - p_a_open) * p_b
+    res.p_open = p_app
+    res.conf = a_conf * res.label_conf
+    res.provenance.extend(["roi"] + prov)
+    res.info.update({"ref_idx": ref_idx, "n_state_b": int(in_b.sum()), "p_a_open": p_a_open})
+    return _with_dets(res, det_logodds, det_conf, cfg_obj)
+
+
+def _with_dets(res: AppearanceResult, det_lo: np.ndarray, det_c: np.ndarray, cfg_obj: dict[str, Any]) -> AppearanceResult:
+    """Покадровое слияние (логит-сумма) вида и прямых детекций."""
+    w_roi, w_det = float(cfg_obj["w_roi"]), float(cfg_obj["w_det"])
+    z = w_roi * res.conf * logit(res.p_open) + w_det * det_c * det_lo
+    c = np.clip(w_roi * res.conf + w_det * det_c, 0.0, 1.0)
+    res.p_open = sigmoid(z)
+    res.conf = c
+    if np.any(det_c > 0) and "det" not in res.provenance:
+        res.provenance.append("det")
+    return res
+
+
+def _state_det_logodds(det_lo: np.ndarray, det_c: np.ndarray, mask: np.ndarray) -> float:
+    if not mask.any():
+        return 0.0
+    w = det_c[mask]
+    if w.sum() <= 1e-6:
+        return 0.0
+    mean = float(np.sum(w * det_lo[mask]) / w.sum())
+    support = min(1.0, float(w.sum()) / 3.0)
+    return float(np.clip(mean * support * 2.0, -4.0, 4.0))
+
+
+def _shape_prior(cur: dict[int, Any], in_a: np.ndarray, in_b: np.ndarray, cfg: dict[str, Any]) -> float:
+    """Слабый априор: «открытый» вид темнее (проём), с большим числом кромок и с вертикальной кромкой вне контура."""
+    ia = [i for i in np.flatnonzero(in_a) if i in cur]
+    ib = [i for i in np.flatnonzero(in_b) if i in cur]
+    if len(ia) < 2 or len(ib) < 2:
+        return 0.0
+
+    rel = float(cfg.get("dark_rel", 0.55))
+
+    def dark(i: int) -> float:
+        # тёмный проём: пиксели ROI темнее dark_rel × медианы окружения (инвариантно к общему освещению)
+        ci, mi, co, mo = cur[i][4], cur[i][1], cur[i][5], cur[i][3]
+        ring_vals = co[mo > 0] if (mo > 0).sum() > 16 else co.ravel()
+        thr = rel * float(np.median(ring_vals))
+        vals = ci[mi > 0] if (mi > 0).sum() > 16 else ci.ravel()
+        return float(np.mean(vals < thr))
+
+    def feats(ids: list[int]) -> tuple[float, float, float]:
+        dk = np.median([dark(i) for i in ids])
+        edge = np.median([R.edge_density(cur[i][0], cur[i][1]) for i in ids])
+        ring = np.median([R.vertical_edge_energy(cur[i][2], cur[i][3]) for i in ids])
+        return float(dk), float(edge), float(ring)
+
+    da, ea, ra = feats(ia)
+    db, eb, rb = feats(ib)
+    # симметричная нормировка: перестановка A↔B меняет только знак априора
+    s = float(cfg.get("dark_gain", 6.0)) * (db - da)
+    s += float(cfg.get("edge_gain", 0.5)) * (eb - ea) / max(ea, eb, 1e-3)
+    s += float(cfg.get("w_geom", 0.3)) * (rb - ra) / max(ra, rb, 1e-3)
+    cap = float(cfg.get("shape_prior_cap", 1.5))
+    return float(np.clip(s, -cap, cap))
+
+
+def _long_runs(mask: np.ndarray, times: np.ndarray, min_s: float, max_gap_s: float) -> list[int]:
+    out: list[int] = []
+    run: list[int] = []
+    last_t: Optional[float] = None
+    for i in range(len(mask)):
+        if not mask[i]:
+            continue
+        if run and last_t is not None and times[i] - last_t > max_gap_s + 1e-9:
+            if times[run[-1]] - times[run[0]] >= min_s - 1e-9:
+                out.extend(run)
+            run = []
+        run.append(i)
+        last_t = float(times[i])
+    if run and times[run[-1]] - times[run[0]] >= min_s - 1e-9:
+        out.extend(run)
+    return out

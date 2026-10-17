@@ -43,16 +43,18 @@ def hmm2_smooth(
     e0 = 1.0 - e1
     dt = np.diff(t, prepend=t[0])
     dt = np.clip(dt, 0.0, None)
-    sw = 1.0 - np.exp(-max(switch_per_s, 0.0) * dt)  # вероятность смены состояния за шаг
-    sw = np.clip(sw, 1e-9, 0.5)
     pr = float(np.clip(prior, 1e-3, 1 - 1e-3))
+    # асимметричные переходы: стационарное распределение = prior, поэтому без наблюдений
+    # (conf=0) апостериорная плавно возвращается к априорной, а не к 0.5
+    lam = max(switch_per_s, 0.0)
+    s01 = np.clip(1.0 - np.exp(-2.0 * lam * pr * dt), 1e-9, 0.5)
+    s10 = np.clip(1.0 - np.exp(-2.0 * lam * (1.0 - pr) * dt), 1e-9, 0.5)
     alpha = np.zeros((n, 2))
     a = np.array([(1 - pr) * e0[0], pr * e1[0]])
     alpha[0] = a / a.sum()
     for i in range(1, n):
-        s = sw[i]
         prev = alpha[i - 1]
-        pred = np.array([prev[0] * (1 - s) + prev[1] * s, prev[1] * (1 - s) + prev[0] * s])
+        pred = np.array([prev[0] * (1 - s01[i]) + prev[1] * s10[i], prev[1] * (1 - s10[i]) + prev[0] * s01[i]])
         a = pred * np.array([e0[i], e1[i]])
         tot = a.sum()
         alpha[i] = a / tot if tot > 0 else pred
@@ -60,13 +62,29 @@ def hmm2_smooth(
     post = np.zeros(n)
     post[-1] = alpha[-1, 1]
     for i in range(n - 2, -1, -1):
-        s = sw[i + 1]
+        a01, a10 = s01[i + 1], s10[i + 1]
         eb = np.array([e0[i + 1], e1[i + 1]]) * beta
-        beta = np.array([(1 - s) * eb[0] + s * eb[1], s * eb[0] + (1 - s) * eb[1]])
+        beta = np.array([(1 - a01) * eb[0] + a01 * eb[1], a10 * eb[0] + (1 - a10) * eb[1]])
         beta = beta / max(beta.sum(), 1e-300)
         g = alpha[i] * beta
         post[i] = g[1] / max(g.sum(), 1e-300)
     return np.clip(post, 0.0, 1.0)
+
+
+def hold_conf(c: Sequence[float], times: Sequence[float], tau_s: float = 1.0) -> np.ndarray:
+    """Уверенность «недавно наблюдали»: max_j c_j·exp(−|t−t_j|/tau) (двусторонний проход)."""
+    c = np.asarray(c, dtype=np.float64)
+    t = np.asarray(times, dtype=np.float64)
+    n = len(c)
+    if n == 0:
+        return c
+    out = c.copy()
+    for rng in (range(1, n), range(n - 2, -1, -1)):
+        for i in rng:
+            j = i - 1 if rng.step == 1 else i + 1
+            decay = np.exp(-abs(t[i] - t[j]) / max(tau_s, 1e-6))
+            out[i] = max(out[i], out[j] * decay)
+    return np.clip(out, 0.0, 1.0)
 
 
 def ema(x: Sequence[float], alpha: float = 0.5, bidirectional: bool = True) -> np.ndarray:
