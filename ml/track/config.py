@@ -69,8 +69,11 @@ DEFAULTS: dict[str, Any] = {
         "near_desk_diag": 0.9,
         "stationary_speed_diag_s": 0.35,
         "w_desk": 0.40, "w_start": 0.25, "w_still": 0.20, "w_presence": 0.15, "w_safe_side": 0.10,
+        "w_desk_center": 0.20,           # ближе к центру объектов стола (сидит перед ноутбуком/счётчиком)
+        "speed_window_s": 1.0,
         "min_cashier_score": 0.35,
         "fallback_cashier_conf_cap": 0.45,   # без объектов стола роль кассира — слабая
+        "fallback_visitor_conf_cap": 0.6,
         "overlap_tol_s": 0.6,
         "app_same_thr": 0.35,
         "app_diff_thr": 0.50,
@@ -101,6 +104,7 @@ DEFAULTS: dict[str, Any] = {
         "cashier_expand": 1.15,
         "cashier_keep_pct": 90.0,
         "cashier_max_dist_diag": 1.5,
+        "cashier_band": True,            # cashier_area = место кассира ∪ «отпечаток» стола на его стороне
         "client_expand": 1.15,
         "client_min_points": 5,
         "client_max_dist_diag": 2.5,

@@ -1,0 +1,61 @@
+import json
+
+import pytest
+
+from ml.track import track_full
+from ml.track.config import DEFAULTS, _read_yaml, load_config
+from ml.track.serialize import load_track_cache, save_track_cache, track_from_dict, track_to_dict
+from ml.track.tests import synth as S
+
+
+def _keys(d, prefix=""):
+    out = set()
+    for k, v in d.items():
+        out.add(prefix + k)
+        if isinstance(v, dict) and k not in ("label_groups", "group_label", "prefer_label", "crop"):
+            out |= _keys(v, prefix + k + ".")
+    return out
+
+
+def test_yaml_keys_are_known():
+    from pathlib import Path
+
+    y = _read_yaml(str(Path(__file__).resolve().parents[1] / "config.yaml"))
+    assert y, "config.yaml should load"
+    assert _keys(y) <= _keys(DEFAULTS)
+    assert load_config(overrides={"roles": {"early_s": 9.0}})["roles"]["early_s"] == 9.0
+
+
+def test_cache_roundtrip(tmp_path):
+    clip, dets, _ = S.make(S.scene_clean())
+    r = track_full(clip, dets)
+    save_track_cache(str(tmp_path), r.tracks, r.zones, r.info)
+    tracks, zones, info = load_track_cache(str(tmp_path))
+    assert [t.track_id for t in tracks] == [t.track_id for t in r.tracks]
+    assert [z.name for z in zones] == [z.name for z in r.zones]
+    assert track_from_dict(track_to_dict(r.tracks[0])).boxes[0][0] == r.tracks[0].boxes[0][0]
+    json.dumps(info)
+
+
+def test_viz_cli_smoke(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    from ml.track.viz import main
+
+    video = tmp_path / "v.avi"
+    vw = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (64, 96))
+    for i in range(20):
+        img = np.full((96, 64, 3), 120, np.uint8)
+        cv2.rectangle(img, (10 + i, 30), (30 + i, 60), (0, 0, 200), -1)
+        vw.write(img)
+    vw.release()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    dets = [{"t": round(i / 10.0, 4), "label": "person", "bbox": [(10 + i) / 64, 30 / 96, (30 + i) / 64, 60 / 96],
+             "score": 0.9} for i in range(0, 20, 2)]
+    (cache / "detections.json").write_text(json.dumps(dets))
+    out = tmp_path / "out.mp4"
+    assert main([str(video), "--cache", str(cache), "--out", str(out), "--fps", "5", "--blur-heads"]) == 0
+    assert out.is_file() and out.stat().st_size > 0
+    assert (cache / "track.json").is_file()

@@ -27,28 +27,43 @@ from .geometry import box_center, dist_point_polygon, iou, iso_dist, point_in_po
 from .views import TrackView
 
 
+def _median_speed(v: TrackView, aspect: float, window_s: float) -> float:
+    """Медианная скорость (диагоналей/с) по точкам, прореженным до ~window_s: дрожание бокса не мешает."""
+    if len(v.times) < 2:
+        return 0.0
+    keep = [0]
+    for i in range(1, len(v.times)):
+        if v.times[i] - v.times[keep[-1]] >= window_s:
+            keep.append(i)
+    if len(keep) < 2:
+        keep = [0, len(v.times) - 1]
+    t = v.times[keep]
+    p = v.pts[keep]
+    dt = np.maximum(np.diff(t), 1e-3)
+    dd = np.hypot(np.diff(p[:, 0]) * aspect, np.diff(p[:, 1])) / max(v.diag, 1e-6)
+    return float(np.median(dd / dt))
+
+
 def person_features(v: TrackView, desk: Optional[Zone], safe: Optional[Zone], cfg: dict, aspect: float,
                     t0: float, t1: float, duration: float) -> dict[str, Any]:
     rc = cfg["roles"]
     f: dict[str, Any] = {"presence_s": round(v.presence, 3)}
     f["start"] = 1.0 if v.t_start <= t0 + rc["early_s"] else 0.0
     f["end"] = 1.0 if v.t_end >= t1 - rc["early_s"] else 0.0
-    if len(v.times) > 1:
-        dt = np.maximum(np.diff(v.times), 1e-3)
-        dd = np.hypot(np.diff(v.pts[:, 0]) * aspect, np.diff(v.pts[:, 1])) / v.diag
-        med_speed = float(np.median(dd / dt))
-    else:
-        med_speed = 0.0
+    med_speed = _median_speed(v, aspect, rc["speed_window_s"])
     f["speed_diag_s"] = round(med_speed, 4)
     f["still"] = math.exp(-med_speed / max(rc["stationary_speed_diag_s"], 1e-6))
     dur = max(duration, 1e-6)
     f["presence_frac"] = min(1.0, v.presence / dur)
     if desk is not None:
+        dcen = polygon_centroid(desk.polygon)
+        f["desk_center"] = math.exp(-iso_dist(v.median_pt, dcen, aspect) / max(v.diag, 1e-6))
         near = np.array([dist_point_polygon(p, desk.polygon, aspect) <= rc["near_desk_diag"] * v.diag for p in v.pts])
         f["near_desk_s"] = round(float(v.w[near].sum()), 3)
         f["desk_frac"] = min(1.0, float(v.w[near].sum()) / dur)
     else:
         f["desk_frac"] = None
+        f["desk_center"] = None
     if safe is not None:
         sc = polygon_centroid(safe.polygon)
         if desk is not None:
@@ -68,6 +83,7 @@ def cashier_score(f: dict[str, Any], cfg: dict) -> float:
     terms = [(rc["w_start"], f["start"]), (rc["w_still"], f["still"]), (rc["w_presence"], f["presence_frac"])]
     if f.get("desk_frac") is not None:
         terms.append((rc["w_desk"], f["desk_frac"]))
+        terms.append((rc["w_desk_center"], f["desk_center"]))
     else:  # без стола его вес уходит в «присутствие»
         terms.append((rc["w_desk"], f["presence_frac"]))
     if f.get("safe_side") is not None:
@@ -237,15 +253,20 @@ def assign_roles(views: Sequence[TrackView], objs: Sequence[TrackView], zones: d
             out[v.tid] = {"role": "unknown", "conf": 0.35, "reasons": ["bag_contact_only"], **info}
             continue
         # 3) второй человек в зоне кассира одновременно с кассиром — НЕ обязательно посторонний
+        if cashier.get("ambiguous_with") == v.tid:
+            out[v.tid] = {"role": "unknown", "conf": 0.5, "reasons": ["ambiguous_cashier_candidate"], **info}
+            continue
         if pv is not None and ov > rc["overlap_tol_s"] and in_ca >= 0.3:
             out[v.tid] = {"role": rc["second_person_role"], "conf": 0.5,
-                          "reasons": ["co_present_in_cashier_area"], **info}
+                          "reasons": ["co_present_in_cashier_area"] + (["entered_mid_clip"] if entered else []), **info}
             continue
         if in_ca >= 0.3:
             out[v.tid] = {"role": "unknown", "conf": 0.4, "reasons": ["in_cashier_area_without_cashier"], **info}
             continue
         # 4) посетитель (клиент)
         conf = min(0.85, 0.5 + 0.3 * in_cl + 0.05 * float(entered))
+        if not cashier.get("independent"):  # кассир найден без опор — «не кассир» тоже неуверенно
+            conf = min(conf, rc["fallback_visitor_conf_cap"])
         reasons = ["not_cashier"] + (["in_client_area"] if in_cl > 0.3 else [])
         out[v.tid] = {"role": "visitor", "conf": round(conf, 3), "reasons": reasons, **info}
 

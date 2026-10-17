@@ -206,17 +206,26 @@ def cashier_area_zone(cviews: Sequence[TrackView], desk: Optional[Zone], cfg: di
     keep &= d <= max(thr, 0.25)
     if keep.sum() == 0:
         keep = d <= np.min(d) + 1e-9
-    poly = scale_polygon(convex_hull(_shrunk_corners(boxes[keep], zc["cashier_shrink"])), zc["cashier_expand"])
+    hull_pts = _shrunk_corners(boxes[keep], zc["cashier_shrink"])
+    band = False
+    if desk is not None and zc.get("cashier_band", True):
+        # «сторона стола»: отпечаток стола, сдвинутый туда, где сидит кассир (аффинно-эквивариантно)
+        dc = polygon_centroid(desk.polygon)
+        cc = np.median(pts[keep], axis=0)
+        sh = (float(cc[0] - dc[0]), float(cc[1] - dc[1]))
+        hull_pts += [(x + sh[0], y + sh[1]) for x, y in desk.polygon]
+        band = True
+    poly = scale_polygon(convex_hull(hull_pts), zc["cashier_expand"])
     conf = float(cashier_conf) * min(1.0, float(w[keep].sum()) / 5.0)
     if not independent:
         conf = min(conf, zc["fallback_zone_conf_cap"])
     z = make_zone("cashier_area", poly, conf, zc["max_vertices"])
-    return z, {"method": "cashier_dwell", "tracks": [v.tid for v in cviews], "kept_obs": int(keep.sum()),
+    return z, {"method": "cashier_dwell+desk_band" if band else "cashier_dwell", "tracks": [v.tid for v in cviews], "kept_obs": int(keep.sum()),
                "independent": False, "cashier_support": "desk_objects" if independent else "fallback"}
 
 
 def client_area_zone(others: Sequence[TrackView], desk: Optional[Zone], cashier_area: Optional[Zone],
-                     cfg: dict, aspect: float) -> tuple[Optional[Zone], dict]:
+                     cfg: dict, aspect: float, desk_independent: bool = True) -> tuple[Optional[Zone], dict]:
     zc = cfg["zones"]
     cap = zc["fallback_zone_conf_cap"]
     if desk is not None and cashier_area is not None:
@@ -237,6 +246,8 @@ def client_area_zone(others: Sequence[TrackView], desk: Optional[Zone], cashier_
                 poly = scale_polygon(convex_hull(_shrunk_corners(np.array(sel_boxes), zc["cashier_shrink"])),
                                      zc["client_expand"])
                 conf = min(0.85, 0.4 + 0.02 * len(sel_boxes)) * max(desk.conf, 0.5)
+                if not desk_independent:
+                    conf = min(conf, cap)
                 return make_zone("client_area", poly, conf, zc["max_vertices"]), {
                     "method": "visitors_opposite_side", "n_obs": len(sel_boxes), "independent": False}
         poly = reflect_polygon(cashier_area.polygon, dc)
