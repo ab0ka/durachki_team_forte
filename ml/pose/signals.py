@@ -884,7 +884,8 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
                 extra["item_placed_on_desk"] = None  # нет зоны desk или объект-треков — unknown
             else:
                 act = [e for e in placements if e["t_start"] - 1e-6 <= t <= e["t_end"] + 1e-6]
-                extra["item_placed_on_desk"] = 1.0 if act else 0.0
+                # «не клали» утверждаем, только если в момент t есть хоть одна поза (кисти видели); иначе unknown
+                extra["item_placed_on_desk"] = 1.0 if act else (0.0 if index.get(key) else None)
                 extra["placements"] = act
         extra["unknown"] = [nm for nm in enabled if nm not in signals]
         states.append(PoseSceneState(t=t, signals=signals, extra=extra))

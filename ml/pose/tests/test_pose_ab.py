@@ -119,3 +119,22 @@ def test_ab_video_mode_uses_pipeline_modules(monkeypatch, tmp_path):
     assert rc == 0
     rep = json.loads((out / "ab_report.json").read_text(encoding="utf-8"))
     assert rep["n_frames"] == 3 and rep["backends"]["mock"]["n_crops"] == 3   # кадры без людей пропущены
+
+
+def test_overlay_without_head_keypoints_blurs_whole_person_not_guess():
+    """Нет точек головы → место головы не угадывается: размыт весь bbox человека (и это посчитано)."""
+    img = np.zeros((200, 120, 3), np.uint8)
+    img[::2, ::2] = 255
+    kp = np.tile(np.array([[60.0, 120.0]], np.float32), (17, 1))
+    sc = np.full(17, 0.9, np.float32)
+    sc[:5] = 0.0                                          # голова не видна
+    box = np.array([20, 20, 100, 190], np.float32)
+    counts: dict = {}
+    out = ab.draw_overlay(img, [(kp, sc, box)], 0.3, blur_heads=True, counts=counts)
+    assert counts == {"whole_bbox": 1}
+    low = out[150:180, 30:50].astype(float)               # низ bbox (не «верх-голова») тоже размыт
+    assert low.std() < img[150:180, 30:50].astype(float).std()
+    counts2: dict = {}
+    sc2 = np.full(17, 0.9, np.float32)
+    ab.draw_overlay(img, [(kp, sc2, box)], 0.3, blur_heads=True, counts=counts2)
+    assert counts2 == {"head_keypoints": 1}

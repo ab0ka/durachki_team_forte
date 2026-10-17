@@ -116,9 +116,10 @@ def test_backend_failure_does_not_raise_and_is_reported(synth_clip, monkeypatch,
     poses = pose.estimate(synth_clip, _tracks(synth_clip, 1))
     assert poses == []                       # никаких поддельных поз
     st = pose.status()
-    assert st["state"] == "failed" and st["error"]
+    assert st["state"] == "unavailable" and st["stage_status"] == "skipped" and st["available"] is False
+    assert st["error"]
     states = pose.pose_signals(poses, _tracks(synth_clip, 1), [])
-    assert all(not s.signals and s.extra["pose_status"] == "failed" for s in states)
+    assert all(not s.signals and s.extra["pose_status"] == "unavailable" for s in states)
     clear_cache()
 
 
