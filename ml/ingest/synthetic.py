@@ -93,18 +93,20 @@ class SyntheticClip:
         if frames is not None:
             self._frames = [np.ascontiguousarray(f) for f in frames]
             self.height, self.width = self._frames[0].shape[:2]
-            self.times = [round(i / sample_fps, 6) for i in range(len(self._frames))]
+            self.times = [i / sample_fps for i in range(len(self._frames))]
             self.duration = len(self._frames) / sample_fps
         else:
             self.width, self.height = int(size[0]), int(size[1])
             self.duration = float(duration_s)
             n = max(1, int(math.floor(duration_s * sample_fps + 1e-9)))
             src = [int(round(i * fps / sample_fps)) for i in range(n)]
-            self.times = [round(k / fps, 6) for k in src]
+            self.times = [k / fps for k in src]
             self._frames = [render_scene(k, k / fps, (self.width, self.height)) for k in src]
         self.source_times = list(self.times)
         self.quality = [{"t": t, "motion_energy": 0.0, "sharpness": 100.0, "brightness": 0.3} for t in self.times]
-        self.meta: dict[str, Any] = {"backend": "synthetic", "warnings": [], "complete": True}
+        # МОК: явная пометка, чтобы его нельзя было принять за анализ реального видео
+        self.meta: dict[str, Any] = {"backend": "synthetic", "mock": True, "warnings": ["MOCK: синтетический клип"],
+                                     "complete": True, "coverage": 1.0, "coverage_gaps": []}
 
     def __len__(self) -> int:
         return len(self.times)

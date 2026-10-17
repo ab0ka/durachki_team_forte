@@ -54,3 +54,9 @@ class DecodeError(IngestError):
     """Контейнер открылся, но кадры не декодируются."""
 
     code = "decode_failed"
+
+
+class FrameGapError(IngestError):
+    """В запрошенный момент нет кадра: вне видео или внутри пробела покрытия (strict-режим)."""
+
+    code = "frame_gap"

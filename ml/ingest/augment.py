@@ -46,10 +46,13 @@ class Aug:
     jpeg_quality: int = 0                    # 0 = выкл; иначе сжать/разжать JPEG с таким качеством
     fps: Optional[float] = None              # только для видео: смена частоты кадров
     border: str = "replicate"                # replicate | constant (чёрный)
+    out_orientation: Optional[str] = None    # None | landscape | portrait: выходной кадр с другим соотношением сторон
+    kind: str = "perturbation"               # ВСЕ пресеты — синтетическое возмущение, не реальный новый ракурс
 
     @property
     def is_geometric(self) -> bool:
-        return self.persp != (0.0, 0.0) or self.rotate_deg != 0.0 or self.zoom != 1.0 or self.mirror
+        return (self.persp != (0.0, 0.0) or self.rotate_deg != 0.0 or self.zoom != 1.0 or self.mirror
+                or self.out_orientation is not None)
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -70,9 +73,14 @@ PRESETS: dict[str, Aug] = {
     "noise": Aug("noise", noise_sigma=8.0),
     "jpeg": Aug("jpeg", jpeg_quality=20),
     "fps25": Aug("fps25", fps=25.0),
+    # «как будто другая камера жюри»: перспектива + поворот + кроп в ЛАНДШАФТ. Это perturbation
+    # (то же изображение, искажённое), а не настоящий новый ракурс: нет параллакса и новых окклюзий.
+    "angle_jury": Aug("angle_jury", persp=(0.18, 0.12), rotate_deg=8.0, zoom=0.9, center=(0.5, 0.45),
+                      out_orientation="landscape"),
 }
 CLI_PRESETS = ["angle_left", "angle_right", "high", "low", "zoom", "mirror", "dark", "rot_cw", "rot_ccw",
-               "bright", "blur", "noise", "jpeg", "fps25"]
+               "bright", "blur", "noise", "jpeg", "fps25", "angle_jury"]
+PERTURBATION_NOTE = "синтетическое искажение (perturbation), не реальный новый ракурс"
 
 
 # ----------------------------------------------------------------------------- геометрия
@@ -106,8 +114,16 @@ def _homography_from_points(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return np.append(sol, 1.0).reshape(3, 3)
 
 
-def homography(aug: Aug, width: int, height: int) -> np.ndarray:
-    """3x3 гомография в пикселях (непрерывные координаты, углы кадра = 0 и W/H)."""
+def output_size(aug: Aug, width: int, height: int) -> tuple[int, int]:
+    """(W', H') выходного кадра: тот же, либо с переставленными сторонами для out_orientation."""
+    w, h = int(width), int(height)
+    if aug.out_orientation == "landscape" and h > w or aug.out_orientation == "portrait" and w > h:
+        return h, w
+    return w, h
+
+
+def _geometry(aug: Aug, width: int, height: int) -> tuple[np.ndarray, tuple[float, float, float, float], tuple[int, int]]:
+    """(H_geo — зеркало/перспектива/поворот в исходном холсте, окно кропа (x0, y0, cw, ch), выходной размер)."""
     w, h = float(width), float(height)
     full = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
     m = np.eye(3)
@@ -122,24 +138,34 @@ def homography(aug: Aug, width: int, height: int) -> np.ndarray:
         t1 = np.array([[1.0, 0.0, -cx], [0.0, 1.0, -cy], [0.0, 0.0, 1.0]])
         t2 = np.array([[1.0, 0.0, cx], [0.0, 1.0, cy], [0.0, 0.0, 1.0]])
         m = t2 @ rot @ t1 @ m
-    if aug.zoom != 1.0:
-        z = min(max(float(aug.zoom), 0.05), 1.0)
-        cw, ch = w * z, h * z
-        x0 = min(max(aug.center[0] * w - cw / 2, 0.0), w - cw)
-        y0 = min(max(aug.center[1] * h - ch / 2, 0.0), h - ch)
-        m = np.array([[1 / z, 0.0, -x0 / z], [0.0, 1 / z, -y0 / z], [0.0, 0.0, 1.0]]) @ m
-    return m
+    out_w, out_h = output_size(aug, width, height)
+    aspect = out_w / float(out_h)
+    cw0 = min(w, h * aspect)  # наибольшее окно с соотношением выхода внутри холста
+    z = min(max(float(aug.zoom), 0.05), 1.0)
+    cw, ch = cw0 * z, cw0 / aspect * z
+    x0 = min(max(aug.center[0] * w - cw / 2, 0.0), w - cw)
+    y0 = min(max(aug.center[1] * h - ch / 2, 0.0), h - ch)
+    return m, (x0, y0, cw, ch), (out_w, out_h)
+
+
+def homography(aug: Aug, width: int, height: int) -> np.ndarray:
+    """3x3 гомография: пиксели исходника -> пиксели выхода (:func:`output_size`), непрерывные координаты."""
+    m, (x0, y0, cw, ch), (out_w, out_h) = _geometry(aug, width, height)
+    sx, sy = out_w / cw, out_h / ch
+    crop = np.array([[sx, 0.0, -x0 * sx], [0.0, sy, -y0 * sy], [0.0, 0.0, 1.0]])
+    return crop @ m
 
 
 def transform_points(points: Sequence[tuple[float, float]], aug: Aug, width: int, height: int) -> list[tuple[float, float]]:
-    """Нормированные точки (x, y) -> нормированные точки после искажения (могут выйти за 0..1)."""
+    """Нормированные точки (x, y) исходника -> нормированные к ВЫХОДНОМУ кадру (могут выйти за 0..1)."""
     if not points:
         return []
     hm = homography(aug, width, height)
+    out_w, out_h = output_size(aug, width, height)
     pts = np.asarray(points, dtype=np.float64) * [width, height]
     homog = np.c_[pts, np.ones(len(pts))] @ hm.T
     out = homog[:, :2] / homog[:, 2:3]
-    return [(float(x) / width, float(y) / height) for x, y in out]
+    return [(float(x) / out_w, float(y) / out_h) for x, y in out]
 
 
 def transform_bbox(bbox: BBoxT, aug: Aug, width: int, height: int, min_visible: float = 0.25) -> Optional[BBoxT]:
@@ -162,14 +188,16 @@ def transform_bbox(bbox: BBoxT, aug: Aug, width: int, height: int, min_visible: 
 
 
 def apply(img: np.ndarray, aug: Aug, rng: Optional[np.random.Generator] = None) -> np.ndarray:
-    """Применить искажение к BGR uint8 кадру. Размер и dtype сохраняются."""
+    """Применить искажение к BGR uint8 кадру. dtype сохраняется; размер — :func:`output_size`
+    (тот же, кроме пресетов с ``out_orientation``)."""
     import cv2
 
     h, w = img.shape[:2]
     out = img
     if aug.is_geometric:
         border = cv2.BORDER_REPLICATE if aug.border == "replicate" else cv2.BORDER_CONSTANT
-        out = cv2.warpPerspective(out, homography(aug, w, h), (w, h), flags=cv2.INTER_LINEAR, borderMode=border)
+        out = cv2.warpPerspective(out, homography(aug, w, h), output_size(aug, w, h), flags=cv2.INTER_LINEAR,
+                                  borderMode=border)
     if aug.brightness or aug.contrast != 1.0 or aug.gamma != 1.0:
         lut = np.arange(256, dtype=np.float64) / 255.0
         lut = np.clip((lut - 0.5) * aug.contrast + 0.5 + aug.brightness, 0.0, 1.0)
@@ -201,8 +229,10 @@ def resample_indices(times: Sequence[float], dst_fps: float) -> list[int]:
     return [int(i) for i in np.where(choose_prev, prev, idx)]
 
 
-def random_aug(rng: np.random.Generator, strength: float = 1.0) -> Aug:
-    """Случайное искажение для обучения (A10/A05): ракурс + качество, сила 0..1."""
+def random_aug(rng: np.random.Generator, strength: float = 1.0, p_landscape: float = 0.0) -> Aug:
+    """Случайное искажение для обучения (A10/A05): ракурс + качество, сила 0..1.
+
+    ``p_landscape`` — вероятность выхода в ландшафт (по умолчанию 0: поведение не меняется)."""
     s = float(min(max(strength, 0.0), 1.0))
     u = lambda lo, hi: float(rng.uniform(lo, hi))  # noqa: E731
     persp = (u(-0.25, 0.25) * s, u(-0.2, 0.2) * s) if rng.random() < 0.7 else (0.0, 0.0)
@@ -221,6 +251,7 @@ def random_aug(rng: np.random.Generator, strength: float = 1.0) -> Aug:
         blur_sigma=u(0.5, 2.0) * s if rng.random() < 0.3 else 0.0,
         noise_sigma=u(2.0, 8.0) * s if rng.random() < 0.3 else 0.0,
         jpeg_quality=int(u(20, 60)) if rng.random() < 0.3 * s else 0,
+        out_orientation="landscape" if (p_landscape > 0 and rng.random() < p_landscape) else None,
     )
 
 
@@ -246,7 +277,15 @@ class ClipAugmenter:
 def ffmpeg_filter(aug: Aug, width: int, height: int) -> str:
     """Цепочка -vf для ffmpeg, эквивалентная :func:`apply` (геометрия — через perspective)."""
     parts: list[str] = []
-    if aug.is_geometric:
+    if aug.is_geometric and output_size(aug, width, height) != (width, height):
+        m, (x0, y0, cw, ch), (out_w, out_h) = _geometry(aug, width, height)
+        if not np.allclose(m, np.eye(3)):
+            c = np.array([[0, 0, 1], [width, 0, 1], [0, height, 1], [width, height, 1]], dtype=np.float64) @ m.T
+            xy = c[:, :2] / c[:, 2:3]
+            coords = ":".join(f"x{i}={x:.3f}:y{i}={y:.3f}" for i, (x, y) in enumerate(xy))
+            parts.append(f"perspective={coords}:sense=destination:interpolation=linear")
+        parts.append(f"crop={cw:.3f}:{ch:.3f}:{x0:.3f}:{y0:.3f}:exact=1,scale={out_w}:{out_h}:flags=bilinear")
+    elif aug.is_geometric:
         hm = homography(aug, width, height)
         corners = np.array([[0, 0, 1], [width, 0, 1], [0, height, 1], [width, height, 1]], dtype=np.float64) @ hm.T
         xy = corners[:, :2] / corners[:, 2:3]  # порядок ffmpeg: TL, TR, BL, BR
@@ -285,7 +324,8 @@ def _augment_python(src: str, dst: str, aug: Aug, seed: int) -> None:
     try:
         out_fps = float(aug.fps or clip.fps or 30.0)
         indices = resample_indices(clip.times, out_fps) if aug.fps else list(range(len(clip)))
-        writer = cv2.VideoWriter(dst, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (clip.frame(0).shape[1], clip.frame(0).shape[0]))
+        out_w, out_h = output_size(aug, clip.frame(0).shape[1], clip.frame(0).shape[0])
+        writer = cv2.VideoWriter(dst, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (out_w, out_h))
         if not writer.isOpened():
             raise RuntimeError(f"cv2.VideoWriter не открылся: {dst}")
         rng = np.random.default_rng(seed)
@@ -332,7 +372,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     for name in names:
         out = dst if args.preset != "all" else dst.with_name(f"{dst.stem}_{name}{dst.suffix or '.mov'}")
         augment_file(args.src, str(out), PRESETS[name], engine=args.engine, seed=args.seed)
-        outputs.append({"preset": name, "output": str(out)})
+        outputs.append({"preset": name, "output": str(out), "kind": PRESETS[name].kind, "note": PERTURBATION_NOTE})
     print(json.dumps(outputs, ensure_ascii=False, indent=2))  # только пути, без содержимого кадров
     return 0
 

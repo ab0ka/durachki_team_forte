@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from ml.ingest import load_video
-from ml.ingest.augment import (PRESETS, Aug, ClipAugmenter, apply, augment_file, homography, main as augment_main,
-                               resample_indices, transform_bbox, transform_points)
+from ml.ingest.augment import (PERTURBATION_NOTE, PRESETS, Aug, ClipAugmenter, apply, augment_file, homography,
+                               main as augment_main, output_size, resample_indices, transform_bbox, transform_points)
 from ml.ingest.contact_sheet import main as sheet_main
 from ml.ingest.contact_sheet import make_contact_sheet
 from ml.ingest.names import find_duplicates, normalize_video_id
@@ -28,7 +28,10 @@ def frame() -> np.ndarray:
 @pytest.mark.parametrize("name", sorted(PRESETS))
 def test_presets_keep_shape_and_dtype(frame: np.ndarray, name: str) -> None:
     out = apply(frame, PRESETS[name])
-    assert out.shape == frame.shape and out.dtype == np.uint8 and out.flags["C_CONTIGUOUS"]
+    h, w = frame.shape[:2]
+    exp_w, exp_h = output_size(PRESETS[name], w, h)
+    assert out.shape == (exp_h, exp_w, 3) and out.dtype == np.uint8 and out.flags["C_CONTIGUOUS"]
+    assert PRESETS[name].kind == "perturbation"
     if PRESETS[name].is_geometric or name in ("dark", "bright", "blur", "noise", "jpeg"):
         assert not np.array_equal(out, frame)
 
@@ -38,7 +41,7 @@ def test_identity_is_noop(frame: np.ndarray) -> None:
     assert np.allclose(homography(Aug(), 100, 200), np.eye(3))
 
 
-@pytest.mark.parametrize("name", ["angle_left", "angle_right", "high", "low", "rot_cw", "zoom", "mirror"])
+@pytest.mark.parametrize("name", ["angle_left", "angle_right", "high", "low", "rot_cw", "zoom", "mirror", "angle_jury"])
 def test_points_follow_image(name: str) -> None:
     """Геометрия кадра и разметки согласована: точка-метка переезжает туда, куда говорит transform_points."""
     w, h = SIZE
@@ -46,9 +49,10 @@ def test_points_follow_image(name: str) -> None:
     px, py = 0.4, 0.6
     img[int(py * h) - 3 : int(py * h) + 4, int(px * w) - 3 : int(px * w) + 4] = 255
     out = apply(img, Aug(**{**PRESETS[name].to_dict(), "border": "constant"}))
+    oh, ow = out.shape[:2]
     ys, xs = np.nonzero(out[..., 0] > 128)
     (ex, ey), = transform_points([(px + 0.5 / w, py + 0.5 / h)], PRESETS[name], w, h)
-    assert abs(xs.mean() / w - ex) < 0.02 and abs(ys.mean() / h - ey) < 0.02
+    assert abs(xs.mean() / ow - ex) < 0.02 and abs(ys.mean() / oh - ey) < 0.02
 
 
 def test_bbox_transform_and_visibility() -> None:
@@ -103,10 +107,51 @@ def test_augment_cli_all(tmp_path: Path, cfr_video: str, capsys: pytest.CaptureF
     outputs = json.loads(capsys.readouterr().out)
     assert len(outputs) >= 8
     for item in outputs:
+        assert item["kind"] == "perturbation" and item["note"] == PERTURBATION_NOTE
         clip = load_video(item["output"], sample_fps=1.0)
-        assert (clip.width, clip.height) == SIZE
+        assert (clip.width, clip.height) == output_size(PRESETS[item["preset"]], *SIZE)
         expected_fps = 25.0 if item["preset"] == "fps25" else FPS
         assert clip.fps == pytest.approx(expected_fps, rel=0.02)
+
+
+# ---------------------------------------------------------------- angle_jury (perturbation)
+
+
+def test_angle_jury_is_landscape_perturbation(frame: np.ndarray) -> None:
+    aug = PRESETS["angle_jury"]
+    assert aug.kind == "perturbation" and aug.out_orientation == "landscape"
+    h, w = frame.shape[:2]  # портрет
+    out = apply(frame, aug)
+    assert out.shape[1] > out.shape[0] and out.shape[:2] == (w, h)
+    land = np.ascontiguousarray(np.rot90(frame))  # ландшафтный вход остаётся ландшафтом
+    assert apply(land, aug).shape == land.shape
+    box = transform_bbox((0.3, 0.5, 0.6, 0.65), aug, w, h)
+    assert box is not None and all(0.0 <= v <= 1.0 for v in box)
+
+
+@needs_ffmpeg
+def test_angle_jury_ffmpeg_matches_numpy(tmp_path: Path, cfr_video: str) -> None:
+    aug = PRESETS["angle_jury"]
+    out = augment_file(cfr_video, str(tmp_path / "jury.mov"), aug, engine="ffmpeg")
+    base = load_video(cfr_video, config={"storage": {"mode": "raw"}}).frame_at(0.0)
+    ff = load_video(out).frame_at(0.0)
+    npy = apply(base, aug)
+    assert ff.shape == npy.shape and ff.shape[1] > ff.shape[0]
+    assert np.abs(ff.astype(int) - npy.astype(int)).mean() < 3.0
+
+
+def test_angle_jury_python_engine(tmp_path: Path, cfr_video: str) -> None:
+    out = augment_file(cfr_video, str(tmp_path / "jury_py.mov"), PRESETS["angle_jury"], engine="python")
+    clip = load_video(out)
+    assert (clip.width, clip.height) == (SIZE[1], SIZE[0])
+
+
+def test_random_aug_landscape_opt_in() -> None:
+    rng = np.random.default_rng(0)
+    assert all(ClipAugmenter(seed=k).sample().out_orientation is None for k in range(20))
+    from ml.ingest.augment import random_aug
+
+    assert any(random_aug(rng, 1.0, p_landscape=0.5).out_orientation == "landscape" for _ in range(20))
 
 
 # ---------------------------------------------------------------- contact sheet / names
