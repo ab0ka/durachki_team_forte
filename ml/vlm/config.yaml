@@ -41,6 +41,7 @@ transformers:
   min_pixels: 3136
   skip_quant_modules: [visual, model.visual, lm_head]   # vision-энкодер не квантуем
   local_files_only: null     # null => берётся из HF_HUB_OFFLINE (прод: HF_HUB_OFFLINE=1, веса скачаны заранее)
+  min_free_vram_mb: 0        # >0: не грузить модель, если свободной VRAM меньше (выставить по замеру bench)
   license_guard: warn        # strict | warn | off — license в README.md локального снапшота ∈ allowed_licenses
   allowed_licenses: [apache-2.0, mit, bsd-2-clause, bsd-3-clause]
 

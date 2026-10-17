@@ -71,8 +71,9 @@ class TransformersBackend(VLMBackend):
                  dtype: str = "float16", attn_implementation: str = "sdpa", max_pixels: int = 448 * 448,
                  min_pixels: int = 3136, skip_quant_modules: Optional[list[str]] = None,
                  local_files_only: Optional[bool] = None, license_guard: str = "warn",
-                 allowed_licenses: Optional[list[str]] = None, **_: Any) -> None:
+                 allowed_licenses: Optional[list[str]] = None, min_free_vram_mb: int = 0, **_: Any) -> None:
         self.model_id = model
+        self.min_free_vram_mb = int(min_free_vram_mb or 0)
         self.license_guard = license_guard
         self.allowed_licenses = list(allowed_licenses or ["apache-2.0", "mit", "bsd-2-clause", "bsd-3-clause"])
         self.license_info = ""
@@ -134,6 +135,10 @@ class TransformersBackend(VLMBackend):
 
             t0 = time.perf_counter()
             dev = self._device()
+            free_mb = _free_vram_mb() if dev.startswith("cuda") else None
+            if free_mb is not None and self.min_free_vram_mb and free_mb < self.min_free_vram_mb:
+                # не грузим, чтобы не выбить OOM у детектора/энкодеров: A03 может вызвать unload() у других
+                raise BackendUnavailable(f"free VRAM {free_mb:.0f} MB < min_free_vram_mb {self.min_free_vram_mb}")
             dtype = getattr(torch, self.dtype_name) if dev != "cpu" else torch.float32
             kw: dict[str, Any] = {"device_map": dev, "attn_implementation": self.attn,
                                   "local_files_only": self.local_files_only}
@@ -211,8 +216,14 @@ class TransformersBackend(VLMBackend):
                 gen_kw.update(do_sample=True, temperature=float(temperature))
             else:
                 gen_kw.update(do_sample=False, temperature=None, top_p=None, top_k=None)
-            with torch.inference_mode():
-                out = self._model.generate(**inputs, **gen_kw)
+            try:
+                with torch.inference_mode():
+                    out = self._model.generate(**inputs, **gen_kw)
+            except torch.cuda.OutOfMemoryError:
+                del inputs
+                torch.cuda.empty_cache()
+                log.warning("VLM generate: CUDA OOM (уменьшите frames.max_side / max_visual_tokens_per_call)")
+                return GenResult(text="", latency_s=time.perf_counter() - t0, error="cuda_oom")
             n_in = int(inputs["input_ids"].shape[1])
             gen_ids = out[:, n_in:]
             txt = self._processor.batch_decode(gen_ids, skip_special_tokens=True,
@@ -226,6 +237,18 @@ class TransformersBackend(VLMBackend):
     def info(self) -> dict[str, Any]:
         return {"backend": self.name, "model": self.model_id, "quant": self.quant, "loaded": self.loaded,
                 "load_s": round(self.load_s, 2), "offline": self.local_files_only, "license": self.license_info}
+
+
+def _free_vram_mb() -> Optional[float]:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            free, _total = torch.cuda.mem_get_info()
+            return free / 2**20
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def _vram_peak_mb() -> Optional[float]:
