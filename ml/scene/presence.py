@@ -207,6 +207,14 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
     out["outsider_in_cashier_area"] = Sig(outsider_p, outsider_c, ["track"])
     out["collector_present"] = Sig(coll_p, coll_c, ["track"])
     out["n_persons"] = Sig(npers, q.copy(), ["track" if has_tracks else "det"])
-    extra = {"workplace_empty_p": empty_p, "workplace_empty_c": empty_c, "unknown_person_in_cashier_area": obs_unknown, "workplace_lost": ws_unknown}
+    extra = {
+        "workplace_empty_p": empty_p,
+        "workplace_empty_c": empty_c,
+        "unknown_person_in_cashier_area": obs_unknown,
+        "workplace_lost": ws_unknown,
+        # для предикатов: кассир наблюдается на рабочем месте / подтверждённо отсутствует (уход виден)
+        "cashier_in_obs": (cash_in >= 0.5).astype(float),
+        "cashier_gone_known": ((cashier_gone > 0) & (ws_unknown == 0) & (cash_in < 0.5)).astype(float) if has_tracks and workplace else np.zeros(n),
+    }
     _ = dt
     return out, extra

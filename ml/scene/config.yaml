@@ -149,3 +149,50 @@ learned:
   enabled: true               # использовать обученную модель (train_signals.py), если файл есть
   path: weights/scene/scene_signals.json   # относительно корня репо; env SENTINEL_SCENE_MODEL
   weight: 0.5                 # 1.0 — заменить ручную фузию, 0.5 — смешать в логит-пространстве
+
+# ---------------------------------------------------------------- фаза 2 ----------------------------
+# Правило: новый режим, меняющий существующие SIGNALS, по умолчанию ВЫКЛЮЧЕН, пока L2 не измерит выигрыш
+# (python -m ml.scene.l2_bench). Предикаты — аддитивный слой (новые поля), legacy-сигналы не меняют.
+
+status:
+  vis_thr: 0.35               # неизвестно и видимость ROI ниже — статус occluded (а не unknown)
+  min_quality: 0.35           # ниже — причина low_quality
+
+lights:
+  abs_dark: 28                # медианная яркость кадра (0..255) ниже — темно
+  rel_dark: 0.4               # ...или ниже 0.4 × типичной для ролика (75-й перцентиль)
+  min_s: 1.0                  # темнота короче — не «выключили свет»
+  max_gap_s: 0.4
+  freeze: false               # [гипотеза H3, выкл] в темноте legacy-SIGNALS держат последнее известное значение
+
+predicates:
+  enabled: true               # аддитивные поля pred/pred_status/pred_why
+  min_quality: 0.35
+  max_gap_s: 0.6              # дребезг одного события склеивается
+  vis_thr: 0.35
+  vis_thr_safe_free: 0.6      # сейф «без людей рядом»: видимость ROI сейфа ≥
+  near_safe_pad: 0.15         # опорная точка у сейфа (ROI + pad) — тоже «сторона кассы»
+  dominant_min_s: 5.0         # доминирующий работник со стороны кассы (кассир по поведению) — от стольких секунд
+  client_history_s: 1.0       # был со стороны клиента до входа на сторону кассы ≥ — посторонний (если не доминирующий)
+  outsider_min_s: 1.0
+  second_person_min_s: 2.0
+  entry_before_s: 2.0
+  entry_after_s: 0.6
+  entry_mark_s: 2.0
+  leave_min_s: 1.0
+  after_leave_window_s: 5.0   # решение «оставил ценности» — по окну [t_ухода, t_ухода + 5 с]
+  k_true: 2                   # ≥ k_true сэмплов «видно» в окне → true
+  k_false: 3                  # ≥ k_false сэмплов «видно, что нет» и ни одного «да» → false
+  bag_min_score: 0.3
+  reach: 0.06                 # «в руках/рядом»: зазор между боксами сумки и человека (норм.)
+  static_radius: 0.04         # неподвижный предмет (стационарный телефон): радиус кластера центров
+  static_frac: 0.3            # ...присутствует в ≥ 30% сэмплов
+  object_min_score: 0.3
+  object_window_s: 0.5        # предмет рядом с кассиром ±0.5 с от позы
+  object_min_s: 1.0
+  phone_det_only: false       # [гипотеза H4, выкл] мобильный по детекции в боксе кассира без позы
+  personal_labels: [bag, backpack, handbag, jacket, coat]
+  personal_min_s: 2.0
+  bag_alone_min_s: 3.0
+  safe_working_min_s: 3.0
+  timecode: onset             # onset | mid | max — t_peak интервала (подбирается замером L2)
