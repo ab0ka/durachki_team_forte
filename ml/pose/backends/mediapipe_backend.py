@@ -131,9 +131,14 @@ def pick_pose(cands: Sequence[tuple[np.ndarray, np.ndarray]], box_px: Sequence[f
 
 
 class MediaPipePose:
+    """running_mode=image — один landmarker, кадры независимы (как было у A07).
+    running_mode=video — отдельный поток VIDEO-режима на каждый track_id: время кадра — PTS из clip.times
+    (монотонно внутри потока), поза внутри кропа выбирается по bbox трека (pick_pose), поэтому порядок
+    скелетов в ответе модели не используется как ID. Число потоков ограничено (max_streams, LRU)."""
+
     name = "mediapipe"
 
-    def __init__(self, cfg: dict[str, Any], landmarker: Any = None) -> None:
+    def __init__(self, cfg: dict[str, Any], landmarker: Any = None, landmarker_factory: Any = None) -> None:
         mc = cfg.get("backend", {}).get("mediapipe", {}) or {}
         self.pad = float(mc.get("crop_padding", 1.4))
         self.min_side = float(mc.get("upscale_min_side", 384))
@@ -141,10 +146,16 @@ class MediaPipePose:
         self.vis_scale = float(mc.get("visibility_scale", 1.0))
         self.use_presence = bool(mc.get("use_presence", True))
         self.min_score = float(cfg.get("signals", {}).get("kp_min_score", 0.3))
+        self.mode = str(mc.get("running_mode", "image")).lower()
+        self.max_streams = max(1, int(mc.get("max_streams", 8)))
         self.batch_size = 1
         self._mp = None
-        if landmarker is not None:  # тесты: внедрённый фейковый landmarker (без mediapipe и модели)
-            self.landmarker = landmarker
+        self._factory = landmarker_factory
+        self._streams: dict[Any, Any] = {}          # track_id → VIDEO-landmarker (порядок вставки = LRU)
+        self._last_ts: dict[Any, int] = {}
+        self.stats = {"calls": 0, "streams_opened": 0, "streams_evicted": 0, "ts_bumped": 0, "no_track_id": 0}
+        if landmarker is not None or landmarker_factory is not None:  # тесты: фейки без mediapipe и модели
+            self.landmarker = landmarker if landmarker is not None else landmarker_factory()
             self.providers = ["injected"]
             return
         path = find_task(cfg)
@@ -160,36 +171,73 @@ class MediaPipePose:
         base = mp_python.BaseOptions(
             model_asset_path=path,
             delegate=(mp_python.BaseOptions.Delegate.GPU if delegate == "gpu" else mp_python.BaseOptions.Delegate.CPU))
-        opts = vision.PoseLandmarkerOptions(
-            base_options=base, running_mode=vision.RunningMode.IMAGE, num_poses=int(mc.get("num_poses", 2)),
-            min_pose_detection_confidence=float(mc.get("min_pose_detection_confidence", 0.3)),
-            min_pose_presence_confidence=float(mc.get("min_pose_presence_confidence", 0.3)),
-            min_tracking_confidence=float(mc.get("min_tracking_confidence", 0.3)),
-            output_segmentation_masks=False)
+
+        def _make(mode: Any) -> Any:
+            opts = vision.PoseLandmarkerOptions(
+                base_options=base, running_mode=mode, num_poses=int(mc.get("num_poses", 2)),
+                min_pose_detection_confidence=float(mc.get("min_pose_detection_confidence", 0.3)),
+                min_pose_presence_confidence=float(mc.get("min_pose_presence_confidence", 0.3)),
+                min_tracking_confidence=float(mc.get("min_tracking_confidence", 0.3)),
+                output_segmentation_masks=False)
+            return vision.PoseLandmarker.create_from_options(opts)
+
         try:
-            self.landmarker = vision.PoseLandmarker.create_from_options(opts)
+            self.landmarker = _make(vision.RunningMode.IMAGE)  # для кропов без track_id и warmup
         except Exception as exc:  # noqa: BLE001 — например, нет libGLESv2 в контейнере
             raise PoseBackendError(f"PoseLandmarker не создан: {type(exc).__name__}: {exc}") from exc
+        self._factory = (lambda: _make(vision.RunningMode.VIDEO)) if self.mode == "video" else None
         self._mp = mp
         self.path = path
-        self.providers = [f"mediapipe-{delegate}"]
+        self.providers = [f"mediapipe-{delegate}-{self.mode}"]
         atexit.register(self.close)
 
     def close(self) -> None:
+        streams = list(getattr(self, "_streams", {}).values())
+        self._streams = {}
         lm, self.landmarker = getattr(self, "landmarker", None), None
-        if lm is not None and hasattr(lm, "close"):
-            try:
-                lm.close()
-            except Exception:  # noqa: BLE001
-                pass
+        for x in streams + [lm]:
+            if x is not None and hasattr(x, "close"):
+                try:
+                    x.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
-    def _detect(self, rgb: np.ndarray) -> list[np.ndarray]:
+    def _stream(self, tid: Any) -> Any:
+        """VIDEO-landmarker трека: создаётся при первом кадре трека; старейший поток закрывается сверх лимита."""
+        lm = self._streams.pop(tid, None)
+        if lm is None:
+            if len(self._streams) >= self.max_streams:
+                old_tid, old = next(iter(self._streams.items()))
+                self._streams.pop(old_tid)
+                self._last_ts.pop(old_tid, None)
+                self.stats["streams_evicted"] += 1
+                if hasattr(old, "close"):
+                    old.close()
+            lm = self._factory()
+            self.stats["streams_opened"] += 1
+        self._streams[tid] = lm  # в конец — недавно использованный
+        return lm
+
+    def _timestamp_ms(self, tid: Any, t: float) -> int:
+        """PTS кадра в мс; VIDEO-режим требует строго возрастающих отметок внутри потока."""
+        ts = int(round(float(t) * 1000.0))
+        last = self._last_ts.get(tid)
+        if last is not None and ts <= last:
+            ts = last + 1
+            self.stats["ts_bumped"] += 1
+        self._last_ts[tid] = ts
+        return ts
+
+    def _detect(self, rgb: np.ndarray, tid: Any = None, t: Optional[float] = None) -> list[np.ndarray]:
         """→ список (33, 3) [x, y, score] нормированных к входному изображению."""
+        video = self._factory is not None and tid is not None and t is not None
+        lm = self._stream(tid) if video else self.landmarker
+        self.stats["calls"] += 1
         if self._mp is not None:
             image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
-            res = self.landmarker.detect(image)
+            res = lm.detect_for_video(image, self._timestamp_ms(tid, t)) if video else lm.detect(image)
         else:
-            res = self.landmarker.detect(rgb)
+            res = lm.detect_for_video(rgb, self._timestamp_ms(tid, t)) if video else lm.detect(rgb)
         out = []
         for pose in getattr(res, "pose_landmarks", None) or []:
             rows = []
@@ -205,11 +253,16 @@ class MediaPipePose:
         return out
 
     def infer(self, items: Sequence[tuple[np.ndarray, np.ndarray]], meta: Any = None) -> list[tuple[np.ndarray, np.ndarray]]:
+        """meta (от estimate): [(t PTS, track_id)] на каждый элемент — нужен VIDEO-режиму."""
         out = []
-        for frame, box in items:
+        metas = list(meta) if meta is not None else [(None, None)] * len(items)
+        for (frame, box), m in zip(items, metas):
+            t, tid = (m[0], m[1]) if isinstance(m, (tuple, list)) and len(m) >= 2 else (None, None)
+            if self._factory is not None and tid is None:
+                self.stats["no_track_id"] += 1
             img, geom = crop_upscale(frame, box, self.pad, self.min_side, self.max_scale)
             cands = []
-            for lm in self._detect(img[..., ::-1]):
+            for lm in self._detect(img[..., ::-1], tid, t):
                 xy, sc = mp33_to_coco17(lm)
                 cands.append((to_frame(xy, geom), np.clip(sc * self.vis_scale, 0.0, 1.0).astype(np.float32)))
             k = pick_pose(cands, box, self.min_score) if cands else -1
