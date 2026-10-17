@@ -1,0 +1,131 @@
+{
+  "job_id": "3f2b6c1e-0000-4000-8000-000000000002",
+  "status": "done",
+  "verdict": "violation",
+  "violations": [
+    {
+      "type": "Посторонний в кассовом помещении",
+      "timecode_sec": 22.0,
+      "description": "На 22.0 с в зоне за кассовым столом находится второй человек, не являющийся кассиром. Признаки возможного нарушения: присутствие постороннего лица в кассовом помещении.",
+      "evidence_frames": [
+        {
+          "timestamp_sec": 22.0,
+          "image_base64": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIfIiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozv/wAARCAAYABADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwCkkLSLkEdcc0PC0a5JHXHFTW3+rP1ouf8AVj61897aXteXofLe3n7fk6EKTNGuAB1zzQ8zSLggdc8UUV0ezjfmtqdfsoc3NbU//9k="
+        },
+        {
+          "timestamp_sec": 23.4,
+          "image_base64": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAoHBwgHBgoICAgLCgoLDhgQDg0NDh0VFhEYIx8lJCIfIiEmKzcvJik0KSEiMEExNDk7Pj4+JS5ESUM8SDc9Pjv/2wBDAQoLCw4NDhwQEBw7KCIoOzs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozs7Ozv/wAARCAAYABADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwCkkLSLkEdcc0PC0a5JHXHFTW3+rP1ouf8AVj61897aXteXofLe3n7fk6EKTNGuAB1zzQ8zSLggdc8UUV0ezjfmtqdfsoc3NbU//9k="
+        }
+      ],
+      "type_id": "V01",
+      "confidence": 0.87,
+      "t_start": 21.2,
+      "t_end": 26.8,
+      "rules": [
+        {
+          "document": "<название документа из norms/catalog.yaml>",
+          "clause": "<пункт из norms/catalog.yaml>",
+          "url": "https://adilet.zan.kz/rus/docs/<id из norms/catalog.yaml>",
+          "quote": "<дословная цитата из norms/catalog.yaml>",
+          "verified": false
+        }
+      ],
+      "rule": {
+        "document": "<название документа из norms/catalog.yaml>",
+        "clause": "<пункт из norms/catalog.yaml>",
+        "url": "https://adilet.zan.kz/rus/docs/<id из norms/catalog.yaml>",
+        "quote": "<дословная цитата из norms/catalog.yaml>",
+        "verified": false
+      },
+      "extra": {
+        "provenance": {
+          "sources": [
+            "rules",
+            "vlm"
+          ]
+        }
+      }
+    }
+  ],
+  "verdict_state": "violation",
+  "analysis_complete": true,
+  "candidates": [],
+  "warnings": [],
+  "progress": 1.0,
+  "stage": "done",
+  "timeline": [
+    [
+      0.0,
+      0.02
+    ],
+    [
+      0.2,
+      0.03
+    ],
+    [
+      21.2,
+      0.61
+    ],
+    [
+      22.0,
+      0.93
+    ],
+    [
+      26.8,
+      0.4
+    ]
+  ],
+  "meta": {
+    "version": "0.1.0",
+    "duration_sec": 48.3,
+    "progress": 1.0,
+    "stage": "done",
+    "completeness": {
+      "complete": true,
+      "analyzed_until_sec": 48.3,
+      "duration_sec": 48.3,
+      "stages": {
+        "ingest": "ok",
+        "detect": "ok",
+        "rules": "ok",
+        "vlm": "skipped"
+      },
+      "required_stages": [
+        "ingest",
+        "detect",
+        "rules"
+      ],
+      "reason": null
+    },
+    "provenance": {
+      "pipeline_version": "0.1.0",
+      "contract_version": "1",
+      "mock": false,
+      "models": [
+        {
+          "name": "<см. models.json модулей>"
+        }
+      ],
+      "sources": [
+        "rules",
+        "fusion"
+      ]
+    },
+    "timings": {
+      "ingest": 1.2,
+      "detect": 9.8,
+      "total": 31.5
+    },
+    "warnings": [],
+    "violation_extra": [
+      {
+        "provenance": {
+          "sources": [
+            "rules",
+            "vlm"
+          ]
+        }
+      }
+    ]
+  }
+}

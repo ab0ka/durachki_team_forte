@@ -1,0 +1,17 @@
+{
+  "job_id": "3f2b6c1e-0000-4000-8000-000000000003",
+  "status": "processing",
+  "verdict": null,
+  "violations": [],
+  "verdict_state": "pending",
+  "analysis_complete": null,
+  "candidates": [],
+  "warnings": [],
+  "progress": 0.35,
+  "stage": "detect",
+  "timeline": [],
+  "meta": {
+    "progress": 0.35,
+    "stage": "detect"
+  }
+}

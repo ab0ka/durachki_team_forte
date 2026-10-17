@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kassa-sentinel"
+version = "0.1.0"
+description = "Kassa Sentinel — локальный AI-сервис проверки видео с потолочной камеры кассы (Datathon ForteBank 2026)"
+readme = "README.md"
+requires-python = ">=3.11"
+# Ядро (контракт, сериализация, тест-кит). Тяжёлые зависимости модулей — в <модуль>/requirements.txt.
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "jsonschema>=4.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+    "opencv-python-headless>=4.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["contracts*", "testkit*", "backend*", "ml*", "norms*", "copilot*", "eval*"]
+
+[tool.setuptools.package-data]
+contracts = ["api_schema.json", "examples/*.json"]
+
+# ----------------------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "8.0"
+pythonpath = ["."]
+testpaths = [
+    "contracts",
+    "testkit",
+    "scripts",
+    "backend/api",
+    "backend/pipeline",
+    "ml/ingest",
+    "ml/detect",
+    "ml/track",
+    "ml/pose",
+    "ml/scene",
+    "ml/rules",
+    "ml/temporal",
+    "ml/vlm",
+    "ml/fusion",
+    "norms",
+    "copilot",
+    "eval",
+    "deploy",
+]
+# importlib: одинаковые имена tests/test_*.py в разных модулях не конфликтуют
+addopts = "-ra --import-mode=importlib"
+norecursedirs = [".git", ".venv", "venv", "node_modules", "frontend", "data", "weights", "cache", "docs", "pitch", "build", "dist", "*.egg-info"]
+markers = [
+    "gpu: нужен CUDA GPU (в CI не запускается)",
+    "slow: долгий тест / реальные веса / длинное видео (в CI не запускается)",
+    "e2e: сквозной тест пайплайна",
+    "integration: тест на стыке нескольких модулей",
+]
+
+# ----------------------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    "contracts/sentinel_contracts.py",  # заморожен байт-в-байт
+    "**/_contract_fallback.py",         # временные копии контракта
+    "frontend",
+    "node_modules",
+    "data",
+    "weights",
+    "cache",
+]
+
+[tool.ruff.lint]
+# Минимальный набор «ловим баги, а не стиль» — чтобы 18 веток не утонули в замечаниях.
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = [
+    "F403",  # from contracts.sentinel_contracts import *  — принятый паттерн
+    "F405",  # имена из star-import
+    "E731",  # lambda assignment
+    "E741",  # ambiguous variable name (x, l, I в CV-коде)
+    "B008",  # FastAPI Depends()/File() в дефолтах
+    "B905",  # zip(strict=...)
+    "B028",  # warnings.warn stacklevel
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"**/tests/**" = ["B011", "B017"]
