@@ -1,17 +1,26 @@
-"""Сквозной mock-прогон: синтетическое видео -> пайплайн -> ответ жюри -> строгая проверка схемы ТЗ (A01).
+"""Сквозной прогон: синтетическое видео -> пайплайн -> канонический сериализатор жюри -> строгая проверка ТЗ (A01).
 
 Порядок выбора реализации:
 
-1. если есть ``backend.pipeline.run`` (A03) — гоняем его (``SENTINEL_MOCK=1``);
-2. иначе собираем пайплайн из стадий контракта: для каждой стадии берём настоящую функцию модуля, если модуль
-   уже в ветке, иначе — фикстуру тест-кита (``testkit.fixtures``). Выход каждой стадии проверяется
-   ``testkit.contract_checks``; невалидный или упавший модуль заменяется фикстурой (или роняет прогон
-   с ``--strict-stages``).
+1. если есть ``backend.pipeline.run`` (A03) — гоняем его;
+2. иначе (или с ``--no-backend``) собираем пайплайн из стадий контракта: настоящая функция модуля, если модуль
+   уже в ветке, иначе — фикстура тест-кита. Выход каждой стадии проверяется ``testkit.contract_checks``;
+   невалидный/упавший модуль заменяется фикстурой или роняет прогон (``--strict-stages``).
 
-Код возврата 1 — ответ не прошёл строгую схему жюри / пайплайн упал / (опционально) стадии или вердикты не те.
+``--require-full`` — проверка ПОЛНОЙ сборки: обязателен ``backend.pipeline.run``, фикстуры запрещены, ответ —
+только через ``contracts.serialize.result_to_jury_api`` + ``jury_response_errors``; ``--expect-status done``
+требует, чтобы оркестратор довёл каждый синтетический ролик до ``done`` (регрессия «нет meta.coverage ->
+failed»), а время прогона укладывалось в ``--deadline`` (+10%). Нет ``backend.pipeline`` -> «NOT RUN», код 3.
 
-    python -m testkit.e2e_stub                         # все сценарии, 8 с, 10 fps
-    python -m testkit.e2e_stub --scenarios clean,V01 --strict-stages
+Окружение процесса НЕ меняется. Mock-режим модулей включает вызывающий (``SENTINEL_MOCK=1`` в окружении
+шага CI / оболочки). Сериализатор допускает mock только (а) для собственных фикстур тест-кита и (б) для
+результата оркестратора, если mock включён явно; mock-результат без явного режима — ошибка
+(production не переключается на mock сам).
+
+Коды возврата: 0 — ок; 1 — ошибка (схема жюри, падение, дедлайн, статус, точность); 3 — NOT RUN.
+
+    SENTINEL_MOCK=1 python -m testkit.e2e_stub --require-full --expect-status done --scenarios clean,V01
+    python -m testkit.e2e_stub --no-backend --strict-stages        # контракт стадий (частичная сборка)
     python -m testkit.e2e_stub --fixtures-only --require-accuracy   # самопроверка тест-кита
 """
 from __future__ import annotations
@@ -30,9 +39,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from contracts.extensions import Provenance, compute_coverage
+from contracts.extensions import Provenance, compute_coverage, is_mock_result, mock_allowed
 from contracts.sentinel_contracts import AnalysisResult, Event, EvidenceFrame, Violation
-from contracts.serialize import result_to_jury_api
+from contracts.serialize import resolve_outcome, result_to_jury_api
 from contracts.validate import jury_response_errors
 
 from . import contract_checks as cc
@@ -50,7 +59,9 @@ from .fixtures import (
 from .scenarios import SCENARIOS
 from .synth_video import make_video
 
-__all__ = ["StageReport", "run_stub_pipeline", "run_backend", "run_scenario", "main"]
+__all__ = ["StageReport", "run_stub_pipeline", "run_backend", "run_scenario", "run_case", "main", "EXIT_NOT_RUN"]
+
+EXIT_NOT_RUN = 3
 
 
 @dataclass
@@ -230,35 +241,43 @@ def run_backend(video_path: str, job_id: str, deadline_s: float = 240.0) -> Opti
 
 def run_scenario(scenario: str, out_dir: Path, *, duration: float = 8.0, fps: float = 10.0, view: str = "default",
                  use_backend: bool = True, prefer_real: bool = True, strict: bool = False,
-                 deadline_s: float = 120.0) -> dict:
+                 deadline_s: float = 240.0, require_backend: bool = False,
+                 expect_status: Optional[str] = None) -> dict:
     """Сценарий v1 (testkit.scenarios)."""
     suffix = "" if view == "default" else f"_{view}"
     video = out_dir / f"{scenario}{suffix}.mov"
     gt = make_video(video, scenario, duration=duration, fps=fps, view=view)
-    return _run(video, gt, f"e2e-{scenario}{suffix}", scenario, use_backend, prefer_real, strict, deadline_s)
+    return _run(video, gt, f"e2e-{scenario}{suffix}", scenario, use_backend, prefer_real, strict, deadline_s,
+                require_backend, expect_status)
 
 
 def run_case(spec: Any, out_dir: Path, *, fps: float = 10.0, use_backend: bool = True, prefer_real: bool = True,
-             strict: bool = False, deadline_s: float = 120.0) -> dict:
+             strict: bool = False, deadline_s: float = 240.0, require_backend: bool = False,
+             expect_status: Optional[str] = None) -> dict:
     """Кейс спецификации (testkit.spec.CaseSpec)."""
     from .spec import make_case_video
 
     name = f"{spec.case}_{spec.layout}_{spec.orientation}"
     gt = make_case_video(out_dir / f"{name}.mov", spec, fps=fps)
     gt["view"] = spec.view
-    return _run(out_dir / f"{name}.mov", gt, f"e2e-{name}", name, use_backend, prefer_real, strict, deadline_s)
+    return _run(out_dir / f"{name}.mov", gt, f"e2e-{name}", name, use_backend, prefer_real, strict, deadline_s,
+                require_backend, expect_status)
 
 
 def _run(video: Path, gt: dict, job_id: str, label: str, use_backend: bool, prefer_real: bool, strict: bool,
-         deadline_s: float) -> dict:
+         deadline_s: float, require_backend: bool = False, expect_status: Optional[str] = None) -> dict:
     duration = float(gt["duration"])
     rec: dict[str, Any] = {"scenario": label, "view": gt.get("view", "default"), "gt_verdict": gt["verdict"],
-                           "gt_type": gt["type_id"], "gt_t": gt["t"], "stages": [], "errors": []}
+                           "gt_type": gt["type_id"], "gt_t": gt["t"], "stages": [], "errors": [], "not_run": None}
     t0 = time.perf_counter()
     try:
         result = run_backend(str(video), job_id, deadline_s) if use_backend else None
         if result is not None:
             rec["runner"] = "backend.pipeline"
+        elif require_backend:
+            rec["runner"] = None
+            rec["not_run"] = "нет backend.pipeline.run (A03) — полная сборка не проверена"
+            return rec
         else:
             result, reports = run_stub_pipeline(str(video), job_id, gt, prefer_real=prefer_real, strict=strict)
             rec["runner"] = "stub"
@@ -270,10 +289,27 @@ def _run(video: Path, gt: dict, job_id: str, label: str, use_backend: bool, pref
         rec["seconds"] = round(time.perf_counter() - t0, 2)
         return rec
     rec["seconds"] = round(time.perf_counter() - t0, 2)
-    body = result_to_jury_api(result, allow_mock=True)  # e2e-заглушка — явно mock-прогон
+    meta = result.meta if isinstance(result.meta, dict) else {}
+    rec["mock_result"] = is_mock_result(meta)
+    rec["fixture_stages"] = [s["name"] for s in rec["stages"] if s["source"] != "real"]
+    if rec["runner"] == "backend.pipeline":
+        # результат оркестратора судится по правилам production: mock допустим только при явном режиме
+        allow = mock_allowed()
+        if rec["mock_result"] and not allow:
+            rec["errors"].append("оркестратор отдал mock-результат, хотя mock-режим явно не включён "
+                                 "(SENTINEL_MOCK) — production не должен переключаться на mock сам")
+        if rec["seconds"] > deadline_s * 1.1:
+            rec["errors"].append(f"дедлайн превышен: {rec['seconds']} с > {deadline_s} с")
+    else:
+        allow = True  # собственные фикстуры тест-кита — явно mock
+    body = result_to_jury_api(result, allow_mock=allow)
+    oc = resolve_outcome(result, allow_mock=allow)
     rec["response"] = {k: body[k] for k in ("job_id", "status", "verdict")}
+    rec["reason"] = oc.error
     rec["violations"] = [{"type": v["type"], "timecode_sec": v["timecode_sec"]} for v in body["violations"]]
     rec["errors"] += jury_response_errors(body, duration)
+    if expect_status and body["status"] != expect_status:
+        rec["errors"].append(f"ожидался status={expect_status}, получен {body['status']}: {oc.error}")
     pred_types = {getattr(v, "type_id", "") for v in result.violations}
     ok_types = {gt["type_id"]} | {a for e in gt.get("events", []) for a in [e["type_id"], *e.get("alt_type_ids", [])]}
     rec["verdict_ok"] = body["verdict"] == gt["verdict"]
@@ -299,10 +335,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fixtures-only", action="store_true", help="все стадии — фикстуры (самопроверка тест-кита)")
     ap.add_argument("--strict-stages", action="store_true", help="падение/невалидный выход модуля -> код 1")
     ap.add_argument("--require-accuracy", action="store_true", help="вердикт и тип должны совпасть с GT")
-    ap.add_argument("--deadline", type=float, default=120.0, help="deadline_s для backend.pipeline.run, с")
+    # 240 с — штатный дедлайн контракта: меньший меняет адаптивный sample_fps оркестратора и маскирует ошибки
+    ap.add_argument("--deadline", type=float, default=240.0, help="deadline_s для backend.pipeline.run, с")
+    ap.add_argument("--require-full", action="store_true", help="полная сборка: обязателен backend.pipeline.run, "
+                    "без фикстур; нет оркестратора -> NOT RUN (код 3)")
+    ap.add_argument("--expect-status", choices=("done", "failed", "processing"), default=None,
+                    help="каждый ответ жюри должен иметь этот статус")
     args = ap.parse_args(argv)
-    os.environ.setdefault("SENTINEL_MOCK", "1")
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    if args.require_full and (args.no_backend or args.fixtures_only):
+        ap.error("--require-full несовместим с --no-backend/--fixtures-only")
+    # окружение процесса не меняем: mock-режим модулей включает вызывающий (SENTINEL_MOCK=1)
+    print(f"mock-режим модулей: {'включён явно (SENTINEL_MOCK)' if mock_allowed() else 'выключен'}")
 
     tmp = None
     if args.out:
@@ -315,7 +358,8 @@ def main(argv: list[str] | None = None) -> int:
     records = []
     try:
         common = dict(use_backend=not args.no_backend and not args.fixtures_only, prefer_real=not args.fixtures_only,
-                      strict=args.strict_stages, deadline_s=args.deadline)
+                      strict=args.strict_stages or args.require_full, deadline_s=args.deadline,
+                      require_backend=args.require_full, expect_status=args.expect_status)
         if args.suite == "spec":
             from .spec import make_suite
 
@@ -331,6 +375,9 @@ def main(argv: list[str] | None = None) -> int:
         for sc, job in jobs:
             rec = job()
             records.append(rec)
+            if rec.get("not_run"):
+                print(f"[NOT RUN] {sc}: {rec['not_run']}")
+                continue
             stages = " ".join(f"{s['name']}:{s['source']}" for s in rec["stages"]) or "-"
             resp = rec.get("response", {})
             mark = "OK " if not rec["errors"] else "ERR"
@@ -352,11 +399,35 @@ def main(argv: list[str] | None = None) -> int:
                 rc = 1
         (out_dir / "e2e_report.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
         n_ok = sum(1 for r in records if r.get("verdict_ok"))
+        not_run = [r for r in records if r.get("not_run")]
+        partial = sorted({st for r in records for st in r.get("fixture_stages", [])})
+        full = bool(records) and not not_run and all(r.get("runner") == "backend.pipeline" for r in records)
         print(f"verdict accuracy (информативно в mock-режиме): {n_ok}/{len(records)}; отчёт: {out_dir / 'e2e_report.json'}")
+        n_err = sum(1 for r in records if r.get("errors"))
+        if full:
+            print(f"ПОЛНАЯ СБОРКА ПРОВЕРЕНА (backend.pipeline.run + канонический сериализатор жюри): "
+                  f"{'ошибок нет' if n_err == 0 else f'прогонов с ошибками: {n_err} из {len(records)}'}")
+        else:
+            print("ПОЛНАЯ СБОРКА НЕ ПРОВЕРЕНА: " + (f"{len(not_run)} прогонов NOT RUN; " if not_run else "")
+                  + (f"стадии из фикстур: {', '.join(partial)}" if partial else "оркестратор не вызывался"))
+        if not_run and rc == 0:
+            rc = EXIT_NOT_RUN
     finally:
+        if any(r.get("runner") == "backend.pipeline" for r in records):
+            _release_backend()
         if tmp is not None:
             tmp.cleanup()
     return rc
+
+
+def _release_backend() -> None:
+    """Остановить процесс-воркер оркестратора (A03: ``release_gpu``) — иначе интерпретатор не завершается."""
+    release = _resolve("backend.pipeline", "release_gpu")
+    if release is not None:
+        try:
+            release()
+        except Exception as e:  # noqa: BLE001
+            print(f"backend.pipeline.release_gpu: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
