@@ -61,3 +61,18 @@ probe:
   min_duration_s: 1.0
   max_duration_s: 900.0
   ffprobe_timeout_s: 20.0
+
+coarse_fine:               # адаптер для A03 (ml/ingest/coarse_fine.py); гипотеза — включать после замера L2
+  enabled: false
+  coarse_step_s: 1.0       # шаг равномерного обзора всей длительности (по сохранённым сэмплам)
+  coarse_frames: 0         # >0: ровно столько кадров обзора (перекрывает coarse_step_s)
+  dense_fps: 5.0           # плотность точного чтения окна
+  max_frames_per_window: 24
+  max_windows: 6           # окна с наибольшим score
+  window_pad_s: 1.5        # расширение окна кандидата
+  merge_gap_s: 1.0         # окна ближе — склеиваются (дребезг одного события)
+  min_window_s: 1.0
+  budget_frames: 0         # >0: общий бюджет кадров (обзор + окна)
+  coarse_share: 0.4        # доля бюджета на обзор
+  activity_top_k: 3        # окна из пиков motion_energy, если кандидатов нет (0 — не брать)
+  activity_window_s: 4.0
