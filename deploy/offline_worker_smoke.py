@@ -6,7 +6,12 @@ tunnel_probe.py). Порядок:
   1) жёсткий офлайн HF/transformers + netguard=block в этом же процессе (до импорта моделей);
   2) weights.py verify: каждый файл из deploy/weights.lock.json на месте и совпадает по sha256;
   3) backend.pipeline.warmup() + run() на синтетическом видео (SENTINEL_MOCK=1 → отказ);
-  4) FAIL, если была хоть одна попытка выхода в сеть (даже если пайплайн её «проглотил»).
+  4) FAIL, если была хоть одна попытка выхода в сеть (даже если пайплайн её «проглотил») — считаем по
+     общему JSONL-логу netguard ВСЕХ процессов, включая spawn-воркер A03 (env и PYTHONPATH наследуются);
+  5) FAIL на mock / fake-пайплайне и на no_violation при неполном анализе (meta.complete=false / coverage);
+  6) --egress-selftest: отдельный python.exe БЕЗ netguard пытается выйти в интернет — под правилом
+     фаервола (windows/offline_smoke.ps1 -Firewall) это должно быть заблокировано ОС.
+Пишет отчёт JSON и человекочитаемый лог для питча (runs/deploy/offline_proof_<время>.md).
 Отчёт — только числа/типы/таймкоды; ни кадров, ни описаний (в т.ч. чтобы не утекли в чат-ассистента).
 
   python deploy/offline_worker_smoke.py                        # Windows/Linux нативно
@@ -23,6 +28,18 @@ import traceback
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+EGRESS_PROBE = """
+import json, socket, sys
+out = {}
+for name, fn in (("tcp_1.1.1.1:443", lambda: socket.create_connection(("1.1.1.1", 443), timeout=4).close()),
+                 ("dns_huggingface.co", lambda: socket.getaddrinfo("huggingface.co", 443))):
+    try:
+        fn()
+        out[name] = "OPEN"
+    except Exception as exc:
+        out[name] = "blocked: " + type(exc).__name__ + ": " + str(exc)[:120]
+print(json.dumps(out))
+"""
 OFFLINE_ENV = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1",
                "HF_HUB_DISABLE_TELEMETRY": "1", "DO_NOT_TRACK": "1"}
 
@@ -43,10 +60,22 @@ def _get(obj: object, key: str, default=None):
 
 def check_result(result: object) -> list[str]:
     problems = []
+    meta = _get(result, "meta", {}) or {}
+    meta = meta if isinstance(meta, dict) else {}
     if _get(result, "status") != "done":
         problems.append(f"status={_get(result, 'status')!r}")
     if _get(result, "verdict") not in ("violation", "no_violation"):
         problems.append(f"verdict={_get(result, 'verdict')!r}")
+    if meta.get("mock") or meta.get("fake_pipeline"):
+        problems.append("meta.mock/fake_pipeline=true — это не реальные модели")
+    stages = meta.get("stages") if isinstance(meta.get("stages"), dict) else {}
+    mocked = sorted(k for k, v in stages.items() if isinstance(v, dict) and "mock" in str(v.get("origin", "")).lower())
+    if mocked:
+        problems.append(f"стадии из mock: {mocked}")
+    cov = meta.get("coverage")
+    incomplete = meta.get("complete") is False or (isinstance(cov, dict) and cov.get("complete") is False)
+    if _get(result, "verdict") == "no_violation" and incomplete:
+        problems.append("no_violation при неполном анализе (meta.complete/coverage) — неполный анализ ≠ «нарушений нет»")
     for i, v in enumerate(_get(result, "violations", []) or []):
         for k in ("type", "timecode_sec", "description", "evidence_frames"):
             if _get(v, k) in (None, ""):
@@ -57,11 +86,75 @@ def check_result(result: object) -> list[str]:
 def summarize(result: object) -> dict:
     vs = _get(result, "violations", []) or []
     meta = _get(result, "meta", {}) or {}
+    meta = meta if isinstance(meta, dict) else {}
+    stages = meta.get("stages") if isinstance(meta.get("stages"), dict) else {}
     return {"status": _get(result, "status"), "verdict": _get(result, "verdict"), "n_violations": len(vs),
             "violations": [{"type_id": _get(v, "type_id", ""), "timecode_sec": _get(v, "timecode_sec"),
                             "n_frames": len(_get(v, "evidence_frames", []) or [])} for v in vs],
-            "meta_keys": sorted(meta) if isinstance(meta, dict) else [],
-            "meta_warnings": (meta.get("warnings") if isinstance(meta, dict) else None)}
+            "complete": meta.get("complete"), "degraded": meta.get("degraded"), "coverage": meta.get("coverage"),
+            "executor": meta.get("executor"), "device": meta.get("device"),
+            "stages": {k: {x: v.get(x) for x in ("status", "origin", "seconds", "vram_peak_mb")}
+                       for k, v in stages.items() if isinstance(v, dict)},
+            "models": meta.get("models"), "n_warnings": len(meta.get("warnings") or []),
+            "meta_keys": sorted(meta)}
+
+
+def count_attempts(log: Path) -> tuple[int, list[dict]]:
+    recs = []
+    try:
+        for line in log.read_text(encoding="utf-8").splitlines():
+            try:
+                recs.append(json.loads(line))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return len(recs), recs[:20]
+
+
+def egress_selftest() -> dict:
+    """Отдельный процесс того же python.exe БЕЗ netguard: проверяем, что ОС (фаервол/--network none) режет выход."""
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SENTINEL_NETGUARD")}
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    for k in [k for k in env if k.lower() in ("http_proxy", "https_proxy", "all_proxy")]:
+        env.pop(k)
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", EGRESS_PROBE], capture_output=True, text=True, timeout=30,
+                           env=env)
+        res = json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    res["all_blocked"] = all(str(v).startswith("blocked") for v in res.values())
+    return res
+
+
+def write_pitch_log(path: Path, report: dict) -> None:
+    r, w, res = report, report.get("weights") or {}, report.get("result") or {}
+    lines = [
+        "# Kassa Sentinel — доказательство локальной обработки",
+        "",
+        f"- Время: {r.get('started_at')}; коммит: `{r.get('git_sha') or '—'}`",
+        f"- Итог: **{'OK' if r.get('ok') else 'FAIL'}**" + ("" if r.get("ok") else f" — {'; '.join(r.get('problems', []))}"),
+        f"- Сеть в процессе анализа: netguard=block (аудит-хук Python, наследуется spawn-воркером); "
+        f"попыток выхода: **{r.get('network_attempts')}**",
+        f"- Офлайн-режим HF: {r.get('env')}",
+        f"- Веса: {len(w.get('models') or [])} моделей проверены по weights.lock.json (точный commit + sha256/размер): "
+        f"{', '.join(w.get('models') or []) or '—'}",
+        f"- Видео: синтетическое={r.get('video', {}).get('synthetic')} (реальные кадры в отчёт не попадают)",
+        f"- Результат: status={res.get('status')}, verdict={res.get('verdict')}, complete={res.get('complete')}, "
+        f"executor={res.get('executor')}",
+        f"- Время: {r.get('timings_s')}; GPU: {r.get('gpu')}",
+    ]
+    eg = r.get("egress_selftest")
+    if eg:
+        lines.append(f"- Проверка ОС (python.exe без netguard → интернет): {eg}")
+    fw = os.environ.get("SENTINEL_FIREWALL_RULE")
+    if fw:
+        lines.append(f"- Правило фаервола (только на python.exe, временное): {fw}")
+    lines += ["", "Публичный HTTP (cloudflared — отдельный процесс) проверяется отдельно: deploy/tunnel_probe.py.", ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def gpu_evidence() -> dict:
@@ -84,19 +177,39 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fast-verify", action="store_true", help="размеры без sha256")
     ap.add_argument("--allow-empty-lock", action="store_true", help="lock пуст — всё равно гонять")
     ap.add_argument("--report", type=Path, default=None)
+    ap.add_argument("--egress-selftest", action="store_true", help="проверить, что ОС режет выход python.exe")
+    ap.add_argument("--require-egress-blocked", action="store_true", help="FAIL, если self-test нашёл выход")
     a = ap.parse_args(argv)
 
     os.environ.update(OFFLINE_ENV)
-    log_dir = Path(os.environ.get("SENTINEL_LOG_DIR") or REPO_ROOT / "logs")
+    log_dir = Path(os.environ.get("SENTINEL_LOG_DIR") or REPO_ROOT / "runs" / "deploy")
     log_dir.mkdir(parents=True, exist_ok=True)
     guard_log = log_dir / "netguard_offline_smoke.jsonl"
     guard_log.unlink(missing_ok=True)
+    egress = egress_selftest() if a.egress_selftest else None  # до установки guard: проверяем именно ОС
+    # spawn-воркер A03 наследует env → netguard и в нём (sitecustomize из deploy/netguard)
+    os.environ["SENTINEL_NETGUARD"] = "block"
+    os.environ["SENTINEL_NETGUARD_LOG"] = str(guard_log)
+    pp = [str(REPO_ROOT / "deploy" / "netguard"), str(REPO_ROOT)]
+    if os.environ.get("PYTHONPATH"):
+        pp.append(os.environ["PYTHONPATH"])
+    os.environ["PYTHONPATH"] = os.pathsep.join(pp)
     ng = _install_guard(guard_log)
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
     report: dict = {"check": "offline_worker_smoke", "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "netguard": "block (process)", "env": {k: os.environ.get(k) for k in OFFLINE_ENV}}
+                    "netguard": "block (process + spawn workers)", "env": {k: os.environ.get(k) for k in OFFLINE_ENV}}
+    try:
+        import subprocess
+        report["git_sha"] = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], capture_output=True,
+                                           text=True, timeout=5).stdout.strip()
+    except Exception:  # noqa: BLE001
+        report["git_sha"] = ""
     problems: list[str] = []
+    if egress is not None:
+        report["egress_selftest"] = egress
+        if a.require_egress_blocked and not egress.get("all_blocked"):
+            problems.append(f"ОС не блокирует выход python.exe: {egress}")
 
     if (os.environ.get("SENTINEL_MOCK") or "0") not in ("0", "", "false", "False"):
         print("[smoke] SENTINEL_MOCK включён: mock не доказывает локальность моделей — отказ", file=sys.stderr)
@@ -139,14 +252,19 @@ def main(argv: list[str] | None = None) -> int:
             problems.append(f"pipeline: {type(exc).__name__}: {exc}")
             report["traceback"] = traceback.format_exc(limit=8)
     report["gpu"] = gpu_evidence()
-    attempts = ng.status()["attempts"]
+    attempts, sample = count_attempts(guard_log)  # все процессы, включая воркер
+    attempts = max(attempts, ng.status()["attempts"])
     report["network_attempts"] = attempts
     if attempts:
+        report["network_attempts_sample"] = sample
         problems.append(f"{attempts} попыток выхода в сеть (см. {guard_log})")
     report["ok"] = not problems
     report["problems"] = problems
     out = a.report or log_dir / "offline_worker_smoke.json"
     out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    pitch = log_dir / f"offline_proof_{time.strftime('%Y%m%d_%H%M%S')}.md"
+    write_pitch_log(pitch, report)
+    print(f"[smoke] лог для питча: {pitch}", file=sys.stderr)
     print(json.dumps({k: report.get(k) for k in ("ok", "problems", "timings_s", "network_attempts", "gpu")},
                      ensure_ascii=False, indent=2))
     print(f"[smoke] отчёт: {out}", file=sys.stderr)
