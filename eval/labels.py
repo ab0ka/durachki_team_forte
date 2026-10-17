@@ -444,10 +444,29 @@ def read_labels_csv(path: str | Path) -> list[LabelRow]:
     return out
 
 
-def read_types_csv(path: str | Path) -> dict[str, list[tuple[float, str]]]:
-    """data/labels_types.csv: video_id,t_sec,type_id (несколько строк на видео допустимо)."""
+_CONFIRMED_TRUE = {"1", "true", "yes", "да", "y"}
+
+
+def read_types_csv(path: str | Path, legacy: str = "accept") -> dict[str, list[tuple[float, str]]]:
+    """data/labels_types.csv: video_id,t_sec,type_id (несколько строк на видео допустимо).
+
+    Есть колонка ``confirmed`` (формат L1, tools/dataprep/types_review.py) — в эталон идут ТОЛЬКО строки
+    с confirmed=1: предложения VLM и черновики разметкой не становятся, даже если type_id заполнен.
+    Колонки нет (старый CSV) — явная политика ``legacy``: "accept" — все строки (как раньше, с
+    предупреждением в логе), "reject" — ни одной.
+    """
+    if legacy not in ("accept", "reject"):
+        raise ValueError(f"legacy: ожидается 'accept' или 'reject', получено {legacy!r}")
+    rows = list(_read_csv_dicts(path))
+    has_confirmed = any("confirmed" in d for d in rows)
+    if not has_confirmed:
+        if legacy == "reject":
+            return {}
+        log.warning("%s: нет колонки confirmed — старый формат, все типы приняты (legacy=accept)", path)
     out: dict[str, list[tuple[float, str]]] = {}
-    for d in _read_csv_dicts(path):
+    for d in rows:
+        if has_confirmed and str(d.get("confirmed") or "").strip().lower() not in _CONFIRMED_TRUE:
+            continue
         vid = normalize_video_id(d.get("video_id")) or d.get("video_id", "")
         tid = (d.get("type_id") or "").strip().upper()
         if not vid or not tid:
