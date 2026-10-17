@@ -45,3 +45,17 @@ def test_nested_cv_temporal_smoke(cfg):
     assert rep["selected"] in ("baseline", "temporal")
     assert rep["temporal"]["n_folds"] == rep["baseline"]["n_folds"] == 2   # одинаковые внешние фолды
     assert [v["name"] for v in rep["temporal"]["per_video"]] == [v["name"] for v in rep["baseline"]["per_video"]]
+
+
+def test_bench_repeated_group_kfold_two_configs(cfg):
+    from ml.temporal import bench
+
+    samples, bank = make_samples(n_pos=6, n_neg=6, T=60), make_bank()
+    samples[1].group = samples[0].group
+    rep = bench.run_bench(cfg, ["E0", "E1"], folds=3, repeats=2, inner=2, seed=0, samples=samples, bank=bank)
+    assert set(rep["experiments"]) == {"E0", "E1"} and "разведочная" in rep["evaluation_status"]
+    s = rep["experiments"]["E1"]["summary"]
+    assert s["n_repeats"] == 2 and s["auc_by_pooling"]["topk_null"]["n"] == 2
+    assert {"peak", "onset"} <= set(s["timecode"]) and "recall@8" in s["candidates"]["hybrid"]
+    assert rep["type_eval"] is None and "type_note" in rep
+    assert "| E0 |" in bench._table(rep)

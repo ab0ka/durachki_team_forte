@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from ml.temporal.config import load_config
-from ml.temporal.dataset import Sample, build_inputs, fit_spec, prepare_samples
+from ml.temporal.dataset import fit_spec, prepare_samples
 from ml.temporal.features import FeatureSet, MockBackend, extract_clip
 from ml.temporal.predictors import BaselineLR
 

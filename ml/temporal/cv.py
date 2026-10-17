@@ -55,12 +55,14 @@ def fit_and_score(kind: str, train: Sequence[Sample], val: Sequence[Sample], ban
     model = fit_predictor(kind, train, spec, cfg, seed=seed, epochs=epochs)
     out = []
     for s, orig in zip(val_only, val):
+        t_inf = time.perf_counter()
         p, _ = model.predict(s.X[0], spec.fps)
         dur = duration_of(orig)
         t, r = risk_curve(p, s.grid[0], cfg, dur)
+        infer_ms = (time.perf_counter() - t_inf) * 1000.0
         fs = orig.versions[0]
         ch = resample_to(fs.times, change_curve(fs.times, fs.emb, fs.dyn, cfg), t)
-        out.append({"t": t, "r": r, "duration": dur, "change": ch})
+        out.append({"t": t, "r": r, "duration": dur, "change": ch, "infer_ms": infer_ms})
     return out
 
 
@@ -179,6 +181,7 @@ def nested_cv(samples: Sequence[Sample], bank: TextBank, cfg: dict, kind: str,
             "n_folds": len(folds), "n_samples": n, "elapsed_s": round(time.monotonic() - t0, 1),
             "threshold_free": free, "nested": nested, "by_pooling": by_pool, "timecode_by_policy": time_by_policy,
             "candidates": cands,
+            "latency_model_ms_per_video": round(float(np.mean([c["infer_ms"] for c in curves if c is not None])), 2),
             "duration_watchdog": {"duration_only_auc": roc_auc(labels, durs), "spearman_neg": rho_neg,
                                   "limit": watch_lim, "warn": bool(rho_neg is not None and abs(rho_neg) > watch_lim),
                                   "note": "длительность — не признак; |ρ(скор, длительность)| на чистых роликах должен "

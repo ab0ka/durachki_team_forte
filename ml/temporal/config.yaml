@@ -134,6 +134,25 @@ propose:                           # генератор кандидатов д�
   recall_tol_s: 1.5
   budgets: [3, 5, 8]
 
+experiments:                       # ≤ 3 заранее описанные конфигурации; сравниваются на одних и тех же фолдах
+  E0:
+    description: "baseline: логрегрессия по кадрам на SigLIP2, равный вес групп, пулинг topk_null"
+    kind: baseline
+    overrides: {}
+  E1:
+    description: "E0 + признаки изменения (change: лаги и контраст «до/после»)"
+    kind: baseline
+    overrides: {model: {input_groups: [sims, emb, dyn, change]}}
+  E2:
+    description: "temporal head (TCN + MIL) на тех же признаках, что E1"
+    kind: temporal
+    overrides: {model: {input_groups: [sims, emb, dyn, change]}}
+
+bench:
+  folds: 5
+  repeats: 3
+  inner: 3
+
 infer:
   # Пулинг уровня видео (исправление: max по кадрам смещён в пользу длинных чистых роликов):
   # max — старый (для сравнения) | topk — среднее pool_k лучших окон | topk_null — topk, нормированный по
