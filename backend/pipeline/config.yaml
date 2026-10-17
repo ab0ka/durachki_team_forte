@@ -163,6 +163,11 @@ fallback_fusion:
   blur_heads: true           # размытие верхней части бокса человека на кадрах-доказательствах
 
 warmup:
+  # Готовность = успешный warmup(): аренда воркера, хуки warmup() модулей обязательных стадий, синтетический
+  # прогон (done + complete + без degraded + обязательные стадии ok из настоящих модулей) — всё в пределах
+  # общего дедлайна deadline_s, включая RPC. Иначе WarmupError → A02 warmup_failed (не ready).
   synthetic_seconds: 2.0
   deadline_s: 120
-  vlm: false                 # прогревать ли VLM (≈5 ГБ VRAM) при старте сервера
+  vlm: false                 # прогревать ли VLM (≈5 ГБ VRAM) при старте сервера; false → VLM в отчёте «not_exercised»
+  optional_policy: warn      # сбой ДОПОЛНИТЕЛЬНОЙ стадии при прогреве: warn (готов, деградации в отчёте) | fail
+  allow_fallbacks: false     # запасной декодер/слияние у обязательной стадии при прогреве = провал (кроме mock-режима)

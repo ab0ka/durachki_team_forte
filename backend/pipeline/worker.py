@@ -289,25 +289,35 @@ class Runtime:
         return {"ok": free_after >= need_gb + margin_gb, "cuda": True, "action": "unload", **res}
 
     def warmup(self, modules: list[str]) -> dict:
+        """Хуки warmup() модулей (загрузка весов). По модулю: {"status": ok | no_hook | missing | error,
+        "seconds", "error"}. missing — пакета нет; error — импорт/хук упал (например, нет весов)."""
         import importlib
 
-        out: dict[str, str] = {}
+        from .stages import _is_missing_module
+
+        out: dict[str, dict] = {}
         for name in modules:
+            t0 = time.perf_counter()
             try:
                 mod = importlib.import_module(name)
+            except ImportError as exc:
+                out[name] = {"status": "missing" if _is_missing_module(exc, name) else "error",
+                             "error": f"{type(exc).__name__}: {exc}"[:300], "seconds": round(time.perf_counter() - t0, 3)}
+                continue
             except Exception as exc:  # noqa: BLE001
-                out[name] = f"нет модуля: {type(exc).__name__}"
+                out[name] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:300],
+                             "seconds": round(time.perf_counter() - t0, 3)}
                 continue
             hook = getattr(mod, "warmup", None)
-            if callable(hook):
-                t0 = time.perf_counter()
-                try:
-                    hook()
-                    out[name] = f"warmup() {time.perf_counter() - t0:.1f} с"
-                except Exception as exc:  # noqa: BLE001
-                    out[name] = f"warmup() упал: {type(exc).__name__}: {exc}"
-            else:
-                out[name] = "импортирован (хука warmup нет)"
+            if not callable(hook):
+                out[name] = {"status": "no_hook", "seconds": round(time.perf_counter() - t0, 3)}
+                continue
+            try:
+                hook()
+                out[name] = {"status": "ok", "seconds": round(time.perf_counter() - t0, 3)}
+            except Exception as exc:  # noqa: BLE001
+                out[name] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:300],
+                             "seconds": round(time.perf_counter() - t0, 3)}
         return out
 
     def device(self) -> str:

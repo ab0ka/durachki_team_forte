@@ -42,8 +42,9 @@ class ModelRegistry:
         self._models: dict[str, _Entry] = {}
         self._device: Optional[str] = None
         self.cfg: Mapping = cfg or {}
-        self.warm = False
+        self.warm = False                      # True только после успешного warmup()
         self.warmup_report: dict[str, Any] = {}
+        self.warmup_error: Optional[str] = None
         self.vram_measured_mb: dict[str, float] = {}
 
     # ---------------------------------------------------------------- синглтон
