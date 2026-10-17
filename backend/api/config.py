@@ -30,30 +30,31 @@ class Settings:
     fair_share: bool = True
     watchdog_s: float = 285.0
     deadline_grace_s: float = 20.0
-    max_queue: int = 100
+    max_queue: int = 12
     max_attempts: int = 3
     max_zombie_workers: int = 2
 
     pipeline: str = "backend.pipeline"
     fake_pipeline: bool = False
     fake_pipeline_s: float = 3.0
-    require_pipeline: bool = False
     warmup: bool = True
     warmup_wait_s: float = 120.0
     evidence_fallback: bool = True
+    video_validation: str = "required"
     copilot_timeout_s: float = 60.0
 
     api_keys: list[str] = field(default_factory=list)
     api_keys_file: Path | None = None
     ui_secret: str = ""
+    ui_password: str = ""
     ui_enabled: bool = True
     ui_token_ttl_s: float = 43200.0
-    ui_allow_no_origin: bool = False
     cors_origins: list[str] = field(default_factory=list)
     trusted_proxies: list[str] = field(default_factory=lambda: ["127.0.0.1", "::1"])
     docs: bool = True
 
     rl_ui_session: str = "30/60"
+    rl_ui_login: str = "10/60"
     rl_ui_upload: str = "12/60"
     rl_ui_read: str = "600/60"
     rl_ui_ask: str = "20/60"
@@ -106,6 +107,8 @@ class Settings:
         s.gpu_slots = max(1, int(s.gpu_slots))
         if s.gpu_lock_scope not in ("job", "none"):
             s.gpu_lock_scope = "job"
+        if s.video_validation not in ("required", "best_effort", "off"):
+            s.video_validation = "required"
         return s
 
 

@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     attempts     INTEGER NOT NULL DEFAULT 0,
     deadline_s   REAL,
     client       TEXT,
-    warnings     TEXT                    -- JSON list
+    warnings     TEXT,                   -- JSON list
+    video_meta   TEXT                    -- JSON: длительность/fps/размер от декодера
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
@@ -38,7 +39,7 @@ CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at);
 
 _COLUMNS = ("id", "status", "stage", "progress", "created_at", "queued_at", "started_at",
             "finished_at", "error", "result_path", "video_path", "filename", "size_bytes",
-            "sha256", "attempts", "deadline_s", "client", "warnings")
+            "sha256", "attempts", "deadline_s", "client", "warnings", "video_meta")
 
 
 class JobStore:
@@ -71,20 +72,23 @@ class JobStore:
         if r is None:
             return None
         d = dict(r)
-        try:
-            d["warnings"] = json.loads(d.get("warnings") or "[]")
-        except ValueError:
-            d["warnings"] = []
+        for k, empty in (("warnings", "[]"), ("video_meta", "{}")):
+            try:
+                d[k] = json.loads(d.get(k) or empty)
+            except ValueError:
+                d[k] = json.loads(empty)
         return d
 
     def create(self, job_id: str, *, video_path: str, filename: str, size_bytes: int,
-               sha256: str, client: str = "", now: Optional[float] = None) -> dict[str, Any]:
+               sha256: str, client: str = "", video_meta: Optional[dict[str, Any]] = None,
+               now: Optional[float] = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         self._exec(
             "INSERT INTO jobs (id, status, stage, progress, created_at, queued_at, video_path, "
-            "filename, size_bytes, sha256, client, warnings) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "filename, size_bytes, sha256, client, warnings, video_meta) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (job_id, "queued", "queued", 0.0, now, now, video_path, filename, size_bytes, sha256,
-             client, "[]"))
+             client, "[]", json.dumps(video_meta or {}, ensure_ascii=False)))
         return self.get(job_id) or {}
 
     def get(self, job_id: str) -> Optional[dict[str, Any]]:
@@ -98,6 +102,8 @@ class JobStore:
             raise KeyError(f"unknown columns: {bad}")
         if "warnings" in fields and not isinstance(fields["warnings"], str):
             fields["warnings"] = json.dumps(list(fields["warnings"]), ensure_ascii=False)
+        if "video_meta" in fields and not isinstance(fields["video_meta"], str):
+            fields["video_meta"] = json.dumps(fields["video_meta"], ensure_ascii=False)
         cols = ", ".join(f"{k}=?" for k in fields)
         self._exec(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
 
