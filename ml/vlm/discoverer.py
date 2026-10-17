@@ -125,7 +125,14 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
     found: list[Event] = []
     windows_done = 0
 
+    do_reverify = bool(dcfg.get("reverify", True))
     for (t0, t1, score) in wins:
+        # при наличии находок оставляем вызов(ы) на повторную проверку (иначе окна съедят весь бюджет)
+        reserve = min(len(found), int(dcfg.get("reverify_reserve_calls", 1))) if do_reverify else 0
+        if reserve and (lim.max_calls - budget.calls <= reserve
+                        or budget.remaining() < budget.est_call_s() * lim.safety * (1 + reserve)):
+            budget.stop_reason = budget.stop_reason or "reserved_for_reverify"
+            break
         if not budget.can_call(n_fr):
             break
         times = [round(t0 + (t1 - t0) * (k + 0.5) / n_fr, 3) for k in range(n_fr)]
@@ -179,7 +186,7 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
             ))
 
     events = _merge(found, float(dcfg.get("merge_gap_s", 1.5)))
-    if events and dcfg.get("reverify", True) and budget.remaining() > 0:
+    if events and do_reverify and budget.remaining() > 0:
         from .verifier import verify_events
 
         # повторная проверка тратит ОСТАТОК того же бюджета discover (общие лимиты не превышаются)

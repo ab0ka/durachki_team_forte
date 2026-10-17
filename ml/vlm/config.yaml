@@ -121,6 +121,7 @@ discover:
   min_vlm_conf: 0.55          # находка ниже этого порога отбрасывается
   max_events: 4
   reverify: true              # подтверждать находку вторым вызовом verify (если есть бюджет)
+  reverify_reserve_calls: 1   # после первой находки держим 1 вызов в резерве под reverify
   motion_weighting: true
   motion_downscale: 64
   min_coverage_windows: 3     # минимум окон по равномерной сетке, даже если движения нет

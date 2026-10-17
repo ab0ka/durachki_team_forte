@@ -22,14 +22,60 @@ def _hf_offline() -> bool:
     return str(os.environ.get("HF_HUB_OFFLINE", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def read_model_license(model_id: str) -> Optional[str]:
+    """license из YAML front-matter README.md локальной папки или снапшота в HF-кэше (без сети)."""
+    readme: Optional[str] = None
+    if os.path.isdir(model_id):
+        cand = os.path.join(model_id, "README.md")
+        readme = cand if os.path.exists(cand) else None
+    else:
+        try:
+            from huggingface_hub import try_to_load_from_cache
+
+            r = try_to_load_from_cache(model_id, "README.md")
+            readme = r if isinstance(r, str) and os.path.exists(r) else None
+        except Exception:  # noqa: BLE001
+            readme = None
+    if not readme:
+        return None
+    with open(readme, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read(8192)
+    if not text.startswith("---"):
+        return None
+    fm = text.split("---", 2)[1] if text.count("---") >= 2 else ""
+    for line in fm.splitlines():
+        if line.strip().lower().startswith("license:"):
+            return line.split(":", 1)[1].strip().strip("'\"").lower() or None
+    return None
+
+
+def check_license(model_id: str, mode: str = "warn", allowed: Optional[list[str]] = None) -> tuple[bool, str]:
+    """strict: лицензия должна быть найдена и разрешена; warn: запрещённая — блок, не найдена — предупреждение."""
+    mode = (mode or "warn").lower()
+    if mode == "off":
+        return True, "license check off"
+    allowed_set = {a.lower() for a in (allowed or ["apache-2.0", "mit", "bsd-2-clause", "bsd-3-clause"])}
+    lic = read_model_license(model_id)
+    if lic is None:
+        msg = f"license of {model_id} not found locally (README.md front-matter)"
+        return (mode != "strict"), msg
+    if lic not in allowed_set:
+        return False, f"license '{lic}' of {model_id} is not in allowed {sorted(allowed_set)}"
+    return True, f"license {lic}"
+
+
 class TransformersBackend(VLMBackend):
     name = "transformers"
 
     def __init__(self, model: str, quant: str = "bnb4", device: str = "cuda", allow_cpu: bool = False,
                  dtype: str = "float16", attn_implementation: str = "sdpa", max_pixels: int = 448 * 448,
                  min_pixels: int = 3136, skip_quant_modules: Optional[list[str]] = None,
-                 local_files_only: Optional[bool] = None, **_: Any) -> None:
+                 local_files_only: Optional[bool] = None, license_guard: str = "warn",
+                 allowed_licenses: Optional[list[str]] = None, **_: Any) -> None:
         self.model_id = model
+        self.license_guard = license_guard
+        self.allowed_licenses = list(allowed_licenses or ["apache-2.0", "mit", "bsd-2-clause", "bsd-3-clause"])
+        self.license_info = ""
         self.quant = (quant or "none").lower()
         self.device = device
         self.allow_cpu = allow_cpu
@@ -77,6 +123,11 @@ class TransformersBackend(VLMBackend):
             ok, why = self.available()
             if not ok:
                 raise BackendUnavailable(why)
+            lic_ok, self.license_info = check_license(self.model_id, self.license_guard, self.allowed_licenses)
+            if not lic_ok:
+                raise BackendUnavailable(self.license_info)
+            if self.license_info.startswith("license of"):
+                log.warning("%s", self.license_info)
             import torch
             import transformers
             from transformers import AutoProcessor
@@ -173,8 +224,8 @@ class TransformersBackend(VLMBackend):
                              meta={"vram_peak_mb": _vram_peak_mb()})
 
     def info(self) -> dict[str, Any]:
-        return {"backend": self.name, "model": self.model_id, "quant": self.quant,
-                "loaded": self.loaded, "load_s": round(self.load_s, 2)}
+        return {"backend": self.name, "model": self.model_id, "quant": self.quant, "loaded": self.loaded,
+                "load_s": round(self.load_s, 2), "offline": self.local_files_only, "license": self.license_info}
 
 
 def _vram_peak_mb() -> Optional[float]:

@@ -1,0 +1,131 @@
+import json
+
+import pytest
+
+from ml.vlm._contract import Event
+from ml.vlm.backends.mock import MockBackend
+from ml.vlm.verifier import verify_events
+
+
+def _ev(tid="V05", t=5.0, conf=0.7, source="rules", facts=None):
+    return Event(tid, t - 1.0, t + 1.0, t, conf, source, list(facts or []), {"cell_phone": (0.3, 0.2, 0.4, 0.3)})
+
+
+def _ans(visible=True, tid="V05", conf=0.9, facts=None, best=3, vis_frames=(2, 3)):
+    return json.dumps({"visible": visible, "type_id": tid, "observed_facts": list(facts or []), "confidence": conf,
+                       "best_frame": best, "visible_frames": list(vis_frames), "uncertain_because": ""},
+                      ensure_ascii=False)
+
+
+def test_one_to_one_order_source_and_inputs_untouched(clip, cfg, clock):
+    evs = [_ev("V05", 3.0, 0.7), _ev("V01", 8.0, 0.4, "temporal")]
+    be = MockBackend(mode="confirm", latency_s=0.5, clock=clock)
+    out = verify_events(clip, evs, 30.0, cfg=cfg, backend=be, clock=clock)
+    assert [e.type_id for e in out] == ["V05", "V01"] and [e.source for e in out] == ["rules", "temporal"]
+    assert all(e.extra["vlm"]["status"] == "ok" for e in out)
+    assert evs[0].confidence == 0.7 and "vlm" not in evs[0].extra  # входные события не мутируются
+    # кадры: 4–6 штук, длинная сторона <= 448
+    assert all(4 <= c["n_images"] <= 6 for c in be.calls)
+    assert all(max(s) <= 448 for c in be.calls for s in c["sizes"])
+
+
+def test_supports_raises_confidence_and_adds_filtered_facts(clip, cfg, clock):
+    be = MockBackend(responses=[_ans(True, "V05", 0.9, ["Кассир держит у уха мобильный телефон",
+                                                         "Кассир звонит, чтобы скрыть деньги",
+                                                         "Сумма 5000 тенге"])], clock=clock)
+    out = verify_events(clip, [_ev(conf=0.5, facts=["Телефон у уха"])], 30.0, cfg=cfg, backend=be, clock=clock)[0]
+    v = out.extra["vlm"]
+    assert v["agreement"] == "supports" and not v["contradiction"]
+    assert 0.5 < out.confidence <= 0.75 + 1e-9  # max_raise = 0.25
+    assert out.facts == ["Телефон у уха", "Кассир держит у уха мобильный телефон"]
+    assert sorted(v["dropped_facts"]) == ["amount", "intent"]
+    assert v["t_best"] == v["frame_times"][2] and len(v["t_visible"]) == 2
+
+
+def test_strong_rule_contradicted_is_lowered_and_flagged_not_floored(clip, cfg, clock):
+    be = MockBackend(responses=[_ans(False, "V05", 0.95, [])], clock=clock)
+    out = verify_events(clip, [_ev(conf=0.9)], 30.0, cfg=cfg, backend=be, clock=clock)[0]
+    v = out.extra["vlm"]
+    assert v["agreement"] == "contradicts" and v["contradiction"] is True
+    assert out.confidence < 0.9 * 0.7  # никакого «пола» 0.7*p0 для сильных правил
+    assert out.source == "rules" and out.type_id == "V05"  # событие не удалено, тип/источник сохранены
+
+
+def test_uncertain_answer_keeps_confidence(clip, cfg, clock):
+    be = MockBackend(mode="neutral", clock=clock)
+    out = verify_events(clip, [_ev(conf=0.66)], 30.0, cfg=cfg, backend=be, clock=clock)[0]
+    assert out.extra["vlm"]["agreement"] == "uncertain" and out.confidence == pytest.approx(0.66, abs=1e-3)
+
+
+def test_type_mismatch_retype_only_for_weak_sources(clip, cfg, clock):
+    ans = _ans(True, "V06", 0.9, ["Кассир пьёт из чашки у стола с наличными"])
+    rules = verify_events(clip, [_ev("V05", conf=0.6)], 30.0, cfg=cfg, backend=MockBackend(responses=[ans], clock=clock),
+                          clock=clock)[0]
+    assert rules.type_id == "V05" and rules.extra["vlm"]["agreement"] == "type_mismatch"
+    assert rules.extra["vlm"]["suggested_type_id"] == "V06" and rules.confidence == 0.6
+    temporal = verify_events(clip, [_ev("V05", conf=0.6, source="temporal")], 30.0, cfg=cfg,
+                             backend=MockBackend(responses=[ans], clock=clock), clock=clock)[0]
+    assert temporal.type_id == "V06" and temporal.extra["vlm_original_type_id"] == "V05"
+    assert temporal.extra["vlm"]["retyped"] and temporal.confidence > 0.6
+
+
+def test_invalid_fields_flagged_and_template_fact_used(clip, cfg, clock):
+    raw = json.dumps({"visible": True, "type_id": "V77", "observed_facts": ["Nice image"], "confidence": 0.9,
+                      "best_frame": 42, "visible_frames": [0, 1, 99], "uncertain_because": ""})
+    out = verify_events(clip, [_ev(conf=0.5)], 30.0, cfg=cfg, backend=MockBackend(responses=[raw], clock=clock),
+                        clock=clock)[0]
+    v = out.extra["vlm"]
+    assert {"type_id_invalid", "best_frame_out_of_range", "visible_frames_out_of_range"} <= set(v["flags"])
+    assert v["t_best"] is None and len(v["t_visible"]) == 1
+    assert v["agreement"] == "supports"  # неизвестный тип -> считается ответом про кандидата
+    assert any(f.startswith("Локальная VLM-модель отметила") for f in out.facts)
+
+
+def test_budget_stops_calls_and_marks_rest(clip, cfg, clock):
+    evs = [_ev("V05", t, 0.5) for t in (2.0, 5.0, 8.0, 11.0)]
+    be = MockBackend(mode="confirm", latency_s=2.0, clock=clock)
+    out = verify_events(clip, evs, 5.0, cfg=cfg, backend=be, clock=clock, limits={"est_call_s": 2.0, "safety": 1.0})
+    statuses = [e.extra["vlm"]["status"] for e in out]
+    assert statuses.count("ok") == 2 and statuses.count("skipped_budget") == 2
+    assert clock() <= 5.0 + 1e-9
+    assert all(e.extra["vlm"]["budget"]["stop_reason"] == "time" for e in out)
+
+
+def test_max_calls_limit(clip, cfg, clock):
+    evs = [_ev("V05", t, 0.5) for t in (2.0, 5.0, 8.0)]
+    be = MockBackend(mode="confirm", clock=clock)
+    out = verify_events(clip, evs, 100.0, cfg=cfg, backend=be, clock=clock, limits={"max_calls": 1})
+    assert len(be.calls) == 1
+    assert sum(e.extra["vlm"]["status"] == "ok" for e in out) == 1
+
+
+def test_duplicates_verified_once(clip, cfg, clock):
+    evs = [_ev("V05", 5.0, 0.6), _ev("V05", 5.2, 0.5, "temporal")]
+    be = MockBackend(mode="confirm", clock=clock)
+    out = verify_events(clip, evs, 30.0, cfg=cfg, backend=be, clock=clock)
+    assert len(be.calls) == 1
+    assert sorted(e.extra["vlm"]["shared"] for e in out) == [False, True]  # второй берёт результат первого
+
+
+def test_garbage_twice_leaves_event_unchanged(clip, cfg, clock):
+    be = MockBackend(mode="garbage", clock=clock)
+    out = verify_events(clip, [_ev(conf=0.7)], 30.0, cfg=cfg, backend=be, clock=clock)[0]
+    assert out.extra["vlm"]["status"] == "parse_failed" and out.confidence == 0.7
+    assert len(be.calls) == 2  # 1 ретрай
+
+
+def test_backend_unavailable_is_graceful(clip, cfg):
+    cfg["backend"] = "off"
+    out = verify_events(clip, [_ev(conf=0.7)], 30.0, cfg=cfg)
+    assert out[0].extra["vlm"]["status"] == "unavailable" and out[0].confidence == 0.7
+
+
+def test_no_raw_text_in_extra_by_default(clip, cfg, clock):
+    be = MockBackend(responses=[_ans(True, "V05", 0.9, ["Кассир держит телефон"])], clock=clock)
+    out = verify_events(clip, [_ev()], 30.0, cfg=cfg, backend=be, clock=clock)[0]
+    assert "raw" not in out.extra["vlm"]
+    assert all(isinstance(c, str) for c in out.extra["vlm"]["dropped_facts"])
+
+
+def test_empty_events(clip, cfg):
+    assert verify_events(clip, [], 10.0, cfg=cfg) == []

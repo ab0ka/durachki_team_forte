@@ -211,10 +211,11 @@ def motion_energy(clip: Any, downscale: int = 64, target_fps: float = 2.0,
         if f is None:
             continue
         arr = np.asarray(f)
-        g = arr.mean(axis=2) if arr.ndim == 3 else arr.astype(np.float32)
-        sy = max(1, g.shape[0] // downscale)
-        sx = max(1, g.shape[1] // downscale)
-        g = g[::sy, ::sx].astype(np.float32)
+        sy = max(1, arr.shape[0] // downscale)
+        sx = max(1, arr.shape[1] // downscale)
+        sub = arr[::sy, ::sx].astype(np.float32)
+        # яркость по BT.601 для BGR (простое среднее каналов «не видит» смену цвета при равной сумме)
+        g = sub[:, :, :3] @ np.array([0.114, 0.587, 0.299], np.float32) if sub.ndim == 3 else sub
         e = 0.0 if prev is None or prev.shape != g.shape else float(np.abs(g - prev).mean() / 255.0)
         out.append((float(ts[i]), e))
         prev = g
