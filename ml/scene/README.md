@@ -67,7 +67,7 @@ ROI берётся из зон A06 (`safe`, `door`, `desk`, `cash_tray`, `cashie
 
 ```bash
 pip install -r ml/scene/requirements.txt
-python -m pytest ml/scene -m "not gpu and not slow" -q        # 35 тестов, синтетика, без GPU и весов
+python -m pytest ml/scene -m "not gpu and not slow" -q        # 36 тестов, синтетика, без GPU и весов
 
 # графики сигналов (сплошная линия — подтверждено, пунктир — неизвестно, красная — GT-секунда)
 python -m ml.scene.plot --cache cache/<sha> --out signals.png --gt 22
@@ -113,7 +113,7 @@ X-7,cash_visible,4.2,,1,1         # пустой t_end — точечная ме
 
 ## Проверено (без реальных данных и GPU)
 
-- **Тесты**: `pytest ml/scene` — 35 passed (Python 3.13 в контейнере, тот же набор под конфигом pytest A01 с `--import-mode=importlib`).
+- **Тесты**: `pytest ml/scene` — 36 passed (Python 3.13 в контейнере, тот же набор под конфигом pytest A01 с `--import-mode=importlib`).
   - Сейф: открылся на 5-й секунде (задержка ≤ 0.5 с), открыт с начала (с подтверждением детекцией и без), статичный сейф без свидетельств остаётся неизвестным.
   - Помехи: человек заслонил сейф, удержание открытого состояния под окклюзией, общее затемнение, мягкая тень, кадры низкого качества.
   - Ракурс: два аффинных преобразования кадра и зон; дрожание камеры ±3 px.

@@ -136,13 +136,16 @@ def scene_states_with_trace(
 ) -> tuple[list[SceneStateEx], dict[str, Any]]:
     t0 = time.perf_counter()
     cfg = load_config(config)
-    times = np.asarray(list(getattr(clip, "times", []) or []), dtype=np.float64)
+    t_attr = getattr(clip, "times", None)  # может быть list или np.ndarray
+    times = np.asarray([] if t_attr is None else list(t_attr), dtype=np.float64)
     n = len(times)
     trace: dict[str, Any] = {"warnings": [], "rois": {}, "raw": {}, "conf_raw": {}, "provenance": {}, "info": {}, "features": {}}
     if n == 0:
         return [], trace
-    dets = list(dets or [])
-    tracks = list(tracks or [])
+    dets = [] if dets is None else list(dets)
+    tracks = [] if tracks is None else list(tracks)
+    zones = [] if zones is None else list(zones)
+    pose_states = [] if pose_states is None else list(pose_states)
     zb = _zones_by_name(zones)
     rc = cfg["roi"]
 
@@ -497,7 +500,7 @@ def _unattended(out_p: dict[str, np.ndarray], out_c: dict[str, np.ndarray], pres
     n = len(times)
     cash_p, cash_c = out_p["cash_visible"], out_c["cash_visible"]
     empty_p = pres_extra["workplace_empty_p"]
-    empty_c = hold_conf(pres_extra["workplace_empty_c"], times, 0.5)
+    empty_c = pres_extra["workplace_empty_c"]  # без «удержания»: уверенность «занято» не должна растекаться на «пусто»
     cash_true = (cash_p >= thr) & (cash_c >= KNOWN_CONF)
     cash_false = (cash_p < thr) & (cash_c >= KNOWN_CONF)
     empty_true = (empty_p >= 0.5) & (empty_c >= KNOWN_CONF)

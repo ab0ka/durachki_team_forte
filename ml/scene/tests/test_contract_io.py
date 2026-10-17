@@ -102,3 +102,17 @@ def test_video_file_roundtrip_with_videowriter(tmp_path):
 def test_video_name_normalization():
     assert normalize_video_name("Х-3.MOV") == normalize_video_name("X-3.mov") == "x-3"
     assert normalize_video_name("X-47") == "x-47"
+
+
+def test_numpy_times_list_boxes_and_none_inputs():
+    from ml.scene._contract import Detection, Track, Zone
+
+    clip = make_clip(3.0)
+    clip.times = np.asarray(clip.times)
+    tr = Track(track_id=1, label="person", role="cashier", role_conf=0.9, boxes=[[float(t), [0.3, 0.78, 0.46, 0.92]] for t in clip.times])
+    dets = [Detection(t=np.float64(t), label="person", bbox=[0.3, 0.78, 0.46, 0.92], score=0.9, track_id=1) for t in clip.times]
+    zones = [Zone(z.name, [list(p) for p in z.polygon]) for z in zones_default()]
+    st = scene_states(clip, dets, [tr], zones, None)
+    assert len(st) == len(clip.times)
+    assert all(s.signals["cashier_in_workplace"] > 0.5 and s.known["cashier_in_workplace"] for s in st[2:])
+    assert len(scene_states(clip, None, None, None, None)) == len(clip.times)
