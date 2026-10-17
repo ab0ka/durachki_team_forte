@@ -115,6 +115,19 @@ cv:
   threshold_margin: 0.02           # порог = max(score негативов inner-OOF) + margin (FP=0) / FP≤1
   min_recall_fp0: 0.8
 
+propose:                           # генератор кандидатов для VLM/правил: propose(clip) -> 3–8 Event
+  mode: hybrid                     # risk | change | hybrid — выбрать по замеру (cv/bench: candidates)
+  max_candidates: 8
+  min_candidates: 3
+  n_risk: 4                        # hybrid: сначала до n_risk пиков риска, остальное — кривая изменений
+  nms_s: 2.0                       # минимальное расстояние между кандидатами
+  window_s: 2.0                    # t_start/t_end кандидата = t ± window_s (окно для VLM)
+  change_deltas_s: [1.0, 3.0]      # окна «до/после» для контраста эмбеддингов
+  motion_weight: 0.5               # вклад начала движения в кривую изменений
+  change_salience_cap: 0.3         # уверенность кандидата из кривой изменений не выше (это не детекция)
+  recall_tol_s: 1.5
+  budgets: [3, 5, 8]
+
 infer:
   # Пулинг уровня видео (исправление: max по кадрам смещён в пользу длинных чистых роликов):
   # max — старый (для сравнения) | topk — среднее pool_k лучших окон | topk_null — topk, нормированный по

@@ -16,6 +16,9 @@ def test_nested_cv_baseline_report(cfg):
     assert {"hit@1s", "hit@2s", "hit@3s", "dt_median"} <= set(f)
     assert all(0.05 <= v["thr_inner"] <= 0.95 for v in rep["per_video"])
     assert set(rep["by_pooling"]) == {"max", "topk", "topk_null"}
+    assert set(rep["candidates"]) == {"risk", "change", "hybrid"}
+    assert {"recall@3", "recall@5", "recall@8", "mean_n"} <= set(rep["candidates"]["hybrid"])
+    assert rep["candidates"]["hybrid"]["mean_n"] <= 8
     assert {"duration_only_auc", "spearman_neg", "warn"} <= set(rep["duration_watchdog"])
     assert {"peak", "onset"} <= set(rep["timecode_by_policy"])
     assert "разведочная" in rep["evaluation_status"]

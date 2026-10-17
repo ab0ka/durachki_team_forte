@@ -21,6 +21,7 @@ import numpy as np
 from .config import load_config, reports_dir
 from .dataset import Sample, fit_spec, prepare_samples
 from .features import TextBank
+from .candidates import candidate_recall, change_curve, resample_to, select_candidates
 from .metrics import recommend_threshold, roc_auc, spearman, summarize
 from .postproc import block_stats, pool_score, risk_curve, timecode
 from .predictors import fit_predictor
@@ -57,7 +58,9 @@ def fit_and_score(kind: str, train: Sequence[Sample], val: Sequence[Sample], ban
         p, _ = model.predict(s.X[0], spec.fps)
         dur = duration_of(orig)
         t, r = risk_curve(p, s.grid[0], cfg, dur)
-        out.append({"t": t, "r": r, "duration": dur})
+        fs = orig.versions[0]
+        ch = resample_to(fs.times, change_curve(fs.times, fs.emb, fs.dyn, cfg), t)
+        out.append({"t": t, "r": r, "duration": dur, "change": ch})
     return out
 
 
@@ -161,12 +164,21 @@ def nested_cv(samples: Sequence[Sample], bank: TextBank, cfg: dict, kind: str,
                    "spearman_score_duration_neg": spearman([d for d, l in zip(durs, labels) if not l],
                                                            [float(v) for v, l in zip(scores[m], labels) if not l]),
                    "spearman_score_duration_all": spearman(durs, scores[m].tolist())} for m in POOLINGS}
+    pr = cfg.get("propose", {})
+    budgets = [int(b) for b in pr.get("budgets", [3, 5, 8])]
+    cands = {}
+    for mode in ("risk", "change", "hybrid"):
+        per_video = [select_candidates(c["t"], c["r"], c.get("change"), cfg, mode=mode, n_max=max(budgets))
+                     if c is not None else [] for c in curves]
+        cands[mode] = candidate_recall(per_video, [s.times if s.label else [] for s in samples], budgets,
+                                       float(pr.get("recall_tol_s", 1.5)))
     watch_lim = float(cv.get("duration_watchdog_rho", 0.3))
     rho_neg = by_pool[pool_mode]["spearman_score_duration_neg"]
     return {"kind": kind, "protocol": "nested_grouped_cv", "evaluation_status": EXPLORATORY,
             "outer": outer, "inner": inner, "seed": seed, "pooling": pool_mode, "timecode_policy": main_pol,
             "n_folds": len(folds), "n_samples": n, "elapsed_s": round(time.monotonic() - t0, 1),
             "threshold_free": free, "nested": nested, "by_pooling": by_pool, "timecode_by_policy": time_by_policy,
+            "candidates": cands,
             "duration_watchdog": {"duration_only_auc": roc_auc(labels, durs), "spearman_neg": rho_neg,
                                   "limit": watch_lim, "warn": bool(rho_neg is not None and abs(rho_neg) > watch_lim),
                                   "note": "длительность — не признак; |ρ(скор, длительность)| на чистых роликах должен "
@@ -258,6 +270,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               f"FPR={nst['fpr']:.2f} |dt| median={f['dt_median']} hit@2s={f.get('hit@2s')} "
               f"rho(score,dur|neg)={dw['spearman_neg']} warn={dw['warn']} ({rep[k]['elapsed_s']} с)")
         print("      AUC by pooling: " + ", ".join(f"{m}={v['auc']}" for m, v in rep[k]["by_pooling"].items()))
+        print("      candidates recall@±1.5s: " + "; ".join(
+            f"{m}: " + ", ".join(f"{kk}={vv}" for kk, vv in v.items() if kk.startswith("recall@"))
+            for m, v in rep[k]["candidates"].items()))
     print(f"selected={rep['selected']} -> {out}  [{EXPLORATORY}]")
     return 0
 

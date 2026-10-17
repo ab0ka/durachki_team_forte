@@ -105,6 +105,8 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
     assert st["status"] == "ok" and st["kind"] == "baseline"
     ts = [t for t, _ in risk]
     assert np.allclose(np.diff(ts), 0.5) and all(0.0 <= r <= 1.0 for _, r in risk)
+    cands = temporal.propose(clip)                          # с чекпоинтом: кандидаты из риска + изменений
+    assert 3 <= len(cands) <= 8 and any(c.extra["candidate_source"] == "risk" for c in cands)
     renamed = tmp_path / "renamed_copy.avi"                  # имя файла не признак: тот же контент -> тот же риск
     renamed.write_bytes((vids / "Х-1.avi").read_bytes())
     risk2, _ = temporal.score(SimpleClip(str(renamed), sample_fps=5.0))
