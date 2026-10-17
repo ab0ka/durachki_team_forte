@@ -54,8 +54,8 @@ def test_tunnel_probe_against_stub(stub):
 
 
 def test_sla_bench_concurrent(stub, video):
-    rep = sla_bench.run_bench(stub, "k1", [video] * 3, limit_s=30)
-    assert rep["ok"] and rep["n"] == 3 and rep["all_done"]
+    rep = sla_bench.run_bench(stub, "k1", [video] * 3, limit_s=30, allow_stub=True)  # stub без dedup
+    assert rep["ok"] and rep["n"] == 3
     assert all(j["status"] == "done" for j in rep["jobs"])
     rep = sla_bench.run_bench(stub, "bad", [video], limit_s=5)
     assert not rep["ok"] and rep["jobs"][0]["status"].startswith("submit 401")
@@ -127,3 +127,64 @@ def test_result_problems_mock_and_coverage():
             "violations": [{"type": "x", "timecode_sec": 1.0, "description": "d", "evidence_frames": [
                 {"timestamp_sec": 1.0, "image_base64": stub_api.TINY_JPEG_B64}]}]}
     assert healthcheck.result_problems(viol) == []   # violation не требует полноты (её требует «нет нарушения»)
+
+
+def _serve(**kw):
+    srv = stub_api.serve("127.0.0.1", 0, keys=["k1"], polls_until_done=1, **kw)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def _videos(tmp_path, n):
+    out = []
+    for i in range(n):
+        p = tmp_path / f"v{i}.mov"
+        p.write_bytes(bytes([i]) * 4096)  # разное содержимое → разный sha256
+        out.append(p)
+    return out
+
+
+def test_sla_sequential_and_queue_of_two_measure_from_accept(tmp_path, stub):
+    rep = sla_bench.run_bench(stub, "k1", _videos(tmp_path, 3), limit_s=30, mode="sequential", poll_s=0.1,
+                              allow_stub=True)
+    assert rep["ok"], rep["problems"]
+    j = rep["jobs"]
+    assert all(x["status"] == "done" and x["from_accept_s"] >= 0 for x in j)
+    assert j[1]["submit_at"] >= j[0]["done_at"]                     # последовательно: следующее после итога
+    assert j[0]["server"]["total_s"] == 0.01 and "очередь" in rep["note"]
+    rep = sla_bench.run_bench(stub, "k1", _videos(tmp_path, 2), limit_s=30, mode="concurrent", poll_s=0.1,
+                              allow_stub=True)
+    assert rep["ok"] and rep["max_from_submit_s"] is not None and rep["max_from_accept_s"] is not None
+
+
+def test_sla_flags_dedup_cache_and_production_checks(tmp_path):
+    srv, url = _serve(dedup=True)
+    try:
+        v = _videos(tmp_path, 1)[0]
+        rep = sla_bench.run_bench(url, "k1", [v, v], limit_s=20, poll_s=0.1, allow_stub=True)
+        assert not rep["ok"] and rep["dedup_detected"]
+        rep = sla_bench.run_bench(url, "k1", [v], limit_s=20, poll_s=0.1)        # без allow_stub: pipeline=stub
+        assert not rep["ok"] and any("meta.api.pipeline=stub" in p for p in rep["problems"])
+    finally:
+        srv.shutdown()
+    srv, url = _serve(result_meta={"api": {"pipeline": "real"}, "cache": {"hits": {"detect": 1}}})
+    try:
+        rep = sla_bench.run_bench(url, "k1", _videos(tmp_path, 1), limit_s=20, poll_s=0.1)
+        assert not rep["ok"] and rep["cache_hit_jobs"] == 1
+    finally:
+        srv.shutdown()
+
+
+def test_sla_expect_failed_for_timeout_test(tmp_path):
+    srv, url = _serve(verdict="failed")
+    try:
+        rep = sla_bench.run_bench(url, "k1", _videos(tmp_path, 1), limit_s=20, poll_s=0.1, expect="failed")
+        assert rep["ok"] and rep["jobs"][0]["error"] == "timeout (stub)"
+    finally:
+        srv.shutdown()
+    srv, url = _serve(verdict="no_violation", result_meta={"api": {"pipeline": "real"}})
+    try:
+        rep = sla_bench.run_bench(url, "k1", _videos(tmp_path, 1), limit_s=20, poll_s=0.1, expect="failed")
+        assert not rep["ok"]   # таймаут не может стать no_violation
+    finally:
+        srv.shutdown()

@@ -31,7 +31,8 @@ RANGE_PAYLOAD = bytes(range(256)) * 4096  # 1 MiB детерминированн
 
 class StubState:
     def __init__(self, keys: list[str], polls_until_done: int = 2, pipeline: str = "stub",
-                 readyz_state: str = "ready", result_meta: dict | None = None, verdict: str = "violation") -> None:
+                 readyz_state: str = "ready", result_meta: dict | None = None, verdict: str = "violation",
+                 dedup: bool = False) -> None:
         self.keys, self.polls_until_done, self.pipeline = keys, polls_until_done, pipeline
         self.readyz_state, self.verdict = readyz_state, verdict
         # как meta A02/A03 (meta.api, coverage), но pipeline=stub — healthcheck без --allow-stub это отвергает
@@ -39,6 +40,7 @@ class StubState:
             "complete": True, "coverage": {"ratio": 1.0, "complete": True},
             "api": {"pipeline": "stub", "queue_wait_s": 0.0, "processing_s": 0.01, "total_s": 0.01}}
         self.n_analyze = 0
+        self.dedup, self.by_sha = dedup, {}  # dedup=True — как A02: тот же файл → та же задача
         self.jobs: dict[str, dict] = {}
         self.lock = threading.Lock()
 
@@ -129,8 +131,13 @@ def make_handler(state: StubState):
                 if b'name="file"' not in body[:4096]:
                     return self._send(422, {"detail": "multipart field 'file' required"})
                 jid = uuid.uuid4().hex
+                payload = body.split(b"\r\n\r\n", 1)[-1].rsplit(b"\r\n--", 1)[0]  # без случайного boundary
+                digest = hashlib.sha256(payload).hexdigest()
                 with state.lock:
                     state.n_analyze += 1
+                    if state.dedup and digest in state.by_sha:
+                        return self._send(200, {"job_id": state.by_sha[digest]})
+                    state.by_sha[digest] = jid
                     state.jobs[jid] = {"polls": 0, "bytes": len(body)}
                 return self._send(200, {"job_id": jid})
             return self._send(404, {"detail": "not found", "stub": True})
@@ -140,11 +147,11 @@ def make_handler(state: StubState):
 
 def serve(host: str = "127.0.0.1", port: int = 8000, keys: list[str] | None = None,
           polls_until_done: int = 2, pipeline: str = "stub", readyz_state: str = "ready",
-          result_meta: dict | None = None, verdict: str = "violation") -> ThreadingHTTPServer:
+          result_meta: dict | None = None, verdict: str = "violation", dedup: bool = False) -> ThreadingHTTPServer:
     keys = keys if keys is not None else [k.strip() for k in (os.environ.get("SENTINEL_API_KEYS") or "").split(",")
                                           if k.strip()]
     srv = ThreadingHTTPServer((host, port), make_handler(StubState(keys, polls_until_done, pipeline, readyz_state,
-                                                                   result_meta, verdict)))
+                                                                   result_meta, verdict, dedup)))
     srv.daemon_threads = True
     return srv
 
