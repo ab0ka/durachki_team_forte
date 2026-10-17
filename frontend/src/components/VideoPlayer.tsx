@@ -287,7 +287,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
           </div>
         )}
         {active >= 0 && (
-          <div className="pointer-events-none absolute right-3 top-3 max-w-[70%] animate-fade-in rounded-lg bg-brand-600/95 px-2.5 py-1.5 text-xs font-semibold text-white shadow-lift">
+          <div className="pointer-events-none absolute right-3 top-3 max-w-[70%] animate-fade-in rounded-lg bg-ks-event/95 px-2.5 py-1.5 text-xs font-semibold text-ks-event-contrast shadow-lift">
             Эпизод {active + 1}: {violations[active].type}
           </div>
         )}

@@ -139,7 +139,7 @@ export default function UploadScreen() {
                 const I = Icon as typeof Lock;
                 return (
                   <li key={i} className="flex items-center gap-2">
-                    <I className="h-4 w-4 shrink-0 text-brand-600 dark:text-brand-300" />
+                    <I className="h-4 w-4 shrink-0 text-ks-info" />
                     {text as string}
                   </li>
                 );
@@ -157,8 +157,8 @@ export default function UploadScreen() {
               className={cx(
                 "group relative flex min-h-[260px] cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed p-6 text-center transition",
                 drag
-                  ? "border-brand-500 bg-brand-50/70 dark:bg-brand-500/10"
-                  : "border-slate-300 bg-slate-50/60 hover:border-brand-400 hover:bg-brand-50/40 dark:border-white/15 dark:bg-white/[.02] dark:hover:border-brand-400/60",
+                  ? "border-[rgb(var(--ks-focus))] bg-ks-accent/5"
+                  : "border-slate-300 bg-slate-50/60 hover:border-[rgb(var(--ks-focus))] hover:bg-ks-accent/[.03] dark:border-white/15 dark:bg-white/[.02] dark:hover:border-[rgb(var(--ks-focus))]",
                 uploading && "pointer-events-none",
               )}
               onClick={() => !uploading && inputRef.current?.click()}
@@ -190,19 +190,19 @@ export default function UploadScreen() {
               />
               {!file ? (
                 <>
-                  <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white text-brand-600 shadow-card ring-1 ring-slate-200 transition group-hover:scale-105 dark:bg-ink-800 dark:text-brand-300 dark:ring-white/10">
+                  <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white text-ks-accent shadow-card ring-1 ring-slate-200 transition group-hover:scale-105 dark:bg-ink-800 dark:ring-white/10">
                     <UploadCloud className="h-7 w-7" />
                   </div>
                   <div className="text-base font-semibold text-slate-900 dark:text-white">Перетащите видео сюда</div>
                   <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-                    или <span className="font-semibold text-brand-600 underline-offset-2 group-hover:underline dark:text-brand-300">выберите файл</span>
+                    или <span className="font-semibold text-ks-accent underline-offset-2 group-hover:underline">выберите файл</span>
                   </div>
                   <div className="mt-4 text-xs text-slate-400">.mov или .mp4 · до {MAX_UPLOAD_MB} МБ · можно несколько файлов сразу</div>
                 </>
               ) : (
                 <div className="w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
                   <div className="flex items-center gap-3 rounded-xl bg-white p-3 text-left shadow-card ring-1 ring-slate-200 dark:bg-ink-800 dark:ring-white/10">
-                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-brand-50 text-brand-700 dark:bg-brand-500/15 dark:text-brand-300">
+                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-ks-surface-2 text-ks-accent">
                       <FileVideo className="h-6 w-6" />
                     </div>
                     <div className="min-w-0 flex-1">
@@ -402,7 +402,7 @@ export function LoginCard({ onDone }: { onDone?: () => void } = {}) {
       }}
     >
       <div className="flex items-center gap-2 text-base font-bold">
-        <Lock className="h-4 w-4 text-brand-600 dark:text-brand-300" /> Вход для проверяющего
+        <Lock className="h-4 w-4 text-ks-info" /> Вход для проверяющего
       </div>
       <p className="mt-1 text-sm text-slate-500">Введите ключ доступа. Сервер откроет защищённую сессию; ключ не сохраняется в браузере.</p>
       <input

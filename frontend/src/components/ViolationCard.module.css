@@ -9,9 +9,10 @@
   position: relative;
 }
 
-/* Эпизод под курсором видео: рамка бренда + тонкая полоса слева (как акцентные линии стартовой сцены). */
+/* Эпизод под курсором видео: рамка + тонкая полоса слева цветом события (--ks-event, как маркеры на шкале и
+   номера в навигации; запасной цвет — если модуль окажется вне .ks-ws). */
 .active {
-  box-shadow: 0 0 0 2px rgb(184 67 110 / 0.45), 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px -4px rgba(16, 24, 40, 0.08);
+  box-shadow: 0 0 0 2px rgb(var(--ks-event, 225 29 72) / 0.45), 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px -4px rgba(16, 24, 40, 0.08);
 }
 .active::before {
   content: "";
@@ -21,7 +22,7 @@
   bottom: 18px;
   width: 3px;
   border-radius: 0 3px 3px 0;
-  background: #9e2c56;
+  background: rgb(var(--ks-event, 225 29 72));
 }
 
 /* ---------- шапка: что обнаружено → когда ---------- */
@@ -45,15 +46,11 @@
   align-items: center;
   justify-content: center;
   border-radius: 9999px;
-  background: #121a2e;
-  color: #fff;
+  background: rgb(var(--ks-event, 225 29 72));
+  color: rgb(var(--ks-event-contrast, 255 255 255));
   font-size: 13px;
   font-weight: 700;
   margin-top: 1px;
-}
-:global(.dark) .number {
-  background: #fff;
-  color: #121a2e;
 }
 .kicker {
   display: flex;
@@ -226,19 +223,20 @@
   color: #475569;
   transition: background-color 0.15s, color 0.15s, border-color 0.15s;
 }
+/* «Подсветка: вкл» — состояние переключателя, а не событие: акцент рабочей области, не бренд. */
 .toggle[aria-pressed="true"] {
-  border-color: #eec8d6;
-  background: #fbf3f6;
-  color: #842147;
+  border-color: var(--ks-border-strong, #cbd5e1);
+  background: rgb(var(--ks-accent-soft, 63 79 116) / 0.1);
+  color: rgb(var(--ks-text, 15 23 42));
 }
 :global(.dark) .toggle {
   border-color: rgb(255 255 255 / 0.12);
   color: #cbd5e1;
 }
 :global(.dark) .toggle[aria-pressed="true"] {
-  border-color: rgb(224 157 182 / 0.35);
-  background: rgb(205 106 142 / 0.12);
-  color: #f6e3ea;
+  border-color: var(--ks-border-strong, rgb(255 255 255 / 0.14));
+  background: rgb(var(--ks-accent-soft, 255 255 255) / 0.1);
+  color: rgb(var(--ks-text, 241 245 249));
 }
 
 /* ---------- доказательства ---------- */
