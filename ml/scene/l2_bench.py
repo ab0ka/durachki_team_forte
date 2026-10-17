@@ -5,7 +5,9 @@
 
 1. Апстрим (ml.ingest → ml.detect → ml.track → ml.pose) считается ОДИН раз на ролик и кэшируется в
    <out>/_upstream/<id>.json; варианты A08 переигрываются на тех же детекциях (честное сравнение).
-2. Каждый вариант пишет <out>/<variant>/<id>/scene_states.json (смотреть: python -m ml.scene.report).
+2. Каждый вариант пишет <out>/<variant>/<id>/scene_states.json (смотреть: python -m ml.scene.report) и
+   <out>/<variant>/a09/<id>.states.json — раскладку кэша A09, чтобы прогнать правила на тех же состояниях:
+   python -X utf8 -m ml.rules.replay --cache <out>/<variant>/a09 --labels data/labels.csv
 3. Метрики (на видео; РАЗВЕДОЧНЫЕ — все 42 ролика уже смотрели, это не независимый тест):
    FP/FN по «кандидат = есть true-интервал нарушающего предиката»; попадание таймкода (|onset − GT| ≤ 2/5 с,
    дубли с конфликтом таймкодов исключены); распределение типов (подсказка, разметки типов нет);
@@ -14,7 +16,8 @@
 
 Варианты (все — флаги config.yaml, по умолчанию выкл):
   baseline — текущие умолчания;  H1 — safe/door.cluster_mode=kmeans2;  H2 — safe.namer=siglip2 (GPU);
-  H3 — lights.freeze;  H4 — predicates.phone_det_only;  H5 — predicates.leave_onset=left_desk.
+  H3 — lights.freeze;  H4 — predicates.phone_det_only;  H5 — predicates.leave_onset=left_desk;
+  H6 — presence.outsider_anchor_only (legacy outsider: клиент напротив не повышает).
 Политики t_peak (onset/mid/max) считаются для каждого варианта без перезапуска.
 """
 from __future__ import annotations
@@ -39,6 +42,7 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "H3": {"lights": {"freeze": True}},
     "H4": {"predicates": {"phone_det_only": True}},
     "H5": {"predicates": {"leave_onset": "left_desk"}},
+    "H6": {"presence": {"outsider_anchor_only": True}},
 }
 
 
@@ -90,6 +94,16 @@ def _upstream(path: Path, cache: Path, log: list[str]) -> tuple[Any, list[Any], 
            "pose": [{"t": float(s.t), "signals": {k: float(v) for k, v in s.signals.items()}} for s in pose], "used": used}
     cache.write_text(json.dumps(doc), encoding="utf-8")
     return clip, dets, tracks, zones, pose, used
+
+
+def _dump_for_a09(path: Path, states: list[Any], tracks: list[Any], zones: list[Any]) -> None:
+    """Раскладка кэша A09 (ml/rules/cache_io.py): <cache>/<video_id>.states.json со states/tracks/zones.
+    Поля SceneStateEx (known/conf/observed/status) сохраняются — A09 build_series их понимает."""
+    from .types import state_to_dict
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = {"states": [state_to_dict(s) for s in states], "tracks": [asdict(t) for t in tracks], "zones": [asdict(z) for z in zones]}
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
 
 
 # ------------------------------------------------------------------------------------------ метрики
@@ -147,7 +161,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--videos", required=True)
     ap.add_argument("--labels", required=True, help="data/labels.csv (eval.labels)")
     ap.add_argument("--out", default="outputs/scene_bench")
-    ap.add_argument("--variants", default="baseline,H1,H3,H4,H5", help="через запятую; H2 требует GPU/весов SigLIP2")
+    ap.add_argument("--variants", default="baseline,H1,H3,H4,H5,H6", help="через запятую; H2 требует GPU/весов SigLIP2")
     ap.add_argument("--limit", type=int, default=0, help="только первые N роликов (smoke)")
     ap.add_argument("--dedup", action="store_true", help="по одному ролику на md5-группу")
     args = ap.parse_args(argv)
@@ -189,6 +203,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             states, trace = scene_states_with_trace(clip, dets, tracks, zones, pose, config=VARIANTS.get(v, {}))
             lat = time.perf_counter() - t0
             dump_states(states, out / v / key / "scene_states.json", trace=trace, meta={"video_id": lab["id"], "variant": v, "gt_sec": lab["t"]})
+            _dump_for_a09(out / v / "a09" / f"{lab['id']}.states.json", states, tracks, zones)
             row = {"id": lab["id"], "label": lab["label"], "conflict": lab["conflict"], "duration_s": round(dur, 2), "latency_s": round(lat, 3),
                    "vram_mb": vram_peak_mb() if v == "H2" else None, "tc_err": {}}
             for pol in ("onset", "mid", "max"):

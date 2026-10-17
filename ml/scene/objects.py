@@ -11,7 +11,7 @@ from typing import Any, Optional
 import numpy as np
 
 from . import roi as R
-from .geometry import BBox, bbox_center, bbox_intersection, bbox_area, expand_bbox, median_bbox, polygon_bbox
+from .geometry import BBox, bbox_area, bbox_center, bbox_intersection, expand_bbox, median_bbox, point_in_polygon, polygon_bbox
 from .presence import member
 from .smoothing import logit
 from .timeline import Timeline
@@ -103,28 +103,37 @@ def door_traffic(tl: Timeline, zones: dict[str, Polys], cfg_door: dict[str, Any]
     return p, c, crossings
 
 
-def cash_det_cue(tl: Timeline, zones: dict[str, Polys], cfg: dict[str, Any], cfg_presence: dict[str, Any]) -> tuple[np.ndarray, list[Optional[BBox]]]:
+def cash_det_cue(tl: Timeline, zones: dict[str, Polys], cfg: dict[str, Any], cfg_presence: dict[str, Any]) -> tuple[np.ndarray, list[Optional[BBox]], bool]:
+    """Сила детекций наличных по зонам (контракт: cash_visible — наличные на столе).
+
+    Приоритет: стол/лоток (1.0) → клиентская зона (0: купюры в руках клиента — не «на столе») →
+    зона кассира (0.8) → прочее (0). Без зон стола/лотка/кассира место не проверить — localized=False,
+    и вызывающий код не даёт такому «да» стать известным."""
     n = len(tl)
-    ay, of = float(cfg_presence["anchor_y"]), float(cfg_presence["overlap_full"])
     zw = cfg["zone_weights"]
     s = np.zeros(n)
     best: list[Optional[BBox]] = [None] * n
-    any_zone = any(zones.get(z) for z in ("desk", "cash_tray", "cashier_area"))
+    localized = any(zones.get(z) for z in ("desk", "cash_tray", "cashier_area"))
+    client = zones.get("client_area")
     for i in range(n):
         for d in tl.dets_of(i, ("cash",), float(cfg["min_det_score"])):
             b = tuple(d.bbox)
-            if any_zone:
-                w = float(zw["other"])
-                for z in ("desk", "cash_tray", "cashier_area"):
-                    if zones.get(z) and member(b, zones[z], 0.5, 0.5) >= 0.5:
-                        w = max(w, float(zw[z]))
+            if localized:
+                cx, cy = bbox_center(b)
+                if any(zones.get(z) and member(b, zones[z], 0.5, 0.5) >= 0.5 for z in ("desk", "cash_tray")):
+                    w = max(float(zw[z]) for z in ("desk", "cash_tray") if zones.get(z) and member(b, zones[z], 0.5, 0.5) >= 0.5)
+                elif client and any(point_in_polygon(cx, cy, p) for p in client):
+                    w = float(zw.get("client_area", 0.0))
+                elif zones.get("cashier_area") and member(b, zones["cashier_area"], 0.5, 0.5) >= 0.5:
+                    w = float(zw["cashier_area"])
+                else:
+                    w = float(zw.get("other", 0.0))
             else:
                 w = 1.0
             if float(d.score) * w > s[i]:
                 s[i] = float(d.score) * w
                 best[i] = b
-    _ = ay, of
-    return s, best
+    return s, best, bool(localized)
 
 
 MASK_LABELS = ("person", "laptop", "cell_phone", "money_counter", "cup", "bottle", "keys", "document", "cash_bag", "bag", "food")

@@ -30,3 +30,5 @@ def test_l2_bench_smoke(tmp_path):
     assert (out / "baseline" / "x-1" / "scene_states.json").is_file()
     assert (out / "_upstream" / "x-1.json").is_file()
     assert "baseline" in (out / "bench.md").read_text(encoding="utf-8")
+    a09 = json.loads((out / "baseline" / "a09" / "X-1.states.json").read_text(encoding="utf-8"))
+    assert set(a09) == {"states", "tracks", "zones"} and "known" in a09["states"][0] and "signals" in a09["states"][0]

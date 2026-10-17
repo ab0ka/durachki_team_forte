@@ -303,10 +303,13 @@ def scene_states_with_trace(
         weighted.add(name)
 
     # --- наличные: детекции в зоне стола + запасной цвет/форма-классификатор ---
-    s_det, _ = cash_det_cue(tl, zb, cc, cfg["presence"])
+    s_det, _, cash_localized = cash_det_cue(tl, zb, cc, cfg["presence"])
     desk_vis = np.ones(n) if desk_box is None else np.array([1.0 - R.occlusion_fraction(desk_box, person_boxes[i]) for i in range(n)])
     z = np.where(s_det > 0, float(cc["w_det"]) * logit(np.clip(0.5 + 0.5 * s_det, 0.05, 0.97)), 0.0)
     c_cash = np.where(s_det > 0, np.minimum(1.0, s_det * 1.25), 0.0)
+    if not cash_localized:  # нет зон — «на столе» не проверить: детекция не делает значение известным
+        c_cash = np.minimum(c_cash, float(cc.get("unlocalized_c_max", 0.45)))
+        trace["warnings"].append("no desk/cash_tray/cashier_area zones: cash location unverifiable → cash_visible unknown")
     # нет детекции: слабое «нет» только если стол виден, детектор работал и кадр годный
     c_absent = np.where(s_det > 0, 0.0, float(cc["det_absent_c"]) * desk_vis * quality * det_ran)
     z = z + c_absent * logit(float(cc["det_absent_p"]))
@@ -386,7 +389,8 @@ def scene_states_with_trace(
     pctx_lights = _lights(times, bright_f, cfg)
     if cfg["lights"].get("freeze", False):
         _freeze_dark(out_p, pctx_lights, trace)
-    sig_tri, why_sig = _statuses(out_p, out_c, vis, quality, pctx_lights, pres_extra, raw, cfg, workplace, bool(dets), have, trace)
+    sig_tri, why_sig = _statuses(out_p, out_c, vis, quality, pctx_lights, pres_extra, raw, cfg, workplace, bool(dets), have, trace,
+                                 cash_localized=cash_localized)
     pred_res = None
     if cfg["predicates"].get("enabled", True):
         from .predicates import PredContext, compute as compute_predicates
@@ -422,8 +426,10 @@ def scene_states_with_trace(
                 provenance=prov,
                 observed={
                     "unknown_person_in_cashier_area": float(obs_unknown[i]),
-                    "workplace_empty": float(pres_extra["workplace_empty_p"][i]),
+                    # A09 читает observed односторонне (≥ 0.5 = наблюдалось): «пусто» отдаём только подтверждённое
+                    "workplace_empty": float(pres_extra["workplace_empty_p"][i]) if pres_extra["workplace_empty_c"][i] >= KNOWN_CONF else 0.0,
                     "workplace_empty_conf": float(pres_extra["workplace_empty_c"][i]),
+                    "personal_items_on_desk": float(pred_res is not None and pred_res.tri["personal_item_on_desk"][i] == tri.T),
                     "workplace_track_lost": float(pres_extra["workplace_lost"][i]),
                     "safe_unattended": float(trace["raw"].get("safe_unattended", np.zeros(n))[i]),
                 },
@@ -478,13 +484,14 @@ _ROI_SIG = ("safe_open", "door_open", "cash_visible")
 
 def _statuses(out_p: dict[str, np.ndarray], out_c: dict[str, np.ndarray], vis: dict[str, np.ndarray], quality: np.ndarray, lights: np.ndarray,
               pres_extra: dict[str, np.ndarray], raw: dict[str, Any], cfg: dict[str, Any], workplace: Any, has_dets: bool, have: np.ndarray,
-              trace: dict[str, Any]) -> tuple[dict[str, np.ndarray], dict[str, list[str]]]:
+              trace: dict[str, Any], cash_localized: bool = True) -> tuple[dict[str, np.ndarray], dict[str, list[str]]]:
     """true / false / unknown / occluded + причина для каждого сигнала (не увидели ≠ нет)."""
     sc = cfg["status"]
     n = len(quality)
     sig_tri: dict[str, np.ndarray] = {}
     whys: dict[str, list[str]] = {}
     lost = pres_extra.get("workplace_lost", np.zeros(n))
+    person_lost = pres_extra.get("person_lost", np.zeros(n))
     unk_person = pres_extra.get("unknown_person_in_cashier_area", np.zeros(n))
     for name in SIGNALS:
         p = out_p.get(name, np.zeros(n))
@@ -508,6 +515,10 @@ def _statuses(out_p: dict[str, np.ndarray], out_c: dict[str, np.ndarray], vis: d
                 w.append("no_zone")
             elif name in _PRESENCE and lost[i] > 0:
                 w.append("track_lost")
+            elif name in ("n_persons", "collector_present") and person_lost[i] > 0:
+                w.append("track_lost")
+            elif name == "cash_visible" and not cash_localized:
+                w.append("no_zone")
             elif name == "outsider_in_cashier_area" and unk_person[i] > 0:
                 w.append("role_unknown")
             elif name in POSE_KEYS_DEFAULT and "pose" not in prov:

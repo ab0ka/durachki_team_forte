@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from .geometry import BBox, zone_membership
+from .geometry import BBox, anchor_point, point_in_polygon, zone_membership
 from .timeline import Timeline, sample_dt
 
 Polys = list[list[tuple[float, float]]]
@@ -83,6 +83,23 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
             "enter_start": workplace is not None and (m[first] < 0.3 or _near_exit(obs[first].bbox, door, border, ay, of)),
         }
     exit_times = sorted(float(tl.times[g["last"]]) for g in geo.values() if g["exit_end"])
+    # человек «потерян» в кадре: трек оборвался не у края кадра/двери или в разрыве внутри трека.
+    # Тогда счёт людей — лишь нижняя граница, а «инкассатора нет» — не факт (пропала детекция ≠ ушёл).
+    any_lost = np.zeros(n, dtype=bool)
+    for tid, g in geo.items():
+        obs_t = tracks[tid]
+        out_end = naive or _near_exit(obs_t[g["last"]].bbox, door, border, ay, of)
+        in_start = naive or _near_exit(obs_t[g["first"]].bbox, door, border, ay, of)
+        t_first = float(tl.times[g["first"]])
+        for i in range(n):
+            if i in obs_t:
+                continue
+            if g["first"] < i < g["last"]:
+                any_lost[i] = not naive
+            elif i > g["last"]:
+                any_lost[i] |= not out_end
+            elif not in_start and t_first - float(tl.times[i]) <= backfill_s:
+                any_lost[i] = True
     # проход 2: статус трека на каждом сэмпле
     for tid, obs in tracks.items():
         g = geo[tid]
@@ -131,6 +148,18 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
                     cashier_absent_known[i] = 0.0
 
     obs_unknown = np.zeros(n)
+    anchor_only = bool(pc.get("outsider_anchor_only", False))
+    # Сотрудник без явной роли — только ОДИН доминирующий «работник со стороны кассы» (больше всех времени
+    # в зоне, ≥ dominant_min_s), и только если A06 не дал явного кассира. Второй человек без явной роли —
+    # неизвестная роль: не «посторонний» и не «сотрудник» (outsider = unknown, observed.unknown_person = факт).
+    explicit_cashier = any(o.explicit_role and o.p_cashier >= 0.5 for ps_ in tl.persons for o in ps_)
+    ws_time: dict[int, float] = {}
+    if workplace and not explicit_cashier:
+        for tid, g in geo.items():
+            ws_time[tid] = sum(1 for i in g["idx"] if g["m"][i] >= 0.5) * dt
+    dominant = max(ws_time, key=lambda k: ws_time[k]) if ws_time else None
+    if dominant is not None and ws_time[dominant] < float(cfg.get("predicates", {}).get("dominant_min_s", 5.0)):
+        dominant = None
     out: dict[str, Sig] = {}
     npers = np.zeros(n)
     outsider_p = np.zeros(n)
@@ -144,6 +173,15 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
         staff_only = True
         for o in ps:
             mi = member(o.bbox, workplace, ay, of) if workplace else 0.0
+            if client and mi > 0 and member(o.bbox, client, ay, of) >= mi:
+                # клиент у стойки (в т.ч. наклонился над столом): одновременно «клиент» и «в зоне кассира» быть
+                # не может — при равенстве или перевесе клиентской стороны он на своей стороне (спецификация: норма)
+                mi = 0.0
+            if anchor_only and workplace:
+                # [H6] опорная точка, а не перекрытие бокса; клиент со своей стороны — никогда не «в зоне кассира»
+                ax_, ay_ = anchor_point(o.bbox, ay)
+                in_client = bool(client) and any(point_in_polygon(ax_, ay_, pp) for pp in client)
+                mi = 0.0 if in_client else float(any(point_in_polygon(ax_, ay_, pp) for pp in workplace))
             info = track_info.get(int(o.track_id)) if o.track_id is not None else None
             # доказательства «не сотрудник»: явная роль visitor или история в зоне клиентов
             if o.explicit_role:
@@ -153,10 +191,11 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
                 p_vis, c_vis = 0.75 * (1.0 - o.p_collector), 0.8
             else:
                 p_vis, c_vis = 0.15, 0.3
+            staff = (o.explicit_role and p_vis < 0.3) or (o.track_id is not None and int(o.track_id) == dominant)
             if mi >= 0.5:
-                if not (o.explicit_role and p_vis < 0.3) and o.p_cashier < 0.7:
+                if not staff:
                     staff_only = False
-                if c_vis < 0.5:
+                if c_vis < 0.5 and not staff:
                     unk = max(unk, mi)
                 if pc.get("outsider_excludes_collectors", True):
                     p_vis *= 1.0 - o.p_collector
@@ -175,7 +214,8 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
             outsider_c[i] = 0.3 * q[i]                            # есть человек неизвестной роли — неизвестно
         if coll_p[i] < 0.5:
             all_known = all(o.explicit_role or o.p_cashier >= 0.7 for o in ps)
-            coll_c[i] = q[i] * (0.8 if all_known else 0.3)
+            # «инкассатора нет» известно, только если никто не потерян (иначе он мог пропасть из детекций)
+            coll_c[i] = 0.0 if any_lost[i] else q[i] * (0.8 if all_known else 0.3)
         else:
             coll_c[i] *= q[i]
 
@@ -209,12 +249,14 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
     out["cashier_in_workplace"] = Sig(ciw_p, ciw_c, ["track" if has_tracks else "det"])
     out["outsider_in_cashier_area"] = Sig(outsider_p, outsider_c, ["track"])
     out["collector_present"] = Sig(coll_p, coll_c, ["track"])
-    out["n_persons"] = Sig(npers, q.copy(), ["track" if has_tracks else "det"])
+    # число людей при потерянном треке — нижняя граница, а не факт → неизвестно
+    out["n_persons"] = Sig(npers, np.where(any_lost, 0.3 * q, q), ["track" if has_tracks else "det"])
     extra = {
         "workplace_empty_p": empty_p,
         "workplace_empty_c": empty_c,
         "unknown_person_in_cashier_area": obs_unknown,
         "workplace_lost": ws_unknown,
+        "person_lost": any_lost.astype(float),
         # для предикатов: кассир наблюдается на рабочем месте / подтверждённо отсутствует (уход виден)
         "cashier_in_obs": (cash_in >= 0.5).astype(float),
         "cashier_gone_known": ((cashier_gone > 0) & (ws_unknown == 0) & (cash_in < 0.5)).astype(float) if has_tracks and workplace else np.zeros(n),
