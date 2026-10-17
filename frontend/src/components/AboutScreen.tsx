@@ -1,4 +1,4 @@
-import { ArrowRight, Cpu, EyeOff, FileSearch, Lock, Scale } from "lucide-react";
+import { ArrowRight, Cpu, EyeOff, FileSearch, Lock, Scale, Terminal } from "lucide-react";
 import { useApp } from "../context";
 import { DEFAULT_MODELS, TYPE_CATALOG } from "../lib/catalog";
 import { LocalBadge } from "./ui";
@@ -14,6 +14,7 @@ const PIPELINE = [
 
 export default function AboutScreen() {
   const { lastResult } = useApp();
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://<host>";
   const serverModels = Array.isArray(lastResult?.meta.models) ? (lastResult!.meta.models as unknown[]) : [];
   return (
     <div className="animate-fade-in space-y-6">
@@ -58,6 +59,28 @@ export default function AboutScreen() {
             </li>
           ))}
         </ol>
+      </section>
+
+      <section className="card p-6">
+        <h2 className="mb-1 flex items-center gap-2 text-lg font-bold">
+          <Terminal className="h-5 w-5 text-slate-400" /> API для автоматической проверки
+        </h2>
+        <p className="mb-4 text-sm text-slate-500">Тот же анализ доступен программно — заголовок <code className="font-mono">X-API-Key</code>, без ключа — 401.</p>
+        <div className="grid gap-3 lg:grid-cols-2">
+          {[
+            ["Загрузить видео → job_id", `curl -H "X-API-Key: <API_KEY>" -F "file=@video.mov" ${origin}/api/v1/analyze`],
+            ["Статус и результат", `curl -H "X-API-Key: <API_KEY>" ${origin}/api/v1/jobs/<job_id>`],
+          ].map(([t, cmd]) => (
+            <div key={t} className="min-w-0 rounded-xl bg-ink-950 p-4 text-slate-100">
+              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400">{t}</div>
+              <pre className="scrollbar-thin overflow-x-auto whitespace-pre-wrap break-all font-mono text-xs leading-relaxed">{cmd}</pre>
+            </div>
+          ))}
+        </div>
+        <p className="mt-3 text-xs text-slate-500">
+          Ответ: <code className="font-mono">{"{job_id, status, verdict, violations:[{type, timecode_sec, description, evidence_frames:[{timestamp_sec, image_base64}]}]}"}</code>{" "}
+          + доп. поля (type_id, confidence, t_start, t_end, rules, timeline, meta).
+        </p>
       </section>
 
       <div className="grid gap-6 lg:grid-cols-2">

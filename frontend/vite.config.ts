@@ -6,9 +6,10 @@ import react from "@vitejs/plugin-react";
 const target = process.env.VITE_PROXY_TARGET ?? "http://127.0.0.1:8000";
 
 export default defineConfig({
-  // Относительный base: dist можно раздавать с "/" или из подкаталога.
+  // A02 раздаёт dist с корня и отдаёт index.html на любой путь (SPA-fallback): абсолютный base
+  // не ломает ассеты при заходе на /что-угодно. Для подкаталога: VITE_BASE=/kassa/ npm run build.
   // Роутинг — через hash (#/job/<id>), поэтому HTML всегда один.
-  base: "./",
+  base: process.env.VITE_BASE ?? "/",
   plugins: [react()],
   build: {
     outDir: "dist",
