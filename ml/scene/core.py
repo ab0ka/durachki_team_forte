@@ -71,7 +71,7 @@ def _frame_reader(clip: Any) -> Callable[[int], Optional[np.ndarray]]:
             except Exception as e:  # noqa: BLE001 — кадр недоступен → признаки кадра пропускаются
                 failed["n"] += 1
                 log.debug("frame %d unavailable: %s", i, e)
-        if len(cache) > 64:
+        if len(cache) > 8:  # кадры читаются одним проходом; кэш нужен только для первых (эталон сдвига)
             cache.clear()
         cache[i] = fr
         return fr
