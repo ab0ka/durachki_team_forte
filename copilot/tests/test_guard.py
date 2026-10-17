@@ -19,10 +19,22 @@ def test_valid_markers_become_footnotes(corpus, job_violation) -> None:
 
 def test_invented_marker_removed(corpus, job_violation) -> None:
     res = normalize_result(job_violation)
-    g = check_answer("Это запрещено [N1] и ещё [N7].", _refs(corpus), corpus, res)
-    assert "[N7]" in g.removed
+    g = check_answer("Телефон запрещён [N1]. А ещё запрещено вот это [N7].", _refs(corpus), corpus, res)
+    assert "[N7]" in g.removed and "вот это" not in g.answer   # утверждение с фальшивой ссылкой ушло целиком
     assert len(g.citations) == 1
     assert not g.grounded  # в сыром ответе была выдуманная ссылка
+
+
+def test_claim_about_nonexistent_event_dropped(corpus, job_clean) -> None:
+    res = normalize_result(job_clean)
+    g = check_answer("Кассир держит телефон у уха [V1].", [], corpus, res)
+    assert "телефон" not in g.answer and "[V1]" in g.removed
+
+
+def test_dangling_text_after_url_removal_dropped(corpus, job_violation) -> None:
+    res = normalize_result(job_violation)
+    g = check_answer("Телефон запрещён [N1]. Подробнее: https://evil.example/x", _refs(corpus), corpus, res)
+    assert g.answer == "Телефон запрещён [1]."
 
 
 def test_invented_clause_sentence_dropped(corpus, job_violation) -> None:

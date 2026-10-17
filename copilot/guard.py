@@ -67,12 +67,16 @@ _CLAIM_NONE_RE = re.compile(
     re.I,
 )
 _CLAIM_SOME_RE = re.compile(r"(?:обнаружен\w*|выявлен\w*|зафиксирован\w*|есть)\s+(?:признак\w*\s+)?(?:возможного\s+)?нарушени", re.I)
+_CLAIM_STRONG_RE = re.compile(
+    r"вс[её]\s+в\s+порядке|касса\s+чист\w*|без\s+нарушений|нарушени\w*\s+нет\b|нет\s+(?:никаких\s+)?нарушени", re.I)
+_BAD = "\u2063BAD\u2063"  # внутренняя метка «предложение ссылается на несуществующее»
 _CAVEAT_RE = re.compile(r"не\s+означает|неполн|не\s+подтвержд|полнота|в\s+проанализированной\s+части", re.I)
 
 
 REFUSAL_PATTERNS = [
     r"установить нельзя", r"нельзя установить", r"не\s+устанавлива", r"в источниках нет", r"нет информации",
     r"нет данных", r"не могу ответить", r"не выполняется", r"не определяется", r"невозможно определить",
+    r"не\s+распозна", r"не\s+идентифицир",
     re.escape(REFUSAL_SCOPE.lower()),
 ]
 UNVERIFIED_ANSWER = f"{REFUSAL_NO_DATA}: ответ модели не подтверждён результатом анализа и источниками."
@@ -197,7 +201,7 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
         n = int(m.group(2))
         if n not in by_n:
             removed.append(m.group(0))
-            return ""
+            return _BAD  # утверждение со ссылкой на несуществующую норму уходит вместе с предложением
         if n not in order:
             order.append(n)
         return f"[{order.index(n) + 1}]"
@@ -210,7 +214,7 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
         v = viols.get(n)
         if v is None:
             removed.append(m.group(0))
-            return ""
+            return _BAD  # утверждение о несуществующем событии уходит вместе с предложением
         return f"(№{n}, {fmt_tc(v.get('timecode_sec'))})"
 
     text = _VMARK_RE.sub(_vmark, text)
@@ -234,11 +238,15 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
 
     kept: list[str] = []
     for sent in _split_sentences(text):
-        bad = False
+        bad = _BAD in sent
+        url_cut = False
         for um in _URL_RE.finditer(sent):
             if norm_url(um.group(0)) not in known_urls:
                 removed.append(um.group(0))
                 sent = sent.replace(um.group(0), "").strip()
+                url_cut = True
+        if url_cut and len(re.findall(r"[а-яёa-z]{2,}", sent, re.I)) < 3:
+            bad = True  # после удаления ссылки осталась «Подробнее:» и т.п.
         for am in _ACT_RE.finditer(sent):
             if not _doc_known(am.group("title"), corpus, refs):
                 removed.append(am.group(0))
@@ -325,6 +333,8 @@ def _contradicts(sent: str, result: dict[str, Any]) -> bool:
             return True
         if has_viols and not scoped:
             return True
+        if state == "unknown" and _CLAIM_STRONG_RE.search(sent):
+            return True  # полнота не подтверждена — «всё в порядке» без оговорки не говорим
     elif _CLAIM_SOME_RE.search(sent) and not has_viols and result.get("status") == "done":
         return not re.search(r"\bне\s+(?:обнаружен|выявлен|зафиксирован)", sent, re.I)
     return False

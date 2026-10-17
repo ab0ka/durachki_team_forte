@@ -17,7 +17,7 @@ from .prompts import (NormRef, REFUSAL_NO_DATA, REFUSAL_SCOPE, REFUSAL_SOURCES, 
 
 # порядок важен: первое совпадение побеждает
 _INTENT_PATTERNS: list[tuple[str, str]] = [
-    ("identity", r"кто\s+(это|он|она|они|такой|такая|эти)\b|как\s+(его|её|ее|их)?\s*зовут|фамили|\bфио\b|личност|"
+    ("identity", r"кто\s+(это|этот|эта|эти|он|она|они|такой|такая|таков\w*)\b|кем\s+явля|как\s+(его|её|ее|их)?\s*зовут|фамили|\bфио\b|личност|"
                  r"опозна|распозна\w*\s+лиц|идентифиц|по\s+лицу|узна(ть|й)\s+(человека|лицо)"),
     ("unobservable", r"сколько\s+(денег|наличн|купюр|тенге|средств)|как(ую|ая)\s+сумм|сумм[ауы]\s+(денег|наличн|в\s+сумке)|"
                      r"подлинн|фальшив|поддел|умыс|умышлен|намеренн|нарочно|специально|хотел[аи]?\s+(ли\s+)?(укра|похит|скрыть)|"
@@ -243,10 +243,19 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
         return "Таймкоды возможных нарушений:\n" + "\n".join(parts)
 
     if intent == "evidence":
+        what = bool(re.search(r"что\s+(там\s+)?видн|что\s+на\s+кадре|что\s+происходит|что\s+изображ", question.lower()))
         parts = []
         for v in targets:
             frames = [fmt_tc(f.get("timestamp_sec")) for f in v.get("evidence_frames") or []]
-            parts.append(f"- [V{v.get('_n')}]: " + (f"кадры {', '.join(frames)}." if frames else "кадров-доказательств нет."))
+            line = f"- [V{v.get('_n')}]: " + (f"кадры {', '.join(frames)}." if frames else "кадров-доказательств нет.")
+            if what:  # «что видно на кадре» — описание и факты из результата, без домысливания картинки
+                desc = str(v.get("description") or "").strip().rstrip(".")
+                if desc:
+                    line += f" Что видно (по описанию системы): {desc}."
+                for ex in explain_lines(explain_for(result, v)):
+                    if ex.startswith("Наблюдаемые факты"):
+                        line += f" {ex}."
+            parts.append(line)
         return "Кадры-доказательства:\n" + "\n".join(parts)
 
     if intent == "confidence":

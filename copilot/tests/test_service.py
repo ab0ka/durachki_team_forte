@@ -195,3 +195,9 @@ def test_python_api_accepts_history_with_text(cfg, corpus, job_violation) -> Non
     llm = ScriptedLLM(["Пользоваться телефоном запрещено [N1]."])
     _svc(cfg, corpus, llm).answer(job_violation, "А норма?", [{"role": "user", "text": "Что с телефоном?"}])
     assert llm.calls[0][1] == {"role": "user", "content": "Что с телефоном?"}
+
+
+def test_identity_refusal_keeps_full_explanation(cfg, corpus, job_violation) -> None:
+    r = _svc(cfg, corpus).answer(job_violation, "Кто этот человек?", [])
+    assert "не распознаёт и не идентифицирует людей по лицу" in r["answer"]
+    assert r["removed_citations"] == []
