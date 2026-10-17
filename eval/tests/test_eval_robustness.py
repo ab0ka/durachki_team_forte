@@ -60,6 +60,6 @@ def test_environment_variants(tmp_path: Path):
 
     pts = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "frame=pts_time",
                           "-of", "csv=p=0", str(vfr_path)], capture_output=True, text=True).stdout.split()
-    t = sorted(float(x) for x in pts if x.strip())
+    t = sorted(float(x.split(",")[0]) for x in pts if x.split(",")[0].strip())   # csv может дать «0.000,»
     gaps = {round(b - a, 2) for a, b in zip(t, t[1:])}
     assert len(t) < 30 and len(gaps) > 1                                  # кадры выброшены неравномерно = VFR
