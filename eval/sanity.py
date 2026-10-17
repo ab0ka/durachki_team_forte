@@ -207,7 +207,8 @@ def sanity(gt: dict, durations: dict[str, float], scores: dict[str, dict[str, fl
     with_dur = [(k, g) for k, g in items if dur_of[k]]
     labels = [g.label == LABEL_VIOLATION for _, g in with_dur]
     groups = [g.group or k for k, g in with_dur]
-    P, N = sum(labels), len(labels) - sum(labels)
+    P = sum(g.label == LABEL_VIOLATION for _, g in items)       # полы вердикта — по ВСЕМ размеченным видео
+    N = len(items) - P
     out: dict[str, Any] = {"n": len(items), "n_with_duration": len(with_dur), "evaluation_kind": "exploratory",
                            "note": "Полы и проверки утечек — разведочные (все видео уже использованы в разработке)."}
     out["floors"] = {

@@ -38,3 +38,28 @@ def test_make_variant_ffmpeg(tmp_path: Path, name: str):
     assert (info["width"], info["height"]) == (64, 96)
     if name == "fps25":
         assert abs(info["fps"] - 25) < 0.5
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нет ffmpeg")
+def test_environment_variants(tmp_path: Path):
+    """Горизонтальное видео, поворот в метаданных, переменный fps (время по PTS должно сохраниться)."""
+    pytest.importorskip("cv2")
+    from eval.common import ffprobe_info
+
+    src = write_synthetic_video(tmp_path / "X-1.mp4", seconds=3.0, fps=10, size=(64, 96))
+    land = ffprobe_info(make_variant(src, tmp_path / "a" / "X-1.mov", "landscape_rot90"))
+    assert land["width"] > land["height"]
+    pad = ffprobe_info(make_variant(src, tmp_path / "b" / "X-1.mov", "landscape_pad"))
+    assert pad["width"] > pad["height"]
+    meta = ffprobe_info(make_variant(src, tmp_path / "c" / "X-1.mov", "rotmeta90"))
+    assert abs(meta["rotation"]) == 90 and (meta["width"], meta["height"]) == (96, 64)   # с учётом rotation
+    vfr_path = make_variant(src, tmp_path / "d" / "X-1.mov", "vfr_drop")
+    assert abs(ffprobe_info(vfr_path)["duration"] - 3.0) < 0.4                            # PTS сохранены
+    import subprocess
+
+    pts = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "frame=pts_time",
+                          "-of", "csv=p=0", str(vfr_path)], capture_output=True, text=True).stdout.split()
+    t = sorted(float(x.split(",")[0]) for x in pts if x.split(",")[0].strip())   # csv может дать «0.000,»
+    gaps = {round(b - a, 2) for a, b in zip(t, t[1:])}
+    assert len(t) < 30 and len(gaps) > 1                                  # кадры выброшены неравномерно = VFR

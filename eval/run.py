@@ -288,7 +288,7 @@ def write_scores_raw(out_dir: Path, labels_csv: Optional[str | Path]) -> Optiona
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Прогон папки через пайплайн + метрики")
-    ap.add_argument("--videos", default="data/videos")
+    ap.add_argument("--videos", default="data/raw", help="папка видео (L1: data/raw)")
     ap.add_argument("--labels", default="data/labels.csv")
     ap.add_argument("--types", default="data/labels_types.csv")
     ap.add_argument("--out", default=None, help="по умолчанию runs/eval/<дата-время>")
@@ -314,9 +314,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--log", default="reports/runs.jsonl", help="журнал итераций (агрегаты)")
     ap.add_argument("--no-log", action="store_true")
     ap.add_argument("--kind", default=None, help="exploratory | holdout_frozen (по умолчанию из config)")
+    ap.add_argument("--ablation-id", default=None)
     args = ap.parse_args(argv)
+    if args.kind == "holdout_frozen":  # только замороженный hold-out (eval.extra freeze), открытый с --final
+        man_p = Path(args.splits).with_name(Path(args.splits).stem + "_manifest.json")
+        frozen = man_p.exists() and bool(read_json(man_p).get("frozen"))
+        if not (frozen and args.subset == "holdout" and args.final):
+            print("ВНИМАНИЕ: --kind holdout_frozen допустим только для --subset holdout --final по split'у из "
+                  "eval.extra freeze; помечаю как exploratory.")
+            args.kind = "exploratory"
     cfg = load_config(args.config, {"dataset": {"evaluation_kind": args.kind}} if args.kind else None)
     env_applied = apply_env(cfg, args.pipeline_config, args.env)
+    if args.raw:  # до протокола: обе руки абляции фиксируют одинаковое окружение
+        raw_env = {k: str(v) for k, v in ((cfg.get("runner") or {}).get("raw_env") or {}).items()}
+        os.environ.update(raw_env)
+        env_applied.update(raw_env)
     mode = "api" if args.api else args.mode
     out_dir = Path(args.out or f"runs/eval/{_dt.datetime.now():%Y%m%d-%H%M%S}")
     subset_ids = None
@@ -379,7 +391,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.no_log:
         from .runs import append, record_from_run
 
-        append(args.log, record_from_run(mdir, args.label, args.role))
+        append(args.log, record_from_run(mdir, args.label, args.role, args.ablation_id))
     print(f"→ {mdir}/metrics.json, proxy_score.json, summary_public.json (наружу — только summary_public.json)")
     return 0
 
