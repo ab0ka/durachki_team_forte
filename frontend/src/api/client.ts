@@ -222,7 +222,17 @@ export class HttpBackend implements Backend {
       throw new ApiError(0, messageForStatus(0));
     }
     if (res.status === 404 || res.status === 405) {
-      // UI-сессий нет — запасной путь: ключ в памяти вкладки для /api/v1/*.
+      // UI-сессий нет — запасной путь: ключ в памяти вкладки для /api/v1/*. Сначала проверяем ключ.
+      let check: Response;
+      try {
+        check = await fetch(this.url(`${ENDPOINTS.apiJobs}?limit=1`), {
+          headers: { Accept: "application/json", "X-API-Key": k },
+          credentials: "same-origin",
+        });
+      } catch {
+        throw new ApiError(0, messageForStatus(0));
+      }
+      if (check.status === 401 || check.status === 403) throw new ApiError(401, "Неверный ключ доступа.");
       settings.apiKey = k;
       this.uiAvailable = false;
       return { token: null, reachable: true, authenticated: true, features: {} };

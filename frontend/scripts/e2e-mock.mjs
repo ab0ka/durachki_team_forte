@@ -278,6 +278,43 @@ try {
     await c.close();
   }
 
+  // ---------- сценарий 1г: /ui/v1 выключен (404) → вход по API-ключу с проверкой ключа ----------
+  {
+    const c = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const pg = await c.newPage();
+    let apiKeyHeaderSeen = false;
+    await pg.route("**/ui/v1/**", (route) => route.fulfill({ status: 404, contentType: "application/json", body: '{"detail":"UI access disabled"}' }));
+    await pg.route("**/api/v1/**", (route) => {
+      const req = route.request();
+      const ok = req.headers()["x-api-key"] === KEY;
+      if (ok) apiKeyHeaderSeen = true;
+      if (!ok) return route.fulfill({ status: 401, contentType: "application/json", body: '{"detail":"invalid or missing API key"}' });
+      const p = new URL(req.url()).pathname;
+      if (p.endsWith("/api/v1/jobs")) return route.fulfill({ status: 200, contentType: "application/json", body: '{"jobs":[]}' });
+      if (p.endsWith("/jobs/k1")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(doneJob("k1")) });
+      return route.fulfill({ status: 404, body: "" });
+    });
+    await pg.goto(`${url}#/`);
+    await step("UI выключен: неверный ключ отвергается, верный — работает через /api/v1", async () => {
+      await pg.getByText("Вход для проверяющего").waitFor({ timeout: 5000 });
+      await pg.getByLabel("Ключ доступа").fill("wrong");
+      await pg.getByRole("button", { name: "Войти" }).click();
+      await pg.getByText("Неверный ключ доступа.").waitFor({ timeout: 5000 });
+      await pg.getByLabel("Ключ доступа").fill(KEY);
+      await pg.getByRole("button", { name: "Войти" }).click();
+      await pg.getByText("Перетащите видео сюда").waitFor({ timeout: 5000 });
+      await pg.goto(`${url}#/job/k1`);
+      await pg.getByText("Обнаружены признаки возможных нарушений").waitFor({ timeout: 8000 }).catch(async () => {
+        // после перехода по URL память вкладки сохраняется (SPA), но goto перезагружает страницу — ключ не хранится
+        await pg.getByText("Не удалось получить результат").waitFor({ timeout: 5000 });
+      });
+      assert.ok(apiKeyHeaderSeen, "X-API-Key не отправлялся");
+      const stored = await pg.evaluate(() => JSON.stringify(Object.assign({}, localStorage)));
+      assert.ok(!stored.includes(KEY), "ключ найден в localStorage");
+    });
+    await c.close();
+  }
+
   // ---------- сценарий 2: failed и неполный анализ не зелёные ----------
   for (const [name, body, expectText] of [
     ["failed", { job_id: "f1", status: "failed", verdict: null, violations: [], error: "синтетическая ошибка" }, "Анализ не завершён"],
