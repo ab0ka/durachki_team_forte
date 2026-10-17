@@ -112,11 +112,53 @@ def fallback_fuse(clip: Any, events: list[Event], risk: list, catalog: dict, job
                           violations=violations, timeline=[(float(t), float(r)) for t, r in risk], meta=meta)
 
 
+class _Fixtures:
+    """Фикстуры стадий по GT: кейс спецификации (``gt['spec']``, testkit.spec) или сценарий v1 (``gt['scenario']``)."""
+
+    def __init__(self, gt: Optional[dict], sample_fps: float, duration: float):
+        self.gt, self.fps, self.d = gt or {}, sample_fps, float((gt or {}).get("duration", duration))
+        self.spec = self.gt.get("spec")
+        self.scenario = self.gt.get("scenario") if self.gt.get("scenario") in SCENARIOS else None
+        self.view = self.gt.get("view", "default")
+        self._bundle = None
+
+    def _b(self):
+        if self._bundle is None:
+            from .spec import CaseSpec, case_bundle
+
+            self._bundle = case_bundle(CaseSpec(**self.spec), self.fps)
+        return self._bundle
+
+    def detections(self):
+        if self.spec:
+            return self._b().detections
+        return make_detections(self.scenario, self.d, self.fps, view=self.view) if self.scenario else []
+
+    def tracks_zones(self):
+        if self.spec:
+            return self._b().tracks, self._b().zones
+        return (make_tracks(self.scenario, self.d, self.fps, view=self.view), make_zones(self.view)) \
+            if self.scenario else ([], [])
+
+    def poses(self):
+        if self.spec:
+            return self._b().poses
+        return make_pose_frames(self.scenario, self.d, self.fps, view=self.view) if self.scenario else []
+
+    def states(self):
+        if self.spec:
+            return self._b().states
+        return make_scene_states(self.scenario, self.d, self.fps) if self.scenario else []
+
+    def events(self):
+        if self.spec:
+            return self._b().events
+        return make_expected_events(self.scenario, self.d) if self.scenario else []
+
+
 def run_stub_pipeline(video_path: str, job_id: str, gt: Optional[dict] = None, *, prefer_real: bool = True,
                       strict: bool = False, sample_fps: float = 5.0) -> tuple[AnalysisResult, list[StageReport]]:
-    """Пайплайн из стадий контракта: настоящие модули, где есть, иначе фикстуры по ``gt['scenario']``."""
-    scenario = (gt or {}).get("scenario")
-    view = (gt or {}).get("view", "default")
+    """Пайплайн из стадий контракта: настоящие модули, где есть, иначе фикстуры (кейс spec или сценарий v1)."""
     reports: list[StageReport] = []
 
     def stage(name: str, module: str, func: str, args: tuple, fallback: Callable[[], Any],
@@ -149,24 +191,18 @@ def run_stub_pipeline(video_path: str, job_id: str, gt: Optional[dict] = None, *
     clip = stage("ingest", "ml.ingest", "load_video", (video_path, sample_fps),
                  lambda: clip_from_video(video_path, sample_fps), cc.check_clip)
     dur = float(clip.duration)
-    d = (gt or {}).get("duration", dur)
-    dets = stage("detect", "ml.detect", "detect", (clip,),
-                 lambda: make_detections(scenario, d, sample_fps, view=view) if scenario else [], cc.check_detections)
-    tracks, zones = stage("track", "ml.track", "track", (clip, dets),
-                          lambda: (make_tracks(scenario, d, sample_fps, view=view), make_zones(view))
-                          if scenario else ([], []), cc.check_tracks_zones)
-    poses = stage("pose", "ml.pose", "estimate", (clip, tracks),
-                  lambda: make_pose_frames(scenario, d, sample_fps, view=view) if scenario else [],
-                  cc.check_pose_frames)
+    fx = _Fixtures(gt, sample_fps, dur)
+    dets = stage("detect", "ml.detect", "detect", (clip,), fx.detections, cc.check_detections)
+    tracks, zones = stage("track", "ml.track", "track", (clip, dets), fx.tracks_zones, cc.check_tracks_zones)
+    poses = stage("pose", "ml.pose", "estimate", (clip, tracks), fx.poses, cc.check_pose_frames)
     pose_states = stage("pose_signals", "ml.pose", "pose_signals", (poses, tracks, zones), lambda: [],
                         cc.check_scene_states)
-    states = stage("scene", "ml.scene", "scene_states", (clip, dets, tracks, zones, pose_states),
-                   lambda: make_scene_states(scenario, d, sample_fps) if scenario else [], cc.check_scene_states)
+    states = stage("scene", "ml.scene", "scene_states", (clip, dets, tracks, zones, pose_states), fx.states,
+                   cc.check_scene_states)
     catalog = stage("norms", "norms", "load_catalog", (), make_catalog,
                     lambda c: [] if isinstance(c, dict) and isinstance(c.get("types"), dict)
                     else ["load_catalog: ожидается dict с ключом types"])
-    rule_events = stage("rules", "ml.rules", "run_rules", (states, tracks, zones, catalog),
-                        lambda: make_expected_events(scenario, d) if scenario else [],
+    rule_events = stage("rules", "ml.rules", "run_rules", (states, tracks, zones, catalog), fx.events,
                         lambda ev: cc.check_events(ev, dur))
     risk, t_events = stage("temporal", "ml.temporal", "score", (clip,), lambda: ([], []),
                            lambda r: (cc.check_risk(r[0], dur) + cc.check_events(r[1], dur))
@@ -195,12 +231,29 @@ def run_backend(video_path: str, job_id: str, deadline_s: float = 240.0) -> Opti
 def run_scenario(scenario: str, out_dir: Path, *, duration: float = 8.0, fps: float = 10.0, view: str = "default",
                  use_backend: bool = True, prefer_real: bool = True, strict: bool = False,
                  deadline_s: float = 120.0) -> dict:
+    """Сценарий v1 (testkit.scenarios)."""
     suffix = "" if view == "default" else f"_{view}"
     video = out_dir / f"{scenario}{suffix}.mov"
     gt = make_video(video, scenario, duration=duration, fps=fps, view=view)
-    job_id = f"e2e-{scenario}{suffix}"
-    rec: dict[str, Any] = {"scenario": scenario, "view": view, "gt_verdict": gt["verdict"], "gt_type": gt["type_id"],
-                           "gt_t": gt["t"], "stages": [], "errors": []}
+    return _run(video, gt, f"e2e-{scenario}{suffix}", scenario, use_backend, prefer_real, strict, deadline_s)
+
+
+def run_case(spec: Any, out_dir: Path, *, fps: float = 10.0, use_backend: bool = True, prefer_real: bool = True,
+             strict: bool = False, deadline_s: float = 120.0) -> dict:
+    """Кейс спецификации (testkit.spec.CaseSpec)."""
+    from .spec import make_case_video
+
+    name = f"{spec.case}_{spec.layout}_{spec.orientation}"
+    gt = make_case_video(out_dir / f"{name}.mov", spec, fps=fps)
+    gt["view"] = spec.view
+    return _run(out_dir / f"{name}.mov", gt, f"e2e-{name}", name, use_backend, prefer_real, strict, deadline_s)
+
+
+def _run(video: Path, gt: dict, job_id: str, label: str, use_backend: bool, prefer_real: bool, strict: bool,
+         deadline_s: float) -> dict:
+    duration = float(gt["duration"])
+    rec: dict[str, Any] = {"scenario": label, "view": gt.get("view", "default"), "gt_verdict": gt["verdict"],
+                           "gt_type": gt["type_id"], "gt_t": gt["t"], "stages": [], "errors": []}
     t0 = time.perf_counter()
     try:
         result = run_backend(str(video), job_id, deadline_s) if use_backend else None
@@ -222,14 +275,22 @@ def run_scenario(scenario: str, out_dir: Path, *, duration: float = 8.0, fps: fl
     rec["violations"] = [{"type": v["type"], "timecode_sec": v["timecode_sec"]} for v in body["violations"]]
     rec["errors"] += jury_response_errors(body, duration)
     pred_types = {getattr(v, "type_id", "") for v in result.violations}
+    ok_types = {gt["type_id"]} | {a for e in gt.get("events", []) for a in [e["type_id"], *e.get("alt_type_ids", [])]}
     rec["verdict_ok"] = body["verdict"] == gt["verdict"]
-    rec["type_ok"] = gt["type_id"] is None or gt["type_id"] in pred_types
+    rec["type_ok"] = gt["type_id"] is None or bool(pred_types & ok_types)
     return rec
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Сквозной mock-прогон Kassa Sentinel на синтетических роликах")
-    ap.add_argument("--scenarios", default=",".join(SCENARIOS))
+    ap.add_argument("--suite", choices=("v1", "spec"), default="v1", help="v1 — сценарии scenarios.py; spec — кейсы "
+                    "спецификации (testkit.spec)")
+    ap.add_argument("--scenarios", default=",".join(SCENARIOS), help="v1: список сценариев")
+    ap.add_argument("--cases", default=None, help="spec: список кейсов (по умолчанию все)")
+    ap.add_argument("--layouts", default="A,B")
+    ap.add_argument("--orientations", default="portrait")
+    ap.add_argument("--duration-range", default="14,20", help="spec: диапазон длительности, с")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--duration", type=float, default=8.0)
     ap.add_argument("--fps", type=float, default=10.0)
     ap.add_argument("--view", default="default")
@@ -253,11 +314,22 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     records = []
     try:
-        for sc in [s.strip() for s in args.scenarios.split(",") if s.strip()]:
-            rec = run_scenario(sc, out_dir, duration=args.duration, fps=args.fps, view=args.view,
-                               use_backend=not args.no_backend and not args.fixtures_only,
-                               prefer_real=not args.fixtures_only, strict=args.strict_stages,
-                               deadline_s=args.deadline)
+        common = dict(use_backend=not args.no_backend and not args.fixtures_only, prefer_real=not args.fixtures_only,
+                      strict=args.strict_stages, deadline_s=args.deadline)
+        if args.suite == "spec":
+            from .spec import make_suite
+
+            lo, hi = (float(x) for x in args.duration_range.split(","))
+            cases = [c.strip() for c in args.cases.split(",")] if args.cases else None
+            jobs = [(f"{s.case}_{s.layout}", lambda s=s: run_case(s, out_dir, fps=args.fps, **common))
+                    for s in make_suite(args.seed, cases, tuple(args.layouts.split(",")),
+                                        tuple(args.orientations.split(",")), duration_range=(lo, hi))]
+        else:
+            jobs = [(sc, lambda sc=sc: run_scenario(sc, out_dir, duration=args.duration, fps=args.fps, view=args.view,
+                                                    **common))
+                    for sc in [s.strip() for s in args.scenarios.split(",") if s.strip()]]
+        for sc, job in jobs:
+            rec = job()
             records.append(rec)
             stages = " ".join(f"{s['name']}:{s['source']}" for s in rec["stages"]) or "-"
             resp = rec.get("response", {})

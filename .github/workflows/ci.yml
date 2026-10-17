@@ -133,8 +133,11 @@ jobs:
           python scripts/ci_requirements.py --all > "$RUNNER_TEMP/req-ci.txt"
           cat "$RUNNER_TEMP/req-ci.txt"
           if [ -s "$RUNNER_TEMP/req-ci.txt" ]; then python -m pip install -r "$RUNNER_TEMP/req-ci.txt"; fi
-      - name: E2E по стадиям контракта (схема ответа жюри обязательна)
-        run: python -m testkit.e2e_stub --no-backend --scenarios clean,V01,V03,V07 --duration 8 --fps 10 --out "$RUNNER_TEMP/e2e"
+      # --strict-stages: модуль, который упал или вернул выход не по контракту, роняет CI (а не тихо заменяется фикстурой)
+      - name: E2E по стадиям контракта (строго; схема ответа жюри обязательна)
+        run: python -m testkit.e2e_stub --no-backend --strict-stages --scenarios clean,V01,V03,V07 --duration 8 --fps 10 --out "$RUNNER_TEMP/e2e"
+      - name: E2E на кейсах спецификации (две планировки, строго)
+        run: python -m testkit.e2e_stub --suite spec --no-backend --strict-stages --cases leave_clean,leave_cash,client_opposite,mobile,desk_phone,lights_off_cash --layouts A,B --fps 5 --out "$RUNNER_TEMP/e2e_spec"
 
   e2e-backend:
     name: e2e через backend.pipeline.run (необязательная)
