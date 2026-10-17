@@ -71,6 +71,16 @@ export interface JobResult {
   elapsedSec?: number;
   /** A02 (только /ui/v1): у failed — частичный результат, если пайплайн успел что-то найти. */
   partialResult?: JobResult;
+  /** A01 UI-report: violation | no_violation | unknown | pending. */
+  verdictState?: string;
+  /** A01 UI-report: полнота подтверждена (coverage_problem = null). */
+  analysisComplete?: boolean;
+  /** A01 UI-report: почему «нет нарушения» не подтверждено. */
+  coverageProblem?: string;
+  /** A01 UI-report: найденные, но не отданные жюри нарушения (ниже порога / не подтверждено). */
+  candidates?: Violation[];
+  /** A01 UI-report: предупреждения верхнего уровня. */
+  warnings?: string[];
 }
 
 export interface AskResponse {

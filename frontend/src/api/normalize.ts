@@ -156,7 +156,19 @@ export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
   const status = normalizeStatus(raw.status);
   let verdict = normalizeVerdict(raw.verdict, violations);
   if (status === "done" && verdict === null) verdict = violations.length > 0 ? "violation" : "no_violation";
-  const meta: JobMeta = isObj(raw.meta) ? (raw.meta as JobMeta) : {};
+  const meta: JobMeta = isObj(raw.meta) ? { ...(raw.meta as JobMeta) } : {};
+  // A01 UI-report дублирует coverage на верхний уровень — подставляем, если в meta его нет.
+  if (meta.coverage === undefined && raw.coverage !== undefined) meta.coverage = raw.coverage;
+  const candidates = Array.isArray(raw.candidates)
+    ? raw.candidates
+        .map((x, i) => {
+          const v = normalizeViolation(x);
+          if (v) v.index = i;
+          return v;
+        })
+        .filter((v): v is Violation => v !== null)
+        .sort((a, b) => a.timecode_sec - b.timecode_sec)
+    : [];
   const error = str(raw.error ?? raw.detail ?? meta.error ?? "") || undefined;
   let partialResult: JobResult | undefined;
   if (status === "failed" && isObj(raw.partial)) {
@@ -170,6 +182,11 @@ export function normalizeJob(raw: unknown, fallbackJobId = ""): JobResult {
   const el = optNum(raw.elapsed_s);
   return {
     job_id: str(raw.job_id ?? raw.id, fallbackJobId),
+    verdictState: str(raw.verdict_state) || undefined,
+    analysisComplete: typeof raw.analysis_complete === "boolean" ? raw.analysis_complete : undefined,
+    coverageProblem: str(raw.coverage_problem) || undefined,
+    candidates,
+    warnings: strList(raw.warnings),
     queuePosition: qp,
     elapsedSec: el,
     partialResult,

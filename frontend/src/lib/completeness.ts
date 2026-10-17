@@ -19,6 +19,8 @@ export interface StageInfo {
   required: boolean;
   error?: string;
   vramPeakMb?: number;
+  /** Доля длительности, реально просмотренная стадией (A03 meta.coverage[stage]); null — неизвестно. */
+  coverage?: number | null;
 }
 
 export interface CompletenessReport {
@@ -34,8 +36,10 @@ export interface CompletenessReport {
   cached: string[];
 }
 
-/** Порог полноты декодирования — как warn_coverage у A04 (0.98). */
+/** Порог полноты декодирования — как warn_coverage у A04 и min_ratio_for_no_violation у A01 (0.98). */
 export const COVERAGE_COMPLETE = 0.98;
+/** Порог покрытия обязательной стадии — как coverage.min_required у A03 (0.9). */
+export const STAGE_COVERAGE_MIN = 0.9;
 
 const STAGE_LABELS: Record<string, string> = {
   ingest: "Декодирование видео",
@@ -88,7 +92,8 @@ export function readCoverage(meta: Obj): number | undefined {
   if (isObj(meta.video)) cands.push(meta.video.coverage);
   if (isObj(meta.ingest)) cands.push(meta.ingest.coverage);
   for (let c of cands) {
-    if (isObj(c)) c = c.ratio ?? c.fraction ?? c.value ?? c.coverage;
+    // A01: {ratio, complete, stages, required}; A03: {стадия: доля|null} — общая доля = ingest.
+    if (isObj(c)) c = c.ratio ?? c.fraction ?? c.value ?? c.coverage ?? c.ingest;
     if (typeof c === "string") c = c.replace("%", "").trim();
     let n = numOrUndef(c);
     if (n === undefined) continue;
@@ -98,9 +103,25 @@ export function readCoverage(meta: Obj): number | undefined {
   return undefined;
 }
 
+/** A03: meta.coverage = {стадия: доля 0..1 | null}. Объект A01 ({ratio,…}) сюда не относится. */
+export function readStageCoverage(meta: Obj): Record<string, number | null> {
+  const c = meta.coverage;
+  if (!isObj(c) || "ratio" in c) return {};
+  const out: Record<string, number | null> = {};
+  for (const [k, v] of Object.entries(c)) {
+    if (v === null) out[k] = null;
+    else {
+      const n = numOrUndef(v);
+      if (n !== undefined && n >= 0 && n <= 1) out[k] = n;
+    }
+  }
+  return out;
+}
+
 export function readStages(meta: Obj): StageInfo[] {
   const st = meta.stages;
   if (!isObj(st)) return [];
+  const cov = readStageCoverage(meta);
   const required = new Set(Array.isArray(meta.required_stages) ? meta.required_stages.map(String) : []);
   return Object.entries(st)
     .filter(([, v]) => isObj(v))
@@ -117,6 +138,7 @@ export function readStages(meta: Obj): StageInfo[] {
         required: r.required === true || required.has(name),
         error: typeof r.error === "string" && r.error ? r.error : undefined,
         vramPeakMb: numOrUndef(r.vram_peak_mb),
+        coverage: name in cov ? cov[name] : undefined,
       };
     });
 }
@@ -146,12 +168,20 @@ export function analyzeCompleteness(job: JobResult): CompletenessReport {
     reasons.push(`проанализировано ${Math.floor(coverage * 100)} % длительности записи`);
   for (const s of stages) {
     if (s.required && !s.ok) reasons.push(`обязательная стадия «${s.label}»: ${s.statusLabel}`);
+    if (s.required && s.ok && typeof s.coverage === "number" && s.coverage < STAGE_COVERAGE_MIN)
+      reasons.push(`обязательная стадия «${s.label}» просмотрела ${Math.floor(s.coverage * 100)} % записи`);
+  }
+  // A01 UI-report: причина, по которой «нет нарушения» не подтверждено.
+  let unknownReason: string | undefined;
+  if (job.coverageProblem) {
+    if (/проанализировано|незаверш|complete=false|обязательная стадия|неполн/i.test(job.coverageProblem)) reasons.push(job.coverageProblem);
+    else unknownReason = job.coverageProblem;
   }
   for (const k of ["skipped_stages", "stages_skipped", "failed_stages"]) {
     const v = m[k];
     if (Array.isArray(v) && v.length) reasons.push(`пропущены стадии: ${v.map((x) => stageLabelRu(String(x))).join(", ")}`);
   }
-  const warnings = Array.isArray(m.warnings) ? m.warnings.map(String) : [];
+  const warnings = [...(Array.isArray(m.warnings) ? m.warnings.map(String) : []), ...(job.warnings ?? [])];
   for (const w of warnings) if (PARTIAL_WARNING.test(w.toLowerCase())) reasons.push(`предупреждение сервера: ${w}`);
 
   const uniq = [...new Set(reasons)];
@@ -160,7 +190,12 @@ export function analyzeCompleteness(job: JobResult): CompletenessReport {
   if (uniq.length) return { state: "partial", coverage, reasons: uniq, stages, mock, cached };
 
   const requiredKnownOk = stages.length > 0 && stages.filter((s) => s.required).every((s) => s.ok);
-  const confirmed = m.complete === true || (coverage !== undefined && coverage >= COVERAGE_COMPLETE && requiredKnownOk);
+  // A01 analysis_complete=true — полнота подтверждена сериализатором; A01 false/коверидж-проблема — не подтверждена.
+  if (job.analysisComplete === false || unknownReason) {
+    return { state: "unknown", coverage, reasons: [unknownReason ?? "сервер не подтвердил полноту анализа"], stages, mock, cached };
+  }
+  const confirmed =
+    job.analysisComplete === true || m.complete === true || (coverage !== undefined && coverage >= COVERAGE_COMPLETE && requiredKnownOk);
   if (confirmed) return { state: "complete", coverage, reasons: [], stages, mock, cached };
   return {
     state: "unknown",

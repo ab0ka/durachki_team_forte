@@ -62,3 +62,51 @@ describe("readCoverage / readStages", () => {
     expect(st.find((x) => x.name === "temporal")).toMatchObject({ statusLabel: "выключена", required: false });
   });
 });
+
+describe("A01 UI-report и A03 coverage по стадиям (интеграция)", () => {
+  it("A01: analysis_complete=true → complete; coverage_problem «нет meta.coverage» → unknown", () => {
+    expect(analyzeCompleteness(normalizeJob({ ...base, analysis_complete: true })).state).toBe("complete");
+    const r = analyzeCompleteness(normalizeJob({ ...base, analysis_complete: false, coverage_problem: "полнота анализа не подтверждена: нет meta.coverage" }));
+    expect(r.state).toBe("unknown");
+    expect(r.reasons[0]).toMatch(/нет meta.coverage/);
+  });
+  it("A01: coverage_problem «проанализировано 87 %» → partial", () => {
+    const r = analyzeCompleteness(
+      normalizeJob({ ...base, status: "done", analysis_complete: false, coverage_problem: "проанализировано 87% видео (< 98%): неизвестные участки ≠ «нарушений нет»" }),
+    );
+    expect(r.state).toBe("partial");
+  });
+  it("A03: meta.coverage = {стадия: доля}; обязательная стадия < 0.9 → partial; общая доля = ingest", () => {
+    const meta = {
+      complete: true,
+      required_stages: ["ingest", "detect"],
+      stages: { ingest: { status: "ok" }, detect: { status: "ok" }, temporal: { status: "ok" } },
+      coverage: { ingest: 1.0, detect: 0.6, temporal: 0.0, vlm_discover: null },
+    };
+    const r = analyzeCompleteness(normalizeJob({ ...base, meta }));
+    expect(r.state).toBe("partial");
+    expect(r.coverage).toBe(1);
+    expect(r.reasons.join(" ")).toMatch(/Поиск людей и объектов.*60 %/);
+    expect(r.stages.find((x) => x.name === "temporal")?.coverage).toBe(0);
+  });
+  it("A01 UI-report: candidates и coverage верхнего уровня разбираются", () => {
+    const j = normalizeJob({
+      job_id: "u",
+      status: "failed",
+      verdict: null,
+      violations: [],
+      verdict_state: "unknown",
+      analysis_complete: false,
+      coverage_problem: "meta.coverage.ratio не задан",
+      candidates: [{ type: "Кандидат", type_id: "V05", timecode_sec: 7, description: "", evidence_frames: [] }],
+      warnings: ["«нет нарушения» не подтверждено"],
+      coverage: { ingest: 1 },
+      meta: {},
+    });
+    expect(j.candidates).toHaveLength(1);
+    expect(j.verdictState).toBe("unknown");
+    expect(j.meta.coverage).toEqual({ ingest: 1 });
+    expect(j.warnings).toHaveLength(1);
+    expect(analyzeCompleteness(j).state).toBe("partial"); // failed → неполный
+  });
+});

@@ -133,6 +133,10 @@ export default function JobScreen({ jobId }: { jobId: string }) {
     const shown: JobResult = { ...job.partialResult, job_id: job.job_id, status: "failed", error: job.error };
     return <ResultView job={shown} raw={raw} fileName={fileName.current} />;
   }
+  if (job.status === "failed" && ((job.candidates?.length ?? 0) > 0 || job.timeline.length > 0 || typeof job.meta.stages === "object")) {
+    // A01 UI-report: у «failed» есть meta (стадии, coverage) и кандидаты — показываем подробный отчёт с жёлтым баннером.
+    return <ResultView job={job} raw={raw} fileName={fileName.current} />;
+  }
   if (job.status === "failed") {
     return (
       <StateCard

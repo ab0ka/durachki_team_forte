@@ -65,6 +65,25 @@ describe("ResultView", () => {
     expect(html).toContain("Найдено до сбоя анализа");
     expect(html).not.toContain("Нарушение не обнаружено");
   });
+  it("A01 failed с кандидатами: жёлтый «Анализ не завершён», кандидаты помечены, зелёного нет", () => {
+    const job = normalizeJob({
+      job_id: "u",
+      status: "failed",
+      verdict: null,
+      violations: [],
+      verdict_state: "unknown",
+      analysis_complete: false,
+      coverage_problem: "meta.coverage.ratio не задан",
+      error: "«нет нарушения» не подтверждено: meta.coverage.ratio не задан",
+      candidates: [{ type: "Кандидат", type_id: "V05", timecode_sec: 7, description: "Описание.", evidence_frames: [] }],
+      meta: { stages: { ingest: { status: "ok", required: true } } },
+    });
+    const html = wrap(<ResultView job={job} raw={{}} />);
+    expect(html).toContain("Анализ не завершён");
+    expect(html).toContain("Кандидаты — не подтверждены, в вердикт не вошли");
+    expect(html).toContain("не вошло в вердикт");
+    expect(html).not.toContain("Нарушение не обнаружено");
+  });
   it("ответ сервера в формате A01 рендерится", () => {
     const job = normalizeJob({
       job_id: "x",

@@ -18,9 +18,11 @@ interface Props {
   onSeek: (t: number) => void;
   /** Кадр из видео в браузере (для «до»), null — видео недоступно. */
   capture?: (t: number) => Promise<string | null>;
+  /** Кандидат A01: найден, но не вошёл в вердикт. */
+  candidate?: boolean;
 }
 
-export default function ViolationCard({ v, index, job, active, onSeek, capture }: Props) {
+export default function ViolationCard({ v, index, job, active, onSeek, capture, candidate }: Props) {
   const info = typeInfo(v.type_id);
   const [lightbox, setLightbox] = useState<number | null>(null);
   const [highlight, setHighlight] = useState(true);
@@ -45,6 +47,11 @@ export default function ViolationCard({ v, index, job, active, onSeek, capture }
             {v.type_id && (
               <span className="chip border-slate-200 bg-white font-mono text-slate-600 dark:border-white/10 dark:bg-white/5 dark:text-slate-300" title={info?.name}>
                 {v.type_id}
+              </span>
+            )}
+            {candidate && (
+              <span className="chip border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-400/30 dark:bg-amber-400/10 dark:text-amber-300">
+                не вошло в вердикт
               </span>
             )}
             <ConfidenceBadge value={v.confidence} />
