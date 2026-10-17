@@ -9,6 +9,7 @@
     rule_refs(type_id)              -> list[dict] ровно с ключами RuleRef ([] для disabled)
     legal_status(type_id)           -> "confirmed" | "candidate" | "disabled"
     exclusions(type_id=None)        -> что само по себе НЕ нарушение (общие + типа)
+    legal_basis(type_id)            -> блок для UI/fusion: статус, пояснение, нормы, уровни проверки
     render_description(type_id, t, facts) -> str по description_template
     catalog_source()                -> "yaml" | "fallback" (для meta.warnings)
 
@@ -33,6 +34,7 @@ __all__ = [
     "TYPE_IDS",
     "catalog_source",
     "exclusions",
+    "legal_basis",
     "legal_status",
     "format_timecode",
     "get_type",
@@ -186,3 +188,24 @@ def render_description(
     facts_list = [str(f).strip().rstrip(".") for f in facts if str(f).strip()]
     facts_str = "; ".join(facts_list) if facts_list else "см. кадры-доказательства"
     return tpl.format_map(_SafeDict(t=format_timecode(t), facts=facts_str)).strip()
+
+
+def legal_basis(type_id: str, catalog: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Всё о нормативном основании типа одним блоком (для fusion.meta, frontend, copilot).
+
+    ``rules``/``checks`` пусты для disabled; ``checks[i]`` описывает уровень проверки ``rules[i]``
+    (точность цитаты, актуальность, применимость, видимость условий). Не юридическое заключение.
+    """
+    cat = catalog or load_catalog()
+    t = get_type(type_id, cat)
+    status = legal_status(type_id, cat)
+    enabled = status != "disabled"
+    return {
+        "type_id": type_id if type_id in cat["types"] else "V99",
+        "status": status,
+        "note": str(t.get("legal_note") or "").strip(),
+        "rules": rule_refs(type_id, cat),
+        "checks": list(t.get("rule_checks") or []) if enabled else [],
+        "exclusions": exclusions(type_id, cat),
+        "disclaimer": str(cat.get("disclaimer") or "").strip(),
+    }

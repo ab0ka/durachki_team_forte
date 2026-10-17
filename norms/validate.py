@@ -92,13 +92,15 @@ class Report:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     quotes: list[QuoteCheck] = field(default_factory=list)
+    legal_status: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
         return not self.errors
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ok": self.ok, "errors": self.errors, "warnings": self.warnings,
+        return {"ok": self.ok, "check": "schema+quote_integrity (not a legal verification)",
+                "legal_status": self.legal_status, "errors": self.errors, "warnings": self.warnings,
                 "quotes": [asdict(q) for q in self.quotes]}
 
 
@@ -327,6 +329,8 @@ def validate_catalog(catalog: Any, base_dir: Path = NORMS_DIR, *, strict: bool =
     sources = _load_sources(catalog, Path(base_dir), rep)
     for tid, t in types.items():
         _check_type(str(tid), t, sources, rep)
+        if isinstance(t, dict):
+            rep.legal_status[str(tid)] = str(t.get("legal_status", "?"))
     if strict and rep.warnings:
         rep.errors.extend(f"[strict] {w}" for w in rep.warnings)
         rep.warnings = []
@@ -363,12 +367,11 @@ def _load_yaml_strict(path: Path) -> dict[str, Any]:
         return yaml.safe_load(fh)
 
 
-def _print_human(rep: Report, path: Path, catalog: Optional[dict[str, Any]] = None) -> None:
+def _print_human(rep: Report, path: Path) -> None:
     print(f"Каталог: {path}")
     print("Проверка: схема + ЦЕЛОСТНОСТЬ цитат относительно norms/sources (не юридическая верификация)")
-    if catalog and isinstance(catalog.get("types"), dict):
-        statuses = {tid: (t or {}).get("legal_status", "?") for tid, t in catalog["types"].items()}
-        print("legal_status: " + ", ".join(f"{k}={v}" for k, v in statuses.items()))
+    if rep.legal_status:
+        print("legal_status: " + ", ".join(f"{k}={v}" for k, v in rep.legal_status.items()))
     print(f"{'тип':<4} {'#':<2} {'цитата':<10} {'verified':<8} {'источник':<14} документ / пункт")
     for q in rep.quotes:
         doc = (q.document[:58] + "…") if len(q.document) > 59 else q.document
@@ -408,7 +411,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.json:
         print(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2))
     else:
-        _print_human(rep, args.catalog, catalog)
+        _print_human(rep, args.catalog)
     return 0 if rep.ok else 1
 
 

@@ -135,3 +135,20 @@ def test_import_has_no_side_effects():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          cwd=Path(norms.NORMS_DIR).parent, check=True).stdout.split()
     assert out == ["False", "none"]  # импорт не читает каталог и не тянет PyYAML
+
+
+def test_legal_basis_block():
+    lb = norms.legal_basis("V08")
+    assert lb["status"] == "candidate" and lb["rules"] and len(lb["checks"]) == len(lb["rules"])
+    assert lb["checks"][0]["quote_level"] == "snippet"
+    off = norms.legal_basis("V05")
+    assert off["status"] == "disabled" and off["rules"] == [] and off["checks"] == []
+    assert any("телефон" in x.lower() for x in off["exclusions"])
+    assert norms.legal_basis("V42")["type_id"] == "V99"
+
+
+def test_validate_report_exposes_statuses():
+    yaml = pytest.importorskip("yaml")
+    rep = v.validate_catalog(yaml.safe_load(norms.CATALOG_PATH.read_text(encoding="utf-8")))
+    d = rep.to_dict()
+    assert d["legal_status"]["V08"] == "candidate" and "not a legal verification" in d["check"]
