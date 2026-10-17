@@ -24,8 +24,13 @@ from .common import load_config, normalize_video_id, read_json, video_sort_key, 
 from .labels import LABEL_VIOLATION, GroundTruth, load_ground_truth
 from .schema import check_api_response, decode_jpeg_b64
 
-CATEGORIES = ("TP", "TN", "FP", "FN", "early", "late", "wrong_type", "failed", "label_conflict")
-EVAL_VERSION = "a16-eval-1.1"
+CATEGORIES = ("TP", "TN", "FP", "FN", "early", "late", "wrong_type", "failed", "partial", "label_conflict",
+              "label_unknown")
+EVAL_VERSION = "a16-eval-2.0"
+KIND_NOTES = {
+    "exploratory": "РАЗВЕДОЧНАЯ оценка: эти видео уже использовались при разработке/разведке — не независимый тест.",
+    "holdout_frozen": "Замороженный hold-out (заморожен до настройки, не использовался для подбора порогов).",
+}
 LOCALIZATION_CAVEAT = ("GT размечена одной секундой на видео (неполная event-разметка): лишние кандидаты "
                        "(extra_candidates) не обязательно ложные — показываются отдельно и не входят в FP по видео.")
 TYPES_NOTE = "Точность типа считается только по настоящей разметке типов (data/labels_types.csv); без неё — n/a."
@@ -136,6 +141,10 @@ class VideoEval:
     timeout: bool = False
     degraded: bool = False
     pipeline_version: Optional[str] = None
+    coverage: Optional[float] = None            # meta.coverage: доля проанализированного видео (None — не сообщено)
+    partial: bool = False                       # no_violation при неполном анализе — НЕ «чисто»
+    invalid_verdict: bool = False               # status=done, но verdict не из схемы — как failed
+    vram_peak_mb: Optional[float] = None
 
     @property
     def gt_positive(self) -> bool:
@@ -176,6 +185,29 @@ def _duration(api: dict, info: dict) -> Optional[float]:
         if _num(v) is not None and _num(v) > 0:
             return _num(v)
     return None
+
+
+def _coverage(api: dict) -> Optional[float]:
+    """meta.coverage: число 0..1 или dict {стадия/кадры: доля} → минимум. None — пайплайн не сообщил."""
+    cov = (api.get("meta") or {}).get("coverage")
+    if isinstance(cov, dict):
+        vals = [_num(v) for v in cov.values() if _num(v) is not None]
+        for k in ("frames", "video", "total", "fraction"):
+            if _num(cov.get(k)) is not None:
+                return _num(cov.get(k))
+        return min(vals) if vals else None
+    return _num(cov)
+
+
+def _vram(api: dict, info: dict) -> Optional[float]:
+    meta = api.get("meta") or {}
+    cands = [info.get("vram_peak_mb"), meta.get("vram_peak_mb"), meta.get("vram_mb")]
+    for sub in ("gpu", "resources", "timings"):
+        d = meta.get(sub)
+        if isinstance(d, dict):
+            cands += [d.get("vram_peak_mb"), d.get("peak_mb"), d.get("max_memory_mb"), d.get("vram_mb")]
+    vals = [_num(v) for v in cands if _num(v) is not None]
+    return max(vals) if vals else None
 
 
 def _texts(api: dict, info: dict) -> list[str]:
@@ -230,6 +262,7 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
     ve = VideoEval(video_id=gt.video_id, gt_label=gt.label, gt_times=list(gt.times), gt_types=list(gt.types),
                    members=list(gt.members or [gt.video_id]), conflict=gt.conflict, pred_id=pred_id)
     ve.latency_s = _latency(api or {}, info or {})
+    ve.vram_peak_mb = _vram(api or {}, info or {})
     ve.error = (info or {}).get("error")
     ve.events_total = len(gt.events or [[t] for t in gt.times]) if gt.positive else 0
     texts = _texts(api or {}, info or {})
@@ -251,6 +284,16 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
         ve.category = "failed"
         return ve
     ve.verdict = api.get("verdict")
+    if ve.verdict not in ("violation", "no_violation"):   # unknown ≠ false: невалидный вердикт — не «чисто»
+        ve.invalid_verdict = True
+        ve.category = "failed"
+        return ve
+    ve.coverage = _coverage(api)
+    cov_cfg = cfg.get("coverage") or {}
+    if ve.verdict == "no_violation" and (
+            (ve.coverage is not None and ve.coverage < float(cov_cfg.get("min", 0.95)) - 1e-9)
+            or (ve.coverage is None and bool(cov_cfg.get("require", False)))):
+        ve.partial = True       # неполный анализ ≠ «нарушений нет»
     vios = [v for v in (api.get("violations") or []) if isinstance(v, dict)]
     ve.n_violations = len(vios)
     ve.violations_brief = [{"t": _num(v.get("timecode_sec")), "type_id": v.get("type_id") or "",
@@ -283,6 +326,10 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
     pred_pos = ve.verdict == "violation"
     if gt.label == "conflict":
         ve.category = "label_conflict"
+    elif gt.label == "unknown":
+        ve.category = "label_unknown"
+    elif ve.partial:
+        ve.category = "partial"
     elif not gt.positive:
         ve.category = "FP" if pred_pos else "TN"
     elif not pred_pos:
@@ -424,44 +471,73 @@ def _norms_review(cfg: dict) -> dict[tuple, bool]:
     return out
 
 
+def _conflict_block(evals: list[VideoEval]) -> list[dict]:
+    """Группы дубликатов с конфликтом таймкодов (57 / 68 с) — отдельно; решает человек."""
+    out = []
+    for e in evals:
+        if not e.conflict:
+            continue
+        out.append({"group": e.video_id, "members": e.members, "gt_alternatives": e.gt_times, "verdict": e.verdict,
+                    "pred_t": e.pred_t,
+                    "dt_to_alternatives": ({f"{g:g}": round(e.pred_t - g, 3) for g in e.gt_times}
+                                           if e.pred_t is not None else None)})
+    return out
+
+
 def summarize(evals_all: list[VideoEval], cfg: dict, dup_check: Optional[list[dict]] = None) -> dict:
     conflicts = [e for e in evals_all if e.gt_label == "conflict"]
-    evals = [e for e in evals_all if e.gt_label != "conflict"]
+    unknown = [e for e in evals_all if e.gt_label == "unknown"]
+    evals = [e for e in evals_all if e.gt_label not in ("conflict", "unknown")]
     pos = [e for e in evals if e.gt_positive]
     neg = [e for e in evals if not e.gt_positive]
+    failed = [e for e in evals if e.status != "done" or e.invalid_verdict]
+    partial = [e for e in evals if e.partial]
     tp = [e for e in pos if e.pred_positive]
-    fn = [e for e in pos if not e.pred_positive]
+    fn = [e for e in pos if not e.pred_positive]                  # включая failed/partial: ответа «есть» нет
     fp = [e for e in neg if e.pred_positive]
-    tn = [e for e in neg if not e.pred_positive]
-    failed = [e for e in evals if e.status != "done"]
+    tn = [e for e in neg if e.status == "done" and e.verdict == "no_violation" and not e.partial]
+    unresolved_neg = [e for e in neg if not e.pred_positive and e not in tn]  # failed/partial ≠ «нарушений нет»
     prec = _rate(len(tp), len(tp) + len(fp))
     rec = _rate(len(tp), len(pos))
     f1 = round(2 * prec * rec / (prec + rec), 4) if prec and rec else (0.0 if (prec is not None and rec is not None) else None)
     confusion: dict[str, dict[str, int]] = {}
     for e in evals:
-        pred = e.verdict if e.status == "done" else "failed"
+        pred = ("failed" if (e.status != "done" or e.invalid_verdict) else
+                "partial" if e.partial else e.verdict)
         confusion.setdefault(e.gt_label, {}).setdefault(str(pred), 0)
         confusion[e.gt_label][str(pred)] += 1
-    n_correct = len(tp) + sum(1 for e in tn if e.status == "done")
+    kind = str((cfg.get("dataset") or {}).get("evaluation_kind") or "exploratory")
     video = {
         "n": len(evals), "n_pos": len(pos), "n_neg": len(neg),
         "tp": len(tp), "tn": len(tn), "fp": len(fp), "fn": len(fn), "failed": len(failed),
+        "partial": len(partial), "unresolved_neg": len(unresolved_neg),
+        "fn_failed_or_partial": sum(1 for e in fn if e in failed or e.partial),
         "timeouts": sum(e.timeout for e in evals), "degraded": sum(e.degraded for e in evals),
+        "coverage_unknown": sum(1 for e in evals if e.status == "done" and not e.invalid_verdict and e.coverage is None),
         "precision": prec, "recall": rec, "f1": f1,
         "precision_ci95": wilson(len(tp), len(tp) + len(fp)), "recall_ci95": wilson(len(tp), len(pos)),
-        "accuracy": _rate(n_correct, len(evals)),
+        "accuracy": _rate(len(tp) + len(tn), len(evals)),
         "specificity": _rate(len(tn), len(neg)), "specificity_ci95": wilson(len(tn), len(neg)),
         "fp_ids": [e.video_id for e in fp], "fn_ids": [e.video_id for e in fn],
-        "failed_ids": [e.video_id for e in failed], "timeout_ids": [e.video_id for e in evals if e.timeout],
-        "label_conflict_ids": [e.video_id for e in conflicts], "confusion": confusion,
-        "note": "failed/missing считаются как «нет нарушения» в P/R (пропуск) и как ошибка в accuracy; "
-                "группы с конфликтом меток исключены (label_conflict_ids).",
+        "failed_ids": [e.video_id for e in failed], "partial_ids": [e.video_id for e in partial],
+        "timeout_ids": [e.video_id for e in evals if e.timeout],
+        "label_conflict_ids": [e.video_id for e in conflicts], "label_unknown_ids": [e.video_id for e in unknown],
+        "confusion": confusion, "evaluation_kind": kind, "kind_note": KIND_NOTES.get(kind, kind),
+        "note": "failed/partial/невалидный вердикт: на позитиве — пропуск (FN), на негативе — НЕ TN (unresolved_neg); "
+                "группы с конфликтом или неизвестной меткой исключены.",
     }
-    localization = _localization(evals, cfg)
+    policy = str(cfg.get("conflict_policy") or "separate")
     no_conf = [e for e in evals if not e.conflict]
-    localization_no_conflict = _localization(no_conf, cfg) if len(no_conf) != len(evals) else None
-    loc_tp = [e for e in tp if e.events_total and e.dt_abs is not None]
-    timed_pos = [e for e in pos if e.events_total]
+    if policy == "alternatives":
+        localization = _localization(evals, cfg)
+        localization_alt = _localization(no_conf, cfg) if len(no_conf) != len(evals) else None
+    else:  # separate: конфликтные группы не входят в основные метрики локализации
+        localization = _localization(no_conf, cfg)
+        localization_alt = _localization(evals, cfg) if len(no_conf) != len(evals) else None
+    localization["conflict_policy"] = policy
+    in_loc = (lambda e: True) if policy == "alternatives" else (lambda e: not e.conflict)  # noqa: E731
+    loc_tp = [e for e in tp if e.events_total and e.dt_abs is not None and in_loc(e)]
+    timed_pos = [e for e in pos if e.events_total and in_loc(e)]
     frames_total = sum(e.frames_total for e in evals)
     n_vios = sum(e.n_violations for e in evals)
     frames_per_vio_ok = sum(1 for e in evals for v in e.violations_brief
@@ -536,7 +612,11 @@ def summarize(evals_all: list[VideoEval], cfg: dict, dup_check: Optional[list[di
                "within_sla_rate": _rate(sum(e.latency_s <= _sla(e) for e in lats), len(lats)),
                "rt_factor": _stats([e.latency_s / e.duration for e in lats if e.duration])}
     cats = {c: [e.video_id for e in evals_all if e.category == c] for c in CATEGORIES}
-    out = {"video": video, "localization": localization, "localization_no_conflict": localization_no_conflict,
+    vr = [e.vram_peak_mb for e in evals_all if e.vram_peak_mb is not None]
+    resources = {"vram_peak_mb": _stats(vr), "vram_source": "meta/runinfo (пайплайн или сэмплер nvidia-smi)" if vr
+                 else "не измерено"}
+    out = {"video": video, "localization": localization, "localization_alt": localization_alt,
+           "conflict_groups": _conflict_block(evals), "resources": resources,
            "evidence": evidence, "types": types, "norms": norms, "schema": schema, "language": language,
            "latency": latency, "categories": cats}
     if dup_check is not None:
@@ -574,18 +654,27 @@ def collect_versions(preds: dict[str, dict], labels_csv: Optional[str | Path] = 
 
 
 def scorecard(summary: dict, versions: Optional[dict] = None) -> dict:
-    """Главная сводка: реальные P/R/FP/FN/timeouts/latency с числом примеров и версиями."""
+    """Главная сводка: реальные P/R/FP/FN/failed/timeouts/latency/VRAM с числом примеров, видом оценки и версиями."""
     v, lat, loc = summary["video"], summary["latency"], summary["localization"]
+    vr = (summary.get("resources") or {}).get("vram_peak_mb") or {}
     return {
+        "evaluation_kind": v.get("evaluation_kind"), "kind_note": v.get("kind_note"),
         "n_videos": v["n"], "n_pos": v["n_pos"], "n_neg": v["n_neg"],
         "precision": v["precision"], "precision_ci95": v["precision_ci95"],
         "recall": v["recall"], "recall_ci95": v["recall_ci95"],
         "specificity": v["specificity"], "specificity_ci95": v["specificity_ci95"],
-        "fp": v["fp"], "fn": v["fn"], "failed": v["failed"], "timeouts": v["timeouts"], "degraded": v["degraded"],
+        "fp": v["fp"], "fn": v["fn"], "failed": v["failed"], "partial": v.get("partial", 0),
+        "unresolved_neg": v.get("unresolved_neg", 0), "timeouts": v["timeouts"], "degraded": v["degraded"],
+        "coverage_unknown": v.get("coverage_unknown", 0),
         "hit_events_all": loc["hit_events_all"], "events_total": loc["events_total"],
         "extra_candidates_total": loc["extra_candidates_total"],
+        "evidence_ok_all": (summary.get("evidence") or {}).get("ok_all"),
+        "types_available": (summary.get("types") or {}).get("available", False),
+        "type_accuracy": (summary.get("types") or {}).get("accuracy"),
         "latency_s": {k: lat.get(k) for k in ("n", "median", "p90", "max")}, "over_sla": len(lat["over_sla_ids"]),
-        "label_conflicts": len(v["label_conflict_ids"]),
+        "vram_peak_mb_max": vr.get("max"),
+        "label_conflicts": len(v["label_conflict_ids"]), "conflict_groups": len(summary.get("conflict_groups") or []),
+        "label_unknown": len(v.get("label_unknown_ids") or []),
         "versions": versions or {},
     }
 
@@ -642,8 +731,9 @@ def public_summary(res: dict, proxy: Optional[dict] = None) -> dict:
     вне локальной машины (в т.ч. облачным агентам/LLM). Полные preds/HTML-отчёты — только локально."""
     s, v = res["summary"], res["summary"]["video"]
     loc, lat = s["localization"], s["latency"]
-    keep = ("n", "n_pos", "n_neg", "tp", "tn", "fp", "fn", "failed", "timeouts", "degraded", "precision", "recall",
-            "f1", "accuracy", "specificity", "precision_ci95", "recall_ci95", "specificity_ci95")
+    keep = ("n", "n_pos", "n_neg", "tp", "tn", "fp", "fn", "failed", "partial", "unresolved_neg", "timeouts", "degraded",
+            "coverage_unknown", "precision", "recall", "f1", "accuracy", "specificity", "precision_ci95", "recall_ci95",
+            "specificity_ci95", "evaluation_kind", "kind_note")
     out = {
         "note": "Агрегаты без кадров/описаний/ID видео. Результат — подсказка, не юридическое заключение.",
         "scorecard": res.get("scorecard"),
@@ -661,6 +751,8 @@ def public_summary(res: dict, proxy: Optional[dict] = None) -> dict:
         "latency": {k: lat.get(k) for k in ("n", "mean", "median", "p90", "max", "sla_s", "within_sla_rate")}
         | {"n_over_sla": len(lat.get("over_sla_ids") or [])},
         "categories": {c: len(ids) for c, ids in s["categories"].items()},
+        "resources": s.get("resources"),
+        "conflict_groups": len(s.get("conflict_groups") or []),
     }
     if proxy:
         out["proxy_score"] = {"value": proxy.get("proxy_score"), "disclaimer": proxy.get("disclaimer"),
@@ -678,17 +770,22 @@ def format_scorecard(sc: dict) -> str:
     lat = sc["latency_s"]
     ver = sc.get("versions") or {}
     return "\n".join([
-        f"SCORECARD  n={sc['n_videos']} (+{sc['n_pos']} / -{sc['n_neg']})  eval={ver.get('eval_version')} "
-        f"git={ver.get('git_sha')} pipeline={','.join(ver.get('pipeline_versions') or []) or '—'} "
+        f"SCORECARD [{sc.get('evaluation_kind')}] {sc.get('kind_note') or ''}",
+        f"  n={sc['n_videos']} (+{sc['n_pos']} / -{sc['n_neg']})  eval={ver.get('eval_version')} git={ver.get('git_sha')} "
+        f"pipeline={','.join(ver.get('pipeline_versions') or []) or '—'} config={ver.get('pipeline_config_sha', '—')} "
         f"labels={ver.get('labels_sha256', '—')} subset={ver.get('subset', 'all')}",
         f"  recall={_f(sc['recall'])}{ci(sc['recall_ci95'])}  precision={_f(sc['precision'])}{ci(sc['precision_ci95'])}  "
         f"specificity={_f(sc['specificity'])}{ci(sc['specificity_ci95'])}",
-        f"  FN={sc['fn']}  FP={sc['fp']}  failed={sc['failed']}  timeouts={sc['timeouts']}  degraded={sc['degraded']}  "
-        f"конфликт меток={sc['label_conflicts']}",
-        f"  hit событий (из {sc['events_total']}): " + " ".join(f"@{k}={_f(x)}" for k, x in sc["hit_events_all"].items())
-        + f"  лишних кандидатов={sc['extra_candidates_total']}",
+        f"  FN={sc['fn']}  FP={sc['fp']}  failed={sc['failed']}  partial={sc.get('partial', 0)}  "
+        f"негативы без ответа={sc.get('unresolved_neg', 0)}  timeouts={sc['timeouts']}  degraded={sc['degraded']}  "
+        f"coverage не сообщён={sc.get('coverage_unknown', 0)}",
+        f"  hit событий (из {sc['events_total']}, без конфликтных групп): "
+        + " ".join(f"@{k}={_f(x)}" for k, x in sc["hit_events_all"].items())
+        + f"  кадр ±1 с={_f(sc.get('evidence_ok_all'))}  лишних кандидатов={sc['extra_candidates_total']}  "
+        f"конфликтных групп={sc.get('conflict_groups', 0)}",
+        f"  тип: {('acc=' + _f(sc.get('type_accuracy'))) if sc.get('types_available') else 'n/a (нет GT типов)'}",
         f"  latency: n={lat['n']} median={_f(lat['median'])} p90={_f(lat['p90'])} max={_f(lat['max'])} с; "
-        f"> SLA: {sc['over_sla']}",
+        f"> SLA: {sc['over_sla']};  VRAM peak={_f(sc.get('vram_peak_mb_max'))} МБ",
     ])
 
 

@@ -46,12 +46,13 @@ def component_detection(summary: dict, cfg: dict) -> tuple[Optional[float], str]
     P, N = v["n_pos"], v["n_neg"]
     if not P + N:
         return None, "нет видео"
-    # failed на негативе — тоже ошибка (ответа нет); failed на позитиве уже входит в FN
-    fp_eff = v["fp"] + len([x for x in v.get("failed_ids", []) if x not in set(v.get("fn_ids", []))])
+    # failed/partial на негативе — тоже ошибка (ответа «чисто» нет); на позитиве уже входит в FN
+    fp_eff = v["fp"] + int(v.get("unresolved_neg", len([x for x in v.get("failed_ids", [])
+                                                       if x not in set(v.get("fn_ids", []))])))
     cost = cfn * v["fn"] + cfp * fp_eff
     val = max(0.0, 1.0 - cost / (cfn * P + cfp * N))
-    return val, f"1 − ({cfn:g}·FN + {cfp:g}·(FP+failed⁻)) / ({cfn:g}·P + {cfp:g}·N): FN={v['fn']} FP={v['fp']} " \
-                f"failed⁻={fp_eff - v['fp']} P={P} N={N}"
+    return val, f"1 − ({cfn:g}·FN + {cfp:g}·(FP+без ответа⁻)) / ({cfn:g}·P + {cfp:g}·N): FN={v['fn']} FP={v['fp']} " \
+                f"без ответа⁻={fp_eff - v['fp']} P={P} N={N}"
 
 
 def component_timecode(per_video: list[dict], cfg: dict) -> tuple[Optional[float], str]:
