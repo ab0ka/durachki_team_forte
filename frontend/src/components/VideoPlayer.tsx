@@ -23,13 +23,14 @@ interface Props {
   duration: number;
   timeline: TimelinePoint[];
   violations: Violation[];
+  hints?: { timecode_sec: number; type: string }[];
   onTime?: (t: number) => void;
 }
 
 const SPEEDS = [0.5, 1, 2];
 
 const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
-  { source, synthetic, duration, timeline, violations, onTime },
+  { source, synthetic, duration, timeline, violations, hints, onTime },
   ref,
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -243,7 +244,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
       </div>
       {d > 0 ? (
         <div className="mt-5">
-          <RiskTimeline duration={d} timeline={timeline} violations={violations} currentTime={t} onSeek={(x) => seek(x)} />
+          <RiskTimeline duration={d} timeline={timeline} violations={violations} hints={hints} currentTime={t} onSeek={(x) => seek(x)} />
         </div>
       ) : (
         <p className="mt-4 text-xs text-slate-500">Длительность записи неизвестна — шкала риска недоступна.</p>

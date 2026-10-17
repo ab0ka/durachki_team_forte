@@ -326,3 +326,39 @@ export function toJuryJson(job: JobResult): Record<string, unknown> {
     })),
   };
 }
+
+export interface ReviewHint {
+  type: string;
+  type_id?: string;
+  timecode_sec: number;
+  t_start?: number;
+  t_end?: number;
+  reasons: string[];
+  facts: string[];
+}
+
+/**
+ * A12: meta.ui.review_hints — кандидаты ниже порога/подавленные. В вердикт НЕ входят;
+ * UI показывает их отдельно как «стоит просмотреть», чтобы проверяющий не пропустил пограничный момент.
+ */
+export function reviewHints(job: JobResult): ReviewHint[] {
+  const ui = (job.meta as Obj).ui;
+  const list = isObj(ui) ? ui.review_hints : undefined;
+  if (!Array.isArray(list)) return [];
+  const out: ReviewHint[] = [];
+  for (const h of list) {
+    if (!isObj(h)) continue;
+    const t = optNum(h.timecode_sec ?? h.t_peak);
+    if (t === undefined || t < 0) continue;
+    out.push({
+      type: str(h.type) || str(h.type_id) || "Возможный эпизод",
+      type_id: str(h.type_id) || undefined,
+      timecode_sec: t,
+      t_start: optNum(h.t_start),
+      t_end: optNum(h.t_end),
+      reasons: strList(h.reasons_ru).length ? strList(h.reasons_ru) : strList(h.reasons),
+      facts: strList(h.facts),
+    });
+  }
+  return out.sort((a, b) => a.timecode_sec - b.timecode_sec);
+}

@@ -12,6 +12,7 @@ import {
   violationFacts,
   violationSources,
   violationVlm,
+  reviewHints,
 } from "../src/api/normalize";
 
 // Формы ответов — как в contracts/examples (A01).
@@ -227,5 +228,21 @@ describe("A12: meta.ui.evidence_overlays", () => {
     expect(violationSources(j.violations[1], j)).toEqual(["rules", "temporal"]);
     expect(violationVlm(j.violations[0], j)?.tone).toBe("ok");
     expect(violationVlm(j.violations[1], j)?.label).toBe("VLM не подтвердила");
+  });
+});
+
+describe("A12: review_hints", () => {
+  it("разбор и сортировка, причины по-русски", () => {
+    const j = normalizeJob({
+      status: "done",
+      verdict: "no_violation",
+      violations: [],
+      meta: { ui: { review_hints: [{ type: "B", timecode_sec: 9, reasons: ["below_threshold"], reasons_ru: ["ниже порога"] }, { type_id: "V05", timecode_sec: 2 }, { type: "bad" }] } },
+    });
+    const h = reviewHints(j);
+    expect(h.map((x) => x.timecode_sec)).toEqual([2, 9]);
+    expect(h[1].reasons).toEqual(["ниже порога"]);
+    expect(h[0].type).toBe("V05");
+    expect(j.verdict).toBe("no_violation");
   });
 });

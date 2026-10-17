@@ -7,6 +7,8 @@ interface Props {
   duration: number;
   timeline: TimelinePoint[];
   violations: Violation[];
+  /** Пограничные моменты (ниже порога, A12 review_hints) — серые засечки, в вердикт не входят. */
+  hints?: { timecode_sec: number; type: string }[];
   currentTime: number;
   onSeek: (t: number) => void;
 }
@@ -14,7 +16,7 @@ interface Props {
 const VB_W = 1000;
 
 /** Кастомная шкала плеера: тепловая полоса риска + интервалы эпизодов + маркеры (клик → перемотка). */
-export default function RiskTimeline({ duration, timeline, violations, currentTime, onSeek }: Props) {
+export default function RiskTimeline({ duration, timeline, violations, hints = [], currentTime, onSeek }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ x: number; t: number; r: number | null } | null>(null);
   const dragging = useRef(false);
@@ -111,6 +113,23 @@ export default function RiskTimeline({ duration, timeline, violations, currentTi
           })}
           {linePath && <path d={linePath} fill="none" stroke="rgba(15,23,42,.55)" strokeWidth={1.5} vectorEffect="non-scaling-stroke" className="dark:stroke-white/70" />}
         </svg>
+        {/* пограничные моменты (ниже порога) */}
+        {hints.map((h, i) => (
+          <button
+            key={`h${i}`}
+            className="absolute -bottom-1.5 z-10 -translate-x-1/2"
+            style={{ left: `${Math.min(1, h.timecode_sec / d) * 100}%` }}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onSeek(h.timecode_sec);
+            }}
+            title={`Стоит просмотреть (ниже порога): ${h.type} — ${formatTimecode(h.timecode_sec)}`}
+            aria-label={`Пограничный момент ${formatTimecode(h.timecode_sec)}`}
+          >
+            <span className="block h-2.5 w-2.5 rotate-45 border-2 border-slate-500 bg-white dark:border-slate-300 dark:bg-ink-900" />
+          </button>
+        ))}
         {/* маркеры эпизодов */}
         {violations.map((v, i) => (
           <button
@@ -164,6 +183,11 @@ export default function RiskTimeline({ duration, timeline, violations, currentTi
         <span className="flex items-center gap-1.5">
           <span className="h-2.5 w-4 rounded-sm border-2 border-dashed border-brand-600" /> интервал эпизода
         </span>
+        {hints.length > 0 && (
+          <span className="flex items-center gap-1.5">
+            <span className="block h-2 w-2 rotate-45 border-2 border-slate-500" /> стоит просмотреть (ниже порога)
+          </span>
+        )}
         {!timeline.length && <span>сервер не передал кривую риска</span>}
       </div>
     </div>

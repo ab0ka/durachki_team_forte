@@ -44,9 +44,11 @@ describe("ResultView", () => {
     expect(html).toContain("Что система не проверяет");
     expect(html).toContain("Как система пришла к выводу");
   });
-  it("без нарушений — формулировка ТЗ", () => {
+  it("без нарушений — формулировка ТЗ; пограничные моменты отдельно и не меняют вердикт", () => {
     const html = wrap(<ResultView job={buildDemoClean()} raw={{}} />);
     expect(html).toContain("Нарушение не обнаружено");
+    expect(html).toContain("Стоит просмотреть");
+    expect(html).toContain("00:37.2");
     expect(html).not.toContain("Обнаружены признаки возможных нарушений");
   });
   it("неполный анализ без нарушений — не зелёный «не обнаружено»", () => {

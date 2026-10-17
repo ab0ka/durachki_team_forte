@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   Ban,
   Download,
+  Eye,
   FileJson,
   FileText,
   ListChecks,
@@ -12,7 +13,7 @@ import {
   Upload,
 } from "lucide-react";
 import { ApiError, localVideo } from "../api/client";
-import { inferDuration, isPartial, toJuryJson } from "../api/normalize";
+import { inferDuration, isPartial, reviewHints, toJuryJson } from "../api/normalize";
 import type { JobResult } from "../api/types";
 import { useApp } from "../context";
 import { formatDateTime, formatDuration, formatTimecode } from "../lib/format";
@@ -54,6 +55,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
   const partial = isPartial(job);
   const view = verdictView(job, partial);
   const duration = inferDuration(job);
+  const hints = reviewHints(job);
   const source = useMemo(() => {
     const server = backend.videoSource(job.job_id);
     const local = localVideo(job.job_id);
@@ -171,6 +173,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
               duration={duration}
               timeline={job.timeline}
               violations={job.violations}
+              hints={hints}
               onTime={onTime}
             />
           </section>
@@ -198,7 +201,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
               <h2 className="mt-3 text-lg font-bold">Эпизодов с признаками нарушений не найдено</h2>
               <p className="mx-auto mt-1 max-w-lg text-sm text-slate-500">
                 {view.tone === "success"
-                  ? "Система не выявила видимых признаков нарушений. Ниже — что система принципиально не проверяет."
+                  ? "Система не выявила видимых признаков нарушений. Ограничения — в блоке «Что система не проверяет»."
                   : "Анализ неполный — вывод об отсутствии нарушений сделать нельзя, просмотрите запись вручную."}
               </p>
             </section>
@@ -216,6 +219,35 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
                       <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-brand-600 text-[11px] font-bold text-white">{i + 1}</span>
                       <span className="min-w-0 flex-1 truncate text-sm font-medium">{v.type}</span>
                       <span className="font-mono text-xs text-slate-500 tnum">{formatTimecode(v.timecode_sec)}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {hints.length > 0 && (
+            <section className="card p-4">
+              <div className="label mb-1 flex items-center gap-1.5">
+                <Eye className="h-3.5 w-3.5" /> Стоит просмотреть
+              </div>
+              <p className="mb-2 text-xs text-slate-500">
+                Пограничные моменты ниже порога уверенности. В вердикт не входят — система не считает их нарушениями.
+              </p>
+              <ul className="space-y-1">
+                {hints.slice(0, 8).map((h, i) => (
+                  <li key={i}>
+                    <button
+                      className="no-print flex w-full items-start gap-3 rounded-lg px-2 py-2 text-left hover:bg-slate-50 dark:hover:bg-white/5"
+                      onClick={() => seek(h.timecode_sec)}
+                      title={h.facts.join("; ") || undefined}
+                    >
+                      <span className="mt-1 block h-2.5 w-2.5 shrink-0 rotate-45 border-2 border-slate-500 dark:border-slate-300" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium">{h.type}</span>
+                        {h.reasons.length > 0 && <span className="block truncate text-xs text-slate-500">{h.reasons.join(", ")}</span>}
+                      </span>
+                      <span className="font-mono text-xs text-slate-500 tnum">{formatTimecode(h.timecode_sec)}</span>
                     </button>
                   </li>
                 ))}

@@ -225,6 +225,19 @@ export function buildDemoResult(jobId = "demo"): JobResult {
       ],
       warnings: ["Демо-режим: результат сгенерирован в браузере, сервер не используется."],
       device: "demo",
+      ui: {
+        review_hints: [
+          {
+            type_id: "V01",
+            type: "Посторонний в кассовом помещении",
+            timecode_sec: 4.5,
+            t_start: 0,
+            t_end: 8,
+            reasons_ru: ["ниже порога уверенности"],
+            facts: ["У стеклянной перегородки в зоне клиента находится человек"],
+          },
+        ],
+      },
     },
     progress: 1,
     stage: "done",
@@ -238,7 +251,23 @@ export function buildDemoClean(jobId = "demo-clean"): JobResult {
     verdict: "no_violation",
     violations: [],
     timeline: demoTimeline().map(([t, r]) => [t, Math.min(0.28, r * 0.3)] as TimelinePoint),
-    meta: { version: "demo", duration: DEMO_DURATION, file_name: "demo_clean.mov", timings: { total: 28.2 } },
+    meta: {
+      version: "demo",
+      duration: DEMO_DURATION,
+      file_name: "demo_clean.mov",
+      timings: { total: 28.2 },
+      ui: {
+        review_hints: [
+          {
+            type_id: "V05",
+            type: "Мобильный телефон при работе с ценностями",
+            timecode_sec: 37.2,
+            reasons_ru: ["ниже порога уверенности"],
+            facts: ["Предмет в руке кассира, тип предмета не определён уверенно"],
+          },
+        ],
+      },
+    },
     progress: 1,
     stage: "done",
   };
