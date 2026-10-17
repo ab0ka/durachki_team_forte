@@ -30,6 +30,7 @@ LABEL_VIOLATION = "violation"
 LABEL_CLEAN = "no_violation"
 CSV_COLUMNS = ["video_id", "file", "label", "t_sec", "md5", "group", "t_all", "conflict", "raw", "sha256"]
 LABEL_CONFLICT = "conflict"   # в md5/sha256-группе разные метки — исключаем из бинарных метрик, не выбираем сами
+LABEL_UNKNOWN = "unknown"     # пустая/непонятная метка в labels.csv — исключается (unknown ≠ false)
 
 _NO_VIOLATION_RE = re.compile(
     r"(без\s*нарушени|нет\s*нарушени|нарушени[йяе]\s*нет|не\s*выявлен|не\s*обнаружен|отсутству|"
@@ -418,10 +419,15 @@ def read_labels_csv(path: str | Path) -> list[LabelRow]:
         vid = normalize_video_id(d.get("video_id")) or d.get("video_id", "")
         if not vid:
             continue
-        lab = (d.get("label") or "").lower()
-        label = LABEL_VIOLATION if lab in ("violation", "1", "true", "yes", "нарушение") else LABEL_CLEAN
+        lab = (d.get("label") or "").strip().lower()
+        if lab in ("violation", "1", "true", "yes", "нарушение", "да"):
+            label = LABEL_VIOLATION
+        elif lab in ("no_violation", "0", "false", "no", "без нарушения", "нет", "clean"):
+            label = LABEL_CLEAN
+        else:  # unknown ≠ false: непонятная/пустая метка не становится «без нарушения»
+            label = LABEL_UNKNOWN
         times: list[float] = []
-        for chunk in (d.get("t_all") or "").split(";") + [d.get("t_sec") or ""]:
+        for chunk in re.split(r"[;,|]", d.get("t_all") or "") + [d.get("t_sec") or ""]:
             chunk = chunk.strip()
             if chunk:
                 try:
@@ -476,7 +482,10 @@ def load_ground_truth(labels_csv: str | Path, types_csv: Optional[str | Path] = 
     for key, members in grouped.items():
         members.sort(key=lambda r: video_sort_key(r.video_id))
         labels = {m.label for m in members}
-        label = labels.pop() if len(labels) == 1 else LABEL_CONFLICT
+        if LABEL_UNKNOWN in labels:
+            label = LABEL_UNKNOWN
+        else:
+            label = labels.pop() if len(labels) == 1 else LABEL_CONFLICT
         rep = next((m for m in members if m.video_id == key), members[0])
         gt = GroundTruth(video_id=key, label=label, group=members[0].group or key, file=rep.file, md5=rep.md5,
                          members=[m.video_id for m in members],

@@ -8,6 +8,13 @@ early_late_tol_s: 2.0                  # |Δt| больше — категори
 type_match_window_s: 3.0               # окно сопоставления GT(t,type) ↔ предсказанное нарушение
 match_window_s: 5.0                    # one-to-one сопоставление нарушение ↔ GT-событие (не меньше max(hit_windows_s))
 dedupe_groups: true                    # дубликаты по md5/sha256 (Х-4≡Х-47) — одно видео в метриках
+conflict_policy: separate              # separate: конфликт 57/68 — отдельным блоком, не в основных метриках локализации
+                                       # alternatives: одно событие с альтернативами [57, 68] (вторая сводка — localization_alt)
+dataset:
+  evaluation_kind: exploratory         # все 42 видео уже использованы в разведке → НЕ независимый тест
+coverage:
+  min: 0.95                            # no_violation при meta.coverage < min → partial (не «чисто»)
+  require: false                       # true: нет meta.coverage → тоже partial (включить, когда A03 начнёт отдавать coverage)
 # Конфликт таймкодов в группе дубликатов (57 / 68 с) НЕ решаем выбором: одно событие с альтернативами
 # [57, 68]; метрики локализации дополнительно считаются без конфликтных групп (localization_no_conflict).
 # Конфликт МЕТОК (нарушение / без нарушения) → группа исключается из бинарных метрик (label_conflict_ids).

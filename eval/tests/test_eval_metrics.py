@@ -84,7 +84,11 @@ def test_one_to_one_and_conflict_alternatives(result):
     assert by["X-1"]["category"] == "TP" and by["X-1"]["hits"]["0.5"]
     loc = result["summary"]["localization"]
     assert loc["extra_candidates_total"] == 3 and "неполная" in loc["caveat"]   # X-8: 2, X-7: 1 (вне окна)
-    assert result["summary"]["localization_no_conflict"]["events_total"] == loc["events_total"] - 1
+    # политика separate: конфликт 57/68 — отдельным блоком, в основные метрики локализации не входит
+    assert loc["conflict_policy"] == "separate"
+    assert result["summary"]["localization_alt"]["events_total"] == loc["events_total"] + 1
+    cg = result["summary"]["conflict_groups"]
+    assert len(cg) == 1 and cg[0]["group"] == "X-4" and cg[0]["dt_to_alternatives"] == {"57": 10.5, "68": -0.5}
 
 
 def test_match_one_to_one_unique():
@@ -161,3 +165,36 @@ def test_schema_errors():
     assert any("JPEG" in w for w in rep.warnings)
     rep = check_api_response({"job_id": "x", "status": "done", "verdict": "maybe", "violations": []})
     assert any("verdict" in e for e in rep.errors)
+
+
+def test_failed_partial_invalid_never_clean(tmp_path: Path):
+    """unknown ≠ false: failed / partial / невалидный вердикт на негативе — не TN; неизвестная метка исключена."""
+    rows = [LabelRow("X-1", "no_violation", []), LabelRow("X-2", "no_violation", []), LabelRow("X-3", "no_violation", []),
+            LabelRow("X-4", "violation", [5.0]), LabelRow("X-5", "no_violation", []), LabelRow("X-6", "violation", [3.0])]
+    p = tmp_path / "l.csv"
+    write_labels_csv(rows, p)
+    txt = p.read_text(encoding="utf-8").replace("X-6,,violation", "X-6,,???")
+    p.write_text(txt, encoding="utf-8")
+    preds = {
+        "X-1": {"job_id": "a", "status": "failed", "verdict": None, "violations": [], "error": "CUDA OOM"},
+        "X-2": make_pred("b", [], meta={"coverage": 0.4}),                       # partial → не «чисто»
+        "X-3": {"job_id": "c", "status": "done", "verdict": None, "violations": []},   # невалидный вердикт
+        "X-4": make_pred("d", [], meta={"coverage": {"frames": 0.5, "vlm": 0.0}}),  # partial на позитиве → FN
+        "X-5": make_pred("e", [], meta={"coverage": 1.0, "vram_peak_mb": 4700}),
+        "X-6": make_pred("f", [make_violation(3.0)]),
+    }
+    res = evaluate(load_ground_truth(p), preds, {}, load_config())
+    v = res["summary"]["video"]
+    assert v["label_unknown_ids"] == ["X-6"] and v["n"] == 5
+    assert v["tn"] == 1 and v["unresolved_neg"] == 3 and v["specificity"] == 0.25
+    assert v["fn"] == 1 and v["fn_failed_or_partial"] == 1 and v["partial"] == 2
+    cats = {e["video_id"]: e["category"] for e in res["per_video"]}
+    assert cats["X-2"] == "partial" and cats["X-3"] == "failed" and cats["X-1"] == "failed" and cats["X-5"] == "TN"
+    sc = res["scorecard"]
+    assert sc["evaluation_kind"] == "exploratory" and "не независимый" in sc["kind_note"]
+    assert sc["vram_peak_mb_max"] == 4700 and sc["coverage_unknown"] == 0
+    assert "РАЗВЕДОЧНАЯ" in format_scorecard(sc)
+    # require: нет coverage → partial
+    res2 = evaluate(load_ground_truth(p), {"X-5": make_pred("e", [])}, {},
+                    load_config(overrides={"coverage": {"require": True}}))
+    assert {e["video_id"]: e["category"] for e in res2["per_video"]}["X-5"] == "partial"
