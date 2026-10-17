@@ -4,9 +4,12 @@
   "verdict": null,
   "violations": [],
   "verdict_state": "unknown",
-  "analysis_complete": null,
+  "analysis_complete": false,
+  "coverage_problem": "полнота анализа не подтверждена: нет meta.coverage",
   "candidates": [],
-  "warnings": [],
+  "warnings": [
+    "не удалось декодировать видео"
+  ],
   "error": "не удалось декодировать видео",
   "timeline": [],
   "meta": {

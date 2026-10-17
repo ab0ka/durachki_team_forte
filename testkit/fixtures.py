@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from contracts.extensions import Completeness, Provenance
+from contracts.extensions import Provenance, compute_coverage
 from contracts.sentinel_contracts import (
     LABELS,
     SIGNALS,
@@ -343,8 +343,9 @@ def make_analysis_result(scenario: str, job_id: str = "testkit-job", duration: f
     gt = SceneScript(scenario, duration).gt
     meta: dict[str, Any] = {
         "duration_sec": duration,
-        "completeness": Completeness(complete=True, analyzed_until_sec=duration, duration_sec=duration,
-                                     stages={"testkit": "mock"}).to_dict(),
+        "mock": True,  # фикстура тест-кита: сериализуется только с allow_mock / SENTINEL_MOCK=1
+        "coverage": compute_coverage(duration, duration, stages={"testkit": "mock"}, required=["testkit"],
+                                     source="testkit"),
         "provenance": Provenance(pipeline_version="testkit", mock=True, sources=["testkit"]).to_dict(),
         "warnings": [],
     }

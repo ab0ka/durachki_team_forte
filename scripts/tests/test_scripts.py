@@ -127,3 +127,40 @@ def test_check_fallbacks(tmp_path):
     (tmp_path / "ml/c/_contract_fallback.py").unlink()
     assert check_fallbacks.main(["--root", str(tmp_path), "--drop"]) == 0
     assert not list(tmp_path.rglob("_contract_fallback.py"))
+
+
+def test_guard_media(tmp_path):
+    import guard_media
+
+    assert guard_media.name_problem("data/X-1.MOV") and guard_media.name_problem("ml/detect/w.safetensors")
+    assert guard_media.name_problem("eval/frames/f.jpg") and not guard_media.name_problem("docs/assets/a.jpg")
+    assert guard_media.name_problem("ml/detect/code.py") is None
+    (tmp_path / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "big.bin").write_bytes(b"0" * (6 * 1024 * 1024))
+    (tmp_path / "video.dat").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 32)
+    (tmp_path / "frame.dat").write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 32)
+    (tmp_path / "w.bin").write_bytes(b"GGUF" + b"0" * 32)
+    assert guard_media.check_file("ok.py", tmp_path) == []
+    assert any("МБ" in p for p in guard_media.check_file("big.bin", tmp_path))
+    assert guard_media.check_file("video.dat", tmp_path) and guard_media.check_file("w.bin", tmp_path)
+    assert guard_media.check_file("frame.dat", tmp_path)
+    assert guard_media.main(["--root", str(tmp_path), "ok.py"]) == 0
+    assert guard_media.main(["--root", str(tmp_path), "ok.py", "video.dat"]) == 1
+    assert guard_media.main(["--root", str(tmp_path), "--max-mb", "10", "big.bin"]) == 0
+
+
+def test_gitignore_is_anchored():
+    lines = [ln.strip() for ln in (SCRIPTS.parent / ".gitignore").read_text(encoding="utf-8").splitlines()
+             if ln.strip() and not ln.startswith("#")]
+    for d in ("/data/", "/weights/", "/cache/", "/reports/frames/"):
+        assert d in lines
+    for bad in ("data/", "weights/", "cache/", "outputs/", "runs/"):
+        assert bad not in lines, f"неякорный шаблон {bad} спрячет папки внутри кода"
+    for ext in ("*.mov", "*.MOV", "*.mp4", "*.avi", "*.mkv", "*.onnx", "*.pt", "*.pth", "*.safetensors", "*.gguf",
+                "*.engine"):
+        assert ext in lines
+
+
+def test_repo_tracked_files_pass_guard():
+    assert subprocess.run([sys.executable, str(SCRIPTS / "guard_media.py"), "--all", "--root", str(SCRIPTS.parent)],
+                          capture_output=True).returncode == 0
