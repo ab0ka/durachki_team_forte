@@ -5,11 +5,14 @@
 Дополнительно:
     track_full(clip, dets, cfg=None) -> TrackResult(tracks, zones, info)   # + provenance
     events: entries_exits, dwell, proximity, gaps, presence_state, person_signals
+    queries: TrackQueries(tracks, zones, info).cashier_left_workplace(t) / cashier_left_room(t) /
+             person_entered(t, role) / n_outsiders(t) / outsider_at_cashier_side(t) / events()
 """
 from __future__ import annotations
 
 from .api import TrackResult, track, track_full
 from .events import dwell, entries_exits, gaps, person_signals, presence_state, proximity
+from .queries import Answer, TrackEvent, TrackQueries
 
 __all__ = ["track", "track_full", "TrackResult", "entries_exits", "dwell", "proximity", "gaps",
-           "presence_state", "person_signals"]
+           "presence_state", "person_signals", "TrackQueries", "Answer", "TrackEvent"]

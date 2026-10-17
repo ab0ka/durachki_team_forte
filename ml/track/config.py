@@ -54,7 +54,9 @@ DEFAULTS: dict[str, Any] = {
         "static_iou": 0.3,
     },
     "appearance": {
-        "enabled": True,
+        # Спецификация команды: цвет одежды/яркость — не признаки (одежда и свет меняются).
+        # Гистограмма одежды оставлена как гипотеза H-APP для замера L2: по умолчанию ВЫКЛ.
+        "enabled": False,
         "samples_per_track": 6,
         "max_frames": 150,
         "budget_s": 4.0,
@@ -68,9 +70,18 @@ DEFAULTS: dict[str, Any] = {
         "min_presence_s": 1.0,           # короче — роль unknown
         "near_desk_diag": 0.9,
         "stationary_speed_diag_s": 0.35,
-        "w_desk": 0.40, "w_start": 0.25, "w_still": 0.20, "w_presence": 0.15, "w_safe_side": 0.10,
-        "w_desk_center": 0.20,           # ближе к центру объектов стола (сидит перед ноутбуком/счётчиком)
+        # w_start = 0: роль НЕ зависит от порядка появления (кассир может войти через дверь в первые секунды)
+        "w_desk": 0.40, "w_start": 0.0, "w_still": 0.20, "w_presence": 0.15, "w_safe_side": 0.10,
+        "w_desk_center": 0.15,           # ближе к центру объектов стола (сидит перед ноутбуком/счётчиком)
+        "w_seated": 0.45,                # сидит у стола со стороны кассы (относительно других людей ролика)
+        "w_counter": 0.15,               # сидит у счётчика банкнот
         "speed_window_s": 1.0,
+        "seated_speed_diag_s": 0.25,     # «сидит/стоит на месте»
+        "min_seated_s": 2.0,             # минимум «сидит у стола со стороны кассы», чтобы быть кандидатом в кассиры
+        "near_counter_diag": 0.8,
+        "side_tol_diag": 0.1,
+        "no_side_cashier_conf_cap": 0.7,     # сторона кассы не подтверждена сейфом
+        "behavior_cashier_conf_cap": 0.65,   # кассир по собственному поведению после разрыва трека
         "min_cashier_score": 0.35,
         "fallback_cashier_conf_cap": 0.45,   # без объектов стола роль кассира — слабая
         "fallback_visitor_conf_cap": 0.6,
@@ -91,6 +102,32 @@ DEFAULTS: dict[str, Any] = {
         "companion_window_s": 4.0,
         "companion_dist_diag": 2.5,
         "second_person_role": "unknown",     # второй человек в зоне кассира: не «посторонний» автоматически
+    },
+    "queries": {
+        "min_role_conf": 0.5,            # роль ниже — передаётся как unknown (fallback-кассир <= 0.45)
+        "min_zone_conf": 0.35,           # зона ниже — «не определена» (fallback-зоны <= 0.3)
+        "max_dt": 0.6,
+        "start_grace_s": 0.5,            # кто в кадре с начала — не «вошёл»
+        "vis_grace_s": 1.0,              # появление сразу после потери видимости — не вход
+        "entry_requires_boundary": True,  # вход = появление у двери/края; в глубине кадра — не вход
+        "entry_window_s": 1.0,
+        "edge_margin": 0.06,
+        "door_expand": 1.3,
+        "safe_expand": 1.3,               # «у ценностей» = в расширенной зоне сейфа
+        "low_quality_min_s": 0.6,         # трек короче — не считается человеком в n_outsiders/входах
+        "min_gap_s": 0.6,
+        "min_loss_s": 0.6,                # потеря видимости (все статичные предметы пропали)
+        "smoothing": "off",               # H-SMOOTH: off | hysteresis — по умолчанию ВЫКЛ до замера L2
+        "min_state_s": 0.4,               # гистерезис состояний (режим off)
+        "merge_gap_s": 0.0,
+        "smooth_min_state_s": 2.0,        # режим hysteresis
+        "smooth_merge_gap_s": 3.0,
+    },
+    "visibility": {
+        "min_loss_s": 0.6,
+        "bridge_tracks": False,           # H-VIS: склейка треков через потерю видимости по положению (ВЫКЛ)
+        "bridge_dist_diag": 1.0,
+        "bridge_max_s": 20.0,
     },
     "zones": {
         "desk_labels": ["laptop", "money_counter"],

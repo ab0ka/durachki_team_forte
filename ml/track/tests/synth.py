@@ -32,6 +32,7 @@ class Person:
     color: tuple = (200, 80, 40)  # BGR одежда
     size: tuple = PSIZE
     jitter: float = 0.003
+    miss: list = field(default_factory=list)  # интервалы, где человек ЕСТЬ, но детектор его не видит
 
     def pos(self, t: float) -> Optional[tuple]:
         if not any(a <= t <= b for a, b in self.visible):
@@ -123,7 +124,10 @@ def apply_box(A: Optional[np.ndarray], b: Sequence[float]) -> tuple:
 
 def make(scene: Scene, A: Optional[np.ndarray] = None, seed: int = 0, drop: float = 0.0,
          render: bool = False, every_n: int = 1, width: Optional[int] = None,
-         height: Optional[int] = None) -> tuple[SynthClip, list[Detection], dict]:
+         height: Optional[int] = None, blackout: Sequence[tuple] = (), jitter: Optional[float] = None,
+         H: Optional[np.ndarray] = None, noise_dets: float = 0.0) -> tuple[SynthClip, list[Detection], dict]:
+    """blackout — интервалы «свет выключили» (нет НИ ОДНОЙ детекции); H — гомография (perspective);
+    noise_dets — вероятность ложной детекции person с низким score в случайном месте на кадр."""
     rng = np.random.default_rng(seed)
     clip = SynthClip(scene, A, render, width, height)
     dets: list[Detection] = []
@@ -131,18 +135,22 @@ def make(scene: Scene, A: Optional[np.ndarray] = None, seed: int = 0, drop: floa
     for i, t in enumerate(clip.times):
         if i % every_n:
             continue
+        dark = any(a <= t <= b for a, b in blackout)
         pos = {}
         for p in scene.persons:
             xy = p.pos(t)
             if xy is None:
                 continue
-            x = xy[0] + rng.normal(0, p.jitter)
-            y = xy[1] + rng.normal(0, p.jitter)
+            jit = p.jitter if jitter is None else jitter
+            x = xy[0] + rng.normal(0, jit)
+            y = xy[1] + rng.normal(0, jit)
             pos[p.key] = (x, y)
             b = apply_box(A, (x - p.size[0] / 2, y - p.size[1] / 2, x + p.size[0] / 2, y + p.size[1] / 2))
+            if H is not None:
+                b = apply_box_h(H, b)
             b = tuple(float(np.clip(v, 0, 1)) for v in b)
             clip._boxes.setdefault(i, []).append((b, p.color))
-            if drop and rng.random() < drop:
+            if dark or any(a <= t <= bb for a, bb in p.miss) or (drop and rng.random() < drop):
                 continue
             d = Detection(t=t, label="person", bbox=b, score=float(np.clip(rng.normal(0.85, 0.05), 0.5, 0.99)))
             dets.append(d)
@@ -158,10 +166,34 @@ def make(scene: Scene, A: Optional[np.ndarray] = None, seed: int = 0, drop: floa
                 continue
             else:
                 box = o.box
+            if dark:
+                continue
             b = apply_box(A, box)
+            if H is not None:
+                b = apply_box_h(H, b)
             b = tuple(float(np.clip(v, 0, 1)) for v in b)
             dets.append(Detection(t=t, label=o.label, bbox=b, score=o.score))
+        if noise_dets and rng.random() < noise_dets:
+            cx, cy = rng.uniform(0.1, 0.9, 2)
+            dets.append(Detection(t=t, label="person", bbox=(cx - 0.08, cy - 0.06, cx + 0.08, cy + 0.06),
+                                  score=float(rng.uniform(0.15, 0.55))))
     return clip, dets, gt
+
+
+def homography(k: float = 0.25) -> np.ndarray:
+    """Перспектива «камера наклонена»: верх кадра сжат (нормированные координаты)."""
+    return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, k, 1.0]]) @ np.array(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+
+def apply_box_h(H: np.ndarray, b: Sequence[float]) -> tuple:
+    pts = []
+    for x, y in ((b[0], b[1]), (b[2], b[1]), (b[2], b[3]), (b[0], b[3])):
+        # центрируем, чтобы перспектива была вокруг центра кадра
+        v = H @ np.array([x - 0.5, y - 0.5, 1.0])
+        pts.append((v[0] / v[2] + 0.5, v[1] / v[2] + 0.5))
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
 
 
 def base_objects(duration: float, safe_label: str = "safe") -> list:
@@ -218,3 +250,15 @@ def scene_two_staff(duration: float = 40.0) -> Scene:
 def scene_no_desk(duration: float = 30.0) -> Scene:
     v = walker("visitor", [(5, *DOOR_PT), (9, *CLIENT), (20, *CLIENT), (24, *DOOR_PT)], (40, 40, 220))
     return Scene(duration, [cashier(duration), v], [])
+
+
+def without(scene: Scene, label: str) -> Scene:
+    """Та же сцена без предметов данного класса (например, без сейфа)."""
+    return Scene(scene.duration, scene.persons, [o for o in scene.objects if o.label != label], scene.width, scene.height)
+
+
+def scene_cashier_enters_client_seated(duration: float = 40.0) -> Scene:
+    """Клиент уже сидит напротив; кассир входит через дверь в первые секунды и садится за кассу."""
+    client = Person("client", [(0, *CLIENT), (duration, *CLIENT)], [(0.0, duration)], color=(40, 40, 220))
+    cas = Person("cashier", [(1.0, *DOOR_PT), (4.0, *SEAT), (duration, *SEAT)], [(1.0, duration)], color=(200, 80, 40))
+    return Scene(duration, [client, cas], base_objects(duration))

@@ -44,7 +44,8 @@ def _link(cands: list[tuple[float, int, int]]) -> tuple[dict[int, int], dict[int
 
 
 def stitch_persons(tracklets: Sequence[Tracklet], app: dict[int, np.ndarray], cfg: dict,
-                   aspect: float) -> tuple[list[list[Tracklet]], list[dict]]:
+                   aspect: float, bridges: Sequence[Sequence[float]] = (),
+                   vcfg: Optional[dict] = None) -> tuple[list[list[Tracklet]], list[dict]]:
     if not cfg.get("enabled", True) or len(tracklets) < 2:
         return [[t] for t in sorted(tracklets, key=lambda x: (x.t_start, x.tid))], []
     cands: list[tuple[float, int, int]] = []
@@ -66,7 +67,16 @@ def stitch_persons(tracklets: Sequence[Tracklet], app: dict[int, np.ndarray], cf
             diag = 0.5 * (box_diag(a.boxes[-1], aspect) + box_diag(b.boxes[0], aspect)) + 1e-6
             d = iso_dist(box_center(a.boxes[-1]), box_center(b.boxes[0]), aspect) / diag
             ad: Optional[float] = bhattacharyya(app.get(a.tid), app.get(b.tid))
-            if gap <= cfg["short_gap_s"]:
+            bridged = False
+            if bridges and vcfg and gap <= vcfg["bridge_max_s"]:
+                for la, lb in bridges:  # H-VIS: разрыв совпал с потерей видимости
+                    if la - 1.5 <= a.t_end <= la + 0.5 and lb - 0.5 <= b.t_start <= lb + 1.5 and d <= vcfg["bridge_dist_diag"]:
+                        bridged = True
+                        break
+            if bridged:
+                cost = 0.5 + 0.1 * d
+                kind = "visibility_bridge"
+            elif gap <= cfg["short_gap_s"]:
                 dmax = cfg["base_dist_diag"] + cfg["max_speed_diag_s"] * gap
                 if d > dmax or (ad is not None and ad > cfg["app_thr_short"]):
                     continue
