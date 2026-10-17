@@ -31,7 +31,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
-from .catalog import norm_status, resolve_catalog, type_info
+from .catalog import legal_basis_of, norm_status, resolve_catalog, type_info
 from .config import RuleSpec, RulesConfig, load_rules_config
 from .expr import EvalContext
 from .signals import SignalSeries, build_series, derive_from_tracks, polygon_bbox, track_box_at
@@ -74,6 +74,16 @@ SIGNAL_RU: dict[str, str] = {
     "handover_motion": "движение передачи",
     "motion_energy": "интенсивность движения",
 }
+
+
+DETECTIONS = ("violation_candidate", "observation", "insufficient_context")
+
+
+def detection_of(rule: RuleSpec, assessment: str) -> str:
+    """Ось обнаружения (поведение по видео), независимая от правовой опоры."""
+    if assessment == INSUFFICIENT:
+        return "insufficient_context"
+    return "violation_candidate" if rule.kind == "violation" else "observation"
 
 
 def assessment_of(ev: Any) -> str:
@@ -249,9 +259,39 @@ class RulesReport:
             return out
         return pts
 
+    def coverage(self) -> dict[str, Any]:
+        """Полнота наблюдений для meta.coverage: неполный анализ ≠ «нарушений нет».
+
+        ``signals`` — доля кадров с известным значением сигнала; ``rules`` — доля кадров, где известны
+        все сигналы обязательных предикатов правила (0 — правило не могло ничего доказать).
+        """
+        s = self.series
+        out: dict[str, Any] = {"n_frames": s.n,
+                               "t_first": _r(s.times[0], 2) if s.n else None,
+                               "t_last": _r(s.times[-1], 2) if s.n else None,
+                               "signals": {}, "rules": {}}
+        if s.n == 0:
+            return out
+        for nm in sorted(s.signals):
+            out["signals"][nm] = _rf(s.known(nm).mean(), 3)
+        for rule in (self.config.enabled_rules if self.config else []):
+            names = sorted(rule.mandatory_names)
+            if not names:
+                continue
+            known = np.ones(s.n, dtype=bool)
+            for nm in names:
+                known &= s.known(nm)
+            out["rules"][rule.id] = _rf(known.mean(), 3)
+        out["not_evaluable_rules"] = sorted(r for r, v in out["rules"].items() if v == 0.0)
+        return out
+
     def summary(self) -> dict[str, Any]:
         groups = split_by_assessment(self.events)
+        det: dict[str, int] = {d: 0 for d in DETECTIONS}
+        for e in self.events:
+            det[e.extra.get("detection", "observation")] = det.get(e.extra.get("detection", "observation"), 0) + 1
         return {"n_events": len(self.events), **{a: len(v) for a, v in groups.items()},
+                "detection": det,
                 "absent_signals": sorted(self.series.absent), "derived_signals": dict(self.series.derived),
                 "catalog_source": self.catalog_source, "warnings": list(self.warnings)}
 
@@ -317,15 +357,17 @@ def _signal_stats(series: SignalSeries, names: Sequence[str], i0: int, i1: int, 
     return out
 
 
-def _peak_index(rule: RuleSpec, times: np.ndarray, strength: np.ndarray, i0: int, i1: int) -> int:
+def _peak_index(rule: RuleSpec, times: np.ndarray, strength: np.ndarray, i0: int, i1: int,
+                policy: Optional[str] = None) -> int:
+    policy = policy or rule.t_peak_policy
     seg = strength[i0:i1 + 1]
-    if rule.t_peak_policy == "onset":
+    if policy == "onset":
         return i0
-    if rule.t_peak_policy == "max":
+    if policy == "max":
         return i0 + int(np.argmax(seg))
-    if rule.t_peak_policy == "center":
+    if policy == "center":
         return int(np.argmin(np.abs(times - (times[i0] + times[i1]) / 2.0)))
-    if rule.t_peak_policy == "onset_plus":
+    if policy == "onset_plus":
         t = float(np.clip(times[i0] + rule.t_peak_offset_s, times[0], times[i1]))
         return int(np.argmin(np.abs(times - t)))
     # evidence: самый ранний кадр сегмента с доказательством, близким к максимальному
@@ -334,19 +376,79 @@ def _peak_index(rule: RuleSpec, times: np.ndarray, strength: np.ndarray, i0: int
     return i0 + int(hits[0]) if hits.size else i0
 
 
+def _transition_index(times: np.ndarray, tlo: np.ndarray, thi: np.ndarray, i0: int, i1: int,
+                      lookback_s: float) -> tuple[Optional[int], str]:
+    """Наблюдаемый переход trigger: доказанно ложен → доказанно истинен (``false→true``).
+
+    Ищется в ``[t_start − lookback_s, t_end]``. Если перед истинным значением было только
+    «неизвестно» — ``unknown→true`` (начало могло быть раньше). Если trigger истинен с начала
+    окна/ролика — перехода не видно (``None``), используется fallback-политика.
+    """
+    j_start = int(np.searchsorted(times, float(times[i0]) - lookback_s - 1e-9, side="left"))
+    weak: Optional[int] = None
+    for j in range(max(j_start, 1), i1 + 1):
+        if tlo[j] >= 0.5 and tlo[j - 1] < 0.5:
+            if thi[j - 1] < 0.5:
+                return j, "false→true"
+            if weak is None:
+                weak = j
+    if weak is not None:
+        return weak, "unknown→true"
+    return None, "not_observed"
+
+
+def _clause_status(lo: float, hi: float) -> str:
+    if lo >= 0.5:
+        return "true"
+    if hi < 0.5:
+        return "false"
+    return "unknown"
+
+
+def _clause_trace(kind: str, clause: Any, bounds: tuple[np.ndarray, np.ndarray], i0: int, i1: int,
+                  ip: int) -> dict[str, Any]:
+    lo, hi = bounds
+    return {"kind": kind, "id": clause.id, "label": clause.label, "expr": clause.expr.source,
+            "at_peak": _clause_status(float(lo[ip]), float(hi[ip])),
+            "frac_true": _rf((lo[i0:i1 + 1] >= 0.5).mean(), 3),
+            "frac_unknown": _rf(((lo[i0:i1 + 1] < 0.5) & (hi[i0:i1 + 1] >= 0.5)).mean(), 3)}
+
+
 def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: int, i1: int,
                 assessment: str, reasons: list[str], tracks: Sequence[Any], zones: Sequence[Any],
-                catalog: Mapping[str, Any], cfg: RulesConfig, from_anchor: bool = False) -> Any:
+                catalog: Mapping[str, Any], cfg: RulesConfig, from_anchor: bool = False,
+                aux: Optional[dict[str, Any]] = None) -> Any:
+    aux = aux or {}
     times = series.times
     info = type_info(catalog, rule.type_id)
     norm = norm_status(catalog, rule.type_id)
     sev_factor = float(cfg.severity_factor.get(info["severity"], 1.0))
-    t_start, t_end = float(times[i0]), float(times[i1])
-    duration = t_end - t_start + series.dt
+    seg_start = float(times[i0])
     seg = strength[i0:i1 + 1]
     mean_s, max_s = float(seg.mean()), float(seg.max())
-    ip = _peak_index(rule, times, strength, i0, i1)
+    policy = cfg.t_peak_policy_override or rule.t_peak_policy
+    transition: dict[str, Any] = {"policy": policy}
+    if policy == "transition" and aux.get("trigger") is not None:
+        tlo, thi = aux["trigger"]
+        jt, kind = _transition_index(times, tlo, thi, i0, i1, rule.t_peak_lookback_s)
+        transition.update(kind=kind, trigger_expr=aux.get("trigger_src"))
+        if jt is not None:
+            ip = jt
+        else:
+            ip = _peak_index(rule, times, strength, i0, i1, rule.t_peak_fallback)
+            transition["fallback"] = rule.t_peak_fallback
+    elif policy == "transition":
+        ip = _peak_index(rule, times, strength, i0, i1, rule.t_peak_fallback)
+        transition.update(kind="no_trigger", fallback=rule.t_peak_fallback)
+    else:
+        ip = _peak_index(rule, times, strength, i0, i1, policy)
     t_peak = float(times[ip])
+    if ip < i0:  # переход (начало действия) раньше, чем доказан весь набор предикатов
+        i0_eff = ip
+    else:
+        i0_eff = i0
+    t_start, t_end = float(times[i0_eff]), float(times[i1])
+    duration = t_end - t_start + series.dt
     t_max = float(times[i0 + int(np.argmax(seg))])
     conf, terms = confidence_for(rule, mean_s, max_s, duration, i1 - i0 + 1, sev_factor)
     if any(n in series.derived for n in rule.names):
@@ -410,6 +512,19 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
         "absent_signals": sorted(n for n in rule.names if n in series.absent),
         "derived_signals": {n: series.derived[n] for n in rule.names if n in series.derived},
     }
+    clauses = []
+    if rule.applicability is not None and "app" in aux:
+        clauses.append(_clause_trace("applicability", rule.applicability, aux["app"], i0, i1, ip))
+    for c in rule.predicates:
+        if ("pred", c.id) in aux:
+            clauses.append(_clause_trace("predicate", c, aux[("pred", c.id)], i0, i1, ip))
+    for c in rule.exclusions:
+        if ("excl", c.id) in aux:
+            clauses.append(_clause_trace("exclusion", c, aux[("excl", c.id)], i0, i1, ip))
+    trace["clauses"] = clauses
+    trace["interval"] = {"t_start": _r(t_start, 2), "t_end": _r(t_end, 2), "segment_t_start": _r(seg_start, 2),
+                         "duration_s": _r(duration, 2)}
+    trace["evidence"] = dict(transition, t_peak=_r(t_peak, 2))
     if from_anchor:
         trace["from_anchor"] = True
     return Event(
@@ -426,6 +541,8 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
             "rule_id": rule.id,
             "rule_ids": [rule.id],
             "assessment": assessment,
+            "detection": detection_of(rule, assessment),
+            "legal_basis": legal_basis_of(norm["status"]),
             "assessment_reasons": list(reasons),
             "legal_claim": False,  # правила не делают юридических выводов — только признаки
             "type_name": info["name"],
@@ -480,6 +597,20 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
     times = series.times
     events: list[Any] = []
     base_assessment, base_reasons = _assess(rule, catalog, cfg)
+    aux: dict[Any, Any] = {}
+    if rule.applicability is not None:
+        aux["app"] = rule.applicability.expr.bounds(ctx)
+    for c in rule.predicates:
+        aux[("pred", c.id)] = c.expr.bounds(ctx)
+    for c in rule.exclusions:
+        aux[("excl", c.id)] = c.expr.bounds(ctx)
+    if (cfg.t_peak_policy_override or rule.t_peak_policy) == "transition":
+        trig = rule.trigger or rule.strength
+        tlo, thi = trig.bounds(ctx)
+        tlo = smooth(np.clip(tlo, 0.0, 1.0), series.dt, rule.smooth_s, rule.smooth_method)
+        thi = np.maximum(smooth(np.clip(thi, 0.0, 1.0), series.dt, rule.smooth_s, rule.smooth_method), tlo)
+        aux["trigger"] = (tlo, thi)
+        aux["trigger_src"] = trig.source
     before_lo = None
     if rule.inaction is not None and rule.inaction.before is not None:
         before_lo = rule.inaction.before(ctx)
@@ -513,7 +644,7 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
             cand["rejected"] = f"{assessment} отключён в global"
             candidates.append(cand)
             continue
-        ev = _make_event(rule, series, s_lo, i0, i1, assessment, reasons, tracks, zones, catalog, cfg)
+        ev = _make_event(rule, series, s_lo, i0, i1, assessment, reasons, tracks, zones, catalog, cfg, aux=aux)
         cand.update(accepted=True, assessment=assessment, confidence=ev.confidence, t_peak=ev.t_peak)
         candidates.append(cand)
         events.append(ev)
@@ -539,7 +670,7 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
                 continue
             reasons = ["не наблюдались сигналы: " + ", ".join(SIGNAL_RU.get(n, n) for n in unknown)]
             ev = _make_event(rule, series, s_hi, i0, i1, INSUFFICIENT, reasons, tracks, zones, catalog, cfg,
-                             from_anchor=True)
+                             from_anchor=True, aux=aux)
             candidates.append({"rule_id": rule.id, "type_id": rule.type_id, "t_start": ev.t_start,
                                "t_end": ev.t_end, "accepted": True, "assessment": INSUFFICIENT,
                                "confidence": ev.confidence, "t_peak": ev.t_peak})
@@ -600,6 +731,9 @@ def _merge_same_type(events: list[Any], cfg: RulesConfig) -> list[Any]:
             conf = min(cap, primary.confidence + cfg.corroboration_bonus * max(0, n_corrob))
             extra = dict(primary.extra)
             extra["rule_ids"] = rule_ids
+            det_rank = {"violation_candidate": 3, "observation": 2, "insufficient_context": 1}
+            extra["detection"] = max((e.extra.get("detection", "observation") for e in g),
+                                     key=lambda d: det_rank.get(d, 0))
             extra["evidence_t"] = sorted({t for e in top for t in e.extra.get("evidence_t", [])} | {first.t_peak})[:3]
             extra["merged"] = [{"rule_id": e.extra.get("rule_id"), "assessment": e.extra.get("assessment"),
                                 "t_start": e.t_start, "t_end": e.t_end, "t_peak": e.t_peak,
@@ -656,7 +790,8 @@ def evaluate(states: Sequence[Any], tracks: Sequence[Any] = (), zones: Sequence[
     for r in cfg.enabled_rules:
         needed |= r.names
     series = build_series(states, needed, defaults=cfg.signal_defaults, ffill_max_s=cfg.ffill_max_s,
-                          merge_policy=cfg.merge_policy)
+                          merge_policy=cfg.merge_policy, known_min_conf=cfg.known_min_conf,
+                          observed_one_sided=cfg.observed_one_sided)
     report = RulesReport(events=[], series=series, warnings=warnings, catalog_source=cat_src, config=cfg)
     if series.n == 0:
         warnings.append("нет состояний сцены — правила не применялись")
@@ -685,6 +820,14 @@ def evaluate(states: Sequence[Any], tracks: Sequence[Any] = (), zones: Sequence[
                 definite_gate = (glo > 0.5) if rule.gate_mode == "strict" else (ghi > 0.5)
                 lo = np.where(definite_gate, lo, 0.0)
                 hi = np.where(ghi > 0.5, hi, 0.0)
+            if rule.applicability is not None:          # применимость: должна быть доказана
+                alo, ahi = rule.applicability.expr.bounds(ctx)
+                lo = np.where(alo > 0.5, lo, 0.0)
+                hi = np.where(ahi > 0.5, hi, 0.0)
+            for exc in rule.exclusions:                 # исключение блокирует, только если доказано
+                elo, _ = exc.expr.bounds(ctx)
+                lo = np.where(elo > 0.5, 0.0, lo)
+                hi = np.where(elo > 0.5, 0.0, hi)
             s_lo = np.clip(smooth(lo, series.dt, rule.smooth_s, rule.smooth_method), 0.0, 1.0)
             s_hi = np.maximum(np.clip(smooth(hi, series.dt, rule.smooth_s, rule.smooth_method), 0.0, 1.0), s_lo)
             report.strengths[rule.id] = s_lo

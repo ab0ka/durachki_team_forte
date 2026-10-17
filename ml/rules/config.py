@@ -17,6 +17,7 @@ except ImportError:  # пока ветка A01 не смерджена
     from contracts.sentinel_contracts import SIGNALS  # noqa
 
 __all__ = [
+    "Clause",
     "RuleSpec",
     "InactionSpec",
     "RulesConfig",
@@ -32,7 +33,7 @@ __all__ = [
 
 DEFAULT_RULES_PATH = Path(__file__).with_name("rules.yaml")
 ENV_RULES_PATH = "SENTINEL_RULES_YAML"
-T_PEAK_POLICIES = ("evidence", "onset", "onset_plus", "max", "center")
+T_PEAK_POLICIES = ("evidence", "transition", "onset", "onset_plus", "max", "center")
 SMOOTH_METHODS = ("none", "median", "mean")
 RULE_KINDS = ("violation", "observation")
 GATE_MODES = ("strict", "lenient")
@@ -63,6 +64,15 @@ class InactionSpec:
 
 
 @dataclass
+class Clause:
+    """Именованная часть правила: обязательный предикат, исключение или применимость (для trace)."""
+
+    id: str
+    label: str
+    expr: CompiledExpr
+
+
+@dataclass
 class RuleSpec:
     id: str
     type_id: str
@@ -75,6 +85,12 @@ class RuleSpec:
     gate_mode: str = "strict"
     anchor: Optional[CompiledExpr] = None
     inaction: Optional[InactionSpec] = None
+    applicability: Optional[Clause] = None                       # строго: должна быть доказана
+    predicates: list[Clause] = field(default_factory=list)       # обязательные видимые предикаты (И)
+    exclusions: list[Clause] = field(default_factory=list)       # блокируют, только если доказаны
+    trigger: Optional[CompiledExpr] = None                       # переход «начало действия» для t_peak
+    t_peak_lookback_s: float = 5.0
+    t_peak_fallback: str = "evidence"
     on: float = 0.5
     off: float = 0.35
     smooth_method: str = "median"
@@ -100,9 +116,17 @@ class RuleSpec:
     max_events: int = 3
 
     @property
+    def mandatory_names(self) -> frozenset[str]:
+        """Сигналы обязательных предикатов (strength), без исключений/якорей."""
+        return frozenset(self.strength.names)
+
+    @property
     def names(self) -> frozenset[str]:
         names = set(self.strength.names)
-        for e in (self.gate, self.anchor, self.inaction.before if self.inaction else None):
+        extra = [self.gate, self.anchor, self.inaction.before if self.inaction else None, self.trigger,
+                 self.applicability.expr if self.applicability else None]
+        extra += [c.expr for c in self.exclusions]
+        for e in extra:
             if e is not None:
                 names |= e.names
         return frozenset(names)
@@ -115,6 +139,8 @@ class RulesConfig:
     signal_defaults: dict[str, float] = field(default_factory=dict)
     signal_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
     ffill_max_s: float = 1.0
+    known_min_conf: float = 0.5
+    observed_one_sided: bool = True
     merge_policy: str = "max"
     derive_from_tracks: bool = True
     presence_tol_s: float = 0.6
@@ -128,6 +154,7 @@ class RulesConfig:
     require_verified_norm: bool = True
     emit_review_observations: bool = True
     emit_insufficient_context: bool = True
+    t_peak_policy_override: Optional[str] = None   # A/B: одна политика t_peak для всех правил
     observation_conf_cap: float = 0.45
     insufficient_conf_cap: float = 0.3
     derived_conf_factor: float = 0.85
@@ -242,6 +269,22 @@ def _compile(r: Mapping[str, Any], key: str, where: str) -> Optional[CompiledExp
         raise ConfigError(f"{where}{key}: {exc}") from None
 
 
+def _clauses(items: Any, where: str) -> list[Clause]:
+    out: list[Clause] = []
+    for i, item in enumerate(items or []):
+        if isinstance(item, str):
+            item = {"id": f"p{i + 1}", "expr": item}
+        if not isinstance(item, Mapping) or item.get("expr") in (None, ""):
+            raise ConfigError(f"{where}[{i}]: ожидался {{id, label, expr}}")
+        try:
+            expr = compile_expr(item["expr"])
+        except ExprError as exc:
+            raise ConfigError(f"{where}[{i}]: {exc}") from None
+        cid = str(item.get("id") or f"p{i + 1}")
+        out.append(Clause(id=cid, label=str(item.get("label") or cid), expr=expr))
+    return out
+
+
 def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None) -> RulesConfig:
     warnings: list[str] = []
     glob = dict(raw.get("global") or {})
@@ -269,6 +312,8 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         signal_defaults={str(k): float(v) for k, v in (raw.get("signal_defaults") or {}).items()},
         signal_ranges=ranges,
         ffill_max_s=_num(glob, "ffill_max_s", 1.0, 0, 60, "global."),
+        known_min_conf=_num(glob, "known_min_conf", 0.5, 0, 1, "global."),
+        observed_one_sided=bool(glob.get("observed_one_sided", True)),
         merge_policy=str(glob.get("merge_policy", "max")),
         derive_from_tracks=bool(glob.get("derive_from_tracks", True)),
         presence_tol_s=_num(glob, "presence_tol_s", 0.6, 0, 10, "global."),
@@ -282,6 +327,8 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         require_verified_norm=bool(glob.get("require_verified_norm", True)),
         emit_review_observations=bool(glob.get("emit_review_observations", True)),
         emit_insufficient_context=bool(glob.get("emit_insufficient_context", True)),
+        t_peak_policy_override=(str(glob["t_peak_policy_override"])
+                                if glob.get("t_peak_policy_override") not in (None, "", "none") else None),
         observation_conf_cap=_num(glob, "observation_conf_cap", 0.45, 0, 1, "global."),
         insufficient_conf_cap=_num(glob, "insufficient_conf_cap", 0.3, 0, 1, "global."),
         derived_conf_factor=_num(glob, "derived_conf_factor", 0.85, 0, 1, "global."),
@@ -290,6 +337,8 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         source_path=source_path,
         warnings=warnings,
     )
+    if cfg.t_peak_policy_override is not None and cfg.t_peak_policy_override not in T_PEAK_POLICIES:
+        raise ConfigError(f"global.t_peak_policy_override={cfg.t_peak_policy_override!r}")
     if cfg.merge_policy not in ("max", "min", "last"):
         raise ConfigError(f"global.merge_policy: {cfg.merge_policy!r} (ожидалось max|min|last)")
 
@@ -314,9 +363,22 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         gate_mode = str(r.get("gate_mode", "strict"))
         if gate_mode not in GATE_MODES:
             raise ConfigError(f"{where}gate_mode={gate_mode!r} (ожидалось {'|'.join(GATE_MODES)})")
-        strength = _compile(r, "strength", where)
+        predicates = _clauses(r.get("predicates"), where + "predicates")
+        exclusions = _clauses(r.get("exclusions"), where + "exclusions")
+        applicability = None
+        if r.get("applicability") not in (None, ""):
+            app = r["applicability"]
+            app = app if isinstance(app, Mapping) else {"id": "applicability", "expr": app}
+            applicability = _clauses([dict(app, id=app.get("id", "applicability"))], where + "applicability")[0]
+        if predicates and r.get("strength") not in (None, ""):
+            raise ConfigError(f"{where}: задайте либо strength, либо predicates")
+        if predicates:
+            joined = ", ".join(f"({c.expr.source})" for c in predicates)
+            strength = compile_expr(f"min({joined})" if len(predicates) > 1 else predicates[0].expr.source)
+        else:
+            strength = _compile(r, "strength", where)
         if strength is None:
-            raise ConfigError(f"{where}strength: обязательное выражение")
+            raise ConfigError(f"{where}strength/predicates: обязательное выражение")
         gate = _compile(r, "gate", where)
         anchor = _compile(r, "anchor", where)
         inaction = None
@@ -336,6 +398,10 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         policy = str(tp.get("policy", "evidence"))
         if policy not in T_PEAK_POLICIES:
             raise ConfigError(f"{where}t_peak.policy={policy!r} (ожидалось {'|'.join(T_PEAK_POLICIES)})")
+        fallback = str(tp.get("fallback", "evidence"))
+        if fallback not in T_PEAK_POLICIES or fallback == "transition":
+            raise ConfigError(f"{where}t_peak.fallback={fallback!r}")
+        trigger = _compile(tp, "trigger", where + "t_peak.")
         smooth = r.get("smooth") or {}
         if isinstance(smooth, str):
             smooth = {"method": smooth}
@@ -373,6 +439,12 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
             gate_mode=gate_mode,
             anchor=anchor,
             inaction=inaction,
+            applicability=applicability,
+            predicates=predicates,
+            exclusions=exclusions,
+            trigger=trigger,
+            t_peak_lookback_s=_num(tp, "lookback_s", 5.0, 0, 120, where + "t_peak."),
+            t_peak_fallback=fallback,
             on=on,
             off=off,
             smooth_method=method,
