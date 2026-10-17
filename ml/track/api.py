@@ -195,9 +195,15 @@ def track_full(clip: Any, dets: Sequence[Any], cfg: Optional[dict] = None,
     frame_dt = float(np.median(np.diff(ft))) if len(ft) > 1 else 0.2
     t0 = float(times[0]) if times is not None and len(times) else float(ft[0])
     t1 = float(times[-1]) if times is not None and len(times) else float(ft[-1])
-    if duration is None or duration <= 0:
-        duration = max(t1 - t0 + frame_dt, frame_dt)
     t1 = max(t1, t0)
+    # Нормировки (доли присутствия, «статичный предмет», conf зон) — по реально сэмплированному отрезку
+    # clip.times, а не по объявленной длительности: в окне refine (WindowClip A03) duration = весь ролик,
+    # а times — только окно, и зоны получали заниженный conf.
+    declared = duration
+    if times is not None and len(times) > 1:
+        duration = max(t1 - t0 + float(np.median(np.diff(times))), frame_dt)
+    elif duration is None or duration <= 0:
+        duration = max(t1 - t0 + frame_dt, frame_dt)
     info.update(aspect=round(aspect, 4), frame_dt=round(frame_dt, 4), n_frames_processed=len(ft),
                 n_detections=len(nd))
     n_total = int(len(times)) if times is not None else None
@@ -206,6 +212,8 @@ def track_full(clip: Any, dets: Sequence[Any], cfg: Optional[dict] = None,
         "frames_processed": len(ft),                   # кадров, прошедших через детектор (с учётом every_n)
         "frames_with_detections": int(sum(1 for v in by_frame.values() if v)),
         "t_first_detection": round(float(ft[0]), 4), "t_last_detection": round(float(ft[-1]), 4),
+        "t_window": [round(t0, 4), round(t1, 4)],      # отрезок clip.times: весь ролик или окно refine
+        "declared_duration": None if declared is None else round(float(declared), 4),
         "span_frac": None if n_total is None or duration <= 0 else round(min(1.0, (ft[-1] - ft[0] + frame_dt) / duration), 4),
     }
 

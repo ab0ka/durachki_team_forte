@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -27,6 +29,10 @@ DEFAULTS: dict[str, Any] = {
         "track_buffer_s": 2.0,   # сколько секунд держим потерянный трек живым
         "tentative_buffer_s": 0.6,
         "min_hits": 2,           # подтверждение трека (кроме треков с первого кадра)
+        "speed_gate": False,        # H-SPEED (ВЫКЛ до замера L2): без перекрытия боксов — не дальше base + v·dt диагоналей
+        "speed_gate_base_diag": 0.2,
+        "speed_gate_diag_s": 1.5,
+        "lost_cost_penalty": 0.1,  # штраф потерянным трекам при выборе пар: подмена ID при проходе перед сидящим (0 = как было)
         "kf_tau_s": 1.0,         # затухание скорости в фильтре Калмана
         "kf_q_pos": 0.5,
         "kf_q_vel": 1.0,
@@ -168,8 +174,17 @@ def deep_merge(base: dict, upd: Optional[dict]) -> dict:
     return out
 
 
-@lru_cache(maxsize=8)
 def _read_yaml(path: str) -> dict:
+    """YAML с кэшем по (путь, mtime, размер): правка файла в долгоживущем воркере подхватывается."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    return _read_yaml_cached(path, st.st_mtime_ns, st.st_size)
+
+
+@lru_cache(maxsize=16)
+def _read_yaml_cached(path: str, mtime_ns: int, size: int) -> dict:
     try:
         import yaml
     except ImportError:
@@ -182,8 +197,19 @@ def _read_yaml(path: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def config_path(path: Optional[str] = None) -> str:
+    return path or os.environ.get("SENTINEL_TRACK_CONFIG") or str(Path(__file__).with_name("config.yaml"))
+
+
 def load_config(path: Optional[str] = None, overrides: Optional[dict] = None) -> dict:
     """Собрать конфиг. Неизвестные ключи YAML не ломают загрузку (проверяются тестом)."""
-    p = path or os.environ.get("SENTINEL_TRACK_CONFIG") or str(Path(__file__).with_name("config.yaml"))
-    cfg = deep_merge(DEFAULTS, _read_yaml(p))
+    cfg = deep_merge(DEFAULTS, _read_yaml(config_path(path)))
     return deep_merge(cfg, overrides)
+
+
+def config_fingerprint(cfg: Optional[dict] = None) -> dict[str, Any]:
+    """Хэш ДЕЙСТВУЮЩЕГО конфига (в т.ч. внешнего $SENTINEL_TRACK_CONFIG) — для ключа кэша A03."""
+    c = cfg if cfg is not None else load_config()
+    blob = json.dumps(c, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    return {"config_sha": hashlib.sha1(blob).hexdigest()[:12], "config_path": config_path(),
+            "config_from_env": bool(os.environ.get("SENTINEL_TRACK_CONFIG"))}

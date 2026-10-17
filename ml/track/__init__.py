@@ -15,4 +15,15 @@ from .events import dwell, entries_exits, gaps, person_signals, presence_state, 
 from .queries import Answer, TrackEvent, TrackQueries
 
 __all__ = ["track", "track_full", "TrackResult", "entries_exits", "dwell", "proximity", "gaps",
-           "presence_state", "person_signals", "TrackQueries", "Answer", "TrackEvent"]
+           "presence_state", "person_signals", "TrackQueries", "Answer", "TrackEvent", "model_info"]
+
+
+def model_info() -> dict:
+    """Для идентичности кэша стадии в A03 (module_identity): хэш действующего конфига.
+
+    Отпечаток кода A03 видит только файлы пакета; внешний $SENTINEL_TRACK_CONFIG без этого
+    не менял бы ключ кэша. Моделей и весов у ml.track нет (checkpoint не указывается).
+    """
+    from .config import config_fingerprint
+
+    return config_fingerprint()

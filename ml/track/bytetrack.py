@@ -41,7 +41,8 @@ def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def fused_cost(tb: np.ndarray, db: np.ndarray, aspect: float, dist_weight: float,
-               sigma: float, gate: float) -> np.ndarray:
+               sigma: float, gate: float, max_shift: Optional[np.ndarray] = None) -> np.ndarray:
+    """1 - [(1-w)·IoU + w·близость центров]; при IoU=0 — запрет дальше gate (или max_shift[i]) диагоналей."""
     tb = np.asarray(tb, float).reshape(-1, 4)
     db = np.asarray(db, float).reshape(-1, 4)
     if len(tb) == 0 or len(db) == 0:
@@ -56,21 +57,26 @@ def fused_cost(tb: np.ndarray, db: np.ndarray, aspect: float, dist_weight: float
     sim = (1.0 - dist_weight) * ov + dist_weight * np.exp(-0.5 * (dn / max(sigma, 1e-6)) ** 2)
     cost = 1.0 - sim
     cost[(ov <= 0) & (dn > gate)] = 1e6
+    if max_shift is not None:  # H-SPEED: правдоподобная скорость с момента последнего наблюдения трека
+        cost[(ov <= 0) & (dn > np.asarray(max_shift, float)[:, None])] = 1e6
     return cost
 
 
-def linear_assignment(cost: np.ndarray, thresh: float) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+def linear_assignment(cost: np.ndarray, thresh: float,
+                      accept: Optional[np.ndarray] = None) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    """Венгерский алгоритм по `cost`; пара допустима, если accept[i, j] <= thresh (по умолчанию accept = cost)."""
     n, m = cost.shape if cost.ndim == 2 else (0, 0)
     if n == 0 or m == 0:
         return [], list(range(n)), list(range(m))
+    acc = cost if accept is None else accept
     matches: list[tuple[int, int]] = []
     try:
         from scipy.optimize import linear_sum_assignment
-        c = np.where(cost > thresh, thresh + 1e3, cost)
+        c = np.where(acc > thresh, float(np.max(cost)) + thresh + 1e3, cost)
         r, k = linear_sum_assignment(c)
-        matches = [(int(i), int(j)) for i, j in zip(r, k) if cost[i, j] <= thresh]
+        matches = [(int(i), int(j)) for i, j in zip(r, k) if acc[i, j] <= thresh]
     except ImportError:  # жадный fallback без scipy
-        pairs = sorted((float(cost[i, j]), i, j) for i in range(n) for j in range(m) if cost[i, j] <= thresh)
+        pairs = sorted((float(cost[i, j]), i, j) for i in range(n) for j in range(m) if acc[i, j] <= thresh)
         used_i: set[int] = set()
         used_j: set[int] = set()
         for _, i, j in pairs:
@@ -212,10 +218,19 @@ class ByteTracker:
 
         tb = np.array([tr.kf.box() for tr in self.alive]).reshape(-1, 4)
         hb = np.array([d.box for d in high]).reshape(-1, 4)
-        cost = fused_cost(tb, hb, self.aspect, c["dist_weight"], c["dist_sigma_diag"], c["gate_diag"])
-        m1, ut, ud = linear_assignment(cost, c["match_thr"])
+        shift = None
+        if c.get("speed_gate", False):  # H-SPEED (ВЫКЛ): трек не «прыгает» на соседа без перекрытия боксов
+            shift = np.array([c["speed_gate_base_diag"] + c["speed_gate_diag_s"] * max(float(t) - tr.t_last, 0.0)
+                              for tr in self.alive])
+        cost = fused_cost(tb, hb, self.aspect, c["dist_weight"], c["dist_sigma_diag"], c["gate_diag"], shift)
+        # Штраф потерянным трекам — только для выбора пар (порог — по исходной стоимости): при почти равной
+        # стоимости детекция достаётся видимому треку. Иначе в точке пересечения потерянный трек перекрытого
+        # человека забирал детекцию проходящего впереди (подмена ID). 0 — прежнее поведение.
+        pen = np.array([float(c.get("lost_cost_penalty", 0.0)) if tr.lost else 0.0 for tr in self.alive])
+        m1, ut, ud = linear_assignment(cost + pen[:, None], c["match_thr"], accept=cost)
         for i, j in m1:
             self.alive[i].update(high[j], t, c["min_hits"])
+        high_left = [high[j] for j in ud]
 
         rem = [self.alive[i] for i in ut if not self.alive[i].lost]
         lost_unmatched = [self.alive[i] for i in ut if self.alive[i].lost]
@@ -228,9 +243,9 @@ class ByteTracker:
             tr.lost = True
 
         first = abs(float(t) - self.t_first) < 1e-9
-        for j in ud:
-            if high[j].score >= c["new_track_thr"]:
-                self.alive.append(_STrack(next(self.ids), high[j], t, c, self.group, confirmed=first))
+        for d in high_left:  # несопоставленные уверенные детекции -> новые треки
+            if d.score >= c["new_track_thr"]:
+                self.alive.append(_STrack(next(self.ids), d, t, c, self.group, confirmed=first))
 
         keep: list[_STrack] = []
         for tr in self.alive:

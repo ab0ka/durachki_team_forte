@@ -1,9 +1,10 @@
 """JSON-(де)сериализация Track/Zone/Detection и кэш стадии трекинга.
 
 Файлы в каталоге кэша (cache/<sha>/):
-  track.json       — {"tracks": [...], "zones": [...], "info": {...}} (пишет ml.track)
-  detections.json  — список детекций (или {"detections": [...]}) — читаем, если есть.
-Также понимаем dets.json / detect.json и pickle (*.pkl) с list[Detection] — только свои локальные кэши.
+  track.json       — {"tracks": [...], "zones": [...], "info": {...}} (пишет ml.track: viz/report)
+  dets.jsonl, tracks.json, zones.json, manifest.json — кэш стадий A03 (backend/pipeline/cache.py)
+  detections.json / dets.json / detect.json — список детекций (или {"detections": [...]}).
+Также понимаем pickle (*.pkl) с list[Detection] — только свои локальные кэши.
 """
 from __future__ import annotations
 
@@ -82,13 +83,42 @@ def save_track_cache(cache_dir: str, tracks: Sequence[Any], zones: Sequence[Any]
     return out
 
 
+def _read_jsonl(path: Path) -> list:
+    out = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
 def load_track_cache(cache_dir: str) -> Optional[tuple[list[Track], list[Zone], dict]]:
-    p = Path(cache_dir) / "track.json"
-    if not p.is_file():
-        return None
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return ([track_from_dict(d) for d in data.get("tracks", [])], [zone_from_dict(d) for d in data.get("zones", [])],
-            data.get("info", {}))
+    """track.json (ml.track) или tracks.json + zones.json (кэш стадии track в A03; без info)."""
+    d = Path(cache_dir)
+    p = d / "track.json"
+    if p.is_file():
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return ([track_from_dict(x) for x in data.get("tracks", [])],
+                [zone_from_dict(x) for x in data.get("zones", [])], data.get("info", {}))
+    tp, zp = d / "tracks.json", d / "zones.json"
+    if tp.is_file():
+        zones = [zone_from_dict(x) for x in json.loads(zp.read_text(encoding="utf-8"))] if zp.is_file() else []
+        return [track_from_dict(x) for x in json.loads(tp.read_text(encoding="utf-8"))], zones, {}
+    return None
+
+
+def load_clip_meta(cache_dir: str) -> dict:
+    """width/height/duration[/times] ролика: meta.json | clip.json | video.json или manifest.json["video"] (A03)."""
+    d = Path(cache_dir)
+    for name in ("meta.json", "clip.json", "video.json"):
+        if (d / name).is_file():
+            data = json.loads((d / name).read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    if (d / "manifest.json").is_file():
+        video = json.loads((d / "manifest.json").read_text(encoding="utf-8")).get("video")
+        return video if isinstance(video, dict) else {}
+    return {}
 
 
 def load_detections(cache_dir: str) -> Optional[list[Detection]]:
@@ -100,6 +130,10 @@ def load_detections(cache_dir: str) -> Optional[list[Detection]]:
             if isinstance(data, dict):
                 data = data.get("detections") or data.get("dets") or []
             return [detection_from_dict(d) for d in data]
+    for name in ("dets.jsonl", "detections.jsonl"):  # dets.jsonl — кэш стадии detect в A03
+        f = p / name
+        if f.is_file():
+            return [detection_from_dict(d) for d in _read_jsonl(f)]
     for name in ("detections.pkl", "dets.pkl", "detect.pkl"):
         f = p / name
         if f.is_file():
