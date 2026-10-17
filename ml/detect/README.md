@@ -17,7 +17,7 @@
 Включение опций: `SENTINEL_DETECT_EXTRAS=tta,tiles,open_vocab,finetuned` (или `all`), либо YAML-override через `SENTINEL_DETECT_CONFIG`.
 
 ### Что реально проверено (CPU, без GPU, без реальных данных и весов)
-`python -m pytest ml/detect/tests`: **42 passed** (torch 2.14.1 CPU, transformers 5.20.1, onnxruntime, Python 3.13).
+`python -m pytest ml/detect/tests`: **43 passed** (torch 2.14.1 CPU, transformers 5.20.1, onnxruntime, Python 3.13).
 - маппинг классов, NMS/WBF/флип/тайлы/подавление вложенных боксов;
 - mock end-to-end на синтетике (в памяти и из mp4-файла через `cv2.VideoWriter`): формат `Detection`, детерминизм, `every_n`, гейтинг ключевых кадров, адаптивный шаг при превышении бюджета, битые кадры, потоковая изоляция `last_stats()`;
 - постобработка RT-DETR и OWLv2 на фейковых выходах модели: пересчёт боксов OWLv2 из квадрата с паддингом в портретный кадр, исходные классы в `source`;
