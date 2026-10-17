@@ -18,6 +18,8 @@ export interface RuleRef {
   url: string;
   quote?: string;
   verified?: boolean;
+  /** A12 (meta.ui.evidence_overlays[].norms[].status_ru): статус сверки по-русски. */
+  status_ru?: string;
 }
 
 export interface Violation {

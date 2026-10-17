@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Crosshair, Minus, Plus, X } from "lucide-react";
 import type { EvidenceFrame } from "../api/types";
-import { imageSrc } from "../api/normalize";
+import { imageSrc, type HighlightBox } from "../api/normalize";
+import { EvidenceImage } from "./Evidence";
 import { formatTimecode } from "../lib/format";
 
 interface Props {
@@ -11,10 +12,11 @@ interface Props {
   onClose: () => void;
   onIndex: (i: number) => void;
   onSeek: (t: number) => void;
+  boxesFor?: (f: EvidenceFrame) => HighlightBox[];
 }
 
 /** Просмотр кадра-доказательства: зум (колесо/кнопки/двойной клик), панорама, стрелки, Esc. */
-export default function Lightbox({ frames, index, caption, onClose, onIndex, onSeek }: Props) {
+export default function Lightbox({ frames, index, caption, onClose, onIndex, onSeek, boxesFor }: Props) {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const drag = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
@@ -83,13 +85,18 @@ export default function Lightbox({ frames, index, caption, onClose, onIndex, onS
         onPointerUp={() => (drag.current = null)}
         onClick={(e) => e.target === e.currentTarget && zoom === 1 && onClose()}
       >
-        <img
-          src={imageSrc(f.image_base64)}
-          alt={`Кадр-доказательство ${formatTimecode(f.timestamp_sec)}`}
-          draggable={false}
-          className="max-h-full max-w-full select-none object-contain transition-transform duration-75"
+        <div
+          className="max-h-full max-w-full transition-transform duration-75"
           style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, cursor: zoom > 1 ? "grab" : "zoom-in" }}
-        />
+        >
+          <EvidenceImage
+            src={imageSrc(f.image_base64)}
+            boxes={boxesFor ? boxesFor(f) : []}
+            alt={`Кадр-доказательство ${formatTimecode(f.timestamp_sec)}`}
+            className="relative inline-block max-h-[calc(100vh-140px)]"
+            imgClassName="max-h-[calc(100vh-140px)] w-auto max-w-[min(92vw,1100px)] object-contain"
+          />
+        </div>
         <button className={`${btn} absolute left-3 top-1/2 -translate-y-1/2`} onClick={() => onIndex(index - 1)} disabled={index === 0} aria-label="Предыдущий кадр">
           <ChevronLeft className="h-5 w-5" />
         </button>

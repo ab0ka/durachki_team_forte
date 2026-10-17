@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertOctagon,
   AlertTriangle,
@@ -20,6 +20,8 @@ import { formatDateTime, formatDuration, formatTimecode } from "../lib/format";
 import { analyzeCompleteness } from "../lib/completeness";
 import { verdictView } from "../lib/verdict";
 import CompletenessPanel from "./CompletenessPanel";
+import EpisodeNavigator from "./EpisodeNavigator";
+import { uiConfig } from "../lib/uiConfig";
 import CopilotPanel from "./CopilotPanel";
 import VideoPlayer, { type PlayerHandle } from "./VideoPlayer";
 import ViolationCard from "./ViolationCard";
@@ -67,11 +69,38 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
     return server;
   }, [backend, job.job_id]);
   const onTime = useCallback((x: number) => setT(x), []);
+  const [current, setCurrent] = useState(0);
+  const [reviewed, setReviewed] = useState<Set<number>>(() => loadReviewed(job.job_id));
+  useEffect(() => saveReviewed(job.job_id, reviewed), [job.job_id, reviewed]);
+  // Сдвиг PTS — только по флагу (гипотеза до замера L2): meta.video.t0_pts_sec.
+  const timeOffset = uiConfig().ptsOffsetMode === "meta_t0" ? readT0(job.meta) : 0;
+  const capture = useCallback((x: number) => player.current?.captureAt(x) ?? Promise.resolve(null), []);
 
   const seek = (time: number) => {
     player.current?.seek(time);
     playerBox.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
+  const goEpisode = (i: number) => {
+    if (i < 0 || i >= job.violations.length) return;
+    setCurrent(i);
+    seek(job.violations[i].timecode_sec);
+  };
+  const playEpisode = (i: number) => {
+    const v = job.violations[i];
+    if (!v) return;
+    setCurrent(i);
+    const from = Math.max(0, (v.t_start ?? v.timecode_sec) - uiConfig().episodePrerollS);
+    const to = (v.t_end ?? v.timecode_sec + 2) + uiConfig().episodePostrollS;
+    player.current?.playRange(from, to);
+    playerBox.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  const toggleReviewed = (i: number) =>
+    setReviewed((r) => {
+      const n = new Set(r);
+      if (n.has(i)) n.delete(i);
+      else n.add(i);
+      return n;
+    });
 
   const timings = (job.meta.timings ?? {}) as Record<string, number>;
   const total = typeof timings.total === "number" ? timings.total : undefined;
@@ -192,8 +221,17 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
               duration={duration}
               timeline={job.timeline}
               violations={job.violations}
-              hints={hints}
+              hints={uiConfig().showReviewHints ? hints : []}
               onTime={onTime}
+              timeOffset={timeOffset}
+            />
+            <EpisodeNavigator
+              violations={job.violations}
+              current={Math.min(current, Math.max(0, job.violations.length - 1))}
+              reviewed={reviewed}
+              onGo={goEpisode}
+              onPlay={playEpisode}
+              onToggleReviewed={toggleReviewed}
             />
           </section>
 
@@ -210,7 +248,11 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
                   index={i}
                   job={job}
                   active={t >= (v.t_start ?? v.timecode_sec - 1) && t <= (v.t_end ?? v.timecode_sec + 1)}
-                  onSeek={seek}
+                  onSeek={(x) => {
+                    setCurrent(i);
+                    seek(x);
+                  }}
+                  capture={capture}
                 />
               ))}
             </section>
@@ -249,7 +291,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             </section>
           )}
 
-          {hints.length > 0 && (
+          {uiConfig().showReviewHints && hints.length > 0 && (
             <section className="card p-4">
               <div className="label mb-1 flex items-center gap-1.5">
                 <Eye className="h-3.5 w-3.5" /> Стоит просмотреть
@@ -336,4 +378,30 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
       </div>
     </div>
   );
+}
+
+function readT0(meta: Record<string, unknown>): number {
+  const pick = (o: unknown) => (o && typeof o === "object" ? (o as Record<string, unknown>).t0_pts_sec : undefined);
+  for (const v of [pick(meta.video), meta.t0_pts_sec, pick(meta.ingest)]) {
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0 && v < 60) return v;
+  }
+  return 0;
+}
+
+const REV_KEY = (id: string) => `ks.reviewed.${id}`;
+function loadReviewed(jobId: string): Set<number> {
+  try {
+    const v = JSON.parse(localStorage.getItem(REV_KEY(jobId)) ?? "[]") as unknown;
+    return new Set(Array.isArray(v) ? v.filter((x): x is number => typeof x === "number") : []);
+  } catch {
+    return new Set();
+  }
+}
+function saveReviewed(jobId: string, s: Set<number>) {
+  try {
+    if (s.size) localStorage.setItem(REV_KEY(jobId), JSON.stringify([...s]));
+    else localStorage.removeItem(REV_KEY(jobId));
+  } catch {
+    /* noop */
+  }
 }

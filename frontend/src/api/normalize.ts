@@ -1,5 +1,6 @@
 // Защитный разбор ответа GET /…/jobs/{id}. Бэкенд собирают 18 агентов —
 // UI не должен падать от лишних/пропущенных полей, строковых чисел и т.п.
+import { typeInfo } from "../lib/catalog";
 import { analyzeCompleteness } from "../lib/completeness";
 import type {
   EvidenceFrame,
@@ -354,4 +355,47 @@ export function reviewHints(job: JobResult): ReviewHint[] {
     });
   }
   return out.sort((a, b) => a.timecode_sec - b.timecode_sec);
+}
+
+/** Рамка подсветки (A12 shapes kind=box, bbox нормирован к кадру: x1,y1,x2,y2). */
+export interface HighlightBox {
+  label: string;
+  color: string;
+  bbox: [number, number, number, number];
+}
+
+export function overlayBoxes(v: Violation, job: JobResult): HighlightBox[] {
+  const ov = violationOverlay(v, job);
+  if (!ov || !Array.isArray(ov.shapes)) return [];
+  const out: HighlightBox[] = [];
+  for (const sh of ov.shapes) {
+    if (!isObj(sh) || str(sh.kind) !== "box" || !Array.isArray(sh.bbox) || sh.bbox.length !== 4) continue;
+    const b = sh.bbox.map((x) => num(x, Number.NaN));
+    if (b.some((x) => !Number.isFinite(x))) continue;
+    const [x1, y1, x2, y2] = b.map((x) => Math.min(1, Math.max(0, x)));
+    if (x2 <= x1 || y2 <= y1) continue;
+    const color = /^#[0-9a-f]{3,8}$/i.test(str(sh.color)) ? str(sh.color) : "#ff3b5c";
+    out.push({ label: str(sh.label) || str(sh.key), color, bbox: [x1, y1, x2, y2] });
+  }
+  return out;
+}
+
+/** Нормы с русским статусом сверки из оверлея A12 (если есть). */
+export function rulesWithStatus(v: Violation, job: JobResult): RuleRef[] {
+  const rules = v.rules ?? [];
+  const ov = violationOverlay(v, job);
+  const norms = ov && Array.isArray(ov.norms) ? ov.norms.filter(isObj) : [];
+  if (!norms.length) return rules;
+  return rules.map((r) => {
+    const n = norms.find((x) => str(x.document) === r.document && (str(x.clause) || null) === (r.clause || null));
+    return n && str(n.status_ru) ? { ...r, status_ru: str(n.status_ru) } : r;
+  });
+}
+
+/** Что по видео установить нельзя для этого типа: от сервера (not_observable) или из каталога A13. */
+export function notCheckedFor(v: Violation, job: JobResult): string[] {
+  const ov = violationOverlay(v, job);
+  const fromServer = ov ? strList(ov.not_observable) : [];
+  if (fromServer.length) return fromServer;
+  return typeInfo(v.type_id)?.notChecked ?? [];
 }

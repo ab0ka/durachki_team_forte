@@ -39,8 +39,9 @@ describe("ResultView", () => {
     expect(html).toContain("Обнаружены признаки возможных нарушений");
     expect(html).toContain("00:24.6");
     expect(html).toContain("00:47.8");
-    expect(html).toContain("цитата проверена");
     expect(html).toContain("цитата не сверена");
+    expect(html).toContain("без пункта");
+    expect(html).not.toContain("цитата сверена"); // в демо нет сверенных норм — бейдж не показывается
     expect(html).toContain("Что система не проверяет");
     expect(html).toContain("Как система пришла к выводу");
   });

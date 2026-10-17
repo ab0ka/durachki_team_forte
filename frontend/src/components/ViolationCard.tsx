@@ -1,7 +1,9 @@
 import { useState } from "react";
-import { CheckCircle2, Cpu, Image as ImageIcon, Scale, Sparkles, Timer } from "lucide-react";
+import { Ban, CheckCircle2, Cpu, Image as ImageIcon, Scale, Sparkles, SquareDashed, Timer } from "lucide-react";
 import type { JobResult, Violation } from "../api/types";
-import { imageSrc, violationFacts, violationSources, violationVlm } from "../api/normalize";
+import { imageSrc, notCheckedFor, overlayBoxes, rulesWithStatus, violationFacts, violationSources, violationVlm } from "../api/normalize";
+import { uiConfig } from "../lib/uiConfig";
+import { BeforeAfter, boxesForFrame, EvidenceImage } from "./Evidence";
 import { typeInfo, sourceLabel } from "../lib/catalog";
 import { formatTimecode } from "../lib/format";
 import Lightbox from "./Lightbox";
@@ -14,15 +16,21 @@ interface Props {
   job: JobResult;
   active: boolean;
   onSeek: (t: number) => void;
+  /** Кадр из видео в браузере (для «до»), null — видео недоступно. */
+  capture?: (t: number) => Promise<string | null>;
 }
 
-export default function ViolationCard({ v, index, job, active, onSeek }: Props) {
-  const [lightbox, setLightbox] = useState<number | null>(null);
+export default function ViolationCard({ v, index, job, active, onSeek, capture }: Props) {
   const info = typeInfo(v.type_id);
+  const [lightbox, setLightbox] = useState<number | null>(null);
+  const [highlight, setHighlight] = useState(true);
+  const boxes = overlayBoxes(v, job);
+  const notChecked = notCheckedFor(v, job);
+  const transition = !!info?.transition && uiConfig().beforeAfterTypes.includes((v.type_id ?? "").toUpperCase());
   const facts = violationFacts(v, job);
   const sources = violationSources(v, job);
   const vlm = violationVlm(v, job);
-  const rules = v.rules ?? [];
+  const rules = rulesWithStatus(v, job);
 
   return (
     <article
@@ -61,19 +69,44 @@ export default function ViolationCard({ v, index, job, active, onSeek }: Props) 
         {v.description && <p className="text-[15px] leading-relaxed text-slate-700 dark:text-slate-200">{v.description}</p>}
 
         {v.evidence_frames.length > 0 ? (
-          <div>
-            <div className="label mb-2 flex items-center gap-1.5">
-              <ImageIcon className="h-3.5 w-3.5" /> Кадры-доказательства
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="label flex items-center gap-1.5">
+                <ImageIcon className="h-3.5 w-3.5" /> Кадры-доказательства
+              </div>
+              {boxes.length > 0 && (
+                <button
+                  className={cx(
+                    "chip no-print",
+                    highlight
+                      ? "border-brand-300 bg-brand-50 text-brand-700 dark:border-brand-400/30 dark:bg-brand-400/10 dark:text-brand-200"
+                      : "border-slate-200 text-slate-500 dark:border-white/10",
+                  )}
+                  aria-pressed={highlight}
+                  onClick={() => setHighlight((h) => !h)}
+                  title="Рамки объектов, на которые опирается вывод (от сервера)"
+                >
+                  <SquareDashed className="h-3.5 w-3.5" /> подсветка {highlight ? "вкл" : "выкл"}
+                </button>
+              )}
             </div>
+            {transition && (
+              <BeforeAfter v={v} boxes={boxes} highlight={highlight} capture={capture} onSeek={onSeek} onOpen={setLightbox} />
+            )}
             <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
               {v.evidence_frames.map((f, i) => (
                 <button
                   key={i}
-                  className="group relative aspect-[3/4] overflow-hidden rounded-lg bg-ink-950 ring-1 ring-slate-200 dark:ring-white/10"
+                  className="group relative overflow-hidden rounded-lg bg-ink-950 ring-1 ring-slate-200 dark:ring-white/10"
                   onClick={() => setLightbox(i)}
                   aria-label={`Открыть кадр ${formatTimecode(f.timestamp_sec)}`}
                 >
-                  <img src={imageSrc(f.image_base64)} alt={`Кадр ${formatTimecode(f.timestamp_sec)}`} className="h-full w-full object-cover transition duration-300 group-hover:scale-105" />
+                  <EvidenceImage
+                    src={imageSrc(f.image_base64)}
+                    boxes={highlight ? boxesForFrame(f, v, boxes) : []}
+                    alt={`Кадр ${formatTimecode(f.timestamp_sec)}`}
+                    imgClassName="h-auto w-full transition duration-300 group-hover:scale-[1.03]"
+                  />
                   <span className="absolute bottom-1.5 left-1.5 rounded bg-black/70 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-white tnum">
                     {formatTimecode(f.timestamp_sec)}
                   </span>
@@ -147,11 +180,28 @@ export default function ViolationCard({ v, index, job, active, onSeek }: Props) 
             Уверенность — внутренняя оценка модели, а не вероятность и не точность. Описание содержит только видимые на записи факты.
           </p>
         </div>
+
+        {notChecked.length > 0 && (
+          <div className="rounded-xl bg-slate-50 p-4 dark:bg-white/[.03]">
+            <div className="label mb-2 flex items-center gap-1.5">
+              <Ban className="h-3.5 w-3.5" /> По видео не установить
+            </div>
+            <ul className="space-y-1 text-sm text-slate-600 dark:text-slate-300">
+              {notChecked.map((x) => (
+                <li key={x} className="flex gap-2">
+                  <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-slate-400" />
+                  {x}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
 
       {lightbox !== null && (
         <Lightbox
           frames={v.evidence_frames}
+          boxesFor={(f) => (highlight ? boxesForFrame(f, v, boxes) : [])}
           index={lightbox}
           caption={`Эпизод ${index + 1}: ${v.type}`}
           onClose={() => setLightbox(null)}
