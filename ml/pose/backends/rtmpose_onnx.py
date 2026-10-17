@@ -14,7 +14,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from .base import PoseBackendError
+from .base import PoseBackendError, WeightsNotFound
 
 log = logging.getLogger("ml.pose")
 
@@ -93,7 +93,7 @@ class RTMPoseOnnx:
         rc = cfg.get("backend", {}).get("rtmpose", {})
         path = find_weights(cfg)
         if not path:
-            raise PoseBackendError("ONNX-веса RTMPose не найдены (см. ml/pose/README.md → «Веса»)")
+            raise WeightsNotFound("ONNX-веса RTMPose не найдены (см. ml/pose/README.md → «Веса»)")
         try:
             import onnxruntime as ort
         except ImportError as exc:  # pragma: no cover - зависит от окружения

@@ -4,11 +4,18 @@
 # Переопределить файл: SENTINEL_POSE_CONFIG=/path/to.yaml (deep-merge поверх этого файла).
 version: 1
 
+# Главный флаг стадии позы (env SENTINEL_POSE_ENABLED=0|1|auto перекрывает) — для замера вклада позы (L2):
+#   auto  — работаем, если веса выбранного бэкенда найдены; нет весов → stage_status "skipped" + warning
+#   true  — поза обязательна для этого запуска: нет бэкенда/весов → stage_status "failed"
+#   false — стадия выключена: estimate() → [] (stage_status "skipped"), все сигналы позы unknown
+enabled: auto
+
 backend:
   # Один реальный бэкенд: RTMPose-m (COCO-17) на onnxruntime (CUDA → CPU). MediaPipe — только opt-in
   # (order: [rtmpose_onnx, mediapipe]) с явным маппингом 33 → COCO-17 (ml/pose/backends/mediapipe_backend.py).
   # Mock — ТОЛЬКО по явному SENTINEL_MOCK=1 / SENTINEL_POSE_BACKEND=mock: при сбое реального бэкенда
   # поддельные позы не подставляются — estimate() вернёт [] и запишет ошибку в ml.pose.status().
+  # SENTINEL_POSE_BACKEND=rtmpose_onnx|mediapipe|mock — один бэкенд вместо order (для A/B у L2).
   order: [rtmpose_onnx]
   device: auto                  # auto | cuda | cpu
   rtmpose:
@@ -22,10 +29,23 @@ backend:
     simcc_split_ratio: 2.0
     batch_size: 16              # кропы батчуются через кадры; если ONNX с фиксированным batch=1 — цикл
     intra_op_threads: 0         # 0 = по умолчанию onnxruntime
-  mediapipe:
-    model_complexity: 1
-    min_detection_confidence: 0.3
+  mediapipe:                    # Pose Landmarker (Tasks API) — переключаемый вариант, по умолчанию не в order
+    variant: full               # lite | full | heavy → pose_landmarker_<variant>.task
+    task_path: null             # явный путь; иначе $SENTINEL_POSE_MP_TASK, затем каталоги весов
+    delegate: cpu               # cpu | gpu (GPU-делегат в python — только Linux)
+    num_poses: 2                # в кропе бывает второй человек — выбираем позу по пересечению с bbox трека
+    min_pose_detection_confidence: 0.3
+    min_pose_presence_confidence: 0.3
+    min_tracking_confidence: 0.3
+    crop_padding: 1.4           # контекст вокруг bbox для детектора BlazePose
+    upscale_min_side: 384       # короткая сторона кропа доводится до N px (апскейл только вверх)
+    upscale_max: 3.0
+    use_presence: true          # score = min(visibility, presence)
     visibility_scale: 1.0       # visibility MediaPipe ≠ score RTMPose; множитель для порогов
+    selection:                  # перекрывает selection.* для этого бэкенда: только кассир, один кроп на кадр
+      max_persons_per_frame: 1
+      roles: [cashier]
+      roles_fallback: top1      # если ни у одного трека нет роли cashier — берём top-1 по приоритету
 
 selection:
   max_persons_per_frame: 3       # лимит кропов на кадр
