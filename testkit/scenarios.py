@@ -232,7 +232,7 @@ class SceneScript:
         # руки: перед собой, при пересчёте — небольшое покачивание
         counting = 0.015 * math.sin(2 * math.pi * 1.5 * t) if self._counting(t) else 0.0
         p.hands = self._hands(p, spread=0.08, reach=0.09 + counting)
-        if sc == "V08" and ramp(t, self.T, o(4.0), fade=0.01) > 0.5:
+        if sc == "V08" and ramp(t, o(-0.2), o(4.0), fade=0.01) > 0.5:
             p.hands_visible = False
         return p
 
@@ -306,7 +306,7 @@ class SceneScript:
         if sc == "V01":
             return ramp(t, o(-3.5), o(5.5))
         if sc == "V04":
-            return ramp(t, self.T - 0.3, o(6.0))
+            return ramp(t, self.T - 0.6, o(6.0))
         if sc == "V07":
             return ramp(t, o(-4.5), o(1.5))
         if sc == "clean_collector":
@@ -343,9 +343,9 @@ class SceneScript:
         elif sc == "V08":
             if t < o(-1.0) or t >= o(5.0):
                 items.append(ItemState("cash", CASH_ON_TRAY))
-            elif t < self.T and hand:  # взял пачку в руку
+            elif (t < o(-0.2) or t >= o(4.0)) and hand:  # пачка в руке
                 items.append(ItemState("cash", box_around(*hand, 0.07, 0.05, a), holder=1))
-            # T..T+4: пачка и руки скрыты от камеры
+            # T-0.2..T+4: пачка и руки скрыты от камеры
         elif sc == "V03":
             if self._safe_open(t) > 0.5:
                 items.append(ItemState("cash", CASH_IN_SAFE))
@@ -361,7 +361,7 @@ class SceneScript:
         # --- еда/напитки (V06) ---
         if sc == "V06" and cashier and hand:
             if o(-1.0) <= t < o(2.5):
-                to_mouth = ramp(t, self.T, o(2.0), fade=0.4)
+                to_mouth = ramp(t, o(-0.5), o(2.0), fade=0.4)
                 cx, cy = _lerp(hand[0], head[0] - 0.03, to_mouth), _lerp(hand[1], head[1] + 0.01, to_mouth)
                 items.append(ItemState("cup", box_around(cx, cy, 0.05, 0.05, a), holder=1, near_head=to_mouth > 0.5))
             elif t >= o(2.5):
