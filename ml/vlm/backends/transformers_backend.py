@@ -236,8 +236,8 @@ class TransformersBackend(VLMBackend):
         content: list[dict[str, Any]] = [{"type": "image", "image": im} for im in images]
         content.append({"type": "text", "text": prompt})
         msgs: list[dict[str, Any]] = []
-        if system:
-            msgs.append({"role": "system", "content": [{"type": "text", "text": system}]})
+        if system:  # строкой: так шаблоны Qwen-VL принимают system гарантированно
+            msgs.append({"role": "system", "content": str(system)})
         msgs.append({"role": "user", "content": content})
         return msgs
 
@@ -246,11 +246,13 @@ class TransformersBackend(VLMBackend):
         try:
             inp = self._processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
                                                       return_dict=True, return_tensors="pt")
-        except (TypeError, ValueError, KeyError):
-            images = [c["image"] for m in messages for c in (m.get("content") or [])
+        except Exception as e:  # noqa: BLE001 — старые версии / ошибки шаблона: запасной путь text + processor
+            log.debug("apply_chat_template(tokenize=True) failed (%s), fallback path", type(e).__name__)
+            images = [c["image"] for m in messages if isinstance(m.get("content"), list) for c in m["content"]
                       if isinstance(c, dict) and c.get("type") == "image"]
-            plain = [{**m, "content": [({"type": "image"} if isinstance(c, dict) and c.get("type") == "image" else c)
-                                       for c in (m.get("content") or [])]} for m in messages]
+            plain = [m if not isinstance(m.get("content"), list) else
+                     {**m, "content": [({"type": "image"} if isinstance(c, dict) and c.get("type") == "image" else c)
+                                       for c in m["content"]]} for m in messages]
             text = self._processor.apply_chat_template(plain, tokenize=False, add_generation_prompt=True)
             inp = self._processor(text=[text], images=images or None, return_tensors="pt", padding=True)
         return inp.to(self._model.device)
@@ -281,6 +283,9 @@ class TransformersBackend(VLMBackend):
             text = m.get("content", "")
             if isinstance(text, list):  # уже в формате контента
                 conv.append({"role": role, "content": text})
+                continue
+            if role != "user":  # system/assistant — строкой
+                conv.append({"role": role, "content": str(text)})
                 continue
             content: list[dict[str, Any]] = []
             if i == last_user and imgs:

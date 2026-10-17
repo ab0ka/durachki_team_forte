@@ -8,19 +8,125 @@
 > Результат VLM — подсказка для fusion (A12) и для человека, не истина. Гипотеза правила — тоже не истина:
 > при расхождении модуль снижает уверенность и выставляет флаг противоречия, а решение принимает fusion.
 
+## Фаза 2: что изменилось и как это замерить (для L2)
+
+**Статус замеров.** На этой стороне нет ни GPU, ни данных. Ни одной цифры качества или скорости
+полного режима модуль не заявляет. Известно только то, что замерил L1:
+- Qwen3-VL-4B nf4+bf16 после загрузки занимает 2.7 ГБ, пик 4.7 ГБ на 6 полноразмерных кадрах;
+- 1–3 с на ответ — это smoke на 2 токенах, а не полный JSON-анализ.
+
+Всё новое включается флагом и **по умолчанию выключено**, пока L2 не измерит выигрыш. Каждый пункт — отдельный коммит.
+
+| Изменение | Флаг / где | По умолчанию |
+|---|---|---|
+| Мнение VLM в формате fusion: `extra.vlm.verdict` (`confirm`/`reject`/`unsure`) + `score`. **Без этого противоречие VLM до fusion не доходило** (см. «Решения») | всегда | вкл. (это исправление интеграции) |
+| `extra.vlm.coverage`: проверено/всего. Непроверенное событие — «неизвестно», а не «нарушения нет» | всегда | вкл. |
+| Адаптер transformers 5.x по пути, проверенному L1: картинки в сообщениях, `apply_chat_template(tokenize=True)`, `cache_dir=weights/hf/hub`, без `min/max_pixels` | `transformers.*` | вкл. |
+| `finish_reason` (`eos`/`length`/`time`) и `truncated` у каждого ответа; тайминги prep/gen/decode, пик VRAM на вызов | всегда | вкл. |
+| **Режим verify `qa`**: нейтральные вопросы по спецификации команды, кадры t−2/t/t+2/t+4 + кроп стола/сейфа, вероятность — softmax логитов «Да/Нет/Не видно», сопоставление с кандидатом в коде, шаблонные факты | `verify.mode: qa`, `qa_spec.yaml` | **выкл.** (`json`) |
+| Подмена `t_peak` моментом смены ответа (`t_transition`) | `qa.refine_t_peak` | **выкл.** |
+| `extra.vlm_verdict="rejected"` (встроенное слияние A03 такие события выбрасывает) | `verify.emit_vlm_verdict_rejected` | **выкл.** |
+| `ml.vlm.service.chat(messages)`: та же модель для копилота A14, анализ всегда раньше чата | `service.chat.*` | вкл. (без вызова не грузит ничего) |
+| Загрузка через `ModelRegistry` A03 (вытеснение LRU, `unload`) | `runtime.use_registry` | вкл., только внутри воркера A03 |
+| Discover | `discover.enabled` | **выкл.** (как в фазе 1) |
+
+### Одна команда замера
+
+Что сравниваем: режимы `none` (без VLM), `json` (verify фазы 1) и `qa` (verify фазы 2) на **одних и тех же
+кандидатах пайплайна A03**. Окна и кандидаты берутся от A03/A04, не из разметки.
+
+```bash
+# 0) один раз: кандидаты без VLM (A03), по каталогу на ролик
+for f in data/raw/*.mov; do s=$(basename "$f" .mov); \
+  python -m backend.pipeline run "$f" --no-vlm --out preds_novlm/$s.json --dump-intermediate cands/$s; done
+# 1) замер скорости/VRAM production-режима (json + qa + chat), холодный и тёплый старт
+python -m ml.vlm.bench --frames <папка с кадрами> --n 10 --out outputs/vlm/bench.json
+# 2) сравнение режимов (агрегаты в stdout и --out; построчно — только в outputs/vlm/compare-*/rows.json)
+python -m ml.vlm.compare --videos data/raw --labels data/labels.csv --candidates cands \
+  --modes none,json,qa --budget 30 --out outputs/vlm/compare.json
+```
+
+Что смотреть в `compare.json → summary.<режим>`:
+- `tp`/`fn`/`fp`/`tn`, `recall`, `specificity`;
+- `vs_none.fp_fixed`, `fn_fixed`, `fp_created`, `fn_created` — сколько ошибок VLM исправил и сколько создал;
+- `timecode_hit["<=1s".."<=5s"]` и `timecode_abs_err_median_s` (для дубликатов с разными таймкодами
+  таймкод не оценивается — это конфликт разметки);
+- `types_predicted`, `vlm_s_mean`/`p95`/`max` на ролик, `vlm_calls_total`;
+- `coverage_incomplete_videos`, `unknown_verdicts` — неполный анализ не считается за «нет нарушения»;
+- `vram_peak_mb_torch`.
+
+Вердикт считает настоящий `ml.fusion.fuse`, если он есть в окружении, иначе порог (`verdict_by`).
+
+В `bench.json`:
+- `json` (production-промпт verify): `cold_first_call_s`; `warm.{total_s, prep_frames_s, prep_s, gen_s, decode_s,
+  parse_s}`; `out_tokens` — фактические; `finish_reasons`, `json_valid_rate`, `truncated_rate`;
+- `qa`: `forward_s`, `candidate_s_est`, `mass`, `option_mode` (words/letters);
+- `chat`: задержка и токены;
+- `load_s`, `vram_*`.
+
+**Проверка связки с fusion.** Прогон на `ml.fusion` из `claude/integration-cloud`: синтетика, mock-VLM,
+событие правил V08, порог 0.5.
+
+| вход (rules) | без VLM | VLM `reject` | VLM `confirm` |
+|---|---|---|---|
+| 0.55 | violation (0.55) | **no_violation** (0.33, `vlm_factor` 0.6) | violation (0.776) |
+| 0.80 | violation (0.80) | **no_violation** (0.48) | violation (0.919) |
+
+Выводы:
+- Мнение VLM теперь реально меняет вердикт. Значит, ложный `reject` способен снять настоящее нарушение.
+  Поэтому решение о включении verify — только по `fn_created` из `compare`. Если `fn_created > 0`, A12 повышает
+  `vlm.reject_min_score` или убирает понижение для сильных правил, A11 — `vlm_weight`/`qa.vlm_weight`.
+- В каталоге A13 из ветки интеграции норма (`rules`) сейчас есть **только у V08**. Остальные типы fusion отсекает
+  как `no_norm` («для типа нет применимой нормы»), независимо от VLM. По FAQ 32 нормы есть у всех нарушений
+  датасета — это задача A13. Без неё compare покажет нарушения только для V08.
+
+**Правило выбора конфигурации.** Режим включается, только если на compare у него `fn_created == 0` и сумма
+`fp_fixed + fn_fixed` больше `fp_created`, а `vlm_s_p95` укладывается в бюджет A03. Выбранный режим фиксируется
+одной строкой `verify.mode` в `config.yaml` с результатом замера в коммите. Важно: все 42 строки разметки уже
+использовались в разведке, поэтому это проверка на переобучение, а не независимый тест.
+
+### Режим `qa` подробно
+- **Вопросы** (`qa_spec.yaml`) не говорят модели, что подозревается нарушение. «Нет» и «Не видно» — нормальные
+  ответы. Рамки событий на кадры не рисуются: подсветка — тоже подсказка.
+- **Вероятности.** Каждый вопрос — один forward без генерации: softmax логитов первого токена по вариантам.
+  Если первые токены вариантов совпадают, используются буквы A/B/C. `mass` — доля вероятности, пришедшаяся
+  на варианты; при `mass < min_mass` вопрос не учитывается («неизвестно»).
+- **Сопоставление с кандидатом** — код по спецификации команды (`qa.decide_<тип>`). Примеры:
+  - V02: уход — норма, если ценности убраны и сейф закрыт; кандидат — если в окне после ухода на столе наличные
+    или сумка, либо сейф открыт;
+  - V01: второй человек на стороне кассира или второй посторонний у клиентов;
+  - V03: открытый сейф, в том числе за спиной работающего кассира.
+
+  «Не видно» уменьшает и `p_support`, и `p_contra`: неизвестность ≠ «нет нарушения». Вес VLM в обновлении
+  уверенности умножается на доказательность ответов.
+- **Факты** — шаблонные русские фразы из уверенных ответов. Свободного текста модели нет, придумать норму или
+  полномочия нечем.
+- **Ограничения.** V99 и неизвестные типы, а также бэкенд без логитов (llama.cpp) уходят в режим `json`.
+  Кроп работает только при зонах A06 (`verify(..., zones=)` или `event.extra["zones"]`) или боксах вида
+  `desk`/`safe`. Без них подаётся полный кадр (`crops_used=0`).
+- **Стоимость.** Один forward на вопрос, 2–5 вопросов на тип, отдельный бюджет `budget.verify_qa`.
+  Реальная скорость — только по `bench`.
+
 ## Публичные функции
 
 ```python
 import ml.vlm as vlm
 
-vlm.verify(clip, events, budget_s, *, limits=None) -> list[Event]    # контракт v1 + необязательный limits
-vlm.discover(clip, budget_s, *, limits=None) -> list[Event]          # по умолчанию выключен -> []
+vlm.verify(clip, events, budget_s, *, limits=None, zones=None) -> list[Event]  # контракт v1 + keyword-расширения
+vlm.discover(clip, budget_s, *, limits=None, motion=None) -> list[Event]      # по умолчанию выключен -> []
+vlm.model_info()        # хук A03 для ключа кэша: checkpoint, revision, prompt_version (+хэш .md-промптов/qa_spec)
+vlm.__version__         # "2.0.0"
 vlm.warmup()            # загрузить модель заранее (держать тёплой)
 vlm.unload()            # освободить VRAM
 vlm.status()            # технический статус: backend, модель, loaded, причина отказа (без содержимого)
 vlm.set_gpu_lock(lock)  # общий GPU-lock A03 (любой context manager): load+generate идут под ним
 vlm.set_catalog(cat)    # каталог норм A13 явно (иначе norms.load_catalog() или встроенный fallback)
 vlm.set_backend(be)     # подстановка бэкенда (тесты/интеграция)
+
+from ml.vlm import service
+service.chat([{"role": "system", "content": "…"}, {"role": "user", "content": "…"}])  # копилот A14
+# -> ChatResult(ok, text, error: unavailable|busy|invalid|timeout|…, finish_reason, truncated, latency_s, wait_s)
+service.chat_request({"messages": [...]})  # JSON вход/выход — для вызова через IPC (воркер A03)
 ```
 
 `verify`/`discover` **не бросают исключений**. При сбое или недоступном бэкенде `verify` возвращает события
@@ -182,9 +288,20 @@ llama.cpp, llama-cpp-python, autoawq, PyYAML — MIT; Pillow — HPND; opencv-py
    - GPU-lock передавать такой, который A03 не держит в момент вызова `verify` (или `RLock`): VLM берёт его сама;
      обычный `Lock`, уже захваченный вызывающим, приведёт к дедлоку;
    - сигнал `motion_energy` из A08 можно отдать в `discover(..., motion=[(t, e), ...])`, чтобы не считать его заново;
-   - при 5+ видео одновременно GPU-вызовы VLM сериализуются lock’ом, бюджет каждого видео — wall-clock.
-2. **A12 (fusion):** читать `event.extra["vlm"]`:
-   - `agreement`, `contradiction`, `p_prior`, `p_vlm`, `p_post`;
+   - при 5+ видео одновременно GPU-вызовы VLM сериализуются lock’ом, бюджет каждого видео — wall-clock;
+   - **фаза 2:** зоны трекинга передавать в verify:
+     `("ml.vlm", "verify", (CLIP, candidates, "$budget"), {"zones": zones})`. Без зон режим qa спрашивает
+     по полному кадру, без кропа стола/сейфа;
+   - `model_info()` и `__version__` уже есть. Промпты лежат в `.md`, их хэш входит в `prompt_version`;
+   - внутри воркера модель грузится через `ModelRegistry.get_or_load("ml.vlm:qwen", vram_gb=3.5)`
+     с `unload` → `release()` освобождает VRAM;
+   - `meta.coverage`: брать `event.extra["vlm"]["coverage"]` (checked/total/complete). Неполная проверка
+     не превращает кандидата в «нарушений нет».
+2. **A12 (fusion):** `ml.fusion.vlm_opinion` уже читает `extra["vlm"]["verdict"]` и `["score"]` — с фазы 2 они
+   заполняются: `confirm` (score = p_vlm), `reject` (score = 1 − p_vlm), `unsure`; при `not_checked`
+   вердикта нет. Остальные поля в `event.extra["vlm"]`:
+   - `agreement`, `contradiction`, `p_prior`, `p_vlm`, `p_post`; в режиме qa ещё `p_support`, `p_contra`,
+     `evidence`, `answers`, `t_transition`, `facts_pro`/`facts_con`;
    - `suggested_type_id`, `t_best`, `t_visible`, `flags`;
    - `status`, `budget` — агрегаты стадии.
 
@@ -197,7 +314,12 @@ llama.cpp, llama-cpp-python, autoawq, PyYAML — MIT; Pillow — HPND; opencv-py
    - на Windows нужны CUDA-сборка torch и bitsandbytes ≥ 0.45;
    - для llama.cpp-варианта: `llama-server -m <gguf> --mmproj <mmproj> --port 8081 -ngl 99 -c 8192`
      и `SENTINEL_VLM_BACKEND=llamacpp_server`.
-5. **A01 (контракт/CI):**
+5. **A14 (копилот):** вместо второй LLM можно использовать ту же Qwen3-VL через `ml.vlm.service.chat(messages)`.
+   - Анализ всегда в приоритете: чат ждёт GPU не дольше `service.chat.wait_s`, иначе получает `busy`.
+   - Если модели нет — `unavailable`, mock не подставляется.
+   - Модель одна на процесс. Если копилот живёт в процессе API, а анализ — в воркере A03, то, чтобы не грузить
+     вторую копию, звать `service.chat_request(payload)` (JSON вход/выход) через IPC воркера.
+6. **A01 (контракт/CI):**
    - контракт не менялся;
    - `_contract_fallback.py` — копия `contracts/sentinel_contracts.py`, удалить после мерджа (импорт идёт
      через `ml/vlm/_contract.py`);
@@ -205,7 +327,8 @@ llama.cpp, llama-cpp-python, autoawq, PyYAML — MIT; Pillow — HPND; opencv-py
    - тесты лежат в пакете `ml.vlm.tests` (`__init__.py`), файлы с префиксом `test_vlm_`, чтобы не
      конфликтовать с одноимёнными тестами других модулей.
    - Предложение: зафиксировать в контракте семантику `Event.extra["vlm"]["agreement"]`.
-6. **A16 (eval):**
+7. **A16 (eval):**
+   - `python -m ml.vlm.compare` (см. «Одна команда замера») — сравнение none/json/qa на кандидатах A03;
    - `python -m ml.vlm.calibrate` даёт долю срабатываний discover/verify на позитивах и негативах; это основа
      для решения о `discover.enabled` и подбора `vlm_weight`;
    - прогнать LOO с `SENTINEL_VLM_BACKEND=transformers`;
@@ -224,6 +347,29 @@ llama.cpp, llama-cpp-python, autoawq, PyYAML — MIT; Pillow — HPND; opencv-py
 - Факты для жюри требуются по-русски; ответы на латинице отбрасываются и заменяются шаблоном из каталога.
 - Неизвестный `type_id` от модели не подменяется на V99 молча: он становится `None` и получает флаг.
 
+**Фаза 2:**
+- **Найден и исправлен разрыв с fusion.**
+  - `ml.fusion` ищет мнение VLM в `extra.vlm.verdict|label|answer|decision|status`, а модуль писал только
+    `status="ok"` и `agreement` — fusion мнения не видел.
+  - A03 отдаёт в fusion и исходные события, и проверенные копии; при `combine: max` пониженная копия ни на что
+    не влияла. Противоречие VLM терялось.
+  - Теперь пишутся `verdict` и `score`. `status` не похож на вердикт, поэтому fusion его игнорирует.
+- **Режим qa: модель отвечает на узкие вопросы, а нарушение определяет код по спецификации.** Решение
+  проверяемо, «Не видно» честно учитывается, а факты не содержат свободного текста модели.
+- **Вероятность берётся из логитов первого токена, а не из «confidence» в JSON.** Самооценка небольшой VLM
+  не откалибрована. Логиты тоже не откалиброваны; температуру и смещение подбирать по замеру L2.
+  Отдельной калибровки пока нет — сначала замер.
+- **Без рамок и без слова «нарушение» в вопросах.** Подсветка и формулировка подсказывали бы ответ
+  (требование «не подсказывай»).
+- **Кадры t−2/t/t+2/t+4 от `t_peak` кандидата.** Политика якоря (`anchor: t_peak|t_start`) и смещения — в
+  `qa_spec.yaml`, подбираются замером. `t_transition` только записывается; подмена `t_peak` — флаг.
+- **transformers 5.x — ровно по пути L1** (`vlm_smoke.py`). Второй стек не строился. `max/min_pixels` не
+  передаются, потому что в 5.x они устарели и кадры уже ужаты.
+- **Чат копилота — на той же модели через приоритетный lock**, а не вторая LLM. Вторая модель на 8 ГБ рядом
+  с анализом не помещается (L1: свободно ~5.3 ГБ).
+- **В облако и чат — только агрегаты** (`compare`/`bench`). Построчные результаты, кадры и ответы пишутся
+  в `outputs/vlm` локально.
+
 ## Файлы
 ```
 __init__.py            публичный API (лёгкий импорт)
@@ -240,6 +386,9 @@ prompting.py, prompts/ библиотека промптов <id>.<version>.<lan
 catalog.py             каталог A13 или встроенный fallback (без норм)
 backends/              mock, transformers, llama.cpp (server/python)
 bench.py, try.py (cli_try.py), calibrate.py           CLI: скорость/VRAM, ручная проверка, калибровка
+compare.py                                              CLI фазы 2: none/json/qa на кандидатах A03, исправлено/создано
+qa.py, qa_spec.yaml                                     режим verify.mode=qa: вопросы, логиты, сопоставление
+service.py, gpu.py                                      чат копилота на той же модели; приоритетный GPU-lock
 localdump.py, _video.py                                 локальный дамп, запасной загрузчик видео
 _contract.py, _contract_fallback.py                     импорт контракта
 tests/                 pytest: mock + синтетика, GPU-тест помечен @gpu

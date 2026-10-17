@@ -116,7 +116,7 @@ def test_generate_eos_complete_and_timings(be):
     assert be._model.kw["do_sample"] is False and be._model.kw["max_new_tokens"] == 10
     assert be._model.kw["max_time"] == 5
     msgs = be._processor.seen[-1]
-    assert msgs[0]["role"] == "system" and msgs[1]["content"][-1] == {"type": "text", "text": "prompt"}
+    assert msgs[0] == {"role": "system", "content": "sys"} and msgs[1]["content"][-1] == {"type": "text", "text": "prompt"}
 
 
 def test_generate_length_truncated(be):
@@ -170,6 +170,7 @@ def test_chat_converts_openai_messages(be):
     conv = be._processor.seen[-1]
     assert [m["role"] for m in conv] == ["system", "user", "assistant", "user"]
     assert conv[3]["content"][0]["type"] == "image" and conv[1]["content"] == [{"type": "text", "text": "U1"}]
+    assert conv[0] == {"role": "system", "content": "S"} and conv[2] == {"role": "assistant", "content": "A1"}
     assert r.finish_reason == "eos"
 
 
