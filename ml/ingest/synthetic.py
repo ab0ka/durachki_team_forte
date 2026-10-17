@@ -137,3 +137,49 @@ def synthetic_clip_from_uri(uri: str, sample_fps: float = 5.0) -> SyntheticClip:
     m = re.match(r"synthetic://([0-9.]+)?", uri)
     duration = float(m.group(1)) if m and m.group(1) else 10.0
     return SyntheticClip(duration_s=duration, sample_fps=sample_fps if sample_fps and sample_fps > 0 else 5.0)
+
+
+# ----------------------------------------------------------------------------- «съёмка с миганием»
+
+
+def write_blink_recording(path: str, scene_lengths: Sequence[float], *, blink_s: float = 1.0, preamble_s: float = 2.0,
+                          size: tuple[int, int] = (240, 432), fps: float = 30.0,
+                          scenario_dark: Optional[dict[int, tuple[float, float]]] = None,
+                          flicker_scene: Optional[int] = None) -> list[dict[str, float]]:
+    """Синтетическая запись для split_blinks: подготовка, затем для каждой сцены — «мигание»
+    (свет выключен blink_s) и сама сцена. ``scenario_dark={k: (offset, length)}`` — длинное
+    выключение света внутри сцены k (НЕ метка); ``flicker_scene`` — метка этой сцены «двойная»
+    (короткое мерцание внутри провала). Возвращает ожидаемые off_t/on_t/end_t по сценам."""
+    import cv2
+
+    w, h = size
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (int(w), int(h)))
+    if not writer.isOpened():
+        raise RuntimeError(f"cv2.VideoWriter не открылся: {path}")
+    rng = np.random.default_rng(0)
+    plan: list[tuple[str, float, int]] = [("bright", preamble_s, -1)]
+    for k, length in enumerate(scene_lengths):
+        plan += [("blink", blink_s, k), ("scene", float(length), k)]
+    expected: list[dict[str, float]] = []
+    n = 0
+    for kind, length, k in plan:
+        frames = int(round(length * fps))
+        if kind == "blink":
+            expected.append({"off_t": n / fps, "on_t": (n + frames) / fps})
+        for j in range(frames):
+            img = render_scene(n, n / fps, (w, h), code=False)
+            dark = kind == "blink"
+            if kind == "blink" and flicker_scene == k and frames // 2 - 2 <= j < frames // 2 + 1:
+                dark = False  # мерцание: на 0.1 с свет «моргнул» внутри метки
+            if kind == "scene" and scenario_dark and k in scenario_dark:
+                off, ln = scenario_dark[k]
+                dark = off <= j / fps < off + ln
+            if dark:
+                gain = 0.12 + 0.15 * min(1.0, j / max(frames, 1))  # автоэкспозиция «вытягивает» темноту
+                img = np.clip(img.astype(np.float32) * gain + rng.normal(0, 2, img.shape), 0, 255).astype(np.uint8)
+            writer.write(img)
+            n += 1
+        if kind == "scene":
+            expected[-1]["end_t"] = n / fps
+    writer.release()
+    return expected

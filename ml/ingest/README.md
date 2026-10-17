@@ -1,177 +1,246 @@
-# ml/ingest — декодирование видео, сэмплинг, качество, синтетические искажения (A04)
+# ml/ingest — декодирование видео, цепочка времени, качество, coarse-to-fine, нарезка съёмок (A04)
 
-Модуль превращает `.mov`/`.mp4` в `Clip` — реализацию контрактного `VideoClip`: сэмплы
-(по умолчанию 5 fps) с **фактическими PTS**, точный доступ к кадрам исходника для
-доказательств, метрики качества и `motion_energy`. Моделей нет (`models.json = []`).
+Модуль превращает `.mov`/`.mp4` (портрет или ландшафт, с поворотом или без, CFR или VFR) в `Clip` —
+реализацию контрактного `VideoClip`: сэмплы (по умолчанию 5 fps) с **фактическими PTS**, точный
+доступ к кадрам исходника для доказательств, метрики качества и `motion_energy`.
+Моделей нет (`models.json = []`), GPU не нужен.
+
+## Команда замера для L2 (одна)
+
+```bash
+python -m ml.ingest.bench --videos data/videos --labels data/labels.csv --out reports/a04_ingest_bench.json \
+    --variant base --variant skip:decode.skip_nonref=true --variant cv:decode.backend=opencv --coarse-fine
+```
+
+* **Что сравниваем:** `base` (настройки по умолчанию) против `skip` (декод только опорных кадров —
+  быстрее, но таймлайн неполный) и `cv` (OpenCV-фолбэк вместо PyAV). Любой другой вариант —
+  `имя:ключ=значение,...` (например, `small:storage.max_side=640`).
+* **Выход:** JSON в `--out`: на вариант — `summary` и записи по роликам. В stdout — таблица по вариантам.
+  Только числа и id роликов, без кадров и описаний.
+* **Метрики:**
+  * coverage: `incomplete`, `with_gaps`, `coverage_min`, ошибки декодера;
+  * PTS: шаг кадров min/median/max/std, VFR, `t0_pts_sec`, отклонение сэмплов от сетки;
+  * точность цепочки времени: `exact_offset_max` (|PTS выданного кадра − запрошенное t| на 20 случайных t),
+    `idempotent_all`, `sample_vs_exact_absdiff_max` (сэмпл `frame(i)` против точного кадра в `times[i]`;
+    около 2 — это потери JPEG, больше 10 — подозрение на чужой кадр);
+  * по разметке: размеченная секунда попадает в покрытие, PTS ближайшего кадра и смещение;
+  * latency: `load_s`, `frame()` промах и попадание, `frames_at(3)`, `coarse_fine.run`;
+  * память: `peak_rss_mb` (psutil или resource; на Windows без psutil — null);
+  * VRAM: модуль CPU-only, null.
+* FP/FN и тип ingest не меряет — он влияет на них косвенно (кадр в нужный момент, без пробелов).
+  Код выхода 1, если хоть один ролик не загрузился.
 
 ## Публичный API
 
 ```python
-from ml.ingest import load_video, IngestError
+from ml.ingest import load_video, IngestError, FrameGapError
 
 clip = load_video("X-1.mov")                 # контракт: load_video(path, sample_fps=5.0)
 clip.path, clip.duration, clip.fps, clip.width, clip.height   # width/height — ПОСЛЕ поворота
-clip.times          # фактические PTS выбранных кадров, сек от первого кадра (первый = 0.0)
+clip.times          # фактические PTS сэмплов, сек от первого кадра (первый = 0.0), без округления
 clip.frame(i)       # BGR uint8 сэмпла i (из LRU — копия)
 clip.frame_at(t)    # контракт: точный кадр исходника, ближайший к t, полный размер (только картинка)
 
-# расширения (совместимы с контрактом, ничего не ломают)
-img, ts = clip.frame_at_ts(t)   # + ФАКТИЧЕСКИЙ timestamp кадра -> EvidenceFrame.timestamp_sec
-ref = clip.read_exact(t)        # FrameRef(image, timestamp_sec, requested_sec)
-refs = clip.frames_at([t1, t2]) # пачкой, один проход декодера
-clip.snap_time(t)               # PTS ближайшего кадра исходника (по таймлайну загрузки)
-clip.index_at(t)                # ближайший сэмпл
-clip.source_times               # PTS всех кадров потока
-clip.quality                    # list[dict] на каждый сэмпл (см. ниже)
-clip.motion_curve()             # [(t, motion_energy)] — формат timeline
-clip.activity_segments()        # [(t0, t1)] участки движения
-clip.gated_indices()            # индексы сэмплов для тяжёлых детекторов (чаще в движении)
-clip.meta                       # probe, backend, orientation, coverage, complete, vfr, timings, warnings
-clip.warnings                   # предупреждения по-русски (тёмное видео, неполный файл, ...)
-clip.close()                    # или `with load_video(...) as clip:`
+# расширения (совместимы с контрактом)
+img, ts = clip.frame_at_ts(t)              # + ФАКТИЧЕСКИЙ PTS кадра -> EvidenceFrame.timestamp_sec
+ref = clip.read_exact(t, strict=False)     # FrameRef(image, timestamp_sec, requested_sec, in_gap, out_of_range, ok)
+refs = clip.frames_at([t1, t2])            # пачкой; запросы в один кадр декодируются один раз
+refs = clip.distinct_frames_at(ts, min_separation_s=0.5)  # без повторов одного кадра (для A12)
+clip.window_indices(t0, t1)                # сэмплы окна кандидата
+clip.snap_time(t), clip.index_at(t)        # PTS ближайшего кадра исходника / ближайший сэмпл
+clip.source_times                          # PTS всех кадров потока
+clip.coverage                              # {complete, coverage, decoded_span, declared_duration, gaps, source_times_complete}
+clip.quality, clip.motion_curve(), clip.activity_segments(), clip.gated_indices()
+clip.meta, clip.warnings, clip.close()     # или `with load_video(...) as clip:`
 
 load_video(path, sample_fps, *, config=None, backend=None, progress=None)  # keyword-only расширения
-load_video("synthetic://10")    # Clip в памяти без файла (для тестов других модулей)
 ```
 
-Прочее: `ml.ingest.probe.probe/validate` (+ CLI `python -m ml.ingest.probe video.mov`),
-`ml.ingest.augment`, `ml.ingest.contact_sheet`, `ml.ingest.names` (`normalize_video_id`,
-`find_duplicates`), `ml.ingest.synthetic` (тестовые видео со штрих-кодом номера кадра).
+Модули: `probe` (ffprobe → PyAV → OpenCV, валидация, CLI), `coarse_fine` (адаптер для A03),
+`augment` (синтетические искажения, CLI), `contact_sheet` (CLI), `split_blinks` (нарезка наших
+съёмок, CLI), `bench` (замер, CLI), `names` (`normalize_video_id`, `find_duplicates`),
+`synthetic` (тестовые видео со штрих-кодом номера кадра; моки — только явно).
 
-## Решения
+## Цепочка времени
 
-* **Время = PTS.** `t = pts * time_base − t0`, t0 — PTS первого выданного декодером кадра.
-  `frame_index / fps` временем не считается нигде. VFR, пропуски кадров, ненулевой start_time
-  и edit lists обрабатываются одинаково. Для узлов сетки `k / sample_fps` берётся **ближайший
-  по PTS** кадр (без повторов); `clip.times` — PTS выбранных кадров, а не узлы сетки.
-* **Поворот.** Display matrix (с кадра PyAV / из ffprobe) или тег `rotate`; логика повторяет
-  autorotate ffmpeg, включая варианты с зеркалом. Размер берётся из декодированного кадра —
-  никаких зашитых 464×848. Тест сверяет наши кадры с выводом `ffmpeg` (autorotate) для
-  −90/90/180/−90+hflip.
-* **Бэкенды.** PyAV (основной) → OpenCV (фолбэк, авто-поворот OpenCV выключается, поворот
-  применяем сами). Проба: ffprobe → PyAV → OpenCV.
-* **Память.** Сэмплы — JPEG q=92 в RAM до `storage.max_ram_mb` (512), сверх — во временный
-  файл (удаляется при `close()`/сборке мусора). LRU декодированных сэмплов ограничен и по
-  числу (96), и по МБ (256); кэш точных кадров — 32 шт / 128 МБ. Сэмплы ужимаются до
-  `max_side=1280` (для 464×848 — без изменений); `frame_at` — всегда полный размер.
-* **Ошибки — не «пустой успех».** Нет кадров / ошибок декодера больше `max_decode_errors` /
-  декодировано < `min_coverage` (50%) заявленной длительности → `DecodeError`
-  (`code="decode_failed"|"incomplete_video"`). 50–98% → Clip с `meta["complete"]=False`,
-  `meta["coverage"]` и предупреждением. Файл без `moov`, мусор, 0 байт → `VideoProbeError`;
-  нет видеопотока → `NoVideoStreamError`; длительность вне 1–900 с → `InvalidDurationError`.
-  У всех: `.code`, русское `.message`, `.to_dict()` (A02 может отдавать 422).
-* **sample_fps.** Default контракта (5.0) не менялся. Можно передать любое значение
-  (`<= 0` — каждый кадр); `sampling.default_fps` в конфиге — для пайплайна/CLI;
-  `sampling.max_samples` (6000) снижает частоту с предупреждением, чтобы не съесть RAM.
-* **Скорость.** Декод в потоках FFmpeg (`thread_type=AUTO`), конвертация кадров + JPEG + метрики —
-  в пуле потоков. `decode.adaptive_skip`: если прогноз декода > `budget_s` (20 с), декодер
-  переключается на опорные кадры (I/P) с предупреждением; `decode.skip_nonref: true` — сразу.
+`PTS` → `t = pts·time_base − t0` (float, `time_base` — Fraction; t0 — PTS первого кадра, поэтому
+смещение старта и edit lists убираются) → сэмпл `times[i]` (ближайший по PTS кадр к узлу
+`k/sample_fps`, без повторов) → окно кандидата `window_indices` → `frames_at(t)`. Внутри:
+`snap_time(t)` даёт PTS кадра из таймлайна загрузки, декодируется ровно он, и в
+`FrameRef.timestamp_sec` возвращается фактический PTS. Округление — только при показе (контакт-листы,
+предупреждения, тайминги). `frame_index/fps` временем не считается нигде.
 
-### `clip.quality[i]`
-`t, sharpness (var Laplacian на 160 px), brightness, contrast, dark_frac, bright_frac,
-motion_raw, motion_frac, motion_energy (= min(1, motion_frac / 0.06)), is_blurry, is_dark,
-is_bright, is_frozen`. Все пороги — `config.yaml` (`quality.*`, `activity.*`).
+* **Начало и конец.** `t < 0` или `t > duration` → крайний кадр с `out_of_range=True`.
+  Последний кадр доступен до `duration` (его показ длится шаг кадра).
+* **Пробелы покрытия.** Соседние PTS дальше, чем `max(min_gap_s, gap_factor·медианный шаг)`;
+  кадры в начале; хвост неполного файла. Всё это попадает в `clip.coverage["gaps"]` с предупреждением.
+  Кадр дальше `frame_at.max_offset_s` (0,25 с) от запрошенного t помечается `in_gap=True`;
+  при `strict=True` — `FrameGapError(code="frame_gap")`. Сэмплы внутри дыры не выдумываются.
+* **unknown ≠ false.** Пробел — это «неизвестно», а не «нарушений нет». Пайплайн должен смотреть
+  `clip.coverage` (и `WindowRead.complete` в coarse-to-fine), прежде чем выдавать `no_violation`.
+* **Дубликаты кадров.** Несколько запросов, попавших в один кадр, дают один и тот же
+  `timestamp_sec`; `distinct_frames_at` отбрасывает повторы, чтобы A12 не взял три копии одного кадра.
 
-## Синтетические искажения (`augment.py`)
+## Решения (фаза 1, сохранены)
 
-Это **синтетическое искажение** кадра (гомография, поворот, кроп-зум, зеркало, фотометрия,
-blur, шум, JPEG, смена fps), а **не** съёмка другой камерой: нет параллакса, новых окклюзий и
-сторон объектов. Устойчивость на пресетах — необходимое, но не достаточное условие для
-критерия «другой угол»; финальная проверка — только на реальном видео.
+* **Поворот.** Display matrix или тег `rotate`, логика autorotate ffmpeg (включая зеркало).
+  Размер берётся из декодированного кадра, 464×848 нигде не зашит.
+* **Бэкенды.** PyAV основной, OpenCV фолбэк (его авто-поворот выключается, поворот применяем сами).
+* **Память.** JPEG q=92 в RAM до `max_ram_mb` (512), сверх — временный файл. LRU: 96 кадров / 256 МБ;
+  точные кадры: 32 / 128 МБ. Сэмплы ужимаются до `max_side=1280`; `frame_at` — полный размер.
+* **Ошибки — не «пустой успех».**
+  * Нет кадров, или ошибок декодера больше `max_decode_errors`, или декодировано меньше 50% длительности —
+    `DecodeError` (`decode_failed` / `incomplete_video`).
+  * 50–98% — клип с `complete=False` и предупреждением.
+  * Битый контейнер — `VideoProbeError`; нет видеопотока — `NoVideoStreamError`;
+    длительность вне 1–900 с — `InvalidDurationError`.
+* **Моки только явно.** `load_video("synthetic://N")` работает лишь при `SENTINEL_MOCK=1` или
+  `mock.allow_synthetic_uri: true`. Без них — `VideoNotFoundError`; production сам на мок не
+  переключается. У `SyntheticClip` стоит `meta.mock=True`.
+* **sample_fps.** Значение по умолчанию из контракта (5.0) не менялось; `sampling.default_fps` —
+  для пайплайна, `sampling.max_samples` — предохранитель памяти.
 
-* numpy: `apply(img, aug)`, `homography(aug, w, h)`, `transform_points`, `transform_bbox`
-  (кадр и разметка преобразуются одной матрицей), `ClipAugmenter(seed).sample()` — одни
-  параметры на весь клип, `random_aug(rng, strength)`, `resample_indices(times, 25)`.
-* CLI: `python -m ml.ingest.augment in.mov out.mov --preset angle_left|angle_right|high|low|zoom|mirror|dark|rot_cw|rot_ccw|bright|blur|noise|jpeg|fps25|all [--engine auto|ffmpeg|python]`.
-  `all` пишет `out_<preset>.mov`. ffmpeg-движок: геометрия через `perspective` (та же
-  гомография); на тесте разница с numpy-версией < 2 уровней яркости. `dark/bright` в ffmpeg
-  (`eq` по яркости в YUV) совпадают с numpy только приблизительно. Кодек вывода — `mpeg4`.
+## Фаза 2: что добавлено (каждое — отдельный коммит; новые режимы выключены)
 
-## Контакт-листы (`contact_sheet.py`)
+1. **Цепочка времени** (см. выше): без округления; кэш точных кадров по фактическому PTS;
+   `in_gap`/`out_of_range`, strict-режим; `coverage`; `distinct_frames_at`; `window_indices`.
+2. **Любая ориентация.** Все функции и тесты гоняются на портрете и ландшафте. Метрики качества теперь
+   уменьшают кадр по КОРОТКОЙ стороне (`quality.analysis_short_side=160`, раньше — по ширине).
+   Для портрета результат тот же, ландшафт теперь в той же шкале резкости.
+3. **Coarse-to-fine** (`coarse_fine.py`, флаг `coarse_fine.enabled: false`):
+   * `coarse_indices` — равномерный обзор всей длительности по сохранённым сэмплам;
+     первый и последний сэмпл всегда входят;
+   * окна — из кандидатов (Event / dict / кортеж), склейка дребезга `merge_gap_s`; если кандидатов нет —
+     окна из пиков `motion_energy` (`activity_top_k`; число окон не растёт с длиной ролика);
+   * `read_window` / `run` — плотное точное чтение окон без дублей;
+   * бюджет `budget_frames` делится на обзор (`coarse_share`) и окна; шаг и плотность — параметры для L2.
+4. **`angle_jury`** — перспектива + поворот + кроп в ЛАНДШАФТ (`out_orientation="landscape"`).
+   У всех пресетов `kind="perturbation"`, CLI пишет пометку «синтетическое искажение, не реальный
+   новый ракурс». Геометрия учитывает выходной размер (`output_size`, точки и bbox нормируются к нему).
+   ffmpeg-движок расходится с numpy меньше чем на 3 уровня. `random_aug(p_landscape=0)` по умолчанию
+   ведёт себя как раньше.
+5. **`split_blinks`** — нарезка наших съёмок (ниже).
+6. **`bench`** — замер для L2 (выше).
 
-`python -m ml.ingest.contact_sheet video.mov --t 22 --window 4 --out sheet.jpg`
-(`--step 0.5`, `--cols 4`; без `--t` — обзор всего ролика `--every N`). Подписи — фактические
-PTS, кадр ближе всего к `t` обведён красным.
-**Приватность:** лист пишется только в локальный файл для человека или ЛОКАЛЬНОЙ VLM; CLI
-печатает лишь путь и таймкоды (без картинок/base64/описаний). Не передавайте листы и кадры
-реальных роликов облачным ассистентам (включая расширения IDE).
-
-## Запуск и проверки
+## Нарезка наших съёмок: `split_blinks`
 
 ```bash
-pip install -r ml/ingest/requirements.txt
-python -m pytest ml/ingest/tests -q          # без GPU, без весов, без реальных данных
-python -m pytest ml/ingest/tests -q -m "not slow"
+python -m ml.ingest.split_blinks --videos data/extra/incoming --journal data/extra/journal.csv \
+    --out data/extra/clips --dry-run      # сначала отчёт сопоставления, затем без --dry-run
 ```
-Тесты генерируют синтетику сами (`cv2.VideoWriter`, ffmpeg lavfi) со штрих-кодом номера
-кадра в каждом кадре — так проверяются PTS сэмплов, `frame_at` и seek вперёд/назад.
-Покрыто: VFR, rotation (−90/90/180/hflip; PyAV и OpenCV против ffmpeg), seek, фактические PTS,
-битые MOV (без moov, обрезанный faststart 30%/85%, испорченный payload, мусор, 0 байт,
-только аудио), лимиты RAM/LRU, pickle, аугментации, контакт-листы, имена.
-Тесты с ffmpeg помечены skip, если ffmpeg нет в PATH.
 
-**Фактически выполнено** (Linux-контейнер, 4 vCPU, Python 3.11.17, av 18.1.0,
-opencv-python-headless 5.0.0.93, ffmpeg 6.1.1): `88 passed` (~21 с).
+* **Метка** — короткий провал средней яркости кадра. Тёмный кадр: ниже `0.5 ×` опорного уровня
+  (75-й перцентиль за ±5 с) и минимум на 20 уровней ниже него. Длительность провала 0,3–3 с;
+  свет горит и до, и после (проверка симметричная). Мерцание внутри метки (< 0,5 с) склеивается.
+* **Не метки.** Длинное затемнение по сценарию и края длинной темноты идут в `long_dark` отчёта.
+  Если автодетект ошибся — `--marks marks.csv` (`camera,file,on_t[,off_t]`).
+* **Клип** — от включения света − 0,5 с до выключения света следующей меткой (или до конца файла);
+  отрезок до первой метки — подготовка. Выход: H.264, 30 fps CFR, короткая сторона 464 (портрет и ландшафт),
+  без звука. Движок `--engine auto|ffmpeg|pyav` (PyAV — если нет ffmpeg CLI, кодировщик из колеса).
+* **Сопоставление** по камерам (подпапки `C1..C4`, файлы в естественном порядке имён): сегменты ↔ сцены
+  журнала с `done=да` в порядке `shot_at` (если формат смешанный — порядок строк, с предупреждением).
+  Число не совпало → камера пропускается (`--force` — по порядку, первые min(N)). Длительности
+  сегментов сравниваются между камерами: метка видна всем сразу, расхождение > 1,5 с — предупреждение.
+* **labels.csv** (по умолчанию `<out>/../labels.csv`, слияние по `video_id`):
+  `video_id,file,label,t_sec,type_id,camera,layout,light,scene_id`, где `video_id = <scene_id>-<камера>`.
+  * `t_sec = t_onset + 0.5`: считаю, что `t_onset` — секунды от включения света.
+  * Для `no_violation` поля `t_sec` и `type_id` пустые, как в `eval.labels` у L1; код сцены
+    восстанавливается по `scene_id`.
+  * `kind`: нарушение / норма / violation / clean / …; нераспознанное → `unknown` с предупреждением.
+* **Приватность.** `title` и `notes` журнала не попадают ни в отчёт, ни в stdout — только id, коды, времена.
+  Отчёт: `<out>/split_report.json`. Код выхода 1, если есть камеры с несовпадением.
 
-**Замеры — только синтетика в этом контейнере** (testsrc2, 145 с, 30 fps, 464×848,
-сэмплинг 5 fps → 725 кадров; на целевом ноутбуке и реальных iPhone-роликах не мерялось):
+## Синтетические искажения и контакт-листы
 
-| файл | бэкенд | загрузка, с | RAM сэмплов |
-|---|---|---|---|
-| H.264, без поворота | PyAV | 5.1 (со `skip_nonref` 4.8) | 33 МБ |
-| HEVC 848×464 + display matrix −90 | PyAV | 6.8 (со `skip_nonref` 5.3) | 33 МБ |
-| H.264 / HEVC | OpenCV-фолбэк | 5.2 / 6.7 | 33 МБ |
+* `augment.py` — numpy (`apply`, `homography`, `output_size`, `transform_points`/`transform_bbox`,
+  `ClipAugmenter`, `random_aug`) и CLI:
+  `python -m ml.ingest.augment in.mov out.mov --preset angle_left|angle_right|high|low|zoom|mirror|dark|rot_cw|rot_ccw|bright|blur|noise|jpeg|fps25|angle_jury|all`.
+  Это **perturbation**: нет параллакса и новых окклюзий. Устойчивость на пресетах — необходимое, но не
+  достаточное условие для критерия «другой угол».
+* `contact_sheet.py` — `python -m ml.ingest.contact_sheet video.mov --t 22 --window 4 --out sheet.jpg`;
+  подписи — фактические PTS. **Только локальный файл** для человека или локальной VLM; CLI печатает лишь
+  путь и таймкоды. Кадры и листы реальных роликов облачным моделям не передавать (включая расширения IDE).
 
-`frame(i)` из LRU ≈ 0.4 мс (копия), промах (декод JPEG) ≈ 2–4 мс; 4 точных кадра
-`frames_at` — 0.07 с (H.264) / 0.5 с (HEVC). Только декод (без конвертации) H.264 занимает
-~2.7 с при ~10 с CPU — контейнер медленный; цель «< 5 с на CPU» на прод-ноутбуке нужно
-подтвердить замером, обещать не могу.
+## Проверки и замеры (фактически выполнено)
+
+`python -m pytest ml/ingest/tests -q` → **156 passed** (~70 с). Linux-контейнер, 4 vCPU, Python 3.11.17,
+версии из lock L1: av 18.1.0, opencv-python-headless 4.14.0.94, numpy 2.4.6, PyYAML 6.0.3, pytest 9.1.1;
+ffmpeg 6.1.1. Фаза 1 проходила и на opencv 5.0.0.93.
+
+Тесты генерируют синтетику сами: штрих-код номера кадра проверяет PTS, `frame_at` и seek; синтетическое
+«мигание» проверяет `split_blinks`. Покрыто:
+* VFR, в том числе дыра ~1 с;
+* смещение старта 2,5 с;
+* начало и конец видео;
+* поворот −90/90/180/hflip против ffmpeg autorotate, на портрете и ландшафте;
+* битые MOV;
+* strict-режим и пробелы;
+* дедупликация кадров;
+* coarse-to-fine;
+* `angle_jury` (numpy и ffmpeg);
+* `split_blinks`: длинная темнота, мерцание, два файла, ландшафтная камера, несовпадение числа сцен,
+  ручные метки, ffmpeg и PyAV, отсутствие title/notes в отчёте;
+* `bench` от начала до конца.
+
+**Замеры — только синтетика в этом контейнере** (testsrc2, 145 с, 30 fps, 464×848, 5 fps → 725 сэмплов;
+вывод `bench`). На целевом ноутбуке и реальных роликах **не мерялось** — это задача L2 по команде выше.
+
+| вариант | файл | load_s | frame() промах / попадание | frames_at(3) | coarse_fine.run |
+|---|---|---|---|---|---|
+| base | H.264 | 5.6 | 3.9 / 0.16 мс | 65 мс | 0.83 с |
+| base | HEVC + display matrix −90 | 6.9 | 2.0 / 0.09 мс | 275 мс | 0.67 с |
+| skip_nonref | H.264 | 4.4 | 1.9 / 0.09 мс | 50 мс | 0.72 с |
+| skip_nonref | HEVC + display matrix −90 | 5.4 | 2.0 / 0.09 мс | 266 мс | 0.69 с |
+
+Во всех строках: `exact_offset_max` = 0,016 с (≤ полкадра), `sample_vs_exact_absdiff_max` ≈ 2,1,
+`idempotent_all` = true, coverage = 1,0, peak RSS процесса ≈ 300 МБ. Цель «< 5 с на CPU» здесь
+выполняется только со `skip_nonref`. Обещать время на проде не могу — нужен замер L2.
 
 ## Зависимости и лицензии
 
 | пакет | лицензия | зачем |
 |---|---|---|
-| PyAV (`av`) | BSD-3-Clause; колёса содержат FFmpeg (LGPL-2.1) | основной декодер |
-| opencv-python-headless | Apache-2.0 (FFmpeg внутри — LGPL) | фолбэк, JPEG, метрики, warp |
+| PyAV (`av`) | BSD-3-Clause; в колёсах FFmpeg (LGPL) | основной декодер; кодировщик H.264 в `split_blinks --engine pyav` |
+| opencv-python-headless (< 5, lock: 4.14.0.94) | Apache-2.0 | фолбэк, JPEG, метрики, warp |
 | numpy | BSD-3-Clause | |
-| PyYAML | MIT | config.yaml |
-| ffmpeg/ffprobe (бинарь, опционально) | LGPL/GPL в зависимости от сборки | probe, CLI augment, тесты; отдельный процесс, не линкуется |
+| PyYAML | MIT | config.yaml, `--variant` |
+| ffmpeg/ffprobe (бинарь, опционально) | LGPL/GPL по сборке | probe, augment CLI, `split_blinks`; отдельный процесс |
+| psutil (опционально) | BSD-3-Clause | peak RSS в `bench` на Windows |
 
 Моделей и весов нет; сеть не нужна.
 
 ## Ограничения
 
-* Повороты не кратные 90° округляются до 90°; анаморфный SAR ≠ 1 не учитывается.
-* HDR/10-бит (iPhone HLG) конвертируется в BGR без тон-маппинга (цвета бледнее).
-* При `skip_nonref` (ручном или адаптивном) `source_times` неполный, сэмплы чуть неравномернее;
+* Повороты не кратные 90° округляются до 90°; анаморфный SAR ≠ 1 не учитывается; HDR/10-бит — без тон-маппинга.
+* При `skip_nonref` таймлайн неполный: `coverage_gaps` не считаются, `snap_time` приблизителен.
   `frame_at_ts` всё равно возвращает фактический PTS.
-* OpenCV-фолбэк выбирает кадр правилом «первый с t ≥ узел − полкадра» (точно для CFR, для VFR —
-  в пределах шага кадра); PyAV — честный ближайший.
+* OpenCV-фолбэк выбирает сэмпл правилом «первый с t ≥ узел − полкадра» (точно для CFR); PyAV — честный ближайший.
+* `split_blinks`:
+  * пороги (ratio, min_drop, длительность провала) подобраны на синтетике; реальные съёмки — сначала `--dry-run`;
+  * сцена целиком в темноте может «съесть» метку — тогда `--marks`;
+  * порядок `shot_at` — единственный ключ сопоставления (абсолютное время записи файла не используется).
 
 ## Для интегратора
 
-* **Импорт контракта:** `video.py` делает `from contracts.sentinel_contracts import *` с фолбэком на
-  `ml/ingest/_contract_fallback.py` (точная копия; удалить после мерджа A01).
-* **Предложение A01 (не меняю контракт сам):** добавить в `VideoClip` необязательный метод
-  `frame_at_ts(t) -> tuple[np.ndarray, float]` и атрибут `source_times: list[float]`.
-  Обратно совместимо: `frame_at(t)` остаётся как есть.
-* **A12 (fusion/доказательства):** `EvidenceFrame.timestamp_sec` брать из `clip.frame_at_ts(t)[1]`
-  (или `clip.read_exact(t).timestamp_sec`), а не из запрошенного t. Если клип чужой реализации
-  без метода — `getattr(clip, "frame_at_ts", None)`, иначе `clip.snap_time(t)` / t.
-* **A03 (pipeline):** `load_video(path, sample_fps, progress=lambda f: progress("ingest", f))`;
-  ловить `ml.ingest.IngestError` (`.code`, `.message`) → `status="failed"` с понятной ошибкой;
-  `clip.meta["warnings"]`, `["complete"]`, `["coverage"]`, `["timings"]` → `AnalysisResult.meta`.
-  `clip.motion_curve()` — дешёвый приор, `clip.gated_indices()` — для activity gating.
-* **A02 (API):** коды ошибок → HTTP 422: `file_not_found`, `probe_failed`, `no_video_stream`,
-  `duration_out_of_range`, `decode_failed`, `incomplete_video`.
-* **A08:** сигнал `motion_energy` уже посчитан: `clip.quality[i]["motion_energy"]` (0..1).
-* **A10/A05:** `ClipAugmenter` для обучения (одни параметры на клип), `transform_bbox` для разметки.
-* **A16 (eval):** `names.normalize_video_id` (Х-3 → X-3); `names.find_duplicates` — по md5
-  Х-4≡Х-47 (таймкоды 57 и 68 с) и Х-5≡Х-48: не считать дубликаты отдельными примерами в LOO.
-  Пресеты `augment` — синтетический стресс-тест, не замена реальному видео под другим углом.
-* **A17 (deploy):** PyAV-колёса для Windows/Python 3.11 есть на PyPI; ffmpeg/ffprobe не обязательны
-  (`$SENTINEL_FFPROBE`, `$SENTINEL_FFMPEG`, `$SENTINEL_INGEST_CONFIG`). Временные файлы
-  при переполнении RAM — в системный temp.
-* **A01:** в корневой `pytest`-конфиг можно добавить маркеры `slow`, `gpu` (сейчас регистрирую
-  в `ml/ingest/tests/conftest.py`). `ml/ingest/.gitignore` не пускает медиа из моей папки.
-* Env: `SENTINEL_INGEST_CONFIG`, `SENTINEL_FFPROBE`/`FFPROBE_BIN`, `SENTINEL_FFMPEG`/`FFMPEG_BIN`.
+* **A01.** Предлагаю добавить в `VideoClip` необязательные `frame_at_ts(t) -> (ndarray, float)` и
+  `source_times` — это обратно совместимо. `_contract_fallback.py` удалить после мерджа контракта.
+  В корневой `.gitignore` нужны `__pycache__/` и `*.pyc`; маркеры pytest `slow`, `gpu`.
+* **A12.** `EvidenceFrame.timestamp_sec = ref.timestamp_sec` из `clip.read_exact(t)` или `frame_at_ts`,
+  не запрошенное t. Кадры брать через `clip.distinct_frames_at(times, min_separation_s=...)`.
+  `ref.in_gap` / `ref.out_of_range` — не показывать как доказательство (или `strict=True`).
+* **A03.**
+  * Загрузка: `load_video(path, sample_fps, progress=...)`; ловить `IngestError` (`.code`, `.message`).
+  * Перед `no_violation` проверять `clip.coverage`: `complete` и `gaps`. При пробелах — частичный результат
+    с предупреждением, а не «нарушений нет».
+  * Coarse-to-fine: `from ml.ingest import coarse_fine as CF; if CF.enabled(cfg): plan, reads = CF.run(clip, candidates)`.
+    Обзорные кадры — `clip.frame(i)` по `plan.coarse_indices`; окна — `reads[k].frames` (точные), `reads[k].complete`.
+* **A02.** Коды ошибок в HTTP 422: `file_not_found`, `probe_failed`, `no_video_stream`,
+  `duration_out_of_range`, `decode_failed`, `incomplete_video`; `frame_gap` — внутренний.
+* **A08.** `clip.quality[i]["motion_energy"]`; метрики не зависят от ориентации. Яркость — не признак
+  нарушения (свет выключают).
+* **A10 / A05.** `ClipAugmenter`, `random_aug(p_landscape=...)`, `transform_bbox` / `output_size` для разметки.
+* **A16 / L1.** `split_blinks` пишет `data/extra/labels.csv` в схеме, совместимой с `eval.labels`
+  (плюс `type_id`, `camera`, `layout`, `light`, `scene_id`). Ролики `<scene>-C1..C4` одной сцены — одна
+  группа для LOO, иначе утечка между камерами. `names.find_duplicates` — md5-дубликаты.
+* **A17.** ffmpeg/ffprobe не обязательны: `$SENTINEL_FFPROBE`, `$SENTINEL_FFMPEG`, `$SENTINEL_INGEST_CONFIG`;
+  `SENTINEL_MOCK=1` — только для тестов и демо.
