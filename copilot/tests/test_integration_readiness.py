@@ -402,3 +402,61 @@ def test_malformed_result_does_not_crash(cfg, corpus) -> None:
     assert md.startswith("# Заключение для проверяющего")
     r = svc.answer("not json at all", "Почему?", [])
     assert r["error"] is None
+
+
+# ----------------------------------------------------------------------------- совместимость с A02/A15
+
+def test_a15_request_shape_history_with_text_and_sources(cfg, corpus, job_violation) -> None:
+    """A15 шлёт history=[{role, text}] и читает answer + sources (строки)."""
+    client = TestClient(_provider_app(cfg, corpus, {"job-test-1": job_violation}.get))
+    body = {"question": "А какая норма?", "history": [{"role": "user", "text": "Что с телефоном?"},
+                                                     {"role": "assistant", "text": "Кассир держит телефон у уха."}]}
+    r = client.post("/api/v1/jobs/job-test-1/ask", json=body)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert isinstance(j["answer"], str) and j["answer"]
+    assert j["sources"] and all(isinstance(s, str) for s in j["sources"])
+    assert j["sources"][0].startswith("[1] ") and "п. 9" in j["sources"][0]
+    assert len(j["sources"]) == len(j["citations"])
+
+
+def test_a02_style_double_mount_api_and_ui(cfg, corpus, job_violation) -> None:
+    """A02 монтирует make_router дважды: /api/v1 (X-API-Key) и /ui/v1 (cookie+CSRF)."""
+    from fastapi import Depends, Header, HTTPException
+
+    def api_key(x_api_key: str = Header(default="")) -> None:
+        if x_api_key != "k":
+            raise HTTPException(401)
+
+    def ui_csrf(x_csrf_token: str = Header(default="")) -> None:
+        if x_csrf_token != "t":
+            raise HTTPException(403)
+
+    svc = CopilotService(cfg=cfg, corpus=corpus)
+    jobs = {"job-test-1": job_violation, "run": {"job_id": "run", "status": "processing", "stage": "detect"}}
+    app = FastAPI()
+    app.include_router(make_router(get_job=jobs.get, service=svc, prefix="/api/v1", dependencies=[Depends(api_key)]))
+    app.include_router(make_router(get_job=jobs.get, service=svc, prefix="/ui/v1", dependencies=[Depends(ui_csrf)]))
+    c = TestClient(app)
+    q = {"question": "Почему?"}
+    assert c.post("/api/v1/jobs/job-test-1/ask", json=q).status_code == 401
+    assert c.post("/ui/v1/jobs/job-test-1/ask", json=q).status_code == 403
+    assert c.post("/api/v1/jobs/job-test-1/ask", json=q, headers={"X-API-Key": "k"}).status_code == 200
+    assert c.post("/ui/v1/jobs/job-test-1/ask", json=q, headers={"X-CSRF-Token": "t"}).status_code == 200
+    assert c.get("/ui/v1/copilot/status", headers={"X-CSRF-Token": "t"}).json()["available"] is True
+    assert c.post("/api/v1/jobs/run/ask", json=q, headers={"X-API-Key": "k"}).status_code == 409
+
+
+def test_openapi_builds_with_double_mount() -> None:
+    """A02 отдаёт /docs: схема должна собираться без дублей operationId при двух префиксах."""
+    import warnings
+
+    app = FastAPI()
+    app.include_router(make_router(get_job=lambda j: None, prefix="/api/v1"))
+    app.include_router(make_router(get_job=lambda j: None, prefix="/ui/v1"))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        spec = app.openapi()
+    assert not [w for w in caught if "operation" in str(w.message).lower()]
+    ops = [op["operationId"] for p in spec["paths"].values() for op in p.values()]
+    assert len(ops) == len(set(ops)) == 6

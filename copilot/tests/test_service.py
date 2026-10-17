@@ -177,3 +177,12 @@ def test_unavailable_rechecked_later(cfg, corpus, monkeypatch) -> None:
     assert svc.status()["available"] is False and not calls  # кэш в пределах RETRY_UNAVAILABLE_S
     svc._resolved_at -= svc.RETRY_UNAVAILABLE_S + 1
     assert svc.status()["available"] is True and calls
+
+
+def test_history_is_truncated(cfg, corpus, job_violation) -> None:
+    llm = ScriptedLLM(["Пользоваться телефоном запрещено [N1]."])
+    hist = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"реплика {i}"} for i in range(20)]
+    _svc(cfg, corpus, llm).answer(job_violation, "Почему?", hist)
+    msgs = llm.calls[0]
+    assert len(msgs) == 1 + 8 + 1  # system + последние 8 реплик + вопрос
+    assert msgs[1]["content"] == "реплика 12" and msgs[-2]["content"] == "реплика 19"

@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 DISCLAIMER = "Подсказка для проверяющего, не юридическое заключение."
 
 ERROR_MESSAGES = {
-    "disabled": "Ассистент отключён в этой установке (COPILOT_ENABLED=0).",
+    "disabled": "Ассистент отключён в этой установке (включается COPILOT_ENABLED=1).",
     "unavailable": "Ассистент недоступен: локальная языковая модель не загружена.",
     "timeout": "Ассистент не успел ответить за отведённое время. Повторите вопрос позже.",
     "busy": "Ассистент занят (GPU или другой вопрос). Повторите вопрос позже.",
@@ -41,6 +41,17 @@ ERROR_MESSAGES = {
     "llm_error": "Ошибка локальной модели. Ответ не сформирован.",
     "internal_error": "Внутренняя ошибка ассистента. Ответ не сформирован.",
 }
+
+
+def source_label(cite: dict[str, Any]) -> str:
+    """Читаемая подпись источника для UI: «[1] Документ, п. 9 — url»."""
+    label = f"[{cite.get('ref')}] " if cite.get("ref") else ""
+    label += str(cite.get("document") or "")
+    if cite.get("clause"):
+        label += f", {cite['clause']}"
+    if cite.get("url"):
+        label += f" — {cite['url']}"
+    return label
 
 
 class CopilotService:
@@ -205,7 +216,7 @@ class CopilotService:
         return refs
 
     def _error(self, code: str, job_id: str = "", **extra: Any) -> dict[str, Any]:
-        out = {"answer": "", "citations": [], "grounded": False, "refusal": False, "error": code,
+        out = {"answer": "", "citations": [], "sources": [], "grounded": False, "refusal": False, "error": code,
                "message": ERROR_MESSAGES.get(code, code), "job_id": job_id, "disclaimer": DISCLAIMER,
                "warnings": list(dict.fromkeys(self.warnings))}
         out.update(extra)
@@ -240,12 +251,13 @@ class CopilotService:
     def _finish(self, p: dict[str, Any], raw: str, backend: str, t0: float) -> dict[str, Any]:
         g = self._check(p, raw)
         warnings = p["warnings"] + g.warnings
-        if self.corpus.is_fixture:
+        if self.corpus.is_fixture and not any("фикстур" in w.lower() for w in warnings):
             warnings.append("нормы взяты из ТЕСТОВОЙ фикстуры — не использовать как ссылки на нормы РК")
         answer = g.answer or UNVERIFIED_ANSWER
         return {
             "answer": answer,
             "citations": g.citations,
+            "sources": [source_label(c) for c in g.citations],
             "grounded": g.grounded,
             "refusal": g.refusal,
             "intent": p["intent"],

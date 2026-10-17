@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable, Literal, Optional, Sequence, Union
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 JobProvider = Callable[[str], Union[Any, Awaitable[Any]]]
@@ -48,7 +48,8 @@ def set_job_provider(fn: Optional[JobProvider]) -> None:
 
 class Turn(BaseModel):
     role: Literal["user", "assistant"]
-    content: str = Field(max_length=8000)
+    # A15 шлёт {role, text}; OpenAI-стиль — {role, content}. Принимаем оба.
+    content: str = Field(default="", max_length=8000, validation_alias=AliasChoices("content", "text"))
 
 
 class AskRequest(BaseModel):

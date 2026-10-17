@@ -1,8 +1,10 @@
 # A14 — `copilot/` — Sentinel Copilot (опциональный модуль)
 
+> **Подключение, форматы, env, отключение, тесты, что проверено:** см. [`INTEGRATION.md`](INTEGRATION.md).
+
 Локальный ассистент проверяющего: отвечает на вопросы по **результату анализа видео** (`job_result`)
-и **нормам из `norms/catalog.yaml`** (RAG), ссылается только на проверенные источники, честно говорит
-«по видео это установить нельзя» / «в источниках нет информации». Плюс детерминированное
+и **нормам из `norms/catalog.yaml`** (RAG), ссылается только на проверенные источники, при нехватке
+данных честно говорит «по имеющимся данным это установить нельзя». Плюс детерминированное
 «заключение для проверяющего» в markdown.
 
 **Статус: опциональный, по умолчанию выключен в проде.** На 8 ГБ VRAM ресурсы делятся с VLM. Если
@@ -37,7 +39,12 @@ copilot выключен или локальной модели нет, `ask` в
   иначе предложение вырезается.
 - Названия актов («Закон «…»», «Правила «…»») сверяются с документами корпуса. URL — только известные корпусу.
 - Таймкоды допускаются только из результата (± `guard.timecode_tolerance_s`) или из вопроса/истории.
-- `<think>…</think>` (Qwen3) вырезается, в том числе в SSE-потоке.
+- Денежные суммы допускаются, только если они явно есть в результате или в вопросе.
+- Предложение без лексической опоры на результат/нормы (доля < `guard.min_support_ratio`) считается
+  домыслом и вырезается. Если не осталось ничего, ответ: «По имеющимся данным это установить нельзя:
+  ответ модели не подтверждён…».
+- Предложения режутся с учётом сокращений («п. 9», «ст. 5», «22 с.»), поэтому «п. 999» не проскакивает.
+- `<think>…</think>` (Qwen3) вырезается. В SSE уходят только проверенные предложения.
 - `grounded = true`, только если в сыром ответе не было неподтверждённых ссылок и ответ на что-то
   опирается: есть цитата, отказ или ссылка на факты результата.
 - Нормы, приложенные к результату (`violations[].rules`), тоже перепроверяются по каталогу.
@@ -45,22 +52,25 @@ copilot выключен или локальной модели нет, `ask` в
 
 ### Обязательные отказы (без вызова LLM)
 Вопросы о сумме, подлинности денег, умысле, личности (кто это, ФИО, распознавание лица), допуске,
-проводках и содержании разговоров получают ответ «По видео это установить нельзя…». Вопросы не по
-теме получают «Я отвечаю только на вопросы по результату анализа видео и нормам». Штрафы и прочее,
-чего нет в источниках, получают «В источниках нет информации об этом».
+проводках и содержании разговоров получают ответ «По имеющимся данным это установить нельзя: по видео
+это не определяется…». Вопросы не по теме получают «Я отвечаю только на вопросы по результату анализа
+видео и нормам». Штрафы и прочее, чего нет в источниках, получают «По имеющимся данным это установить
+нельзя: в источниках нет информации об этом». Вопрос о моменте, где в результате нет событий, тоже
+получает «По имеющимся данным…».
 
 ## Публичные функции
 
 ```python
 from copilot import answer, report, status, warmup, release, make_router
 
-answer(job_result: dict | AnalysisResult, question: str, history: list[{"role","content"}]) -> dict
-# -> {"answer": str, "citations": [{"document","clause","url","ref","quote","verified"}], "grounded": bool,
-#     "refusal": bool, "intent": str, "backend": str, "warnings": [...], "removed_citations": [...],
-#     "latency_ms": int, "disclaimer": str, "error": None | "disabled" | "unavailable" | "timeout" | "busy" | ...}
+answer(job_result: dict | AnalysisResult | str, question: str, history: list[{"role","content"|"text"}]) -> dict
+# -> {"answer": str, "citations": [{"document","clause","url","ref","quote","verified"}], "sources": [str],
+#     "grounded": bool, "refusal": bool, "intent": str, "backend": str, "warnings": [...], "removed_citations": [...],
+#     "latency_ms": int, "disclaimer": str,
+#     "error": None | "disabled" | "unavailable" | "timeout" | "busy" | "not_ready" | "empty_question" | "llm_error" | "internal_error"}
 report(job_result) -> str            # markdown, работает и без LLM
 status() -> {"enabled","available","backend","reason","message","llm","warnings",...}
-warmup() / release()                 # прогреть / выгрузить LLM (освободить VRAM)
+warmup() -> bool / release()         # прогреть / выгрузить LLM (освободить VRAM); исключений не бросают
 copilot.service.set_gpu_lock(lock)   # общий замок GPU от A03 (acquire(timeout=)/release())
 ```
 `job_result` — dict по схеме API (`result_to_api`) или `AnalysisResult`. Base64-кадры в LLM не передаются.
@@ -70,13 +80,13 @@ copilot.service.set_gpu_lock(lock)   # общий замок GPU от A03 (acqui
 | Метод | Путь | Ответ |
 |---|---|---|
 | GET | `/api/v1/copilot/status` | `{"enabled","available","backend","reason",...}` |
-| POST | `/api/v1/jobs/{job_id}/ask` | тело `{"question": str(1..2000), "history": [{"role":"user"\|"assistant","content"}] (≤40)}` → `answer()` |
-| POST | `/api/v1/jobs/{job_id}/ask?stream=1` (или `Accept: text/event-stream`) | SSE: `event: token` `{"text"}` …, затем `event: done` (полный ответ) или `event: error` |
+| POST | `/api/v1/jobs/{job_id}/ask` | тело `{"question": str(1..2000), "history": [{"role":"user"\|"assistant","content" или "text"}] (≤40)}` → `answer()` |
+| POST | `/api/v1/jobs/{job_id}/ask?stream=1` (или `Accept: text/event-stream`) | SSE: `event: token` `{"text"}` (только проверенные предложения) …, затем `event: done` (полный ответ) или `event: error` |
 | GET | `/api/v1/jobs/{job_id}/report` | `text/markdown` |
 
 Коды: 404 нет задачи · 409 анализ не завершён · 422 пустой вопрос / неверная история ·
-**501 copilot выключен или модели нет** · 503 GPU занят / провайдер задач не задан · 504 таймаут ·
-500 ошибка модели. Тело ошибки: `{"detail": {"error", "message", "answer": "", ...}}`.
+**501 copilot выключен или модели нет** · 503 GPU/модель заняты, провайдер задач не задан или упал ·
+504 таймаут · 500 ошибка модели / внутренняя. Тело ошибки: `{"detail": {"error", "message", "answer": "", ...}}`.
 
 ## Режимы и конфиг (`copilot/config.yaml`, все пороги там)
 
@@ -122,26 +132,23 @@ COPILOT_ENABLED=1 COPILOT_MODEL_PATH=weights/copilot/Qwen3-4B-Instruct-2507-Q4_K
 Размеры приблизительные: HF API из этой среды был недоступен.
 
 ## Проверки (реально выполнены в этой сессии)
-`python -m pytest copilot/tests -q` даёт **76 passed** (Python 3.11, CPU, без весов, ещё раз с
-`HTTPS_PROXY` в окружении). Что покрыто:
-- выдуманные `[N9]`, «п. 999/404», «Закон «…»», неизвестные URL и таймкоды удаляются, `grounded=false`;
-- нормы, приложенные к результату, но отсутствующие в каталоге, не цитируются ни в ответе, ни в отчёте;
-- **нет облачных вызовов**: AST-скан импортов (openai/anthropic/genai/...), скан облачных эндпоинтов,
-  блокировка сокетов во время mock-ответа, отказ на нелокальный `server_url`, прокси для LLM-сервера отключены;
-- **нет загрузки моделей при импорте**: subprocess-проверка, что torch/transformers/llama_cpp/sentence_transformers
-  не попадают в `sys.modules`; конструкторы не трогают LLM и корпус;
-- **соблюдается таймаут**: обычный и SSE-ответ дают `error=timeout` (504) за ≤2 с при бюджете 0.1–0.2 с;
-  llama.cpp-бэкенд (через фейковый модуль `llama_cpp`) прерывается по дедлайну;
-- 501 при `enabled=false` и при отсутствии GGUF (в том числе для SSE: ошибка до первого токена отдаётся HTTP-кодом, а не 200); 409/404/422; SSE заканчивается `done`; API-ключ A02 через `dependencies`;
-- SSE-генерация идёт в потоке-производителе, поэтому замки модели и GPU (даже RLock) не освобождаются из чужого потока, когда Starlette вызывает `next()` из разных воркеров;
-- недоступная модель перепроверяется раз в 30 с: llama-server может подняться позже API;
-- частичный offload (`plan_gpu_layers`), ленивая загрузка и выгрузка llama.cpp, think-фильтр;
-- без `SENTINEL_MOCK`/`COPILOT_ALLOW_FIXTURE` тестовая фикстура норм не используется.
+`python -m pytest copilot/tests -q` даёт **101 passed** (Python 3.11, CPU, без весов и сети). Полный
+список проверенного и того, что требует локального GPU, — в [`INTEGRATION.md`](INTEGRATION.md#6-что-реально-проверено-и-что-требует-локального-gpu). Кратко:
+- выдуманные `[Nk]`, «п. 999», названия актов, URL, таймкоды, суммы и предложения без опоры
+  вырезаются и в ответе, и в SSE;
+- нет облачных вызовов (AST-скан, блокировка сокетов, только локальный `server_url`), нет
+  автоскачивания (e5 только `local_files_only`, llama.cpp только `model_path`);
+- нет тяжёлых импортов и загрузки моделей при import. Без весов: `status.available=false`, `ask` → 501;
+- ошибки, таймауты и занятость copilot дают JSON 5xx и не затрагивают другие эндпоинты API;
+  `warmup`/`release`/`status` не бросают исключений;
+- совместимость с текущим кодом A02 (двойной монтаж `/api/v1` + `/ui/v1`) и A15
+  (`history[{role, text}]`, `sources`).
 
 ## Для интегратора
 
-**A02 (API).** Подключить лениво и защитить тем же API-ключом / той же сессией, что и остальные
-эндпоинты:
+**A02 (API).** В ветке A02 подключение уже сделано (`_mount_copilot`, двойной монтаж), сигнатура
+совпадает. Общий шаблон: подключить лениво и защитить тем же API-ключом / той же сессией, что и
+остальные эндпоинты:
 ```python
 try:
     from copilot.router import make_router
@@ -160,11 +167,11 @@ dependency A02, роутер сам ключи не знает.
 `vram_reserve_mb` другим и при нехватке уходит на CPU. После простоя `idle_unload_s` модель
 выгружается. Для `warmup()` в общем `backend.pipeline.warmup()` copilot не нужен.
 
-**A15 (UI).** Перед показом панели вызвать `GET /api/v1/copilot/status`. При `available=false`
-панель скрыть. В SSE токены идут **до** пост-проверки, поэтому по `event: done` текст нужно
-заменить на `done.answer` и показать `citations` (сноски `[k]` ↔ `ref=k`). Показывать `disclaimer`.
-При `grounded=false` пометить ответ «источники не подтверждены». Кнопка «Заключение (md)» ведёт
-на `GET /jobs/{id}/report`.
+**A15 (UI).** Текущий клиент A15 совместим: `history[{role, text}]` принимается, `sources`
+отдаются, при 501 панель скрывается. Опционально: перед показом панели вызвать
+`GET …/copilot/status` (`available=false` → скрыть). При SSE по `event: done` заменять текст на
+`done.answer`. Показывать `disclaimer`, при `grounded=false` пометить ответ «источники не
+подтверждены». Кнопка «Заключение (md)» ведёт на `GET /jobs/{id}/report`.
 
 **A13 (нормы).** Ожидается `norms/catalog.yaml` формата из ТЗ (`types.Vxx.rules[] = {document, clause, url,
 quote, verified}`, `not_observable`). `norms/sources/*.md` лучше с front matter `title:` и `url:`,
