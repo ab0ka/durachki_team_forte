@@ -20,7 +20,8 @@ def test_process_worker_e2e_mock(synth_video, monkeypatch):
     res = run(synth_video, "job-proc", None, 120, overrides={"mock": True})
     assert res.status == "done", res.meta.get("error")
     assert res.meta["executor"]["mode"] == "process" and res.meta["executor"]["pid"]
-    assert res.meta["stages"]["detect"]["origin"] == "builtin-mock"
+    # без модуля ml.detect в ветке — встроенный фейк; в интеграции — mock-бэкенд самого модуля
+    assert res.meta["stages"]["detect"]["origin"] in ("builtin-mock", "module")
 
 
 def test_process_worker_killed_on_timeout_and_restarted(synth_video, monkeypatch, fake_ml_files):
@@ -71,8 +72,10 @@ def test_cli_run_and_dump(synth_video, tmp_path):
     assert "Декодирование" in p.stderr
 
 
-def test_cli_run_failed_exit_code(synth_video, tmp_path):
-    p = _cli("run", synth_video, "--out", str(tmp_path / "o.json"), "--no-vlm")  # без mock и без модулей ml
+def test_cli_run_failed_exit_code(tmp_path):
+    bad = tmp_path / "broken.mp4"
+    bad.write_bytes(b"not a video at all")                    # не декодируется ни ml.ingest, ни OpenCV
+    p = _cli("run", str(bad), "--out", str(tmp_path / "o.json"), "--no-vlm", "--mock")
     assert p.returncode == 2
     assert json.loads((tmp_path / "o.json").read_text(encoding="utf-8"))["status"] == "failed"
 
