@@ -7,6 +7,7 @@ meta.completeness); иначе он — лишь подробности для U
 from __future__ import annotations
 
 import base64
+import dataclasses
 import importlib
 import inspect
 import json
@@ -24,8 +25,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .config import Settings
-from .results import (analysis_complete, coverage_ratio, enforce_size, fill_missing_evidence,
-                      iter_frames, json_size, normalize, to_api_dict)
+from .results import (analysis_complete, coverage_problem, coverage_ratio, enforce_size,
+                      fill_missing_evidence, iter_frames, json_size, normalize, to_api_dict)
 from .store import JobStore
 
 log = logging.getLogger("sentinel.api.worker")
@@ -484,6 +485,11 @@ class JobManager:
     def _complete(self, job_id: str, result: Any, spec: PipelineSpec, *, t0: float,
                   started: float, deadline: float) -> None:
         warns: list[str] = []
+        if not (isinstance(result, dict) or dataclasses.is_dataclass(result)
+                or hasattr(result, "violations")):
+            self._fail(job_id, f"pipeline returned unusable result: {type(result).__name__}",
+                       "bad_result")
+            return
         try:
             api, w = to_api_dict(result)
             warns += w
@@ -495,7 +501,7 @@ class JobManager:
             self._fail(job_id, "pipeline returned a MOCK result (meta.mock) — refused in production",
                        "mock_result", details=api)
             return
-        api, w = normalize(api, job_id, min_coverage=self.s.min_coverage)
+        api, w = normalize(api, job_id, min_coverage=self.s.min_coverage, allow_mock=self.s.allow_mock)
         warns += w
         if api["status"] == "failed":
             self._fail(job_id, str(api.get("error") or "analysis failed"), "pipeline_failed",
@@ -525,7 +531,8 @@ class JobManager:
             "deadline_at_passed": bool(self.s.pass_deadline_at and spec.accepts_deadline_at),
             "filename": row.get("filename"), "video": row.get("video_meta") or {},
             "coverage": coverage_ratio(meta), "analysis_complete": analysis_complete(
-                meta, self.s.min_coverage), "partial": partial, "api_version": "2",
+                meta, self.s.min_coverage, not partial, self.s.allow_mock),
+            "partial": partial, "api_version": "2",
         }
         gm = gpu_memory()
         if gm:
@@ -581,12 +588,13 @@ class JobManager:
         """partial.json -> done, только если включено и полнота достаточна. (принят?, причина)."""
         meta = partial.get("meta") if isinstance(partial.get("meta"), dict) else {}
         cov = coverage_ratio(meta)
-        complete = analysis_complete(meta, self.s.min_coverage, pipeline_flags=False)
+        problem = coverage_problem(meta, self.s.min_coverage, allow_mock=self.s.allow_mock,
+                                   pipeline_flags=False)
         why = (f"coverage={cov:.2f}" if cov is not None else "coverage not reported") + \
-              f", complete={complete}"
+              (f"; {problem}" if problem else "")
         if not self.s.partial_accept:
             return False, f"partial result not accepted (partial_accept=false; {why})"
-        if complete is not True:
+        if problem is not None:
             return False, f"partial result incomplete ({why}; need >= {self.s.min_coverage})"
         if not self.s.allow_mock and result_is_mock(meta):
             return False, "partial result is MOCK — refused"
@@ -596,7 +604,8 @@ class JobManager:
         for k in ("complete", "partial"):  # флаги «не доделано» у partial по определению
             cmeta.pop(k, None)
         cand["meta"] = cmeta
-        api, warns = normalize(cand, job_id, min_coverage=self.s.min_coverage)
+        api, warns = normalize(cand, job_id, min_coverage=self.s.min_coverage,
+                               allow_mock=self.s.allow_mock, pipeline_flags=False)
         if api["status"] != "done":
             return False, f"partial result rejected by outcome policy: {api.get('error')}"
         row = self.store.get(job_id) or {}

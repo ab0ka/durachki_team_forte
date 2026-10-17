@@ -40,10 +40,12 @@ video_validation: required      # required: файл должен открыть
 copilot_timeout_s: 60
 
 # --- честность и полнота результата ---
-min_coverage: 0.95              # meta.completeness/meta.coverage ниже -> анализ неполный
+min_coverage: 0.98              # meta.coverage.ratio ниже (или нет meta.coverage) -> no_violation не выдаётся
+                                # (как contracts: coverage.min_ratio_for_no_violation у A01)
 partial_accept: false           # НОВЫЙ РЕЖИМ (выкл. до замера L2): по таймауту отдать partial.json как done,
                                 # только если полнота >= min_coverage; иначе всегда failed с причиной
 jury_profile: extended          # extended: поля ТЗ + доп. (type_id, rules, meta…); strict: ровно поля ТЗ
+jury_embed_rule: false          # strict: дописывать норму rules[0] в description (у A01 по умолчанию false)
 max_response_mb: 3.0            # ответ GET /jobs/{id} не больше (кадры ужимаются)
 dedup: true                     # тот же файл (sha256) + та же версия пайплайна -> тот же job/результат
 

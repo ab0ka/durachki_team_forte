@@ -156,7 +156,7 @@ def _result_bytes(ctx: Ctx, row: dict[str, Any], view: str = "raw") -> bytes:
             data = raw
         else:
             obj = json.loads(raw)
-            data = json.dumps(jury_view(obj, view), ensure_ascii=False,
+            data = json.dumps(jury_view(obj, view, ctx.s.jury_embed_rule), ensure_ascii=False,
                               separators=(",", ":")).encode("utf-8")
         ctx.cache[key] = data
         while len(ctx.cache) > 64:

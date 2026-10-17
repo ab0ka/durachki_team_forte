@@ -47,9 +47,10 @@ class Settings:
     evidence_fallback: bool = True
     video_validation: str = "required"
     copilot_timeout_s: float = 60.0
-    min_coverage: float = 0.95
+    min_coverage: float = 0.98
     partial_accept: bool = False
     jury_profile: str = "extended"
+    jury_embed_rule: bool = False
     max_response_mb: float = 3.0
     dedup: bool = True
 

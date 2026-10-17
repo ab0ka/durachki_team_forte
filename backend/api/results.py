@@ -105,69 +105,70 @@ def _clean_b64(s: Any) -> Optional[str]:
     return s if raw[:2] == b"\xff\xd8" else None  # только JPEG
 
 
+OK_STAGE_STATUSES = frozenset({"ok", "done", "cached"})  # как contracts.extensions (A01)
+
+
 def coverage_ratio(meta: Any) -> Optional[float]:
-    """Доля видео, покрытая обязательным анализом: meta.coverage (число 0..1 или
-    {ratio | analyzed_s/duration_s | analyzed_until_sec/duration_sec})."""
+    """meta.coverage — число 0..1 или {"ratio": ...} (contracts.extensions.Coverage, A01)."""
     if not isinstance(meta, dict):
         return None
     cov = meta.get("coverage")
-    if isinstance(cov, bool):
-        return 1.0 if cov else 0.0
-    if isinstance(cov, (int, float)):
+    raw = cov.get("ratio") if isinstance(cov, dict) else cov
+    if isinstance(raw, bool):
+        return None
+    r = _num(raw)
+    return None if r is None else min(1.0, max(0.0, r))
+
+
+def coverage_problem(meta: Any, min_ratio: float = 0.98, *, allow_mock: bool = False,
+                     pipeline_flags: bool = True) -> Optional[str]:
+    """None — полнота ПОДТВЕРЖДЕНА и «нарушений нет» допустимо; иначе причина для failed.
+    Зеркало contracts.extensions.coverage_problem (A01): без meta.coverage полнота не подтверждена
+    (unknown != «нет нарушений»). pipeline_flags=False — для partial.json, где A03 по определению
+    пишет complete=false/partial=true."""
+    meta = meta if isinstance(meta, dict) else {}
+    if pipeline_flags and meta.get("complete") is False:
+        return "оркестратор сообщил незавершённый анализ (meta.complete=false)"
+    cov = meta.get("coverage")
+    if cov is None:
+        return "полнота анализа не подтверждена: нет meta.coverage"
+    if not isinstance(cov, dict):
         r = _num(cov)
-        return None if r is None else min(1.0, max(0.0, r))
-    if isinstance(cov, dict):
-        r = _num(cov.get("ratio"))
-        if r is None:
-            a = _num(cov.get("analyzed_s", cov.get("analyzed_until_sec")))
-            dur = _num(cov.get("duration_s", cov.get("duration_sec")))
-            r = a / dur if a is not None and dur else None
-        if r is None and isinstance(cov.get("complete"), bool):
-            r = 1.0 if cov["complete"] else 0.0
-        return None if r is None else min(1.0, max(0.0, r))
+        if r is None or isinstance(cov, bool):
+            return f"meta.coverage не число и не объект: {cov!r}"[:120]
+        cov = {"ratio": r, "complete": True}
+    ratio = _num(cov.get("ratio"))
+    if ratio is None:
+        return "meta.coverage.ratio не задан"
+    if ratio + 1e-9 < min_ratio:
+        return f"проанализировано {ratio:.0%} видео (< {min_ratio:.0%}): неизвестные участки ≠ «нарушений нет»"
+    if cov.get("complete") is False:
+        return "meta.coverage.complete=false"
+    stages = cov.get("stages") if isinstance(cov.get("stages"), dict) else {}
+    top = meta.get("stages") if isinstance(meta.get("stages"), dict) else {}
+    for req in list(cov.get("required") or meta.get("required_stages") or []):
+        status = stages.get(req)
+        if status is None and req in top:
+            status = top[req].get("status") if isinstance(top[req], dict) else top[req]
+        if status == "mock" and allow_mock:
+            continue
+        if status not in OK_STAGE_STATUSES:
+            return f"обязательная стадия {req}: {status or 'нет статуса'}"
     return None
 
 
-def analysis_complete(meta: Any, min_coverage: float = 0.95,
-                      pipeline_flags: bool = True) -> Optional[bool]:
-    """True/False, если пайплайн сообщил полноту (A01 meta.completeness, meta.coverage и — для
-    итогового результата — флаги A03 meta.complete / статусы required_stages); None — сведений нет.
-    Любой источник «неполный» -> False (unknown != false, но и не true).
-    pipeline_flags=False для partial.json: там A03 всегда пишет complete=false по определению."""
-    if not isinstance(meta, dict):
+def analysis_complete(meta: Any, min_coverage: float = 0.98, pipeline_flags: bool = True,
+                      allow_mock: bool = False) -> Optional[bool]:
+    """Для отчёта: True — полнота подтверждена, False — сообщена неполнота, None — сведений нет."""
+    if not isinstance(meta, dict) or (meta.get("coverage") is None and
+                                      not (pipeline_flags and meta.get("complete") is False)):
         return None
-    votes: list[bool] = []
-    if pipeline_flags:
-        if isinstance(meta.get("complete"), bool):
-            votes.append(meta["complete"])
-        stages = meta.get("stages") if isinstance(meta.get("stages"), dict) else {}
-        for st in meta.get("required_stages") or []:
-            info = stages.get(st)
-            status = info.get("status") if isinstance(info, dict) else info
-            if status in ("failed", "timeout", "skipped", "error"):
-                votes.append(False)
-    comp = meta.get("completeness")
-    if isinstance(comp, bool):
-        votes.append(comp)
-    elif isinstance(comp, dict):
-        ok = bool(comp.get("complete", True))
-        stages = comp.get("stages") if isinstance(comp.get("stages"), dict) else {}
-        for st in comp.get("required_stages") or []:
-            if stages.get(st, "ok") in ("failed", "timeout", "skipped"):
-                ok = False
-        a, dur = _num(comp.get("analyzed_until_sec")), _num(comp.get("duration_sec"))
-        if ok and a is not None and dur and a / dur < min_coverage:
-            ok = False
-        votes.append(ok)
-    r = coverage_ratio(meta)
-    if r is not None:
-        votes.append(r >= min_coverage)
-    if not votes:
-        return None
-    return all(votes)
+    return coverage_problem(meta, min_coverage, allow_mock=allow_mock,
+                            pipeline_flags=pipeline_flags) is None
 
 
-def normalize(d: dict[str, Any], job_id: str, *, min_coverage: float = 0.95
+def normalize(d: dict[str, Any], job_id: str, *, min_coverage: float = 0.98,
+              allow_mock: bool = False, pipeline_flags: bool = True
               ) -> tuple[dict[str, Any], list[str]]:
     """Формат ТЗ + честная политика исхода (как contracts.serialize.resolve_outcome у A01):
     * violation без валидного нарушения -> failed; нет вердикта и нарушений -> failed (no_violation
@@ -228,7 +229,9 @@ def normalize(d: dict[str, Any], job_id: str, *, min_coverage: float = 0.95
         v["evidence_frames"] = frames
         vios.append(v)
 
-    complete = analysis_complete(out["meta"], min_coverage)
+    problem = coverage_problem(out["meta"], min_coverage, allow_mock=allow_mock,
+                               pipeline_flags=pipeline_flags)
+    complete = analysis_complete(out["meta"], min_coverage, pipeline_flags, allow_mock)
     verdict = out.get("verdict")
     out["violations"] = vios
 
@@ -240,10 +243,10 @@ def normalize(d: dict[str, Any], job_id: str, *, min_coverage: float = 0.95
         return out, warns
 
     if verdict == "violation" and not vios:
-        return failed("verdict=violation but no violation with a finite timecode")
+        return failed("verdict=violation, но нет ни одного нарушения с конечным таймкодом")
     if verdict == "no_violation":
-        if complete is False:
-            return failed("incomplete analysis (meta.completeness/coverage): no_violation is not issued")
+        if problem is not None:
+            return failed(f"«нет нарушения» не подтверждено: {problem}")
         if vios:
             warns.append("verdict=no_violation: candidates are not shown to the jury (see candidates)")
             out["candidates"] = vios
@@ -252,7 +255,7 @@ def normalize(d: dict[str, Any], job_id: str, *, min_coverage: float = 0.95
         if verdict is not None:
             warns.append(f"invalid verdict={verdict!r}")
         if not vios:
-            return failed("analysis produced no verdict: no_violation is not invented")
+            return failed("анализ не выдал вердикт — no_violation не выдумываем")
         out["verdict"] = "violation"
         warns.append("verdict missing; inferred 'violation' from violations")
     out["status"] = "done"
@@ -387,15 +390,16 @@ def jury_description(v: dict[str, Any]) -> str:
     return desc
 
 
-def jury_view(d: dict[str, Any], profile: str = "extended") -> dict[str, Any]:
+def jury_view(d: dict[str, Any], profile: str = "extended", embed_rule: bool = False) -> dict[str, Any]:
     """profile=extended — схема ТЗ + доп. поля (разрешены ТЗ; на них опирается eval A16);
-    profile=strict — РОВНО поля ТЗ (как contracts.serialize.result_to_jury_api)."""
+    profile=strict — РОВНО поля ТЗ (как contracts.serialize.result_to_jury_api; норма в description —
+    только при embed_rule, у A01 по умолчанию выключено)."""
     if profile == "strict":
         return {
             "job_id": d.get("job_id"), "status": d.get("status"), "verdict": d.get("verdict"),
             "violations": [{
                 "type": v.get("type"), "timecode_sec": v.get("timecode_sec"),
-                "description": jury_description(v),
+                "description": jury_description(v) if embed_rule else str(v.get("description") or ""),
                 "evidence_frames": [{"timestamp_sec": f.get("timestamp_sec"),
                                      "image_base64": f.get("image_base64")}
                                     for f in (v.get("evidence_frames") or [])[:MAX_FRAMES]],
