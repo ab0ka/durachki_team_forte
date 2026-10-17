@@ -170,3 +170,39 @@ def test_disable_review_and_insufficient_emission() -> None:
     states = make_states(30.0, segments=[(0.0, 20.0, {"safe_open": 1.0, "cashier_present": 0.0}),
                                          (5.0, 15.0, {"phone_in_hand": 1.0})])
     assert evaluate(states, [], [], CAT, cfg).events == []
+
+
+# ----------------------------------------------------------------------------- facts honesty
+
+def test_absent_or_branch_does_not_spoil_coverage() -> None:
+    """workplace_unattended_with_cash не приходит, но доказана другая ветвь OR → кандидат."""
+    case = RULE_CASES["V02_cash_left_unattended"]
+    states = make_states(60.0, segments=case["pos"]["segments"], omit=("workplace_unattended_with_cash",))
+    evs = [e for e in run_rules(states, [], [], CAT) if e.type_id == "V02"]
+    assert evs and evs[0].extra["assessment"] == CANDIDATE
+
+
+def test_insufficient_event_does_not_claim_unobserved_stage() -> None:
+    states = make_states(60.0, segments=[(5.0, 30.0, {"cashier_present": 0.0, "cashier_in_workplace": 0.0}),
+                                         (10.0, 30.0, {"safe_open": 1.0})])
+    evs = [e for e in _v03(run_rules(states, [], [], CAT)) if e.extra["assessment"] == INSUFFICIENT]
+    assert evs
+    assert not any("До этого" in f for e in evs for f in e.facts)
+
+
+def test_occlusion_facts_state_only_the_anchor() -> None:
+    states = make_states(60.0, segments=[(10.0, 30.0, {"safe_open": 1.0}),
+                                         (15.0, 30.0, {"cashier_present": None, "cashier_in_workplace": None})])
+    evs = [e for e in _v03(run_rules(states, [], [], CAT)) if e.extra["trace"].get("from_anchor")]
+    assert evs
+    facts = " ".join(evs[0].facts)
+    assert "наблюдается: сейф открыт" in facts
+    assert "кассир в кадре не наблюдается" not in facts
+
+
+def test_fact_with_unknown_value_is_dropped() -> None:
+    case = RULE_CASES["V01_outsider_in_cashier_area"]
+    states = make_states(60.0, segments=[(20.0, 26.0, {"outsider_in_cashier_area": 1.0})], omit=("n_persons",))
+    evs = [e for e in run_rules(states, [], [], CAT) if e.type_id == "V01"]
+    assert evs and len(evs[0].facts) == 1 and "?" not in evs[0].facts[0]
+    assert case["type_id"] == "V01"

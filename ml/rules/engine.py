@@ -183,14 +183,20 @@ def confidence_for(rule: RuleSpec, mean_strength: float, max_strength: float, du
     return conf, terms
 
 
+class _UnknownValue(Exception):
+    pass
+
+
 class _SafeFormatter(string.Formatter):
-    """Только простые имена из контекста: без атрибутов/индексов; пропуски/неизвестные → «?»."""
+    """Только простые имена из контекста: без атрибутов/индексов; неизвестное значение → факт не печатается."""
 
     def get_field(self, field_name: str, args: Sequence[Any], kwargs: Mapping[str, Any]) -> Any:
         if not field_name.isidentifier():
-            return "?", field_name
-        v = kwargs.get(field_name, "?")
-        return ("?" if v is None else v), field_name
+            raise _UnknownValue(field_name)
+        v = kwargs.get(field_name)
+        if v is None or (isinstance(v, float) and not math.isfinite(v)):
+            raise _UnknownValue(field_name)
+        return v, field_name
 
     def format_field(self, value: Any, format_spec: str) -> str:
         try:
@@ -202,11 +208,12 @@ class _SafeFormatter(string.Formatter):
 _FMT = _SafeFormatter()
 
 
-def format_fact(template: str, ctx: Mapping[str, Any]) -> str:
+def format_fact(template: str, ctx: Mapping[str, Any]) -> Optional[str]:
+    """Факт по шаблону; ``None``, если какое-то значение неизвестно (не утверждаем невидимое)."""
     try:
         return _FMT.vformat(template, (), dict(ctx))
-    except (ValueError, IndexError, KeyError):
-        return template
+    except (_UnknownValue, ValueError, IndexError, KeyError):
+        return None
 
 
 # --------------------------------------------------------------------------- report
@@ -329,7 +336,7 @@ def _peak_index(rule: RuleSpec, times: np.ndarray, strength: np.ndarray, i0: int
 
 def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: int, i1: int,
                 assessment: str, reasons: list[str], tracks: Sequence[Any], zones: Sequence[Any],
-                catalog: Mapping[str, Any], cfg: RulesConfig, extra_trace: Optional[dict] = None) -> Any:
+                catalog: Mapping[str, Any], cfg: RulesConfig, from_anchor: bool = False) -> Any:
     times = series.times
     info = type_info(catalog, rule.type_id)
     norm = norm_status(catalog, rule.type_id)
@@ -358,7 +365,13 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
         ctx[f"{nm}_mean"] = st["mean"]
         ctx[f"{nm}_min"] = st["min"]
         ctx[f"{nm}_max"] = st["max"]
-    facts = [format_fact(tpl, ctx) for tpl in rule.facts]
+    if from_anchor:
+        # условие правила не доказано — печатаем только наблюдаемый якорь
+        seen = [SIGNAL_RU.get(c.name, c.name) for c in (rule.anchor.comparisons if rule.anchor else ())]
+        templates = [f"С {{t_start:.1f}} по {{t_end:.1f}} с наблюдается: {', '.join(seen)}."] if seen else []
+    else:
+        templates = list(rule.facts) + (list(rule.facts_stage) if assessment != INSUFFICIENT else [])
+    facts = [f for f in (format_fact(tpl, ctx) for tpl in templates) if f]
     if assessment == INSUFFICIENT and reasons:
         facts.append("Недостаточно контекста: " + "; ".join(reasons) + ".")
     conditions = []
@@ -394,8 +407,8 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
         "absent_signals": sorted(n for n in rule.names if n in series.absent),
         "derived_signals": {n: series.derived[n] for n in rule.names if n in series.derived},
     }
-    if extra_trace:
-        trace.update(extra_trace)
+    if from_anchor:
+        trace["from_anchor"] = True
     return Event(
         type_id=rule.type_id,
         t_start=_rf(t_start, 2),
@@ -431,7 +444,7 @@ def _assess(rule: RuleSpec, catalog: Mapping[str, Any], cfg: RulesConfig) -> tup
     return CANDIDATE, []
 
 
-def _stage_reasons(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, i0: int, i1: int,
+def _stage_reasons(rule: RuleSpec, series: SignalSeries, s_lo: np.ndarray, s_hi: np.ndarray, i0: int, i1: int,
                    before_lo: Optional[np.ndarray]) -> list[str]:
     """Проверка полноты этапа для правил «по бездействию»."""
     ina = rule.inaction
@@ -447,14 +460,12 @@ def _stage_reasons(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, i0: i
         window = before_lo[lo_idx:i0]
         if window.size == 0 or not bool((window >= 0.5).any()):
             reasons.append(f"предшествующее состояние ({ina.before.source}) не наблюдалось за {ina.before_window_s:g} с")
-    names = sorted(rule.strength.names)
-    if names:
-        known = np.ones(i1 - i0 + 1, dtype=bool)
-        for nm in names:
-            known &= series.known(nm)[i0:i1 + 1]
-        cov = float(known.mean())
-        if cov + 1e-9 < ina.min_coverage:
-            reasons.append(f"сигналы правила известны лишь в {cov:.0%} кадров (окклюзия/пропуски)")
+    # кадр «не наблюдён», если условие не доказано, но возможно (неизвестные сигналы);
+    # отсутствующая OR-альтернатива при доказанной другой ветви покрытие не портит
+    unknown = (s_lo[i0:i1 + 1] < rule.on) & (s_hi[i0:i1 + 1] >= rule.on)
+    cov = 1.0 - float(unknown.mean())
+    if cov + 1e-9 < ina.min_coverage:
+        reasons.append(f"сигналы правила известны лишь в {cov:.0%} кадров (окклюзия/пропуски)")
     return reasons
 
 
@@ -487,7 +498,7 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
                 cand["rejected"] = f"короче min_duration_s={rule.min_duration_s}"
                 candidates.append(cand)
                 continue
-        reasons += [r for r in _stage_reasons(rule, series, ctx, i0, i1, before_lo) if r not in reasons]
+        reasons += [r for r in _stage_reasons(rule, series, s_lo, s_hi, i0, i1, before_lo) if r not in reasons]
         if reasons:
             assessment = INSUFFICIENT
         else:
@@ -497,8 +508,7 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
             cand["rejected"] = f"{assessment} отключён в global"
             candidates.append(cand)
             continue
-        ev = _make_event(rule, series, s_lo if assessment != INSUFFICIENT else np.maximum(s_lo, 0.0), i0, i1,
-                         assessment, reasons, tracks, zones, catalog, cfg)
+        ev = _make_event(rule, series, s_lo, i0, i1, assessment, reasons, tracks, zones, catalog, cfg)
         cand.update(accepted=True, assessment=assessment, confidence=ev.confidence, t_peak=ev.t_peak)
         candidates.append(cand)
         events.append(ev)
@@ -518,7 +528,7 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
                     continue
                 reasons = ["не наблюдались сигналы: " + ", ".join(SIGNAL_RU.get(n, n) for n in unknown)]
                 ev = _make_event(rule, series, s_hi, i0, i1, INSUFFICIENT, reasons, tracks, zones, catalog, cfg,
-                                 {"from_anchor": True})
+                                 from_anchor=True)
                 candidates.append({"rule_id": rule.id, "type_id": rule.type_id, "t_start": ev.t_start,
                                    "t_end": ev.t_end, "accepted": True, "assessment": INSUFFICIENT,
                                    "confidence": ev.confidence, "t_peak": ev.t_peak})

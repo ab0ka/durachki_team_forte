@@ -20,7 +20,8 @@
 #
 # Плейсхолдеры в facts: {t_start} {t_end} {t_peak} {duration} {strength} {strength_max}
 # {confidence} {type_name} и для каждого сигнала правила + n_persons: {sig} (в t_peak),
-# {sig_mean} {sig_min} {sig_max} (по сегменту). Неизвестное значение печатается как «?».
+# {sig_mean} {sig_min} {sig_max} (по сегменту). Если значение неизвестно — факт не печатается.
+# facts_stage — факты о полном этапе «по бездействию»; печатаются только если этап наблюдался.
 # Факты — только наблюдаемое; никаких утверждений о допуске, умысле, суммах, подлинности.
 
 version: 1
@@ -114,6 +115,7 @@ rules:
     confidence: {base: 0.35, w_strength: 0.35, w_duration: 0.25, tau_s: 10.0}
     facts:
       - "С {t_start:.1f} по {t_end:.1f} с (≈{duration:.0f} с) на рабочем месте видны наличные, кассир в кадре не наблюдается."
+    facts_stage:
       - "До этого кассир наблюдался в кадре."
     highlight: ["label:cash", "zone:desk", "zone:cash_tray"]
 
@@ -159,6 +161,7 @@ rules:
     confidence: {base: 0.35, w_strength: 0.35, w_duration: 0.25, tau_s: 10.0}
     facts:
       - "С {t_start:.1f} по {t_end:.1f} с (≈{duration:.0f} с) сейф открыт, кассир в кадре не наблюдается."
+    facts_stage:
       - "До этого кассир наблюдался в кадре при открытом сейфе."
     highlight: ["label:safe_open", "label:safe", "zone:safe"]
 
@@ -263,6 +266,7 @@ rules:
     confidence: {base: 0.35, w_strength: 0.35, w_duration: 0.25, tau_s: 10.0}
     facts:
       - "С {t_start:.1f} по {t_end:.1f} с инкассаторская сумка видна, ни инкассатора, ни кассира в кадре не наблюдается."
+    facts_stage:
       - "До этого инкассатор наблюдался в кадре."
     highlight: ["label:cash_bag"]
 

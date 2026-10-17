@@ -93,6 +93,7 @@ class RuleSpec:
     conf_expr: Optional[CompiledExpr] = None
     weight: float = 1.0
     facts: list[str] = field(default_factory=list)
+    facts_stage: list[str] = field(default_factory=list)   # только если этап «по бездействию» наблюдался полностью
     highlight: list[str] = field(default_factory=list)
     yield_to: list[str] = field(default_factory=list)
     yield_factor: float = 0.7
@@ -351,7 +352,8 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
         if off > on:
             raise ConfigError(f"{where}off={off} > on={on}")
         facts = [str(f) for f in (r.get("facts") or [])]
-        for tmpl in facts:
+        facts_stage = [str(f) for f in (r.get("facts_stage") or [])]
+        for tmpl in facts + facts_stage:
             _template_fields(tmpl)
         enabled = bool(r.get("enabled", True))
         reason = str(r.get("status_reason") or "").strip()
@@ -387,6 +389,7 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
             conf_expr=conf_expr,
             weight=_num(r, "weight", 1.0, 0, 2, where),
             facts=facts,
+            facts_stage=facts_stage,
             highlight=[str(h) for h in (r.get("highlight") or [])],
             yield_to=[str(y) for y in (r.get("yield_to") or [])],
             yield_factor=_num(r, "yield_factor", 0.7, 0, 1, where),
