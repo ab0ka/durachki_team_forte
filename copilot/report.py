@@ -43,8 +43,11 @@ def _verified_rules(v: dict[str, Any], corpus: Optional[Corpus]) -> tuple[list[d
     return out, dropped
 
 
-def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[str, Any]] = None) -> str:
+def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[str, Any]] = None,
+           fmt: str = "md") -> str:
+    """Заключение для проверяющего: ``fmt="md"`` (по умолчанию) или ``fmt="html"`` (автономный файл)."""
     cfg = cfg or default_config()
+    html_mode = str(fmt).lower() == "html"
     if corpus is None:
         try:
             from .service import get_service
@@ -125,6 +128,8 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
                 lines.append("- **Когда это не нарушение (каталог):** " + "; ".join(_md(x) for x in excl))
             if dropped:
                 lines.append(f"- _Отброшено ссылок, не найденных в каталоге норм: {dropped}_")
+            if html_mode:
+                lines.append(f"@@FRAMES:{v.get('_n')}@@")
             lines.append("")
 
     hints = review_hints(res)
@@ -147,4 +152,136 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
               "- Ссылки на нормы приводятся только из каталога норм системы."]
     if corpus is not None and corpus.is_fixture:
         lines.append("- ⚠️ Каталог норм РК недоступен: показаны ТЕСТОВЫЕ нормы-фикстуры, не использовать.")
-    return "\n".join(lines) + "\n"
+    md = "\n".join(lines) + "\n"
+    if not html_mode:
+        return md
+    rcfg = cfg.get("report", {})
+    frames = _evidence_frames(job_result, int(rcfg.get("html_max_frames", 3)),
+                              int(rcfg.get("html_max_frame_kb", 600))) if rcfg.get("html_include_frames", True) else {}
+    return render_html(md, title=f"Заключение для проверяющего — {res.get('job_id') or ''}".strip(" —"), frames=frames)
+
+
+# ----------------------------------------------------------------------------- HTML
+
+_CSS = """body{font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#1d2433;background:#fff;margin:0}
+main{max-width:860px;margin:0 auto;padding:24px 16px}h1{font-size:24px;margin:0 0 12px}h2{font-size:19px;margin:24px 0 8px;
+border-bottom:1px solid #e3e6ec;padding-bottom:4px}h3{font-size:16px;margin:18px 0 6px}blockquote{margin:12px 0;padding:10px 14px;
+background:#fff6e5;border-left:4px solid #e0a100}ul{padding-left:22px}code{background:#f2f4f7;padding:0 4px;border-radius:3px}
+figure{display:inline-block;margin:6px 8px 6px 0}figure img{max-width:260px;border:1px solid #d0d5dd;border-radius:4px}
+figcaption{font-size:12px;color:#5b6475}a{color:#1a56db}@media print{a{color:#000}figure img{max-width:200px}}"""
+
+
+def _inline(text: str) -> str:
+    import html
+    import re as _re
+
+    s = html.escape(text, quote=True)
+
+    def _link(m: "_re.Match[str]") -> str:
+        label, url = m.group(1), m.group(2)
+        if _re.match(r"^https?://", html.unescape(url)):
+            return f'<a href="{url}" rel="noopener noreferrer">{label}</a>'
+        return label
+
+    s = _re.sub(r"\[([^\]]{1,300})\]\(([^)\s]{1,500})\)", _link, s)
+    s = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+    s = _re.sub(r"(?<![\w/])_(.+?)_(?![\w/])", r"<em>\1</em>", s)
+    s = _re.sub(r"`([^`]{1,200})`", r"<code>\1</code>", s)
+    return s
+
+
+def render_html(md: str, title: str = "Заключение для проверяющего",
+                frames: Optional[dict[int, list[tuple[float, str]]]] = None) -> str:
+    """Подмножество markdown отчёта -> безопасный HTML (всё экранировано, скрипты запрещены CSP)."""
+    import html
+    import re as _re
+
+    out: list[str] = []
+    depth = 0
+
+    def set_depth(d: int) -> None:
+        nonlocal depth
+        while depth < d:
+            out.append("<ul>")
+            depth += 1
+        while depth > d:
+            out.append("</ul>")
+            depth -= 1
+
+    for raw in md.splitlines():
+        m_fr = _re.match(r"^@@FRAMES:(\d+)@@$", raw.strip())
+        if m_fr:
+            set_depth(0)
+            for t, b64 in (frames or {}).get(int(m_fr.group(1)), []):
+                cap = fmt_tc(t)
+                out.append(f'<figure><img src="data:image/jpeg;base64,{b64}" alt="кадр {cap}">'
+                           f"<figcaption>кадр {cap}</figcaption></figure>")
+            continue
+        h = _re.match(r"^(#{1,6})\s+(.*)$", raw)
+        if h:
+            set_depth(0)
+            n = len(h.group(1))
+            out.append(f"<h{n}>{_inline(h.group(2))}</h{n}>")
+            continue
+        if raw.startswith(">"):
+            set_depth(0)
+            out.append(f"<blockquote>{_inline(raw.lstrip('> ').strip())}</blockquote>")
+            continue
+        b = _re.match(r"^(\s*)- (.*)$", raw)
+        if b:
+            set_depth(len(b.group(1)) // 2 + 1)
+            item = b.group(2)
+            if item.startswith("[ ] "):
+                item = "☐ " + item[4:]
+            out.append(f"<li>{_inline(item)}</li>")
+            continue
+        set_depth(0)
+        if raw.strip():
+            out.append(f"<p>{_inline(raw.strip())}</p>")
+    set_depth(0)
+    csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'"
+    return ("<!doctype html>\n<html lang=\"ru\"><head><meta charset=\"utf-8\">"
+            f'<meta http-equiv="Content-Security-Policy" content="{csp}">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f"<title>{html.escape(title)}</title><style>{_CSS}</style></head>"
+            f"<body><main>\n" + "\n".join(out) + "\n</main></body></html>\n")
+
+
+def _evidence_frames(job_result: Any, max_frames: int, max_kb: int) -> dict[int, list[tuple[float, str]]]:
+    """Кадры-доказательства из исходного результата: только валидный base64 JPEG, ограничение размера."""
+    import base64
+    import binascii
+    import re as _re
+
+    from .prompts import _to_dict, to_float
+
+    data = job_result
+    if isinstance(data, (str, bytes)):
+        try:
+            import json
+
+            data = json.loads(data)
+        except ValueError:
+            return {}
+    data = _to_dict(data)
+    out: dict[int, list[tuple[float, str]]] = {}
+    viols = data.get("violations") if isinstance(data, dict) else None
+    n = 0
+    for v in viols if isinstance(viols, list) else []:
+        if not isinstance(v, dict):
+            continue
+        n += 1
+        for f in (v.get("evidence_frames") or [])[:max(0, max_frames)]:
+            b64 = str((f or {}).get("image_base64") or "") if isinstance(f, dict) else ""
+            if b64.startswith("data:"):
+                b64 = b64.split(",", 1)[-1]
+            if not b64 or len(b64) > max_kb * 1366 or not _re.fullmatch(r"[A-Za-z0-9+/=\s]+", b64):
+                continue
+            try:
+                head = base64.b64decode(b64[:64] + "=" * (-len(b64[:64]) % 4), validate=False)
+            except (binascii.Error, ValueError):
+                continue
+            if not head.startswith(b"\xff\xd8\xff"):
+                continue
+            out.setdefault(n, []).append((to_float(f.get("timestamp_sec"), 0.0) or 0.0, _re.sub(r"\s+", "", b64)))
+    return out

@@ -25,8 +25,11 @@ _INTENT_PATTERNS: list[tuple[str, str]] = [
                      r"что\s+(он|она|они)\s+(говор|сказал)|о\s+ч[её]м\s+(говор|разговар)|содержани\w*\s+разговор"),
     ("offtopic", r"\bстих|анекдот|погод|рецепт|переведи|напиши\s+(код|программ|письмо|эссе)|сочини|курс\s+(доллар|валют)"),
     ("fine", r"штраф|наказан|санкци|ответственност|уволь|выговор"),
+    ("exclusions", r"когда\s+это\s+не\s+нарушени|не\s+считается\s+нарушени|исключени|в\s+каких\s+случаях\s+(это\s+)?норм"),
+    ("coverage", r"\bполн(ый|ая|ое|ота|оту|ого|ом|ым|ые)\b|\bполон\b|неполн|покрыт|весь\s+ролик|вс[её]\s+видео"),
     ("evidence", r"кадр|доказательств|скриншот|фото|изображени"),
-    ("checklist", r"что\s+(мне\s+)?(проверить|делать|сделать)|как\s+проверить|рекомендац|следующ\w+\s+шаг|на\s+что\s+обратить"),
+    ("checklist", r"что\s+(мне\s+)?(проверить|делать|сделать)|как\s+проверить|рекомендац|следующ\w+\s+шаг|"
+                  r"на\s+что\s+обратить|просмотреть|вручную"),
     ("hints", r"спорн|сомнительн|кандидат|ниже\s+порога|не\s+вошл|отсеян|отброшен"),
     ("confidence", r"уверен|вероятност|точност|насколько\s+(надёжн|надежн|точн)|ошиб(ка|ся|лась)|ложн"),
     ("when", r"когда|в\s+какой\s+момент|на\s+какой\s+секунд|таймкод|в\s+какое\s+время|время\s+нарушени"),
@@ -46,6 +49,7 @@ _TYPE_HINTS: dict[str, str] = {
     "V06": r"\bе(ст|л|да)\b|пь[её]т|напит|кофе|чай|еда|пищ",
     "V07": r"инкасс|сумк",
     "V08": r"пересч|скрыт|вне\s+обзора|руки",
+    "V09": r"личн\w*\s+вещ|куртк|рюкзак|одежд|пакет",
 }
 
 _ORDINALS = {"перв": 1, "втор": 2, "трет": 3, "четв": 4, "пят": 5, "шест": 6}
@@ -186,6 +190,38 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
             return f"{REFUSAL_SOURCES}."
         return "\n".join(lines)
 
+    if intent == "coverage":
+        c = completeness(result)
+        text = f"Полнота анализа: {completeness_text(result)}."
+        if c["state"] == "incomplete":
+            text += " Отсутствие находок в непроанализированной части не означает, что нарушений нет."
+        elif c["state"] == "unknown":
+            text += " Пайплайн не сообщил, проанализировано ли видео целиком."
+        return text
+
+    if intent == "exclusions":
+        if corpus is None:
+            return f"{REFUSAL_SOURCES}."
+        parts = []
+        for t in targets or viols:
+            tid = str(t.get("type_id") or "")
+            name = t.get("type") or corpus.type_name(tid)
+            excl = [str(x) for x in corpus.type_info(tid).get("exclusions") or [] if str(x).strip()]
+            if excl:
+                parts.append(f"«{name}» по каталогу не считается нарушением, если: " + "; ".join(excl) + ".")
+            else:
+                parts.append(f"Для «{name}» исключения в каталоге не описаны.")
+        return "\n".join(parts) if parts else f"{REFUSAL_SOURCES}."
+
+    if intent == "hints":
+        hints = review_hints(result)
+        if not hints:
+            return ("Сведений о спорных местах (кандидатах ниже порога) в результате нет. "
+                    "Это не означает, что сомнительных моментов не было.")
+        parts = [f"- {h.get('type') or h.get('type_id') or 'кандидат'}, {fmt_tc(h.get('timecode_sec'))}: "
+                 + (", ".join(str(x) for x in h.get("reasons_ru") or []) or "ниже порога") for h in hints]
+        return ("Спорные места (в вердикт не вошли, решение за проверяющим):\n" + "\n".join(parts))
+
     comp = completeness(result)
     if not viols and comp["state"] == "incomplete":
         return (f"{REFUSAL_NO_DATA}: {completeness_text(result)}. Нарушений в проанализированной части не найдено, "
@@ -212,15 +248,6 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
             frames = [fmt_tc(f.get("timestamp_sec")) for f in v.get("evidence_frames") or []]
             parts.append(f"- [V{v.get('_n')}]: " + (f"кадры {', '.join(frames)}." if frames else "кадров-доказательств нет."))
         return "Кадры-доказательства:\n" + "\n".join(parts)
-
-    if intent == "hints":
-        hints = review_hints(result)
-        if not hints:
-            return ("Сведений о спорных местах (кандидатах ниже порога) в результате нет. "
-                    "Это не означает, что сомнительных моментов не было.")
-        parts = [f"- {h.get('type') or h.get('type_id') or 'кандидат'}, {fmt_tc(h.get('timecode_sec'))}: "
-                 + (", ".join(str(x) for x in h.get("reasons_ru") or []) or "ниже порога") for h in hints]
-        return ("Спорные места (в вердикт не вошли, решение за проверяющим):\n" + "\n".join(parts))
 
     if intent == "confidence":
         parts = [f"- [V{v.get('_n')}]: уверенность {float(v.get('confidence') or 0):.2f}." for v in targets]

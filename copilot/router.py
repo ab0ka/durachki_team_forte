@@ -6,7 +6,8 @@
 Эндпоинты (префикс /api/v1):
     GET  /copilot/status              -> {"enabled", "available", "backend", "reason", ...}  (UI скрывает панель, если available=false)
     POST /jobs/{job_id}/ask           -> {"answer", "citations", "grounded", ...}; ?stream=1 или Accept: text/event-stream -> SSE
-    GET  /jobs/{job_id}/report        -> text/markdown «заключение для проверяющего» (без LLM)
+    GET  /jobs/{job_id}/report        -> text/markdown «заключение для проверяющего» (без LLM); ?format=html
+    GET  /jobs/{job_id}/suggestions   -> {"suggestions": [...], "by_type": {...}} — вопросы-подсказки для UI
 
 Коды: 404 — задачи нет; 409 — анализ не завершён; 501 — copilot выключен/модели нет;
 503 — GPU занят / провайдер задач не настроен; 504 — таймаут генерации.
@@ -20,7 +21,7 @@ import json
 from typing import Any, Awaitable, Callable, Literal, Optional, Sequence, Union
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import AliasChoices, BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -129,7 +130,7 @@ def make_router(get_job: Optional[JobProvider] = None, service: Any = None, pref
         return result
 
     @router.get("/jobs/{job_id}/report", response_class=PlainTextResponse)
-    async def job_report(job_id: str) -> PlainTextResponse:
+    async def job_report(job_id: str, format: str = Query("md", pattern="^(md|html)$")) -> Any:
         job = await _load(job_id)
         if _status_of(job) == "processing":
             raise HTTPException(status_code=409, detail={"code": "not_ready", "message": "Анализ ещё не завершён"})
@@ -138,10 +139,21 @@ def make_router(get_job: Optional[JobProvider] = None, service: Any = None, pref
         def _render() -> str:
             from .report import report
 
-            return report(job, corpus=svc.corpus, cfg=svc.cfg)
+            return report(job, corpus=svc.corpus, cfg=svc.cfg, fmt=format)
 
         text = await run_in_threadpool(_render)
+        if format == "html":
+            return HTMLResponse(text, headers={"Content-Security-Policy": "default-src 'none'; img-src data:; "
+                                                                          "style-src 'unsafe-inline'"})
         return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
+
+    @router.get("/jobs/{job_id}/suggestions")
+    async def job_suggestions(job_id: str, limit: int = Query(4, ge=1, le=8)) -> dict[str, Any]:
+        """3–4 вопроса-подсказки для панели (по типам нарушений в результате). Работает без модели."""
+        job = await _load(job_id)
+        from .suggestions import suggestions
+
+        return await run_in_threadpool(suggestions, job, limit)
 
     return router
 

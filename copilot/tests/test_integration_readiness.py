@@ -459,4 +459,4 @@ def test_openapi_builds_with_double_mount() -> None:
         spec = app.openapi()
     assert not [w for w in caught if "operation" in str(w.message).lower()]
     ops = [op["operationId"] for p in spec["paths"].values() for op in p.values()]
-    assert len(ops) == len(set(ops)) == 6
+    assert len(ops) == len(set(ops)) == 8  # status, ask, report, suggestions × 2 префикса
