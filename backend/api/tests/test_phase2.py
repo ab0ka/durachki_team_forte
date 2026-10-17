@@ -66,6 +66,10 @@ def test_processing_and_failed_have_required_fields(client_factory):
                                        "stages": {"detect": "timeout"}}}, [], "failed"),
     ("no_violation", {"coverage": {"analyzed_s": 99, "duration_s": 100}}, [], "done"),
     ("no_violation", {}, [], "done"),                                  # нет сведений = совместимость
+    ("no_violation", {"complete": False}, [], "failed"),              # флаг A03
+    ("no_violation", {"required_stages": ["detect"],
+                      "stages": {"detect": {"status": "timeout"}}}, [], "failed"),  # стадии A03
+    ("violation", {"complete": False}, None, "done"),                 # нарушение с кадром — отдаём
     (None, {}, None, "done"),                                          # есть нарушения -> violation
 ])
 def test_outcome_policy(client_factory, verdict, meta, violations, expect):

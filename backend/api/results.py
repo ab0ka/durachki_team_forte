@@ -128,12 +128,24 @@ def coverage_ratio(meta: Any) -> Optional[float]:
     return None
 
 
-def analysis_complete(meta: Any, min_coverage: float = 0.95) -> Optional[bool]:
-    """True/False, если пайплайн сообщил полноту (A01 meta.completeness и/или meta.coverage);
-    None — сведений нет. Любой источник «неполный» -> False (unknown != false, но и не true)."""
+def analysis_complete(meta: Any, min_coverage: float = 0.95,
+                      pipeline_flags: bool = True) -> Optional[bool]:
+    """True/False, если пайплайн сообщил полноту (A01 meta.completeness, meta.coverage и — для
+    итогового результата — флаги A03 meta.complete / статусы required_stages); None — сведений нет.
+    Любой источник «неполный» -> False (unknown != false, но и не true).
+    pipeline_flags=False для partial.json: там A03 всегда пишет complete=false по определению."""
     if not isinstance(meta, dict):
         return None
     votes: list[bool] = []
+    if pipeline_flags:
+        if isinstance(meta.get("complete"), bool):
+            votes.append(meta["complete"])
+        stages = meta.get("stages") if isinstance(meta.get("stages"), dict) else {}
+        for st in meta.get("required_stages") or []:
+            info = stages.get(st)
+            status = info.get("status") if isinstance(info, dict) else info
+            if status in ("failed", "timeout", "skipped", "error"):
+                votes.append(False)
     comp = meta.get("completeness")
     if isinstance(comp, bool):
         votes.append(comp)

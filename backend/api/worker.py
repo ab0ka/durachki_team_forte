@@ -581,7 +581,7 @@ class JobManager:
         """partial.json -> done, только если включено и полнота достаточна. (принят?, причина)."""
         meta = partial.get("meta") if isinstance(partial.get("meta"), dict) else {}
         cov = coverage_ratio(meta)
-        complete = analysis_complete(meta, self.s.min_coverage)
+        complete = analysis_complete(meta, self.s.min_coverage, pipeline_flags=False)
         why = (f"coverage={cov:.2f}" if cov is not None else "coverage not reported") + \
               f", complete={complete}"
         if not self.s.partial_accept:
@@ -592,6 +592,10 @@ class JobManager:
             return False, "partial result is MOCK — refused"
         cand = dict(partial)
         cand.pop("status", None)  # A03 пишет processing
+        cmeta = dict(meta)
+        for k in ("complete", "partial"):  # флаги «не доделано» у partial по определению
+            cmeta.pop(k, None)
+        cand["meta"] = cmeta
         api, warns = normalize(cand, job_id, min_coverage=self.s.min_coverage)
         if api["status"] != "done":
             return False, f"partial result rejected by outcome policy: {api.get('error')}"
