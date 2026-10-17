@@ -176,33 +176,33 @@ class PersonGeom:
         return float(np.linalg.norm(np.asarray(a) - np.asarray(b))) / self.s
 
     def facing(self, nose_weight: float, min_nose_offset: float) -> tuple[Optional[np.ndarray], float]:
-        """Оценка направления «лица/груди» на плоскости изображения (единичный вектор, надёжность 0..1).
+        """Направление «груди» на плоскости изображения (единичный вектор, надёжность 0..1).
 
-        Перпендикуляр к линии плеч (знак — по разметке левое/правое плечо) + смещение носа от центра плеч.
-        Для камеры, смотрящей сверху/сверху-спереди, d = (-v_y, v_x), где v = L_shoulder - R_shoulder.
+        Основной признак — перпендикуляр к линии плеч, знак — по разметке левое/правое плечо:
+        d = (-v_y, v_x), v = L_shoulder - R_shoulder (камера смотрит сверху/сверху-спереди, без зеркала).
+        Нос смещён от плеч ещё и из-за высоты головы (наклонная камера), поэтому его вклад nose_weight
+        по умолчанию 0; при nose_weight > 0 он подмешивается (для почти вертикальной камеры).
+        Плечи «схлопнуты» (человек боком к наклонной камере) → надёжность падает.
         """
-        vec = np.zeros(2, dtype=np.float64)
-        conf = 0.0
-        if self.vis[L_SHOULDER] and self.vis[R_SHOULDER]:
-            v = self.p[L_SHOULDER, :2] - self.p[R_SHOULDER, :2]
-            n = float(np.linalg.norm(v))
-            if n > 1e-6:
-                perp = np.array([-v[1], v[0]], dtype=np.float64) / n
-                w = (1.0 - nose_weight) * min(self.score(L_SHOULDER), self.score(R_SHOULDER))
-                vec += w * perp
-                conf += w
-        mid = self.shoulder_mid()
-        if self.vis[NOSE] and mid is not None:
-            off = self.p[NOSE, :2] - mid
-            n = float(np.linalg.norm(off)) / self.s
-            if n >= min_nose_offset:
-                w = nose_weight * self.score(NOSE) * min(1.0, n / (2 * min_nose_offset))
-                vec += w * off / (float(np.linalg.norm(off)) or 1.0)
-                conf += w
-        norm = float(np.linalg.norm(vec))
-        if norm < 1e-6 or conf <= 0:
+        if not (self.vis[L_SHOULDER] and self.vis[R_SHOULDER]):
             return None, 0.0
-        return vec / norm, float(min(1.0, conf))
+        v = self.p[L_SHOULDER, :2] - self.p[R_SHOULDER, :2]
+        n = float(np.linalg.norm(v))
+        if n < 1e-6:
+            return None, 0.0
+        vec = np.array([-v[1], v[0]], dtype=np.float64) / n
+        conf = min(self.score(L_SHOULDER), self.score(R_SHOULDER)) * min(1.0, (n / self.s) / 0.6)
+        mid = self.shoulder_mid()
+        if nose_weight > 0 and self.vis[NOSE] and mid is not None:
+            off = self.p[NOSE, :2] - mid
+            on = float(np.linalg.norm(off))
+            if on / self.s >= min_nose_offset:
+                vec = (1.0 - nose_weight) * vec + nose_weight * off / on
+                nv = float(np.linalg.norm(vec))
+                if nv < 1e-6:
+                    return None, 0.0
+                vec = vec / nv
+        return vec, float(min(1.0, conf))
 
 
 def track_scale(kps_iso_seq: Sequence[np.ndarray], bboxes_iso: Sequence[Optional[np.ndarray]],

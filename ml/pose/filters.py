@@ -140,7 +140,7 @@ def hysteresis_mask(times: Sequence[float], evidence: Sequence[float], on: float
 def gated_values(times: Sequence[float], evidence: Sequence[float], p: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     """Evidence → (значения 0..1, маска активности). Активно ⇒ ≥ 0.5, неактивно ⇒ ≤ 0.49."""
     e = np.clip(np.nan_to_num(np.asarray(evidence, dtype=np.float64), nan=0.0), 0.0, 1.0)
-    mask = hysteresis_mask(times, e, float(p.get("on", 0.6)), float(p.get("off", 0.4)),
+    mask = hysteresis_mask(times, e, float(p.get("thr_on", 0.6)), float(p.get("thr_off", 0.4)),
                            float(p.get("min_duration_s", 0.0)), float(p.get("max_gap_s", 0.0)))
     vals = 0.49 * e
     for a, b in runs_from_mask(mask):
