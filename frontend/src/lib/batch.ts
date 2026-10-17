@@ -154,6 +154,8 @@ export class BatchStore {
             status: job.status,
             verdict: job.status === "done" ? job.verdict : null,
             n_violations: job.violations.length,
+            completeness: rep.state,
+            mock: rep.mock,
           });
         } else {
           this.set(it.key, { stage: job.stage, progress: job.progress });

@@ -18,7 +18,7 @@ export interface UiConfig {
   beforeAfterTypes: string[];
   /** На сколько секунд до начала эпизода брать кадр «до». */
   beforeOffsetS: number;
-  /** Рамки подсветки рисуются на кадрах не дальше N с от пикового момента. */
+  /** Рамки подсветки (заданы A12 для кадра t_peak) рисуются только на кадре не дальше N с от t_peak. */
   highlightMaxDtS: number;
   /**
    * Сдвиг времени при перемотке: "none" — таймкод = currentTime видео; "meta_t0" — + meta.video.t0_pts_sec
@@ -38,7 +38,7 @@ export const DEFAULT_UI_CONFIG: UiConfig = {
   episodePostrollS: 1,
   beforeAfterTypes: ["V02", "V03", "V07"],
   beforeOffsetS: 2,
-  highlightMaxDtS: 0.6,
+  highlightMaxDtS: 0.1,
   ptsOffsetMode: "none",
   showReviewHints: true,
 };

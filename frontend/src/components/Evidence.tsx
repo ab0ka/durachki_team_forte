@@ -3,6 +3,7 @@ import { ArrowRight, Crosshair, ImageOff } from "lucide-react";
 import type { EvidenceFrame, Violation } from "../api/types";
 import { imageSrc, type HighlightBox } from "../api/normalize";
 import { formatTimecode } from "../lib/format";
+import { uiConfig } from "../lib/uiConfig";
 import { cx, Spinner } from "./ui";
 
 /** Кадр с необязательной подсветкой рамками (A12 shapes; координаты нормированы к кадру). */
@@ -54,9 +55,9 @@ export function EvidenceImage({
   );
 }
 
-/** Рамки применимы к кадру, близкому к пиковому моменту (A12 рисует их на кадре t_peak). */
-export function boxesForFrame(frame: EvidenceFrame, v: Violation, boxes: HighlightBox[], maxDt = 0.6): HighlightBox[] {
-  return Math.abs(frame.timestamp_sec - v.timecode_sec) <= maxDt ? boxes : [];
+/** Рамки A12 заданы для кадра t_peak — рисуем их только на нём (|ts − t_peak| ≤ maxDt), не на соседних кадрах. */
+export function boxesForFrame(frame: EvidenceFrame, peakT: number, boxes: HighlightBox[], maxDt = uiConfig().highlightMaxDtS): HighlightBox[] {
+  return !frame.missing && Math.abs(frame.timestamp_sec - peakT) <= maxDt ? boxes : [];
 }
 
 /**
@@ -66,6 +67,7 @@ export function boxesForFrame(frame: EvidenceFrame, v: Violation, boxes: Highlig
  */
 export function BeforeAfter({
   v,
+  peakT,
   boxes,
   highlight,
   capture,
@@ -74,6 +76,8 @@ export function BeforeAfter({
   beforeS = 2,
 }: {
   v: Violation;
+  /** t_peak, к которому относятся рамки. */
+  peakT: number;
   boxes: HighlightBox[];
   highlight: boolean;
   capture?: (t: number) => Promise<string | null>;
@@ -83,12 +87,14 @@ export function BeforeAfter({
 }) {
   const start = v.t_start ?? v.timecode_sec;
   const beforeT = Math.max(0, start - beforeS);
-  const frames = v.evidence_frames;
+  // Только кадры с изображением; индексы — в этом же списке (его же получает лайтбокс).
+  const frames = v.evidence_frames.filter((f) => !f.missing);
   const serverBeforeIdx = frames.findIndex((f) => f.timestamp_sec <= start - 0.3);
-  const afterCandidates = frames.map((f, i) => ({ f, i })).filter(({ f }) => f.timestamp_sec >= start - 0.05);
-  const after =
-    afterCandidates.sort((a, b) => Math.abs(a.f.timestamp_sec - v.timecode_sec) - Math.abs(b.f.timestamp_sec - v.timecode_sec))[0] ??
-    (frames.length ? { f: frames[frames.length - 1], i: frames.length - 1 } : undefined);
+  // «После» — только кадр в момент/после начала эпизода; более ранний кадр НЕ подставляется.
+  const after = frames
+    .map((f, i) => ({ f, i }))
+    .filter(({ f }) => f.timestamp_sec >= start - 0.05)
+    .sort((a, b) => Math.abs(a.f.timestamp_sec - v.timecode_sec) - Math.abs(b.f.timestamp_sec - v.timecode_sec))[0];
   const [captured, setCaptured] = useState<string | null | "loading" | "error">(null);
 
   useEffect(() => {
@@ -138,12 +144,12 @@ export function BeforeAfter({
               <button className="block w-full" onClick={() => onOpen(after.i)} aria-label="Открыть кадр «после»">
                 <EvidenceImage
                   src={imageSrc(after.f.image_base64)}
-                  boxes={highlight ? boxesForFrame(after.f, v, boxes, 1.5) : []}
+                  boxes={highlight ? boxesForFrame(after.f, peakT, boxes) : []}
                   alt="Кадр после начала эпизода"
                 />
               </button>
             ) : (
-              <div className="flex aspect-[3/4] items-center justify-center p-3 text-center text-xs text-slate-300">кадров нет</div>
+              <div className="flex aspect-[3/4] items-center justify-center p-3 text-center text-xs text-slate-300">кадра «после» нет</div>
             )}
           </div>
           <figcaption className="mt-1 text-[11px] text-slate-500 tnum">после · {after ? formatTimecode(after.f.timestamp_sec) : "—"}</figcaption>

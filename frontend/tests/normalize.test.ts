@@ -79,7 +79,7 @@ describe("normalizeJob", () => {
       job_id: 7,
       status: "DONE",
       verdict: "Violation",
-      violations: [null, 5, { type: "X", timecode_sec: "12,5", evidence_frames: ["abc", { foo: 1 }], confidence: 3 }],
+      violations: [null, 5, { type: "X", timecode_sec: "12,5", evidence_frames: ["/9j/4AAQSkZJRgABAQAAAQABAAD", { foo: 1 }, "abc"], confidence: 3 }],
       timeline: [[1, 2], { t: 0, risk: 0.1 }, "bad", [-1, 0.5]],
     });
     expect(j.job_id).toBe("7");

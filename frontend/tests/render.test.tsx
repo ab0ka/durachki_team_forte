@@ -89,10 +89,10 @@ describe("ResultView", () => {
       job_id: "x",
       status: "done",
       verdict: "violation",
-      violations: [{ type: "Тип", timecode_sec: 22, description: "Описание.", evidence_frames: [{ timestamp_sec: 22, image_base64: "/9j/AAAA" }] }],
+      violations: [{ type: "Тип", timecode_sec: 22, description: "Описание.", evidence_frames: [{ timestamp_sec: 22, image_base64: "/9j/4AAQSkZJRgABAQAAAQABAAD" }] }],
     });
     const html = wrap(<ResultView job={job} raw={{}} />);
-    expect(html).toContain("data:image/jpeg;base64,/9j/AAAA");
+    expect(html).toContain("data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD");
     expect(html).toContain("норма в каталоге не найдена");
   });
 });
@@ -113,5 +113,29 @@ describe("ProcessingView / AboutScreen", () => {
     const html = wrap(<AboutScreen />);
     expect(html).toContain("V01");
     expect(html).toContain("Apache-2.0");
+  });
+});
+
+describe("JobScreen-логика: failed с partial.json A03 (стадии, coverage)", () => {
+  it("partial без нарушений, но со стадиями → подробный жёлтый отчёт с панелью полноты", () => {
+    const job = normalizeJob({
+      job_id: "f",
+      status: "failed",
+      error: "pipeline_failed",
+      partial: {
+        status: "processing",
+        verdict: null,
+        violations: [],
+        coverage_problem: "оркестратор сообщил незавершённый анализ (meta.complete=false)",
+        meta: { complete: false, stages: { ingest: { status: "ok", required: true }, temporal: { status: "ok" } }, coverage: { ingest: 1, temporal: 0 } },
+      },
+    });
+    expect(job.partialResult?.meta.stages).toBeTruthy();
+    const shown = { ...job.partialResult!, job_id: job.job_id, status: "failed" as const, error: job.error };
+    const html = wrap(<ResultView job={shown} raw={{}} />);
+    expect(html).toContain("Анализ не завершён");
+    expect(html).toContain("Полнота анализа");
+    expect(html).toContain("Временная модель");
+    expect(html).not.toContain("Нарушение не обнаружено");
   });
 });

@@ -37,7 +37,7 @@ export const STEPS: StepDef[] = [
     id: "reasoning",
     title: "Анализ событий",
     hint: "Правила, временная модель, локальная VLM",
-    keys: ["rule", "temporal", "vlm", "verify", "discover", "event", "правил", "временн"],
+    keys: ["rule", "temporal", "refine", "vlm", "verify", "discover", "event", "правил", "временн", "уточнен"],
   },
   {
     id: "report",

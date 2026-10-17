@@ -91,3 +91,26 @@ export function verdictView(
   }
   return { tone: "warning", title: "Вердикт не получен", subtitle: "Сервер не вернул вердикт — нужен ручной просмотр.", flags };
 }
+
+/**
+ * Строка «Недавние проверки». Уверенный зелёный «без нарушений» — только при подтверждённой полноте
+ * и не для mock; старые записи без completeness считаются «полнота не подтверждена».
+ */
+export function historyView(h: {
+  verdict?: Verdict | null;
+  n_violations?: number;
+  status?: string;
+  completeness?: Completeness;
+  mock?: boolean;
+}): { tone: "danger" | "success" | "warning" | "neutral"; label: string } {
+  if (h.mock) return { tone: "neutral", label: "тестовый результат (mock)" };
+  if (h.verdict === "violation") return { tone: "danger", label: `нарушений: ${h.n_violations ?? "?"}` };
+  if (h.verdict === "no_violation") {
+    if (h.completeness === "complete") return { tone: "success", label: "без нарушений" };
+    if (h.completeness === "partial") return { tone: "warning", label: "анализ неполный" };
+    return { tone: "neutral", label: "не обнаружено · полнота не подтверждена" };
+  }
+  if (h.status === "failed") return { tone: "warning", label: "анализ не завершён" };
+  if (h.status === "done") return { tone: "neutral", label: "готово" };
+  return { tone: "neutral", label: "в обработке" };
+}

@@ -8,6 +8,7 @@ import ResultView from "./ResultView";
 import RetryUpload from "./RetryUpload";
 import { LoginCard } from "./UploadScreen";
 import { uiConfig } from "../lib/uiConfig";
+import { analyzeCompleteness } from "../lib/completeness";
 import { Spinner } from "./ui";
 
 export default function JobScreen({ jobId }: { jobId: string }) {
@@ -52,12 +53,15 @@ export default function JobScreen({ jobId }: { jobId: string }) {
         setRaw(r.raw);
         setError(null);
         if (r.job.status === "done" || r.job.status === "failed") {
+          const rep = analyzeCompleteness(r.job);
           saveHistoryItem({
             job_id: jobId,
             status: r.job.status,
             verdict: r.job.status === "done" ? r.job.verdict : null,
             n_violations: r.job.violations.length,
             demo: demo || undefined,
+            completeness: rep.state,
+            mock: rep.mock,
           });
           if (r.job.status === "done") setLastResult(r.job);
           return; // опрос остановлен
@@ -128,9 +132,14 @@ export default function JobScreen({ jobId }: { jobId: string }) {
       </>
     );
   }
-  if (job.status === "failed" && job.partialResult && (job.partialResult.violations.length > 0 || job.partialResult.timeline.length > 0)) {
+  const pr = job.partialResult;
+  if (
+    job.status === "failed" &&
+    pr &&
+    (pr.violations.length > 0 || pr.timeline.length > 0 || (pr.candidates?.length ?? 0) > 0 || typeof pr.meta.stages === "object")
+  ) {
     // A02 отдаёт для UI частичный результат упавшего анализа: показываем найденное, баннер — «Анализ не завершён».
-    const shown: JobResult = { ...job.partialResult, job_id: job.job_id, status: "failed", error: job.error };
+    const shown: JobResult = { ...pr, job_id: job.job_id, status: "failed", error: job.error };
     return <ResultView job={shown} raw={raw} fileName={fileName.current} />;
   }
   if (job.status === "failed" && ((job.candidates?.length ?? 0) > 0 || job.timeline.length > 0 || typeof job.meta.stages === "object")) {

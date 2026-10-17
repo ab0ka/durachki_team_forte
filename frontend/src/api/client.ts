@@ -476,6 +476,9 @@ export interface HistoryItem {
   n_violations?: number;
   status?: string;
   demo?: boolean;
+  /** Полнота анализа на момент завершения: зелёный в истории — только "complete" и не mock. */
+  completeness?: "complete" | "partial" | "unknown";
+  mock?: boolean;
 }
 
 const HKEY = "ks.history";

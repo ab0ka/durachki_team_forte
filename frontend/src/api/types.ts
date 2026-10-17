@@ -9,6 +9,11 @@ export type Verdict = "violation" | "no_violation";
 export interface EvidenceFrame {
   timestamp_sec: number;
   image_base64: string;
+  /**
+   * Только UI: сервер сообщил кадр, но без изображения (A02 у failed заменяет base64 на "<jpeg omitted>").
+   * Такой кадр НЕ рисуется и ничем не подменяется — показывается плашка «кадр не передан».
+   */
+  missing?: boolean;
 }
 
 /** Ссылка на норму РК — только из norms/catalog.yaml (A13). */

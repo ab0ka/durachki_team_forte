@@ -9,6 +9,7 @@ import Header from "./components/Header";
 import UploadScreen from "./components/UploadScreen";
 import JobScreen from "./components/JobScreen";
 import AboutScreen from "./components/AboutScreen";
+import ReplayScreen from "./components/ReplayScreen";
 import SettingsDialog from "./components/SettingsDialog";
 import { cx } from "./components/ui";
 
@@ -121,6 +122,7 @@ export default function App() {
           {route.name === "upload" && <UploadScreen />}
           {route.name === "job" && <JobScreen key={route.id} jobId={route.id} />}
           {route.name === "about" && <AboutScreen />}
+          {route.name === "replay" && <ReplayScreen />}
         </main>
         <footer className="no-print border-t border-slate-200/70 py-6 text-center text-xs text-slate-500 dark:border-white/5 dark:text-slate-500">
           Kassa Sentinel · результат — подсказка для проверяющего, не юридическое заключение · видео не покидает локальный контур
