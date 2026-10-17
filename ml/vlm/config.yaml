@@ -113,6 +113,9 @@ verify:
   retype_sources: [temporal, vlm]   # чьи события VLM может переклассифицировать
   retype_min_conf: 0.7
   drop_below: null            # null — verify никогда не удаляет события (решает fusion)
+  # extra.vlm.verdict/score — мнение для ml.fusion (confirm|reject|unsure). Флаг ниже дополнительно ставит
+  # extra.vlm_verdict="rejected" — встроенное слияние A03 такие события ВЫБРАСЫВАЕТ; выкл. до замера L2.
+  emit_vlm_verdict_rejected: false
   max_facts: 4
   dedupe_iou_s: 0.6           # совпадающие по времени события одного типа проверяем один раз
   priority: uncertain_first   # uncertain_first | confidence_desc | time

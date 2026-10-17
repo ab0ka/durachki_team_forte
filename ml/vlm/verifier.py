@@ -21,7 +21,7 @@ from .frames import clip_duration, get_frame, prepare_images, verify_times
 from .parsing import normalize_verify, regex_fallback_verify, verify_schema
 from .prompting import render_verify, retry_suffix
 from .runtime import call_json, ensure_loaded, fit_images, get_backend
-from .scoring import update_confidence
+from .scoring import fusion_opinion, update_confidence
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
         if backend is None:
             for e in out:
                 _mark(e, "unavailable", reason=reason[:160])
-            return out
+            return _with_coverage(out)
     lim = VLMLimits.from_cfg(cfg, "verify", limits)
     budget = Budget(float(budget_s), lim, **({"clock": clock} if clock else {}))
     rcfg = cfg.get("runtime") or {}
@@ -88,7 +88,7 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
     if not ok:
         for e in out:
             _mark(e, "unavailable", reason=reason[:160])
-        return out
+        return _with_coverage(out)
 
     catalog = catalog or load_catalog()
     types = catalog_types(catalog)
@@ -163,7 +163,22 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
     for e in out:
         e.extra.setdefault("vlm", {"status": "skipped_budget", "agreement": "not_checked"})
         e.extra["vlm"].setdefault("budget", summary)
+    return _with_coverage(out)
+
+
+def _with_coverage(out: list[Event]) -> list[Event]:
+    cov = coverage(out)
+    for e in out:
+        e.extra.setdefault("vlm", {"status": "not_checked", "agreement": "not_checked"})["coverage"] = cov
     return out
+
+
+def coverage(events: list[Event]) -> dict[str, Any]:
+    """Полнота проверки для meta.coverage: непроверенное событие — «неизвестно», а не «нет нарушения»."""
+    st = [str((e.extra.get("vlm") or {}).get("status", "not_checked")) for e in events]
+    checked = sum(s == "ok" for s in st)
+    return {"checked": checked, "total": len(st), "complete": checked == len(st),
+            "statuses": {s: st.count(s) for s in sorted(set(st))}}
 
 
 def _apply(ev: Event, res: dict[str, Any], types: dict[str, dict[str, Any]], cfg: dict[str, Any],
@@ -230,7 +245,10 @@ def _apply(ev: Event, res: dict[str, Any], types: dict[str, dict[str, Any]], cfg
         "model": res.get("_backend"),
         "shared": shared_from,
         **trace,
+        **fusion_opinion(agreement, trace.get("p_vlm")),  # verdict/score — то, что читает ml.fusion
     }
     if keep_raw:
         vlm_extra["raw"] = res
     ev.extra["vlm"] = vlm_extra
+    if vlm_extra.get("verdict") == "reject" and vcfg.get("emit_vlm_verdict_rejected", False):
+        ev.extra["vlm_verdict"] = "rejected"  # встроенное слияние A03 такие события отбрасывает — по умолчанию выкл.
