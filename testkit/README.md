@@ -43,14 +43,65 @@ assert check_detections(ml.detect.detect(clip)) == []        # выход ста
 
 `make_catalog()` — заглушка той же формы, что `norms/catalog.yaml`, но **без норм** (`rules: []`). Настоящие ссылки на нормы берутся только из каталога A13.
 
+## v2: кейсы спецификации команды (`testkit/spec.py`)
+
+Синтетика проверяет **механизмы** (контракт, логику, тайминги, «неизвестно»), а **не качество модели**. Метрики считаются только на реальных данных у L2.
+
+- **Кейсы — пары «норма / нарушение»** из спецификации, всего 21:
+
+  | Группа | Норма | Нарушение |
+  |---|---|---|
+  | Уход кассира | `leave_clean` — убрала всё, сейф закрыт | `leave_cash`, `leave_bag` (тип V02, альтернатива V07), `leave_safe_open` (V03, альтернатива V02) |
+  | Клиенты и посторонние | `client_opposite` | `outsider_cashier_side`, `second_outsider` (V01) |
+  | Порядок появления | `cashier_enters_first`; `client_first` — роль по зоне, а не по порядку | — |
+  | Свет выключили | `lights_off_clean` | `lights_off_cash` |
+  | Еда, рука у лица | `hand_to_face` — не сигнал | `drinking` (V06) |
+  | Телефон | `desk_phone` — стационарный, норма | `mobile` (V05) |
+  | Личные вещи | — | `jacket_on_desk` (V09) |
+  | Инкассаторская сумка | `bag_handover_proper` — из рук в руки и сразу в сейф | `bag_left` (V07) |
+  | Сейф | — | `safe_open_working` (V03) |
+  | Несколько событий | — | `multi_event` (V05, затем V02), `debounce_phone` (одно событие) |
+- **Планировки:** `A` (горизонтальная перегородка) и `B` (вертикальная перегородка, стол вдоль неё, сейф внизу); ориентации `portrait` и `landscape`. В логике нет пиксельных констант: стороны кассира и клиента — полигоны планировки.
+- **Тайминги:** длительность и момент события — из одного распределения для всех классов. `sample_timing(rng, duration_range)` класса не знает, поэтому длительность и позиция события не становятся признаками.
+- **GT:**
+  - `events` — список событий, таймкод по началу действия (переход: отошла, вошёл, поднесла);
+  - `alt_type_ids` — допустимые альтернативные типы;
+  - `unknown_spans` — интервалы, где сцена не видна (свет выключили).
+- **Неизвестно ≠ нет:** в темноте в `signals` остаётся только `scene_visibility`. Если кассира нет в кадре, его сигналы (телефон, еда, руки, взгляд) отсутствуют, а не равны 0.
+
+```python
+from testkit.spec import make_suite, build_case, case_bundle, make_case_video, CaseSpec
+for spec in make_suite(seed=0):                  # 21 кейс × 2 планировки × 2 ориентации
+    gt = build_case(spec).gt.as_dict()           # verdict, events[...], unknown_spans
+    b = case_bundle(spec)                        # детекции/треки/зоны/позы/сигналы/ожидаемые события
+make_case_video("x.mov", CaseSpec("leave_cash", "B", "landscape", duration=20, onset=9), fps=10)
+```
+
+```bash
+python -m testkit.e2e_stub --suite spec --strict-stages --layouts A,B --orientations portrait,landscape
+```
+
+Сценарии v1 (`testkit/scenarios.py`) сохранены для совместимости. Событие в них всегда на 45% ролика, поэтому для оценки модели они не подходят — только для проверки механики.
+
 ## Сквозной прогон
 
 ```bash
-python -m testkit.e2e_stub                                   # все сценарии, mock-режим
+SENTINEL_MOCK=1 python -m testkit.e2e_stub                   # все сценарии, mock модулей включён явно
 python -m testkit.e2e_stub --scenarios clean,V01 --view perspective --strict-stages
 python -m testkit.e2e_stub --fixtures-only --require-accuracy   # самопроверка тест-кита (10/10)
 python -m testkit.synth_video --out data/synth --all          # ролики в data/synth (в .gitignore)
+
+# полная сборка (как job e2e-full в CI): оркестратор + канонический сериализатор жюри
+SENTINEL_MOCK=1 python -m testkit.e2e_stub --require-full --expect-status done --scenarios clean,V01,V03,V07 --duration 8 --fps 30
+python -m testkit.e2e_stub --require-full --expect-status failed --scenarios clean --duration 8 --fps 30   # без mock
 ```
+
+`e2e_stub` не меняет `os.environ`: mock модулей включает вызывающий (`SENTINEL_MOCK=1` в команде или в шаге CI). Mock-результат оркестратора без явного режима — ошибка: production сам на mock не переключается.
+
+* `--require-full` — обязателен `backend.pipeline.run`, фикстуры запрещены, ответ — только через `contracts.serialize.result_to_jury_api`. Нет оркестратора → «NOT RUN», код 3 («ПОЛНАЯ СБОРКА НЕ ПРОВЕРЕНА»), а не зелёный результат.
+* `--expect-status done|failed|processing` — статус каждого ответа. `done` ловит регрессию «нет `meta.coverage` → `failed`».
+* `--deadline` (по умолчанию 240 с, как в ТЗ): прогон дольше дедлайна +10% — ошибка. Меньший дедлайн меняет адаптивный `sample_fps` оркестратора, поэтому для проверки сборки его не уменьшают.
+* Коды возврата: 0 — ок; 1 — ошибка (схема жюри, падение, дедлайн, статус, точность); 3 — NOT RUN.
 
 Как выбирается реализация:
 
@@ -64,7 +115,7 @@ python -m testkit.synth_video --out data/synth --all          # ролики в 
 
 ## Тесты
 
-`pytest testkit -q` — 109 тестов примерно за 4 с, без GPU и без весов. Для видео нужен `opencv-python-headless`; без него видео-тесты пропускаются (`importorskip`).
+`pytest testkit -q` — 228 тестов (v1 и v2) примерно за 8 с, без GPU и без весов. Для видео нужен `opencv-python-headless`; без него видео-тесты пропускаются (`importorskip`).
 
 ## Ограничения
 

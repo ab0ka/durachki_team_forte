@@ -21,7 +21,7 @@ from ownership import agent_from_title, forbidden_reason, is_shared, owner_of  #
     ("backend/api/main.py", "A02"), ("backend/pipeline/run.py", "A03"), ("ml/detect/x.py", "A05"),
     ("ml/fusion/fuse.py", "A12"), ("norms/catalog.yaml", "A13"), ("frontend/src/App.tsx", "A15"),
     ("docs/arch.md", "A18"), ("pitch/deck.md", "A18"), ("./testkit/fixtures.py", "A01"),
-    ("random/file.py", None), ("ml/other/x.py", None),
+    ("random/file.py", None), ("ml/other/x.py", None), (".pre-commit-config.yaml", "A01"), ("any.toml", "A01"),
 ])
 def test_owner_of(path, owner):
     assert owner_of(path) == owner
@@ -132,6 +132,25 @@ def test_check_fallbacks(tmp_path):
     assert [p.parent.name for p in tmp_path.rglob("_contract_fallback.py")] == ["b"]  # с прямым импортом — оставлен
 
 
+def test_check_fallbacks_dangling_import(tmp_path, capsys):
+    import check_fallbacks
+
+    (tmp_path / "contracts").mkdir()
+    (tmp_path / "contracts" / "sentinel_contracts.py").write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "ml/a/tests").mkdir(parents=True)
+    (tmp_path / "ml/a/core.py").write_text(  # охраняемый импорт: при наличии contracts ветка except не выполняется
+        "try:\n    from contracts.sentinel_contracts import X\nexcept ImportError:\n"
+        "    from ._contract_fallback import X\n", encoding="utf-8")
+    assert check_fallbacks.main(["--root", str(tmp_path)]) == 0
+    (tmp_path / "ml/a/tests/test_a.py").write_text("from .. import _contract_fallback\n", encoding="utf-8")
+    (tmp_path / "ml/a/tests/test_b.py").write_text("from ml.a._contract_fallback import X\n", encoding="utf-8")
+    assert check_fallbacks.unguarded_imports(tmp_path) == {"ml/a": ["ml/a/tests/test_a.py:1", "ml/a/tests/test_b.py:1"]}
+    assert check_fallbacks.main(["--root", str(tmp_path)]) == 1  # копии нет — модуль не загрузится
+    assert "DANGLING" in capsys.readouterr().out
+    (tmp_path / "ml/a/_contract_fallback.py").write_text("X = 1\n", encoding="utf-8")
+    assert check_fallbacks.main(["--root", str(tmp_path)]) == 0
+
+
 def test_guard_media(tmp_path):
     import guard_media
 
@@ -231,3 +250,47 @@ def test_resolve_deps(tmp_path):
     assert rd.main(["--tree", str(tmp_path), "--lock", str(lock_file), "--out", str(tmp_path / "r.md")]) == 0
     assert rd.main(["--tree", str(tmp_path), "--lock", str(lock_file), "--out", str(tmp_path / "r.md"),
                     "--strict"]) == 1
+
+
+def test_l2_contract_check(tmp_path):
+    import l2_contract_check as l2
+    from contracts.extensions import compute_coverage
+    from contracts.sentinel_contracts import AnalysisResult, EvidenceFrame, RuleRef, Violation
+    from contracts.serialize import result_to_ui_report
+
+    jpeg = json.loads((SCRIPTS.parent / "contracts/examples/job_done_tz.json").read_text(encoding="utf-8"))[
+        "violations"][0]["evidence_frames"][0]["image_base64"]
+    cov = compute_coverage(30.0, 30.0)
+    rule = RuleRef("ТЕСТ", None, "https://adilet.zan.kz/rus/docs/TEST", "q")
+    preds = tmp_path / "preds"
+    preds.mkdir()
+    results = {
+        "X-1": AnalysisResult("j1", "done", "violation", [Violation("t", 11.0, "d", [EvidenceFrame(11.0, jpeg)],
+                              "V02", 0.9, 11.0, 15.0, [rule])], meta={"coverage": cov, "timings": {"total": 20.5}}),
+        "Х-2": AnalysisResult("j2", "done", "no_violation", meta={"coverage": cov, "timings": {"total": 30.0}}),
+        "X-3": AnalysisResult("j3", "done", "no_violation", meta={"timings": {"total": 40.0}}),  # нет coverage
+        "X-4": AnalysisResult("j4", "done", "violation", [Violation("t", 5.0, "d", [], "V05")], meta={"mock": True}),
+    }
+    for name, r in results.items():
+        (preds / f"{name}.json").write_text(json.dumps(result_to_ui_report(r, allow_mock=True), ensure_ascii=False),
+                                            encoding="utf-8")
+    (preds / "broken.json").write_text("{", encoding="utf-8")
+    labels = tmp_path / "labels.csv"
+    labels.write_text("video,label,second\nX-1.mov,нарушение,10\nX-2.MOV,без нарушения,\nX-3.mov,нарушение,7\n"
+                      "X-4.mov,без нарушения,\n", encoding="utf-8")
+    out = tmp_path / "r.json"
+    assert l2.main(["--preds", str(preds), "--labels", str(labels), "--out", str(out),
+                    "--compare-set", "jury.embed_rule_in_description=true", "--repeat", str(preds)]) == 0
+    rep = json.loads(out.read_text(encoding="utf-8"))
+    s = rep["baseline"]["summary"]
+    assert s["n"] == 5 and s["load_errors"] == 1 and s["jury_json_valid"] == 4
+    assert s["status"] == {"done": 2, "failed": 2}
+    assert s["confusion"] == {"tp": 1, "fn": 0, "fp": 0, "tn": 1, "failed_on_violation": 1, "failed_on_clean": 1,
+                              "unlabeled": 0}
+    assert s["timecode"]["signed_median"] == 1.0 and s["timecode"]["hit_1s"] == 1
+    assert s["latency_s"]["max"] == 40.0
+    assert s["violations_with_norm_in_description"] == 0
+    assert rep["variant"]["summary"]["violations_with_norm_in_description"] == 1
+    assert rep["variant"]["changed_videos"] == ["X-1"]
+    assert rep["reproducibility"]["identical"] == rep["reproducibility"]["n"] == 4
+    assert l2.norm_id("Х-47.MOV") == "X-47"

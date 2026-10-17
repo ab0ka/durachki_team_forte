@@ -42,10 +42,16 @@ git merge --no-ff --allow-unrelated-histories origin/<ветка-агента> -
    * удалить `<модуль>/_contract_fallback.py`;
    * заменить в коде блок `try: from contracts.sentinel_contracts import * / except ImportError: from ._contract_fallback import *` на `from contracts.sentinel_contracts import *  # noqa`;
    * найти оставшиеся: `git grep -n "_contract_fallback"`;
-   * сверить копии с каноном и удалить совпадающие: `python scripts/check_fallbacks.py` (отчёт), затем `--drop`. На 17.10 все 14 копий побайтно совпадают с каноном.
+   * сверить копии с каноном и удалить совпадающие: `python scripts/check_fallbacks.py` (отчёт), затем `--drop`. Скрипт падает (код 1) и на «висячем» импорте (`DANGLING`): копии уже нет, а модуль импортирует её без `try/except`. В `integration-cloud@2055fc4` копий нет, висячих импортов нет.
 4. Прогнать тесты модуля: `pytest <папка> -m "not gpu and not slow"`.
-5. Прогнать сторож правил: `python scripts/check_licenses.py` (лицензии моделей, облачные API, видео/веса в git).
-6. Прогнать сквозной mock-тест: `python -m testkit.e2e_stub` (схема ответа жюри обязательна).
+5. Прогнать сторожей:
+   * `python scripts/check_licenses.py` — лицензии моделей, облачные API;
+   * `python scripts/guard_media.py --all` — медиа, веса, файлы > 5 МБ;
+   * `python scripts/resolve_deps.py --lock-ref origin/data/labels:tools/dataprep/requirements-l1.lock.txt` — зависимости против lock L1.
+6. Прогнать сквозной тест строго:
+   * контракт стадий: `SENTINEL_MOCK=1 python -m testkit.e2e_stub --no-backend --strict-stages` и то же с `--suite spec`;
+   * полная сборка (оркестратор + сериализатор жюри): `make e2e-full` — явный mock → `done`, без mock → `failed`. Код 3 («NOT RUN») — оркестратора нет, сборка не проверена.
+7. Перегенерировать матрицу совместимости: `python scripts/compat_matrix.py --tree .` — в корне интеграционной ветки, где все модули уже на месте.
 
 ## 3. Точки стыковки, которые легко пропустить
 
@@ -53,7 +59,7 @@ git merge --no-ff --allow-unrelated-histories origin/<ветка-агента> -
 * **A03:** заполняет `meta.completeness`, `meta.duration_sec`, `meta.provenance` (`contracts/extensions.py`). Без этого `no_violation` выдаётся только «по совместимости».
 * **A12:** ставит `verdict` явно; кадры — JPEG base64 без `data:`; нормы только из `norms/catalog.yaml`.
 * **Все:** имена файлов датасета `X-1` (латинская X) и `Х-3` (кириллическая Х) нормализует ingest или eval. Дубликаты Х-4≡Х-47 и Х-5≡Х-48 надо учитывать в LOO.
-* **CI:** обязательные проверки — `core`, `modules` (матрица), `e2e`. Необязательные — `frontend`, а `ownership` для PR без тега `[Axx]` только информирует.
+* **CI:** обязательные проверки — `core`, `modules` (матрица по присутствующим модулям), `e2e-stages`, `e2e-full` (только если в ветке есть оркестратор и модули критического пути; иначе пропущен). Необязательные — `frontend`, а `ownership` для PR без тега `[Axx]` только информирует. Глобального `SENTINEL_MOCK` нет.
 
 ## 4. Финальная проверка перед сдачей
 
@@ -64,6 +70,8 @@ python scripts/check_ownership.py --base origin/main --all-branches --report-onl
 ```
 
 ## 5. Пробная интеграция (A01, 17.10, ~08:05 UTC; локально, ничего не пушилось)
+
+> Исторический снимок до `integration-cloud`. Актуальное состояние и несовместимости — `contracts/COMPAT.md`, раздел 0.
 
 Деревья всех 17 веток наложены во временную папку поверх ветки A01: агенты пишут в разные папки, так что это эквивалент мерджа. Окружение: CPU, Python 3.11, только `numpy`, `opencv-python-headless`, `PyYAML`, `jsonschema`, `pytest`; без GPU, весов и `requirements.txt` модулей.
 

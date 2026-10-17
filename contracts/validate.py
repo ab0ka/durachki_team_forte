@@ -159,6 +159,9 @@ def _semantic_problems(data: Mapping[str, Any], duration: Optional[float], jury:
             ts = fr.get("timestamp_sec")
             if not _is_num(ts) or not math.isfinite(ts) or ts < 0:
                 out.append(f"violations/{i}/evidence_frames/{j}: timestamp_sec не конечное число ({ts!r})")
+            elif duration is not None and ts > duration + 0.05:
+                out.append(f"violations/{i}/evidence_frames/{j}: timestamp_sec={ts} за концом видео ({duration}) — "
+                           "неверный PTS")
             problem = jpeg_b64_problem(fr.get("image_base64"))
             if problem:
                 out.append(f"violations/{i}/evidence_frames/{j}: {problem}")

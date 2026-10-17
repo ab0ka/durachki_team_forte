@@ -86,6 +86,8 @@ API_REQUIRED_FRAME = ("timestamp_sec", "image_base64")
 TIME_DECIMALS = 1      # таймкоды — до 0.1 с
 SCORE_DECIMALS = 3     # confidence / risk / progress
 MAX_JURY_FRAMES = 3    # ТЗ: 1–3 кадра-доказательства
+PTS_TOLERANCE_S = 0.05  # кадр-доказательство не может быть позже конца видео (PTS)
+EVIDENCE_WINDOW_S = 3.0  # кадр дальше этого от окна события — предупреждение в UI-report (жюри не меняется)
 
 _STATUSES = ("processing", "done", "failed")
 _VERDICTS = ("violation", "no_violation")
@@ -270,6 +272,10 @@ def _normalize_violation(v: Any, index: int, duration: Optional[float], meta: Ma
         if ts is None or ts < 0:
             warnings.append(f"нарушение {index}, кадр {j}: нет конечного timestamp_sec — кадр отброшен")
             continue
+        if duration is not None and ts > duration + PTS_TOLERANCE_S:
+            warnings.append(f"нарушение {index}, кадр {j}: timestamp_sec={ts:.2f} за концом видео "
+                            f"({duration:.2f} с) — неверный PTS, кадр отброшен")
+            continue
         if problem:
             warnings.append(f"нарушение {index}, кадр {j}: {problem} — кадр отброшен")
             continue
@@ -301,6 +307,10 @@ def _normalize_violation(v: Any, index: int, duration: Optional[float], meta: Ma
     if duration is not None:
         t_end = min(t_end, duration)
 
+    for f in frames:
+        if not t_start - EVIDENCE_WINDOW_S <= f["timestamp_sec"] <= t_end + EVIDENCE_WINDOW_S:
+            warnings.append(f"нарушение {index}: кадр {f['timestamp_sec']:.1f} с вне окна события "
+                            f"[{t_start:.1f}; {t_end:.1f}] ± {EVIDENCE_WINDOW_S:g} с — проверьте PTS доказательства")
     description = str(_get(v, "description", "") or "").strip()
     if not description:
         description = f"Признаки возможного нарушения ({vtype}) на {tc:.1f} с. Требуется проверка человеком."

@@ -402,10 +402,11 @@ class SpecCase:
         self.plan: Plan = CASES[spec.case](float(spec.onset), self.duration)
 
     def _near_seat(self) -> tuple[float, float]:
+        """Точка сбоку от кассира (перпендикулярно направлению взгляда) — «на стороне кассира, у ценностей»."""
         sx, sy = self.layout["seat"]
         a = math.radians(self.layout["cashier_facing"])
-        return sx - 0.20 * math.cos(a) * 0 + 0.20 * (1 if sx < 0.5 else -1) * abs(math.cos(a)), \
-            sy + 0.06 * (1 if abs(math.cos(a)) > 0.5 else -1) * abs(math.sin(a)) + 0.03 * abs(math.cos(a))
+        fx, fy = math.sin(a), -math.cos(a)
+        return sx - fy * 0.20, sy + fx * 0.20 * self.aspect
 
     @property
     def gt(self) -> _GT:

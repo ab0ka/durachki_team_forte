@@ -25,8 +25,9 @@
 
 ```bash
 make setup-dev          # контракт, тест-кит, pytest, ruff
-make test-fast          # тесты без GPU и без весов (SENTINEL_MOCK=1)
+make test-fast          # тесты без GPU и без весов (без глобального SENTINEL_MOCK)
 make e2e                # сквозной mock-пайплайн на синтетическом видео
+make e2e-full           # полная сборка: backend.pipeline.run + сериализатор жюри (нужны все модули)
 make setup && make weights && make run   # полный запуск (веса качаются один раз, дальше офлайн)
 ```
 
@@ -64,9 +65,39 @@ Windows / Docker / Cloudflare Tunnel — см. [`deploy/`](deploy/) (A17).
 * **Тесты:**
   * `pytest <папка>` из корня, `pythonpath=["."]`;
   * тяжёлые тесты помечать `@pytest.mark.gpu` / `@pytest.mark.slow`;
-  * моки включаются через `SENTINEL_MOCK=1`.
+  * mock включается только явно: `SENTINEL_MOCK=1` в команде прогона или `monkeypatch.setenv` в тесте. На всю сессию pytest его не ставят ни CI, ни `make test`: иначе результат зависит от порядка тестов.
 * **CI (`.github/workflows/ci.yml`):**
-  * обязательные проверки: `core`, `modules` (матрица по модулям, `fail-fast: false`), `e2e`;
-  * необязательная: `frontend`.
+  * `core` — контракт, тест-кит, скрипты: тесты без `SENTINEL_MOCK` и повторно с ним (политика mock не зависит от окружения), примеры ТЗ, лицензии, fallback-копии и висячие импорты, медиа;
+  * `modules` — матрица только по модулям, которые есть в ветке; модуль без тестов — ошибка;
+  * `e2e-stages` — контракт каждой стадии (`--strict-stages`), частичная сборка допускается и так и подписана;
+  * `e2e-full` — полная сборка: `backend.pipeline.run` + `result_to_jury_api`, явный тестовый mock → `done`, без mock → `failed` (весов в CI нет). Запускается, только если в ветке есть оркестратор и модули критического пути, иначе job пропущен (серый), а не зелёный;
+  * необязательные: `frontend`; `ownership` для PR без тега `[Axx]` только информирует.
 * **Интеграция:** порядок мерджа и чек-лист — [`scripts/merge_order.md`](scripts/merge_order.md). Проверка чужих файлов — `scripts/check_ownership.py`. Лицензии, облачные API и файлы в git — `scripts/check_licenses.py`. Сверка fallback-копий контракта с каноном — `scripts/check_fallbacks.py`.
 * **В git не коммитим:** видео, кадры из датасета, веса (`*.mov`, `*.mp4`, `*.onnx`, `*.pt`, `*.safetensors`, `*.gguf`…), ключи и `.env`. См. `.gitignore`.
+
+## Решения A01 (фаза 2)
+
+- **«Нет нарушения» — только при подтверждённой полноте `meta.coverage`.** Без неё, при неполном или упавшем анализе ответ — `failed` с причиной. Это инвариант, а не гипотеза. Оркестратору — `contracts.extensions.compute_coverage`.
+- **Production сам на mock не переключается.** Результат с `meta.mock` или стадией `mock` без явного `SENTINEL_MOCK=1` отдаётся как `failed`. Фикстуры и e2e тест-кита помечены как mock явно.
+- **Неизвестно ≠ нет:** ненаблюдавшийся сигнал отсутствует в `signals`, `0.0` означает «видели, что нет».
+- **Гипотезы — за флагами в `contracts/config.yaml`, по умолчанию выключены**, пока L2 не измерит выигрыш. Сейчас это `jury.embed_rule_in_description: false` (в фазе 1 было включено).
+- **`result_to_api` = UI-report**, как в контракте; ответ жюри — `result_to_jury_api`. Строгий ответ по умолчанию ломал кэш A03 и `eval` A16 — это показала пробная интеграция.
+- **Таймкод** — начало действия; если `timecode_sec` не конечен, берётся `t_start`. Сдвиг `t_peak` подбирается замером L2 (`signed_median` в отчёте), а не фиксированным +0.5 с.
+- **`.gitignore` — только якорные шаблоны каталогов данных** (`/data/` и т.п.). Медиа, веса и файлы > 5 МБ блокирует `scripts/guard_media.py`: в pre-commit и в CI.
+- **Зависимости — от lock L1:** `scripts/resolve_deps.py` показывает конфликты и не подставляет максимальные версии (`scripts/DEPS_REPORT.md`).
+- **Совместимость веток** — `contracts/COMPAT.md`: матрица генерируется `scripts/compat_matrix.py`, к ней приложены записки владельцам.
+- **CI строгий:** e2e с `--strict-stages` — модуль, нарушивший контракт, роняет обязательную проверку. Полная сборка проверяется отдельно (`e2e-full`, `--require-full`): без `backend.pipeline.run` это «NOT RUN» (код 3), а не зелёный пропуск.
+
+### Команда замера для L2 (без GPU, по готовым результатам пайплайна)
+
+```bash
+python scripts/l2_contract_check.py --preds <папка JSON-результатов прогона, напр. preds_raw от eval A16> \
+    --labels <CSV video,label,second> --out reports/a01_l2_contract.json \
+    --compare-set jury.embed_rule_in_description=true
+```
+
+| Что сравниваем | Метрики |
+|---|---|
+| База (флаги по умолчанию) против одной гипотезы `--compare-set` | доля валидных строгих ответов жюри; статусы и причины `failed` (сколько «нет нарушения» не подтверждено `meta.coverage`); TP/FP/FN/TN и `failed` по разметке; таймкод (\|Δ\| медиана и p90, попадание ±1/±2/±3 с, знаковый сдвиг); latency (`meta.timings.total`); пик VRAM (`meta.vram_events`); воспроизводимость (`--repeat` со вторым прогоном) |
+
+Цифр без этого замера A01 не приводит.

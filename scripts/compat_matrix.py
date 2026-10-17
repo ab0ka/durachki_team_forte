@@ -238,7 +238,7 @@ def branch_info() -> list[dict]:
             o = owner_of(f)
             if o and o != "A01":
                 owners[o] = owners.get(o, 0) + 1
-        agent = max(owners, key=owners.get) if owners else "A01"
+        agent = "L2 (интеграция)" if "integration" in ref else max(owners, key=owners.get) if owners else "A01"
         related = subprocess.run(["git", "merge-base", "origin/main", ref], cwd=ROOT, capture_output=True).returncode
         out.append({"ref": ref, "agent": agent, "sha": git("rev-parse", "--short", ref),
                     "related": "да" if related == 0 else "нет (несвязанная история)"})

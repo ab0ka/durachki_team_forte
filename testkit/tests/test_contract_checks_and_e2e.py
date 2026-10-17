@@ -76,3 +76,76 @@ def test_e2e_main(out_dir):
     assert e2e_stub.main(["--scenarios", "clean,V05", "--duration", "5", "--fps", "5", "--fixtures-only",
                           "--require-accuracy", "--out", str(out_dir)]) == 0
     assert (out_dir / "e2e_report.json").exists()
+
+
+# ----------------------------------------------------------------------------- аудит 2055fc4: окружение и полная сборка
+
+def test_e2e_main_does_not_mutate_environ(out_dir, monkeypatch):
+    monkeypatch.delenv("SENTINEL_MOCK", raising=False)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    import os
+
+    before = dict(os.environ)
+    assert e2e_stub.main(["--scenarios", "clean", "--duration", "3", "--fps", "5", "--fixtures-only",
+                          "--out", str(out_dir)]) == 0
+    assert dict(os.environ) == before
+
+
+def test_require_full_without_backend_is_not_run(out_dir, monkeypatch, capsys):
+    real = e2e_stub._resolve
+    monkeypatch.setattr(e2e_stub, "_resolve", lambda m, f: None if m == "backend.pipeline" else real(m, f))
+    rc = e2e_stub.main(["--require-full", "--scenarios", "clean", "--duration", "3", "--fps", "5",
+                        "--out", str(out_dir)])
+    out = capsys.readouterr().out
+    assert rc == e2e_stub.EXIT_NOT_RUN and "NOT RUN" in out and "ПОЛНАЯ СБОРКА НЕ ПРОВЕРЕНА" in out
+
+
+def _fake_backend(meta: dict, verdict: str = "no_violation"):
+    def run(video_path, job_id, progress=None, deadline_s=240):
+        return AnalysisResult(job_id=job_id, status="done", verdict=verdict, meta=dict(meta))
+    return run
+
+
+def _with_backend(monkeypatch, fn):
+    real = e2e_stub._resolve
+    monkeypatch.setattr(e2e_stub, "_resolve", lambda m, f: fn if (m, f) == ("backend.pipeline", "run") else real(m, f))
+
+
+def test_full_build_passes_with_coverage_and_explicit_mock(out_dir, monkeypatch):
+    from contracts.extensions import compute_coverage
+
+    _with_backend(monkeypatch, _fake_backend({"mock": True, "coverage": compute_coverage(3.0, 3.0)}))
+    monkeypatch.setenv("SENTINEL_MOCK", "1")
+    rec = e2e_stub.run_scenario("clean", out_dir, duration=3, fps=5, require_backend=True, expect_status="done")
+    assert rec["runner"] == "backend.pipeline" and rec["errors"] == [] and rec["response"]["status"] == "done"
+
+
+def test_backend_mock_without_explicit_mode_is_an_error(out_dir, monkeypatch):
+    from contracts.extensions import compute_coverage
+
+    _with_backend(monkeypatch, _fake_backend({"mock": True, "coverage": compute_coverage(3.0, 3.0)}))
+    monkeypatch.delenv("SENTINEL_MOCK", raising=False)
+    rec = e2e_stub.run_scenario("clean", out_dir, duration=3, fps=5, require_backend=True)
+    assert any("production" in e for e in rec["errors"]) and rec["response"]["status"] == "failed"
+
+
+def test_expect_status_catches_missing_coverage(out_dir, monkeypatch):
+    _with_backend(monkeypatch, _fake_backend({}))  # оркестратор без meta.coverage
+    monkeypatch.setenv("SENTINEL_MOCK", "1")
+    rec = e2e_stub.run_scenario("clean", out_dir, duration=3, fps=5, require_backend=True, expect_status="done")
+    assert any("ожидался status=done" in e and "meta.coverage" in e for e in rec["errors"])
+
+
+def test_deadline_overrun_is_an_error(out_dir, monkeypatch):
+    import time as _t
+
+    from contracts.extensions import compute_coverage
+
+    def slow(video_path, job_id, progress=None, deadline_s=240):
+        _t.sleep(0.05)
+        return AnalysisResult(job_id=job_id, status="done", verdict="no_violation",
+                              meta={"coverage": compute_coverage(3.0, 3.0)})
+
+    _with_backend(monkeypatch, slow)
+    rec = e2e_stub.run_scenario("clean", out_dir, duration=3, fps=5, require_backend=True, deadline_s=0.001)
+    assert any("дедлайн" in e for e in rec["errors"])

@@ -2,7 +2,8 @@
 """Сверка fallback-копий контракта (``<модуль>/_contract_fallback.py``) с каноном (владелец A01).
 
 После мерджа A01 модули импортируют ``contracts.sentinel_contracts``, а не свою копию. Если копия разошлась
-с каноном (добавлены/изменены поля), модуль мог опираться на другой контракт — это ошибка (код 1).
+с каноном (добавлены/изменены поля), модуль мог опираться на другой контракт — это ошибка (код 1). Ошибка и
+«висячий» импорт (DANGLING): копии уже нет, а модуль импортирует её без ``try/except`` — модуль не загрузится.
 
     python scripts/check_fallbacks.py            # отчёт
     python scripts/check_fallbacks.py --drop     # (интегратор, после мерджа A01) удалить совпадающие копии
@@ -48,7 +49,7 @@ def find_fallbacks(root: Path) -> list[Path]:
 def unguarded_imports(root: Path) -> dict[str, list[str]]:
     """Прямые (вне try/except) импорты ``_contract_fallback``: {каталог модуля: [файл:строка]}."""
     out: dict[str, list[str]] = {}
-    for p in root.rglob("*.py"):
+    for p in sorted(root.rglob("*.py")):
         rel = p.relative_to(root)
         if any(part in SKIP for part in rel.parts) or p.name == "_contract_fallback.py":
             continue
@@ -58,12 +59,21 @@ def unguarded_imports(root: Path) -> dict[str, list[str]]:
             continue
         guarded = {id(m) for n in ast.walk(tree) if isinstance(n, ast.Try) for h in n.handlers for m in ast.walk(h)}
         for n in ast.walk(tree):
-            if isinstance(n, ast.ImportFrom) and n.module and "_contract_fallback" in n.module \
-                    and id(n) not in guarded:
-                target = n.module.replace(".", "/").rsplit("/_contract_fallback", 1)[0] if n.level == 0 \
-                    else rel.parent.as_posix() if n.level == 1 else rel.parent.parent.as_posix()
+            target = _fallback_target(rel, n) if isinstance(n, ast.ImportFrom) else None
+            if target is not None and id(n) not in guarded:
                 out.setdefault(target, []).append(f"{rel.as_posix()}:{n.lineno}")
     return out
+
+
+def _fallback_target(rel: Path, n: ast.ImportFrom) -> str | None:
+    """Каталог, из которого ``n`` импортирует ``_contract_fallback``; None — импорт не про копию контракта."""
+    parts = n.module.split(".") if n.module else []
+    if "_contract_fallback" in parts:
+        parts = parts[:parts.index("_contract_fallback")]
+    elif not any(a.name == "_contract_fallback" for a in n.names):  # from . import _contract_fallback
+        return None
+    base = rel.parents[min(n.level, len(rel.parents)) - 1] if n.level else Path()
+    return base.joinpath(*parts).as_posix()
 
 
 def compare(path: Path, canon_src: str) -> tuple[str, str]:
@@ -94,7 +104,13 @@ def main(argv: list[str] | None = None) -> int:
     canon = canon_path.read_text(encoding="utf-8")
     rc = 0
     blockers = unguarded_imports(root)
-    for p in find_fallbacks(root):
+    fallbacks = find_fallbacks(root)
+    present = {p.parent.relative_to(root).as_posix() for p in fallbacks}
+    for module_dir, refs in sorted(blockers.items()):
+        if module_dir not in present:
+            print(f"{'DANGLING':15} {module_dir}/_contract_fallback.py нет, а импорт без try/except: {', '.join(refs)}")
+            rc = 1
+    for p in fallbacks:
         status, why = compare(p, canon)
         rel = p.relative_to(root).as_posix()
         print(f"{status:15} {rel}" + (f" — {why}" if why else ""))
