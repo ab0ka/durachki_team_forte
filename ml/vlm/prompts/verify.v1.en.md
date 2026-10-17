@@ -2,10 +2,10 @@
 id: verify
 version: v1
 lang: en
-placeholders: [n_frames, frame_times, candidate_type, candidate_name, candidate_facts, type_catalog]
+placeholders: [n_frames, frame_times, boxes_note, candidate_type, candidate_name, candidate_facts, type_catalog]
 ---
 You see {{n_frames}} frames of one fragment from a ceiling camera above a bank cash desk, in order; frame times (s): {{frame_times}}.
-Red boxes highlight objects flagged by an automatic detector (the label is the detector's guess; it can be wrong).
+{{boxes_note}}
 
 The automatic system suspects a violation:
 - type: {{candidate_type}} "{{candidate_name}}"

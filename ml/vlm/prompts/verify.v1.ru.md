@@ -2,10 +2,10 @@
 id: verify
 version: v1
 lang: ru
-placeholders: [n_frames, frame_times, candidate_type, candidate_name, candidate_facts, type_catalog]
+placeholders: [n_frames, frame_times, boxes_note, candidate_type, candidate_name, candidate_facts, type_catalog]
 ---
 Перед тобой {{n_frames}} кадр(ов) одного фрагмента записи потолочной камеры кассы, по порядку; время кадров (с): {{frame_times}}.
-Красными рамками подсвечены объекты, на которые указал автоматический детектор (подпись — что это по его мнению; детектор может ошибаться).
+{{boxes_note}}
 
 Автоматическая система подозревает нарушение:
 - тип: {{candidate_type}} «{{candidate_name}}»

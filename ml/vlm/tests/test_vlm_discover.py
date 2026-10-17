@@ -1,4 +1,5 @@
 import json
+import re
 
 from ml.vlm.backends.mock import MockBackend
 from ml.vlm.discoverer import discover_events, plan_windows
@@ -110,3 +111,23 @@ def test_merge_adjacent_windows(clip, cfg, clock):
     cfg["discover"]["motion_weighting"] = False
     out = discover_events(clip, 60.0, cfg=cfg, backend=be, clock=clock, force=True)
     assert len(out) == 1 and out[0].extra["vlm_discover"].get("windows", 1) == 2
+
+
+def test_external_motion_curve_is_used(cfg, clock):
+    long_clip = SyntheticClip(duration=30.0)
+    seen = []
+
+    def responder(images, system, prompt):
+        seen.append(prompt)
+        return EMPTY
+
+    be = MockBackend(responder=responder, clock=clock)
+    cfg["discover"]["min_coverage_windows"] = 0
+    motion = [(t * 0.5, 1.0 if 24.0 <= t * 0.5 <= 27.0 else 0.0) for t in range(60)]
+    discover_events(long_clip, 60.0, cfg=cfg, backend=be, clock=clock, force=True, motion=motion,
+                    limits={"max_calls": 1})
+    assert len(seen) == 1
+    line = seen[0].split("время кадров (с): ")[1].split("\n")[0]
+    times = [float(x) for x in re.findall(r"\d+: (\d+\.\d+)", line)]
+    assert times
+    assert all(24.0 <= t <= 27.0 for t in times)  # первое окно — самое активное по внешней кривой

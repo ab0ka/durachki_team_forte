@@ -2,7 +2,7 @@
 
 Публичные функции (сигнатуры контракта v1 + необязательные keyword-only расширения):
     verify(clip, events, budget_s, *, limits=None) -> list[Event]
-    discover(clip, budget_s, *, limits=None) -> list[Event]
+    discover(clip, budget_s, *, limits=None, motion=None) -> list[Event]
 Служебные: warmup(), unload(), status(), set_gpu_lock(lock), set_catalog(catalog), set_backend(backend).
 
 Импорт пакета лёгкий: torch/transformers/cv2 подгружаются только при первом реальном вызове.
@@ -33,12 +33,14 @@ def verify(clip: Any, events: list[Any], budget_s: float, *, limits: Optional[di
         return out
 
 
-def discover(clip: Any, budget_s: float, *, limits: Optional[dict[str, Any]] = None) -> list[Any]:
-    """Поиск нарушений вне правил (включая V99). По умолчанию выключен (config: discover.enabled=false)."""
+def discover(clip: Any, budget_s: float, *, limits: Optional[dict[str, Any]] = None,
+             motion: Optional[list[tuple[float, float]]] = None) -> list[Any]:
+    """Поиск нарушений вне правил (включая V99). По умолчанию выключен (config: discover.enabled=false).
+    motion — необязательная кривая [(t, 0..1)] (сигнал motion_energy из A08), чтобы не считать её заново."""
     from .discoverer import discover_events
 
     try:
-        return discover_events(clip, float(budget_s), limits=limits)
+        return discover_events(clip, float(budget_s), limits=limits, motion=motion)
     except Exception as e:  # noqa: BLE001
         log.warning("ml.vlm.discover failed: %s", type(e).__name__)
         return []

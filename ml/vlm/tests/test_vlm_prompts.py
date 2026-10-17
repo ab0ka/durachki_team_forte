@@ -38,6 +38,12 @@ def test_render_discover_checklist(lang):
     assert '"findings": []' in user
 
 
+def test_boxes_note_depends_on_boxes():
+    _, with_boxes = render_verify("V05", [], [1.0], None, "ru", has_boxes=True)
+    _, without = render_verify("V05", [], [1.0], None, "ru", has_boxes=False)
+    assert "Красными рамками" in with_boxes and "Рамок на кадрах нет" in without
+
+
 def test_unknown_candidate_type_falls_back_to_v99():
     _, user = render_verify("V42", [], [1.0], None, "ru")
     assert FALLBACK_CATALOG["types"]["V99"]["name"] in user

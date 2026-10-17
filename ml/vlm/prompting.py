@@ -121,15 +121,27 @@ def checklist_block(checklist: dict[str, str], lang: str = "ru") -> str:
     return "\n".join(lines)
 
 
+BOXES_NOTE = {
+    "ru": ("Красными рамками подсвечены объекты, на которые указал автоматический детектор "
+           "(подпись — что это по его мнению; детектор может ошибаться).",
+           "Рамок на кадрах нет — оцени кадр целиком."),
+    "en": ("Red boxes highlight objects flagged by an automatic detector (the label is the detector's guess; "
+           "it can be wrong).", "There are no boxes on the frames — judge the whole frame."),
+}
+
+
 def render_verify(event_type: str, candidate_facts: list[str], frame_times: list[float],
-                  catalog: Optional[dict[str, Any]] = None, lang: str = "ru", version: str = "v1") -> tuple[str, str]:
+                  catalog: Optional[dict[str, Any]] = None, lang: str = "ru", version: str = "v1",
+                  has_boxes: bool = True) -> tuple[str, str]:
     """-> (system, user) для verify."""
     types = catalog_types(catalog)
     spec = types.get(event_type) or types["V99"]
     facts = "; ".join(candidate_facts) if candidate_facts else ("нет" if lang == "ru" else "none")
+    note = BOXES_NOTE.get(lang, BOXES_NOTE["ru"])
     user = get_prompt("verify", version, lang).render(
         n_frames=len(frame_times),
         frame_times=_fmt_times(frame_times),
+        boxes_note=note[0] if has_boxes else note[1],
         candidate_type=event_type,
         candidate_name=spec.get("name", event_type),
         candidate_facts=facts,

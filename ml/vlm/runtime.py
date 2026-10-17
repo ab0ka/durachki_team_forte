@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Optional
 
@@ -65,22 +66,52 @@ def get_backend(cfg: dict[str, Any]) -> tuple[Optional[VLMBackend], str]:
         return _backend, _backend_reason
 
 
-def ensure_loaded(be: VLMBackend) -> tuple[bool, str]:
+_load_failed: dict[int, tuple[float, str]] = {}  # id(backend) -> (monotonic time, причина)
+
+
+def ensure_loaded(be: VLMBackend, budget: Optional[Budget] = None, min_budget_s: float = 0.0,
+                  retry_cooldown_s: float = 300.0) -> tuple[bool, str]:
+    """Ленивая загрузка. Если бюджет передан: время загрузки съедает его же (модель держите тёплой через
+    warmup()); при остатке < min_budget_s холодная загрузка не начинается. Неудачная загрузка не
+    повторяется retry_cooldown_s секунд (иначе каждое видео платило бы за неё заново)."""
     if be.loaded:
         return True, ""
+    failed = _load_failed.get(id(be))
+    if failed is not None and time.monotonic() - failed[0] < retry_cooldown_s:
+        return False, f"load failed recently: {failed[1]}"
+    if budget is not None and budget.remaining() < min_budget_s:
+        return False, f"model not warm and budget {budget.remaining():.1f}s < lazy_load_min_budget_s {min_budget_s}"
     try:
         with gpu_guard():
             be.load()
+        _load_failed.pop(id(be), None)
         return True, ""
     except BackendUnavailable as e:
-        return False, str(e)
+        reason = str(e)
     except Exception as e:  # noqa: BLE001 — OOM, битые веса и т.п.: стадия пропускается
         log.warning("VLM load failed: %s", type(e).__name__)
-        return False, f"{type(e).__name__}: {str(e)[:200]}"
+        reason = f"{type(e).__name__}: {str(e)[:200]}"
+        _free_cuda()
+    _load_failed[id(be)] = (time.monotonic(), reason)
+    return False, reason
+
+
+def _free_cuda() -> None:
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def unload_backend() -> None:
     global _backend, _backend_key
+    _load_failed.clear()
     with _state_lock:
         if _backend is not None:
             with contextlib.suppress(Exception):

@@ -80,7 +80,11 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
             for e in out:
                 _mark(e, "unavailable", reason=reason[:160])
             return out
-    ok, reason = ensure_loaded(backend)
+    lim = VLMLimits.from_cfg(cfg, "verify", limits)
+    budget = Budget(float(budget_s), lim, **({"clock": clock} if clock else {}))
+    rcfg = cfg.get("runtime") or {}
+    ok, reason = ensure_loaded(backend, budget, float(rcfg.get("lazy_load_min_budget_s", 0.0)),
+                               float(rcfg.get("load_retry_cooldown_s", 300.0)))
     if not ok:
         for e in out:
             _mark(e, "unavailable", reason=reason[:160])
@@ -95,8 +99,6 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
     ffcfg = cfg.get("facts_filter") or {}
     lang = str(cfg.get("lang", "ru"))
     version = str(cfg.get("prompt_version", "v1"))
-    lim = VLMLimits.from_cfg(cfg, "verify", limits)
-    budget = Budget(float(budget_s), lim, **({"clock": clock} if clock else {}))
     budget.px_per_token = _px_per_token(cfg)
     duration = clip_duration(clip)
     n_frames = max(1, min(int(fcfg.get("verify_n_frames", 5)), lim.max_frames_per_call))
@@ -124,7 +126,8 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
         images = prepare_images(frames, ftimes, ev.bboxes, ev.t_peak, fcfg)
         # число кадров уже <= max_frames_per_call; здесь только ужимаем под лимит визуальных токенов
         images = fit_images(images, len(images), lim.max_visual_tokens_per_call, budget.px_per_token)
-        system, user = render_verify(orig_type, list(ev.facts or []), ftimes, catalog, lang, version)
+        has_boxes = bool(ev.bboxes) and bool(fcfg.get("draw_boxes", True))
+        system, user = render_verify(orig_type, list(ev.facts or []), ftimes, catalog, lang, version, has_boxes)
         n_ref = len(ftimes)
         outcome = call_json(
             backend, images, system, user, budget,

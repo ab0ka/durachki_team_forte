@@ -77,7 +77,9 @@ def _merge(events: list[Event], gap: float) -> list[Event]:
 def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]] = None,
                     backend: Optional[VLMBackend] = None, limits: Optional[dict[str, Any]] = None,
                     catalog: Optional[dict[str, Any]] = None, clock: Any = None, force: bool = False,
-                    dump: Optional[DumpFn] = None, t_range: Optional[tuple[float, float]] = None) -> list[Event]:
+                    dump: Optional[DumpFn] = None, t_range: Optional[tuple[float, float]] = None,
+                    motion: Optional[list[tuple[float, float]]] = None) -> list[Event]:
+    """motion: готовая кривая [(t, energy 0..1)] (например, сигнал motion_energy из A08) — иначе считаем сами."""
     cfg = cfg or load_config()
     dcfg = cfg.get("discover") or {}
     if not (dcfg.get("enabled", False) or force):
@@ -86,7 +88,11 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
         backend, _reason = get_backend(cfg)
         if backend is None:
             return []
-    ok, _reason = ensure_loaded(backend)
+    lim = VLMLimits.from_cfg(cfg, "discover", limits)
+    budget = Budget(float(budget_s), lim, **({"clock": clock} if clock else {}))
+    rcfg = cfg.get("runtime") or {}
+    ok, _reason = ensure_loaded(backend, budget, float(rcfg.get("lazy_load_min_budget_s", 0.0)),
+                                float(rcfg.get("load_retry_cooldown_s", 300.0)))
     if not ok:
         return []
     catalog = catalog or load_catalog()
@@ -100,14 +106,13 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
     ffcfg = cfg.get("facts_filter") or {}
     lang = str(cfg.get("lang", "ru"))
     version = str(cfg.get("prompt_version", "v1"))
-    lim = VLMLimits.from_cfg(cfg, "discover", limits)
-    budget = Budget(float(budget_s), lim, **({"clock": clock} if clock else {}))
     budget.px_per_token = int(preset_cfg(cfg, "transformers").get("px_per_token", 28))
 
     duration = clip_duration(clip)
     lo, hi = (0.0, duration) if t_range is None else (max(0.0, t_range[0]), min(duration, t_range[1]))
-    motion = None
-    if dcfg.get("motion_weighting", True):
+    if motion is not None:
+        motion = [(float(t), float(e)) for (t, e) in motion if lo <= float(t) <= hi]
+    elif dcfg.get("motion_weighting", True):
         try:
             motion = [(t, e) for (t, e) in motion_energy(clip, int(dcfg.get("motion_downscale", 64)))
                       if lo <= t <= hi]

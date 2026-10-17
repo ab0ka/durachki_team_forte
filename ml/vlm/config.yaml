@@ -57,9 +57,14 @@ llamacpp_python:
   n_gpu_layers: -1
   n_ctx: 8192
 
+# Холодная загрузка модели внутри verify/discover съедает их бюджет: держите модель тёплой (vlm.warmup()).
+runtime:
+  lazy_load_min_budget_s: 45    # без warmup грузим лениво, только если бюджета >= 45 с
+  load_retry_cooldown_s: 300    # после неудачной загрузки не пробуем снова 5 минут
+
 generation:
-  max_new_tokens_verify: 220
-  max_new_tokens_discover: 300
+  max_new_tokens_verify: 180   # цель ≤ 6 с/вызов: короткий JSON (≤3 факта); проверить bench
+  max_new_tokens_discover: 220
   temperature: 0.0
   call_timeout_s: 12.0       # жёсткий потолок на один вызов (generate(max_time=...), HTTP timeout)
   # ретраи (1 повтор при невалидном JSON со строгим суффиксом) — лимитируются в budget.*

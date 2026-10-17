@@ -87,3 +87,54 @@ def test_fit_images_caps_frames_and_tokens():
     out = fit_images(imgs, max_frames=4, max_vis_tokens=400, px_per_token=28, keep_index=7)
     assert len(out) == 4
     assert sum(visual_tokens(i.size, 28) for i in out) <= 400
+
+
+class _SlowLoad(MockBackend):
+    """Бэкенд с «холодной» загрузкой: load() двигает часы, может падать."""
+
+    def __init__(self, clock, load_s=30.0, fail=False):
+        super().__init__(mode="confirm", clock=clock)
+        self._loaded = False
+        self.load_s, self.fail, self.load_calls = load_s, fail, 0
+
+    @property
+    def loaded(self):
+        return self._loaded
+
+    def load(self):
+        self.load_calls += 1
+        self.clock.advance(self.load_s)
+        if self.fail:
+            raise RuntimeError("CUDA out of memory")
+        self._loaded = True
+
+
+def test_cold_load_counts_against_budget(clip, cfg, clock):
+    from ml.vlm.verifier import verify_events
+    from ml.vlm._contract import Event
+    be = _SlowLoad(clock, load_s=30.0)
+    cfg["runtime"]["lazy_load_min_budget_s"] = 10.0
+    out = verify_events(clip, [Event("V05", 1, 2, 1.5, 0.6, "rules")], 32.0, cfg=cfg, backend=be, clock=clock,
+                        limits={"est_call_s": 3.0, "safety": 1.0})
+    assert be.load_calls == 1 and out[0].extra["vlm"]["status"] == "skipped_budget"  # 2 с после загрузки мало
+
+
+def test_cold_load_skipped_when_budget_small(clip, cfg, clock):
+    from ml.vlm.verifier import verify_events
+    from ml.vlm._contract import Event
+    be = _SlowLoad(clock)
+    cfg["runtime"]["lazy_load_min_budget_s"] = 45.0
+    out = verify_events(clip, [Event("V05", 1, 2, 1.5, 0.6, "rules")], 20.0, cfg=cfg, backend=be, clock=clock)
+    assert be.load_calls == 0 and out[0].extra["vlm"]["status"] == "unavailable"
+    assert "not warm" in out[0].extra["vlm"]["reason"]
+
+
+def test_failed_load_has_cooldown(clip, cfg, clock):
+    from ml.vlm.verifier import verify_events
+    from ml.vlm._contract import Event
+    be = _SlowLoad(clock, load_s=1.0, fail=True)
+    ev = [Event("V05", 1, 2, 1.5, 0.6, "rules")]
+    for _ in range(3):
+        out = verify_events(clip, ev, 100.0, cfg=cfg, backend=be, clock=clock)
+        assert out[0].extra["vlm"]["status"] == "unavailable" and out[0].confidence == 0.6
+    assert be.load_calls == 1  # повторно не грузим в течение load_retry_cooldown_s
