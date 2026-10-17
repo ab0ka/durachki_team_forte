@@ -29,6 +29,9 @@ def pytest_configure(config: Any) -> None:
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import os
+
+    saved = {k: v for k, v in os.environ.items() if k.startswith("SENTINEL_")}  # ничего не утекает в чужие тесты
     for k in _ENV_CLEAR:
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("SENTINEL_CACHE_DIR", str(tmp_path / "cache"))
@@ -40,6 +43,10 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     yield
     reset_executor()
     ModelRegistry.reset()
+    for k in [k for k in os.environ if k.startswith("SENTINEL_")]:
+        if k not in saved:
+            del os.environ[k]
+    os.environ.update(saved)
 
 
 @pytest.fixture(scope="session")

@@ -217,3 +217,12 @@ def test_cold_flag_queue_wait_and_vlm_usage(fake_ml, synth_video):
     assert r1.meta["queue_wait_s"] >= 0
     assert r1.meta["vlm"]["vlm_verify"]["budget"]["output_tokens"] == 37
     assert r1.meta["vlm"]["vlm_verify"]["statuses"] == {"checked": 1}
+
+
+def test_mock_config_does_not_leak_into_process_env(fake_ml, synth_video):
+    """mock одной задачи не должен переключать процесс API (и следующие задачи) в mock."""
+    import os
+
+    fake_ml()
+    run(synth_video, "job-mock-cfg", None, 60, overrides={"mock": True})
+    assert "SENTINEL_MOCK" not in os.environ
