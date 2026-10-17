@@ -108,3 +108,22 @@ def test_repo_itself_is_clean():
     rc = subprocess.run([sys.executable, str(SCRIPTS / "check_licenses.py"), "--root", str(root)],
                         capture_output=True, text=True)
     assert rc.returncode == 0, rc.stdout + rc.stderr
+
+
+def test_check_fallbacks(tmp_path):
+    import check_fallbacks
+
+    (tmp_path / "contracts").mkdir()
+    canon = (SCRIPTS.parent / "contracts" / "sentinel_contracts.py").read_text(encoding="utf-8")
+    (tmp_path / "contracts" / "sentinel_contracts.py").write_text(canon, encoding="utf-8")
+    for mod, text in {"ml/a": canon, "ml/b": "# копия\n" + canon,
+                      "ml/c": canon.replace("    source: str = \"\"\n", "    source: str = \"\"\n    extra: int = 0\n")}.items():
+        (tmp_path / mod).mkdir(parents=True)
+        (tmp_path / mod / "_contract_fallback.py").write_text(text, encoding="utf-8")
+    assert check_fallbacks.compare(tmp_path / "ml/a/_contract_fallback.py", canon)[0] == "identical"
+    assert check_fallbacks.compare(tmp_path / "ml/b/_contract_fallback.py", canon)[0] == "same-structure"
+    assert check_fallbacks.compare(tmp_path / "ml/c/_contract_fallback.py", canon)[0] == "DIVERGED"
+    assert check_fallbacks.main(["--root", str(tmp_path)]) == 1
+    (tmp_path / "ml/c/_contract_fallback.py").unlink()
+    assert check_fallbacks.main(["--root", str(tmp_path), "--drop"]) == 0
+    assert not list(tmp_path.rglob("_contract_fallback.py"))

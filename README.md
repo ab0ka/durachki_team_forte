@@ -68,5 +68,5 @@ Windows / Docker / Cloudflare Tunnel — см. [`deploy/`](deploy/) (A17).
 * **CI (`.github/workflows/ci.yml`):**
   * обязательные проверки: `core`, `modules` (матрица по модулям, `fail-fast: false`), `e2e`;
   * необязательная: `frontend`.
-* **Интеграция:** порядок мерджа и чек-лист — [`scripts/merge_order.md`](scripts/merge_order.md). Проверка чужих файлов — `scripts/check_ownership.py`. Лицензии, облачные API и файлы в git — `scripts/check_licenses.py`.
+* **Интеграция:** порядок мерджа и чек-лист — [`scripts/merge_order.md`](scripts/merge_order.md). Проверка чужих файлов — `scripts/check_ownership.py`. Лицензии, облачные API и файлы в git — `scripts/check_licenses.py`. Сверка fallback-копий контракта с каноном — `scripts/check_fallbacks.py`.
 * **В git не коммитим:** видео, кадры из датасета, веса (`*.mov`, `*.mp4`, `*.onnx`, `*.pt`, `*.safetensors`, `*.gguf`…), ключи и `.env`. См. `.gitignore`.

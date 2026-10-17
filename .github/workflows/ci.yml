@@ -52,6 +52,8 @@ jobs:
           python -m contracts.validate contracts/examples/job_done_full.json contracts/examples/ui_processing.json
       - name: Licenses / no cloud APIs / no weights or videos in git
         run: python scripts/check_licenses.py
+      - name: Fallback-копии контракта совпадают с каноном
+        run: python scripts/check_fallbacks.py
 
   modules:
     name: module ${{ matrix.module }}

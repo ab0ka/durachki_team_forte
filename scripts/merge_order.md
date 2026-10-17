@@ -41,7 +41,8 @@ git merge --no-ff --allow-unrelated-histories origin/<ветка-агента> -
 3. Удалить fallback-копию контракта, когда A01 уже в `main`:
    * удалить `<модуль>/_contract_fallback.py`;
    * заменить в коде блок `try: from contracts.sentinel_contracts import * / except ImportError: from ._contract_fallback import *` на `from contracts.sentinel_contracts import *  # noqa`;
-   * найти оставшиеся: `git grep -n "_contract_fallback"`.
+   * найти оставшиеся: `git grep -n "_contract_fallback"`;
+   * сверить копии с каноном и удалить совпадающие: `python scripts/check_fallbacks.py` (отчёт), затем `--drop`. На 17.10 все 14 копий побайтно совпадают с каноном.
 4. Прогнать тесты модуля: `pytest <папка> -m "not gpu and not slow"`.
 5. Прогнать сторож правил: `python scripts/check_licenses.py` (лицензии моделей, облачные API, видео/веса в git).
 6. Прогнать сквозной mock-тест: `python -m testkit.e2e_stub` (схема ответа жюри обязательна).
