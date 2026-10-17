@@ -60,3 +60,11 @@ def test_md5_duplicates_grouped():
     labs = {"X-2": VideoLabel("X-2", 0), "X-9": VideoLabel("X-9", 0), "X-3": VideoLabel("X-3", 1, [5.0])}
     g = assign_groups(labs, md5s={"X-2": "h", "X-9": "h", "X-3": "z"})
     assert g["X-2"] == g["X-9"] == "X-2" and g["X-3"] == "X-3"
+
+
+def test_time_inside_label_column(tmp_path):
+    p = tmp_path / "l.csv"
+    p.write_text("Видео;Нарушение\nX-1;22 секунда\nX-2;нет\nX-3;1\n", encoding="utf-8")
+    labs = read_labels(p)
+    assert labs["X-1"].label == 1 and labs["X-1"].times == [22.0]
+    assert labs["X-2"].label == 0 and labs["X-3"].label == 1 and labs["X-3"].times == []

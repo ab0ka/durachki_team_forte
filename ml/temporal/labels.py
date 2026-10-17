@@ -141,7 +141,10 @@ def read_labels(path: str | Path, time_offset_s: float = 0.0) -> dict[str, Video
             continue
         name = normalize_name(raw_name)
         times = [t + time_offset_s for t in parse_times(cell(i_time))]
-        lab = parse_label_value(cell(i_label))
+        lab_cell = cell(i_label)
+        lab = parse_label_value(lab_cell)
+        if not times and lab != 0 and lab_cell.strip() not in ("0", "1") and re.search(r"\d", lab_cell):
+            times = [t + time_offset_s for t in parse_times(lab_cell)]  # «22 секунда» в столбце метки
         if lab is None:  # нет явной метки: есть таймкод -> нарушение
             lab = 1 if times else 0
         typ = cell(i_type).upper().translate(_HOMOGLYPHS)

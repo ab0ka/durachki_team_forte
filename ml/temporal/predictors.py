@@ -268,7 +268,7 @@ def load_checkpoint(root: str | Path, cfg: dict, kind: Optional[str] = None) -> 
     if kind is None:
         sel = root / "selected.json"
         kind = json.loads(sel.read_text(encoding="utf-8")).get("kind") if sel.exists() else None
-        candidates = [kind] if kind else list(KINDS)
+        candidates = ([kind] if kind else []) + [k for k in KINDS if k != kind]
     else:
         candidates = [kind]
     for k in candidates:
@@ -276,6 +276,8 @@ def load_checkpoint(root: str | Path, cfg: dict, kind: Optional[str] = None) -> 
         if not (d / "meta.json").exists():
             continue
         meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        if kind is not None and k != kind:
+            log.warning("temporal: выбранный чекпоинт '%s' не найден, использую '%s'", kind, k)
         spec = InputSpec.from_npz(d / "spec.npz")
         model = BaselineLR.load(d, cfg) if k == "baseline" else TemporalHead.load(d, cfg)
         return model, spec, meta

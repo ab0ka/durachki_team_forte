@@ -17,7 +17,8 @@
 | Разметка | `labels.py` | Нормализация `X-1` / `Х-3` (кириллица), гибкий парсер `labels.csv` (`,` `;` или таб, рус/англ заголовки, «22 секунда», «0:22», «57 и 68»), группы дубликатов по md5 и по списку из конфига |
 | Обучение | `dataset.py`, `predictors.py`, `model.py` | **baseline**: логрегрессия по кадрам (numpy, + скользящее среднее). **temporal**: TCN (опционально +BiGRU) + MIL. Скейлер и PCA подгоняются только на train |
 | Валидация | `cv.py`, `splits.py`, `metrics.py` | Nested grouped CV и опциональный нетронутый holdout. Проверка утечек в `check_split` |
-| Инференс | `infer.py`, `postproc.py` | `score(clip)`. Без чекпоинта возвращает `([], [])` |
+| Инференс | `infer.py`, `postproc.py`, `predict.py` | `score(clip)`. Без чекпоинта возвращает `([], [])`. CLI `predict` — для ручной проверки (подмодуль не назван `score`, чтобы не затенять функцию контракта) |
+| Проверка сплитов | `check_split.py` | CLI: группы дубликатов, конфликты меток, отсутствие утечек на реальном индексе |
 | Бонус | `cluster.py` | k-means окон вокруг размеченных секунд + сетки кадров (локально, в `outputs/`) для быстрой разметки типов |
 
 ### Слабая разметка (как учим)
@@ -72,8 +73,10 @@ pip install -r ml/temporal/requirements.txt
 # один раз скачать веса (дальше всё офлайн; по умолчанию модуль сам ставит HF_HUB_OFFLINE=1):
 SENTINEL_OFFLINE=0 python -c "from transformers import AutoModel, AutoProcessor as P; m='google/siglip2-base-patch16-224'; AutoModel.from_pretrained(m); P.from_pretrained(m)"
 python -m ml.temporal.extract --videos data/raw --labels data/labels.csv      # cache/features/*.npz + index.json
+python -m ml.temporal.check_split                                              # группы дубликатов, конфликты, утечки (код 1 при утечке)
 python -m ml.temporal.cv --kind both                                           # reports/temporal_cv.json
 python -m ml.temporal.train --kind both                                        # weights/temporal/{baseline,temporal}/ + selected.json
+python -m ml.temporal.predict --video data/raw/X-1.mov                        # score() на одном видео (кривая + события)
 python -m ml.temporal.cluster --k 5                                            # outputs/temporal/clusters/ (локально)
 python -m pytest ml/temporal/tests -q                                          # без GPU и без весов
 ```
@@ -82,10 +85,10 @@ python -m pytest ml/temporal/tests -q                                          #
 Тип нарушения можно добавить в `labels.csv` столбцом `type_id`, после чего голова типа начнёт обучаться.
 
 ## Что реально проверено (контейнер без GPU, синтетика)
-- `pytest ml/temporal/tests`: **30 passed** (Python 3.13, numpy 2.5, torch 2.14 CPU, transformers 5.20.1,
+- `pytest ml/temporal/tests`: **32 passed** (Python 3.13, numpy 2.5, torch 2.14 CPU, transformers 5.20.1,
   opencv 4.x).
 - Сквозной тест в mock-режиме: синтетические видео (X/Х вперемешку, md5-дубликат с конфликтом меток)
-  → `extract` → `cv` → `train` → `score`.
+  → `extract` → `check_split` → `cv` → `train` → `predict`/`score`.
 - Путь SigLIP-бэкенда проверен на **крошечной случайной** SiglipModel (формы, нормировка). Настоящие
   веса SigLIP2 не скачивались и не запускались.
 - Скорость temporal head на CPU контейнера (4 потока), синтетический батч 8×192 шага×137 признаков:

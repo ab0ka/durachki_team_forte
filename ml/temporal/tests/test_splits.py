@@ -62,3 +62,13 @@ def test_validation_uses_only_original_version(monkeypatch, cfg):
     cvmod.fit_and_score("baseline", s[:2] + s[3:5], [s[2], s[5]], bank, cfg, seed=0)
     assert seen["X-3"] == [1] and seen["X-6"] == [1]       # валидация — только оригинал
     assert seen["X-1"] == [3]                               # train — оригинал + аугментации
+
+
+def test_check_split_verify_report():
+    from ml.temporal.check_split import verify
+
+    s = _dup_samples()
+    s[0].sources = [{"name": "X-1", "label": 1, "times": [5.0]}, {"name": "X-2", "label": 1, "times": [9.0]}]
+    rep = verify(s, ["loo", "3"], holdout=0.25)
+    assert rep["ok"] and rep["folds"]["loo"]["n_folds"] == len({x.group for x in s})
+    assert rep["duplicate_groups"] == {"X-1": ["X-1", "X-2"]}

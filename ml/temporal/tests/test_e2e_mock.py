@@ -87,10 +87,18 @@ def test_end_to_end_extract_cv_train_score(tmp_path, monkeypatch):
     # исходные метки обоих файлов сохранены, расхождение помечено (политика positive)
     assert x6["conflict"] and x6["label"] == 1
     assert {(s["name"], s["label"]) for s in x6["sources"]} == {("X-6", 0), ("X-9", 1)}
+    from ml.temporal import check_split
+
+    assert check_split.main(["--folds", "loo", "3", "--holdout", "0.25"]) == 0
     assert train.main(["--kind", "baseline", "--cv-report", str(out)]) == 0
+    from ml.temporal import predict
+
+    assert predict.main(["--video", str(vids / "X-2.avi"), "--json", str(tmp_path / "pred.json")]) == 0
+    assert json.loads((tmp_path / "pred.json").read_text(encoding="utf-8"))["status"]["status"] == "ok"
 
     import ml.temporal as temporal
 
+    assert callable(temporal.score)                 # подмодуль predict не затеняет функцию контракта
     clip = SimpleClip(str(vids / "Х-1.avi"), sample_fps=5.0)
     risk, events = temporal.score(clip)
     st = temporal.status()
