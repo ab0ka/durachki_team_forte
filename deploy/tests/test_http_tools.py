@@ -58,3 +58,15 @@ def test_sla_bench_concurrent(stub, video):
     assert all(j["status"] == "done" for j in rep["jobs"])
     rep = sla_bench.run_bench(stub, "bad", [video], limit_s=5)
     assert not rep["ok"] and rep["jobs"][0]["status"].startswith("submit 401")
+
+
+def test_ready_rejects_fake_pipeline_in_readyz(video):
+    srv = stub_api.serve("127.0.0.1", 0, keys=["k1"], polls_until_done=0, pipeline="fake")
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}"
+        rep = healthcheck.ready(url, "k1", video, limit_s=10)
+        assert not rep["ok"] and any("pipeline=fake" in p for p in rep["problems"])
+        assert rep["readyz"]["pipeline"] == "fake"
+    finally:
+        srv.shutdown()

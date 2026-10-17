@@ -46,6 +46,16 @@ def ready(url: str, api_key: str, video: Path, limit_s: float = 300.0, allow_stu
         p.append(f"сервер не отвечает: {lv['error'] or lv['status']}")
         rep["ok"] = False
         return rep
+    rz = httpkit.request("GET", url.rstrip("/") + "/readyz", timeout=10)
+    rzb = rz.json() if rz.status else None
+    rep["readyz"] = {"status": rz.status, "state": (rzb or {}).get("state") if isinstance(rzb, dict) else None,
+                     "pipeline": (rzb or {}).get("pipeline") if isinstance(rzb, dict) else None}
+    if rz.status == 503:
+        p.append(f"/readyz 503 (state={rep['readyz']['state']}): warmup A02 не завершён или нет весов")
+        rep["ok"] = False
+        return rep
+    if rep["readyz"]["pipeline"] == "fake" and not allow_stub:
+        p.append("/readyz: pipeline=fake — фиктивный пайплайн в проде запрещён")
     body, ctype = httpkit.multipart("file", video.name, video.read_bytes())
     noauth = httpkit.request("POST", url.rstrip("/") + "/api/v1/analyze", {"Content-Type": ctype}, body, timeout=120)
     rep["no_key_status"] = noauth.status
@@ -70,6 +80,12 @@ def ready(url: str, api_key: str, video: Path, limit_s: float = 300.0, allow_stu
         p.append(f"задача не завершилась успешно за {limit_s:.0f} с: status={rep['status']!r}")
     else:
         p += httpkit.validate_job(doc)
+        meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+        if (meta.get("fake_pipeline") or meta.get("mock")) and not allow_stub:
+            p.append("meta.fake_pipeline/mock=true — результат не от реальных моделей")
+        if doc.get("verdict") == "no_violation" and meta.get("complete") is False:
+            p.append("no_violation при meta.complete=false — неполный анализ ≠ «нарушений нет»")
+        rep["complete"] = meta.get("complete")
     rep["ok"] = not p
     return rep
 

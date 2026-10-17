@@ -30,8 +30,8 @@ RANGE_PAYLOAD = bytes(range(256)) * 4096  # 1 MiB детерминированн
 
 
 class StubState:
-    def __init__(self, keys: list[str], polls_until_done: int = 2) -> None:
-        self.keys, self.polls_until_done = keys, polls_until_done
+    def __init__(self, keys: list[str], polls_until_done: int = 2, pipeline: str = "stub") -> None:
+        self.keys, self.polls_until_done, self.pipeline = keys, polls_until_done, pipeline
         self.jobs: dict[str, dict] = {}
         self.lock = threading.Lock()
 
@@ -64,8 +64,10 @@ def make_handler(state: StubState):
         def do_GET(self):  # noqa: N802
             u = urllib.parse.urlsplit(self.path)
             q = urllib.parse.parse_qs(u.query)
-            if u.path in ("/healthz", "/readyz"):
+            if u.path == "/healthz":
                 return self._send(200, {"status": "ok", "stub": True})
+            if u.path == "/readyz":
+                return self._send(200, {"ready": True, "state": "ready", "pipeline": state.pipeline, "stub": True})
             if u.path == "/__probe/slow":
                 secs = min(float(q.get("seconds", ["1"])[0]), 600.0)
                 time.sleep(secs)
@@ -118,10 +120,10 @@ def make_handler(state: StubState):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000, keys: list[str] | None = None,
-          polls_until_done: int = 2) -> ThreadingHTTPServer:
+          polls_until_done: int = 2, pipeline: str = "stub") -> ThreadingHTTPServer:
     keys = keys if keys is not None else [k.strip() for k in (os.environ.get("SENTINEL_API_KEYS") or "").split(",")
                                           if k.strip()]
-    srv = ThreadingHTTPServer((host, port), make_handler(StubState(keys, polls_until_done)))
+    srv = ThreadingHTTPServer((host, port), make_handler(StubState(keys, polls_until_done, pipeline)))
     srv.daemon_threads = True
     return srv
 
