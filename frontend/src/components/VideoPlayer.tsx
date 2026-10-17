@@ -1,4 +1,4 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState, type ReactNode } from "react";
 import { AlertTriangle, Info, Pause, Play, RotateCcw, RotateCw, VideoOff, X } from "lucide-react";
 import type { TimelinePoint, Violation } from "../api/types";
 import { demoSceneDataUri } from "../api/demo";
@@ -37,6 +37,21 @@ interface Props {
    * Задаётся флагом uiConfig.ptsOffsetMode; по умолчанию 0.
    */
   timeOffset?: number;
+  /** Оверлей поверх видимой области кадра (object-fit: contain): (время анализа, размер области px). */
+  overlay?: (t: number, box: { w: number; h: number }) => ReactNode;
+  /** Выбор эпизода с шкалы — общий с навигатором и карточками. */
+  onSelect?: (i: number) => void;
+}
+
+/** Видимая область кадра внутри сцены при object-fit: contain (поля по бокам или сверху/снизу). */
+export function contentRect(stage: { w: number; h: number }, aspect: number): { left: number; top: number; w: number; h: number } {
+  let w = stage.w;
+  let h = aspect > 0 ? stage.w / aspect : stage.h;
+  if (h > stage.h) {
+    h = stage.h;
+    w = stage.h * aspect;
+  }
+  return { left: (stage.w - w) / 2, top: (stage.h - h) / 2, w, h };
 }
 
 const SPEEDS = [0.5, 1, 2];
@@ -72,7 +87,7 @@ function mediaErrorReason(code: number | undefined): string {
 }
 
 const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
-  { source, synthetic, duration, timeline, violations, hints, onTime, timeOffset = 0 },
+  { source, synthetic, duration, timeline, violations, hints, onTime, timeOffset = 0, overlay, onSelect },
   ref,
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -344,6 +359,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
   // Поверх кадра — только номер и интервал (название — в навигаторе и карточке под плеером).
   const compactChip = !inMargins;
   const badge = virtual ? <span className={s.badge}>синтетическая сцена · демо</span> : null;
+  const rect = overlay && showVideo && stageBox && shownAspect ? contentRect(stageBox, shownAspect) : null;
   const range = av
     ? av.t_start !== undefined && av.t_end !== undefined
       ? `${formatTimecode(av.t_start)}–${formatTimecode(av.t_end)}`
@@ -429,6 +445,11 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
             {noticeEl}
           </div>
         )}
+        {rect && overlay && (
+          <div className={s.overlayLayer} style={{ left: rect.left, top: rect.top, width: rect.w, height: rect.h }}>
+            {overlay(t, { w: rect.w, h: rect.h })}
+          </div>
+        )}
         {loading && showVideo && (
           <div className={s.center} role="status" aria-label="Видео загружается">
             <Spinner className="h-7 w-7" />
@@ -506,7 +527,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
       </div>
       {d > 0 ? (
         <div className="mt-5">
-          <RiskTimeline duration={d} timeline={timeline} violations={violations} hints={hints} currentTime={t} onSeek={(x) => seekTo(x, "scrub")} />
+          <RiskTimeline duration={d} timeline={timeline} violations={violations} hints={hints} currentTime={t} onSeek={(x) => seekTo(x, "scrub")} onSelect={onSelect} />
         </div>
       ) : (
         <p className="mt-4 text-xs text-slate-500">Длительность записи неизвестна — шкала риска недоступна.</p>

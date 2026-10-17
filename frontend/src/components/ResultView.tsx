@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { ApiError, localVideo } from "../api/client";
 import { inferDuration, reviewHints, toJuryJson } from "../api/normalize";
+import { episodesForViolation, type Observations } from "../api/observations";
 import type { JobResult } from "../api/types";
 import { useApp } from "../context";
 import { formatDateTime, formatDuration, formatTimecode } from "../lib/format";
@@ -24,6 +25,8 @@ import EpisodeNavigator from "./EpisodeNavigator";
 import RetryUpload from "./RetryUpload";
 import { uiConfig } from "../lib/uiConfig";
 import CopilotPanel from "./CopilotPanel";
+import ObservationOverlay, { DEFAULT_LAYERS, type OverlayLayers } from "./ObservationOverlay";
+import RuleObservations, { OverlayToggles } from "./RuleObservations";
 import VideoPlayer, { type PlayerHandle } from "./VideoPlayer";
 import ViolationCard from "./ViolationCard";
 import { cx, LocalBadge } from "./ui";
@@ -98,6 +101,37 @@ export default function ResultView({
   // Сдвиг PTS — только по флагу (гипотеза до замера L2): meta.video.t0_pts_sec.
   const timeOffset = uiConfig().ptsOffsetMode === "meta_t0" ? readT0(job.meta) : 0;
   const capture = useCallback((x: number) => player.current?.captureAt(x) ?? Promise.resolve(null), []);
+
+  // Наблюдения правил (профиль pose_rules) — оверлей и объяснение; нет на сервере → null, UI как раньше.
+  const [obs, setObs] = useState<Observations | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setObs(null);
+    if (!replay && backend.observations && job.status === "done") {
+      backend.observations(job.job_id).then((o) => alive && setObs(o)).catch(() => alive && setObs(null));
+    }
+    return () => {
+      alive = false;
+    };
+  }, [backend, job.job_id, job.status, replay]);
+  const [layers, setLayers] = useState<OverlayLayers>(loadLayers);
+  useEffect(() => saveLayers(layers), [layers]);
+  const selIdx = Math.min(current, Math.max(0, episodes.length - 1));
+  const selEps = useMemo(() => episodesForViolation(obs, episodes[selIdx]), [obs, episodes, selIdx]);
+  const selIds = useMemo(() => new Set(selEps.map((e) => e.id)), [selEps]);
+  const shownEps = useMemo(
+    () => (layers.all ? (obs?.episodes ?? []).filter((e) => e.status === "event") : selEps),
+    [layers.all, obs, selEps],
+  );
+  const overlay = useMemo(
+    () =>
+      obs
+        ? (tt: number, box: { w: number; h: number }) => (
+            <ObservationOverlay obs={obs} episodes={shownEps} selectedIds={selIds} t={tt} width={box.w} height={box.h} layers={layers} />
+          )
+        : undefined,
+    [obs, shownEps, selIds, layers],
+  );
 
   const seek = (time: number) => {
     player.current?.seek(time);
@@ -256,7 +290,10 @@ export default function ResultView({
               hints={uiConfig().showReviewHints ? hints : []}
               onTime={onTime}
               timeOffset={timeOffset}
+              overlay={overlay}
+              onSelect={(i) => setCurrent(i)}
             />
+            {obs && <OverlayToggles layers={layers} onChange={setLayers} />}
             <EpisodeNavigator
               violations={episodes}
               current={Math.min(current, Math.max(0, episodes.length - 1))}
@@ -317,7 +354,17 @@ export default function ResultView({
               <ul className="space-y-1">
                 {episodes.map((v, i) => (
                   <li key={i}>
-                    <button className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left hover:bg-slate-50 dark:hover:bg-white/5" onClick={() => seek(v.timecode_sec)}>
+                    <button
+                      className={cx(
+                        "flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left hover:bg-slate-50 dark:hover:bg-white/5",
+                        i === selIdx && "bg-slate-50 ring-1 ring-ks-event/40 dark:bg-white/5",
+                      )}
+                      aria-current={i === selIdx ? "true" : undefined}
+                      onClick={() => {
+                        setCurrent(i);
+                        seek(v.timecode_sec);
+                      }}
+                    >
                       <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-ks-event text-[11px] font-bold text-ks-event-contrast">{i + 1}</span>
                       <span className="min-w-0 flex-1 truncate text-sm font-medium">{v.type}</span>
                       <span className="font-mono text-xs text-slate-500 tnum">{formatTimecode(v.timecode_sec)}</span>
@@ -356,6 +403,8 @@ export default function ResultView({
               </ul>
             </section>
           )}
+
+          {obs && <RuleObservations obs={obs} selected={selEps} violation={episodes[selIdx]} onSeek={seek} />}
 
           {!replay && job.status === "done" && <CopilotPanel jobId={job.job_id} />}
 
@@ -423,6 +472,23 @@ function readT0(meta: Record<string, unknown>): number {
     if (typeof v === "number" && Number.isFinite(v) && v >= 0 && v < 60) return v;
   }
   return 0;
+}
+
+const LAYERS_KEY = "ks.overlay.layers";
+function loadLayers(): OverlayLayers {
+  try {
+    const v = JSON.parse(localStorage.getItem(LAYERS_KEY) ?? "null") as Partial<OverlayLayers> | null;
+    return { ...DEFAULT_LAYERS, ...(v && typeof v === "object" ? v : {}) };
+  } catch {
+    return { ...DEFAULT_LAYERS };
+  }
+}
+function saveLayers(l: OverlayLayers) {
+  try {
+    localStorage.setItem(LAYERS_KEY, JSON.stringify(l));
+  } catch {
+    /* noop */
+  }
 }
 
 const REV_KEY = (id: string) => `ks.reviewed.${id}`;

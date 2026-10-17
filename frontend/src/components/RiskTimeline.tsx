@@ -11,12 +11,14 @@ interface Props {
   hints?: { timecode_sec: number; type: string }[];
   currentTime: number;
   onSeek: (t: number) => void;
+  /** Клик по маркеру эпизода — тот же выбор, что в навигаторе, карточках и оверлее. */
+  onSelect?: (i: number) => void;
 }
 
 const VB_W = 1000;
 
 /** Кастомная шкала плеера: тепловая полоса риска + интервалы эпизодов + маркеры (клик → перемотка). */
-export default function RiskTimeline({ duration, timeline, violations, hints = [], currentTime, onSeek }: Props) {
+export default function RiskTimeline({ duration, timeline, violations, hints = [], currentTime, onSeek, onSelect }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ x: number; t: number; r: number | null } | null>(null);
   const dragging = useRef(false);
@@ -139,6 +141,7 @@ export default function RiskTimeline({ duration, timeline, violations, hints = [
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => {
               e.stopPropagation();
+              onSelect?.(i);
               onSeek(v.timecode_sec);
             }}
             title={`Эпизод ${i + 1}: ${v.type} — ${formatTimecode(v.timecode_sec)}`}

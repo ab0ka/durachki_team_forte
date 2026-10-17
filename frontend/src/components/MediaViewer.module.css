@@ -782,3 +782,10 @@
     transform: none;
   }
 }
+
+/* оверлей наблюдений правил: ровно поверх видимой области кадра, клики проходят к видео */
+.overlayLayer {
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+}

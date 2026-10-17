@@ -363,6 +363,18 @@ def build_jobs_router(auth: Callable[[str], Callable[..., Any]], ui: bool) -> AP
                 pass
         raise HTTPException(404, "frame not found")
 
+    @r.get("/jobs/{job_id}/observations", tags=tag,
+           summary="Наблюдения правил по последовательностям: скелеты, предметы, зоны (расширение контракта)")
+    async def get_observations(job_id: str, request: Request, _: str = Depends(auth("read"))) -> Response:
+        """Только то, что использовали правила ml.seqrules (профиль pose_rules): meta + эпизоды с кадрами.
+        Нет файла → 404 (профиль без seqrules или анализ не дошёл до стадии), а не пустой «всё чисто»."""
+        ctx = _ctx(request)
+        _job_row(ctx, job_id)
+        p = ctx.manager.job_dir(job_id) / "observations.json"
+        if not p.is_file():
+            raise HTTPException(404, "observations not available for this job")
+        return FileResponse(p, media_type="application/json", headers={"Cache-Control": "no-store"})
+
     @r.post("/jobs/{job_id}/ask", tags=tag, summary="Вопрос локальному ассистенту (copilot)")
     async def ask(job_id: str, request: Request, _: str = Depends(auth("ask"))) -> Any:
         ctx = _ctx(request)

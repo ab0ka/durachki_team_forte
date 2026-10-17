@@ -3,6 +3,7 @@
 // Авторизация UI: GET /ui/v1/session → токен → заголовок X-UI-Token для /ui/v1/*.
 // Запасной путь: API-ключ из настроек → X-API-Key для /api/v1/*.
 import { normalizeJob } from "./normalize";
+import { parseObservations, type Observations } from "./observations";
 import type { AskResponse, JobResult, SessionInfo } from "./types";
 
 export const ENDPOINTS = {
@@ -24,6 +25,9 @@ export const ENDPOINTS = {
   uiVideo: (id: string) => `/ui/v1/jobs/${encodeURIComponent(id)}/video`,
   /** Запасной путь (только с API-ключом в памяти вкладки → blob). */
   apiVideo: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/video`,
+  /** Наблюдения правил ml.seqrules (профиль pose_rules): скелеты, предметы, зоны — расширение контракта. */
+  uiObservations: (id: string) => `/ui/v1/jobs/${encodeURIComponent(id)}/observations`,
+  apiObservations: (id: string) => `/api/v1/jobs/${encodeURIComponent(id)}/observations`,
 };
 
 export class ApiError extends Error {
@@ -127,6 +131,8 @@ export interface Backend {
   ask(id: string, question: string, history: { role: "user" | "assistant"; text: string }[]): Promise<AskResponse>;
   /** URL исходного видео для <video>; fallbacks — запасные источники (blob с X-API-Key и т. п.). */
   videoSource(id: string): { url: string; fallbacks?: (() => Promise<string>)[] } | null;
+  /** Наблюдения правил для оверлеев; null — сервер их не отдаёт (профиль без seqrules). */
+  observations?(id: string): Promise<Observations | null>;
 }
 
 function sessionFromJson(info: Record<string, unknown>, authenticated: boolean): SessionInfo {
@@ -389,6 +395,16 @@ export class HttpBackend implements Backend {
     const res = await this.fetchWithFallback(ENDPOINTS.uiReport(id), ENDPOINTS.apiReport(id));
     if (!res.ok) throw new ApiError(res.status, res.status === 404 ? "Заключение недоступно на этом сервере." : messageForStatus(res.status));
     return res.text();
+  }
+
+  async observations(id: string): Promise<Observations | null> {
+    try {
+      const res = await this.fetchWithFallback(ENDPOINTS.uiObservations(id), ENDPOINTS.apiObservations(id));
+      if (!res.ok) return null;
+      return parseObservations(await res.json());
+    } catch {
+      return null;
+    }
   }
 
   async getJob(id: string): Promise<{ job: JobResult; raw: unknown }> {
