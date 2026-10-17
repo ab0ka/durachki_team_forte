@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from .geometry import BBox, zone_membership
+from .geometry import BBox, anchor_point, point_in_polygon, zone_membership
 from .timeline import Timeline, sample_dt
 
 Polys = list[list[tuple[float, float]]]
@@ -131,6 +131,7 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
                     cashier_absent_known[i] = 0.0
 
     obs_unknown = np.zeros(n)
+    anchor_only = bool(pc.get("outsider_anchor_only", False))
     out: dict[str, Sig] = {}
     npers = np.zeros(n)
     outsider_p = np.zeros(n)
@@ -144,6 +145,11 @@ def presence_signals(tl: Timeline, zones: dict[str, Polys], workplace: Optional[
         staff_only = True
         for o in ps:
             mi = member(o.bbox, workplace, ay, of) if workplace else 0.0
+            if anchor_only and workplace:
+                # [H6] опорная точка, а не перекрытие бокса; клиент со своей стороны — никогда не «в зоне кассира»
+                ax_, ay_ = anchor_point(o.bbox, ay)
+                in_client = bool(client) and any(point_in_polygon(ax_, ay_, pp) for pp in client)
+                mi = 0.0 if in_client else float(any(point_in_polygon(ax_, ay_, pp) for pp in workplace))
             info = track_info.get(int(o.track_id)) if o.track_id is not None else None
             # доказательства «не сотрудник»: явная роль visitor или история в зоне клиентов
             if o.explicit_role:

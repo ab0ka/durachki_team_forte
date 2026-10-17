@@ -14,7 +14,8 @@
 
 Варианты (все — флаги config.yaml, по умолчанию выкл):
   baseline — текущие умолчания;  H1 — safe/door.cluster_mode=kmeans2;  H2 — safe.namer=siglip2 (GPU);
-  H3 — lights.freeze;  H4 — predicates.phone_det_only;  H5 — predicates.leave_onset=left_desk.
+  H3 — lights.freeze;  H4 — predicates.phone_det_only;  H5 — predicates.leave_onset=left_desk;
+  H6 — presence.outsider_anchor_only (legacy outsider: клиент напротив не повышает).
 Политики t_peak (onset/mid/max) считаются для каждого варианта без перезапуска.
 """
 from __future__ import annotations
@@ -39,6 +40,7 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "H3": {"lights": {"freeze": True}},
     "H4": {"predicates": {"phone_det_only": True}},
     "H5": {"predicates": {"leave_onset": "left_desk"}},
+    "H6": {"presence": {"outsider_anchor_only": True}},
 }
 
 
@@ -147,7 +149,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--videos", required=True)
     ap.add_argument("--labels", required=True, help="data/labels.csv (eval.labels)")
     ap.add_argument("--out", default="outputs/scene_bench")
-    ap.add_argument("--variants", default="baseline,H1,H3,H4,H5", help="через запятую; H2 требует GPU/весов SigLIP2")
+    ap.add_argument("--variants", default="baseline,H1,H3,H4,H5,H6", help="через запятую; H2 требует GPU/весов SigLIP2")
     ap.add_argument("--limit", type=int, default=0, help="только первые N роликов (smoke)")
     ap.add_argument("--dedup", action="store_true", help="по одному ролику на md5-группу")
     args = ap.parse_args(argv)

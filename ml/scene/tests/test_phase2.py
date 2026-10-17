@@ -283,3 +283,25 @@ def test_replay_never_creates_violations_from_missing_data(tmp_path):
     assert intervals(back) == intervals(st2)
     assert predicate(back[40], "cash_left_after_leave") is True
     assert predicate(back[40], "outsider_cashier_side") is not True
+
+
+def test_cash_in_client_hands_after_leave_is_not_cash_left_on_desk():
+    tr = leaving_cashier()
+    client = person_track(2, {t: CLIENT_SEAT for t in TIMES})
+    held = cash(box=(0.33, 0.24, 0.41, 0.30))  # купюры в руках клиента со стороны клиента
+    st, trace = run(person_dets([tr, client]) + held, [tr, client])
+    assert "true" not in pst(st, "cash_left_after_leave")
+
+
+def test_h6_legacy_outsider_anchor_only_flag():
+    from ml.scene.tests.synth import zones_default
+
+    cashier = person_track(1, {t: (0.30, 0.78, 0.46, 0.92) for t in TIMES})
+    tall_client = person_track(2, {t: (0.55, 0.0, 0.70, 0.50) for t in TIMES})  # опорная точка — в client_area
+    dets = person_dets([cashier, tall_client])
+    clip = make_clip(DUR)
+    _, tr_off = scene_states_with_trace(clip, dets, [cashier, tall_client], zones_default(), [])
+    _, tr_on = scene_states_with_trace(clip, dets, [cashier, tall_client], zones_default(), [], config={"presence": {"outsider_anchor_only": True}})
+    assert float(np.mean(tr_off["raw"]["outsider_in_cashier_area"])) > 0.3
+    # с флагом клиент (опорная точка в client_area) не вносит вклада; остаётся только априор 0.15 кассира с неизвестной ролью
+    assert float(np.max(tr_on["raw"]["outsider_in_cashier_area"])) <= 0.15 + 1e-9

@@ -252,13 +252,13 @@ def entry_events(ctx: PredContext, sides: list[list[tuple[Any, str]]], roles: di
     return evs
 
 
-def entry_pred(ctx: PredContext, evs: list[dict[str, Any]], lights: np.ndarray) -> tuple[np.ndarray, list[str]]:
+def entry_pred(ctx: PredContext, evs: list[dict[str, Any]], lights: np.ndarray, cash_desk: Optional[np.ndarray] = None) -> tuple[np.ndarray, list[str]]:
     pr = ctx.cfg["predicates"]
     n = len(ctx.times)
     ok = ctx.det_ran & (lights != T) & (ctx.quality >= float(pr["min_quality"]))
     out = np.where(ok, F, U).astype(np.int8)
     why = ["" if ok[i] else ("dark" if lights[i] == T else "no_detector") for i in range(n)]
-    vo = tri.t_or(ctx.sig_tri["safe_open"], ctx.sig_tri["cash_visible"])
+    vo = tri.t_or(ctx.sig_tri["safe_open"], cash_desk if cash_desk is not None else ctx.sig_tri["cash_visible"])
     win = float(pr["entry_mark_s"])
     for e in evs:
         i = e["i"]
@@ -346,6 +346,26 @@ def _bag_on_desk(ctx: PredContext) -> np.ndarray:
             if (not zones or any(point_in_polygon(cx, cy, p) for p in zones)) and not held:
                 on = True
         out[i] = T if on else F
+    return out
+
+
+def _cash_on_desk(ctx: PredContext) -> np.ndarray:
+    """Наличные именно НА СТОЛЕ (desk/cash_tray): детекция cash с центром в зоне стола (±1 сэмпл) — true;
+    legacy cash_visible = false (стол виден, детектор работал, цветовой признак молчит) — false; иначе unknown/occluded.
+    Купюры в руках клиента у стойки сюда не попадают. Без зоны стола — legacy cash_visible."""
+    pr = ctx.cfg["predicates"]
+    n = len(ctx.times)
+    zones = [p for zn in ("desk", "cash_tray") for p in (ctx.zones.get(zn) or [])]
+    legacy = ctx.sig_tri["cash_visible"]
+    if not zones:
+        return legacy.copy()
+    hit = np.zeros(n, bool)
+    for i in range(n):
+        for d in ctx.tl.dets_of(i, ("cash",), float(pr["object_min_score"])):
+            cx, cy = bbox_center(tuple(d.bbox))
+            if any(point_in_polygon(cx, cy, p) for p in zones):
+                hit[max(0, i - 1) : i + 2] = True
+    out = np.where(hit, T, np.where(legacy == F, F, np.where(legacy == O, O, U))).astype(np.int8)
     return out
 
 
@@ -522,8 +542,9 @@ def compute(ctx: PredContext) -> PredResult:
     whys["cashier_left_workplace"] = _why_fill(left, ["track_lost" if ctx.pres_extra.get("workplace_lost", np.zeros(n))[i] > 0 else "" for i in range(n)], "no_evidence")
 
     st = ctx.sig_tri
+    cash_desk = _cash_on_desk(ctx)
     for name, obj, vis in (
-        ("cash_left_after_leave", st["cash_visible"], ctx.sig_vis.get("cash_visible")),
+        ("cash_left_after_leave", cash_desk, ctx.sig_vis.get("cash_visible")),
         ("bag_left_after_leave", _bag_on_desk(ctx), None),
         ("safe_open_after_leave", st["safe_open"], ctx.sig_vis.get("safe_open")),
     ):
@@ -540,7 +561,7 @@ def compute(ctx: PredContext) -> PredResult:
     for name, (x, w) in outsider_preds(ctx, sides, roles, lo).items():
         res[name], whys[name] = x, w
     entries = entry_events(ctx, sides, roles)
-    res["entry_while_valuables_open"], whys["entry_while_valuables_open"] = entry_pred(ctx, entries, lo)
+    res["entry_while_valuables_open"], whys["entry_while_valuables_open"] = entry_pred(ctx, entries, lo, cash_desk)
 
     safe_vis = ctx.sig_vis.get("safe_open", np.ones(n))
     nobody_at_safe = np.where(safe_vis >= float(pr["vis_thr_safe_free"]), T, F).astype(np.int8)
@@ -551,7 +572,7 @@ def compute(ctx: PredContext) -> PredResult:
     det_only = bool(pr.get("phone_det_only", False))
     res["mobile_phone_in_hand"], whys["mobile_phone_in_hand"] = object_in_hand(ctx, "phone_in_hand", ("cell_phone",), roles, det_only)
     res["eating_drinking_with_object"], whys["eating_drinking_with_object"] = object_in_hand(ctx, "eating_drinking", ("cup", "bottle", "food"), roles, False)
-    valuables = tri.t_or(st["cash_visible"], st["safe_open"])
+    valuables = tri.t_or(cash_desk, st["safe_open"])
     ew = tri.t_and(res["eating_drinking_with_object"], st["cashier_in_workplace"], valuables)
     res["eating_at_workplace_with_valuables"] = ew
     whys["eating_at_workplace_with_valuables"] = _why_fill(ew, [""] * n, "no_evidence")
