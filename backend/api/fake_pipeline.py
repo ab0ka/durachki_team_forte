@@ -73,7 +73,7 @@ def make_fake_runner(seconds: float = 3.0) -> Callable[..., Any]:
         t = round(max(0.0, duration * 0.4), 2)
         g = grab_frame_at(Path(video_path), t)
         if g.ok:  # фактический PTS кадра, а не запрошенное время
-            t, img = float(g.pts or t), g.jpeg_b64 or ""
+            t, img = float(g.pts if g.pts is not None else t), g.jpeg_b64 or ""
         else:
             img = _placeholder(t)  # фейк: явно синтетическая картинка с надписью FAKE
         rules_raw, name = _catalog_rules("V01")
