@@ -1,0 +1,9 @@
+# ml/ingest (A04). Проверено: Python 3.11.17, av 18.1.0, opencv-python-headless 5.0.0, numpy 2.4.6, PyYAML 6.0.3, pytest 9.1.1
+av>=13.0            # BSD-3-Clause; колёса включают FFmpeg под LGPL-2.1 (коммерческое использование допустимо)
+opencv-python-headless>=4.9   # Apache-2.0 (фолбэк-декодер, JPEG, метрики, аугментации)
+numpy>=1.26         # BSD-3-Clause
+PyYAML>=6.0         # MIT
+# dev / тесты
+pytest>=7.4         # MIT
+# внешние бинарники (опционально): ffprobe/ffmpeg в PATH или $SENTINEL_FFPROBE/$SENTINEL_FFMPEG.
+# Без них probe идёт через PyAV/OpenCV, augment — через python-движок; часть тестов skip.
