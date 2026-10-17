@@ -1,0 +1,121 @@
+# Kassa Sentinel — ml.vlm (A11). Все пороги здесь; тюнятся на реальных данных.
+# Env-переопределения: SENTINEL_MOCK=1 (mock), SENTINEL_VLM_BACKEND, SENTINEL_VLM_PRESET,
+# SENTINEL_VLM_MODEL, SENTINEL_VLM_URL, SENTINEL_VLM_CONFIG (другой yaml), SENTINEL_VLM_LANG.
+version: 1
+
+# auto | off | mock | transformers | llamacpp_server | llamacpp_python
+# auto: пробует backends из auto_order; первый доступный (сервер отвечает / есть CUDA) — используется.
+backend: auto
+auto_order: [llamacpp_server, transformers]
+preset: qwen3vl4b            # какой пресет брать для transformers/llamacpp (см. presets)
+lang: ru                     # язык промптов: ru | en (факты всегда просим по-русски)
+prompt_version: v1
+
+presets:
+  # (б) Qwen3-VL-4B-Instruct, 4-bit bitsandbytes — ~3.2 ГБ VRAM, основной кандидат для RTX 4060 8 ГБ
+  qwen3vl4b:
+    transformers: {model: Qwen/Qwen3-VL-4B-Instruct, quant: bnb4}
+    llamacpp: {model_file: Qwen3VL-4B-Instruct-Q4_K_M.gguf, mmproj_file: mmproj-Qwen3VL-4B-Instruct-F16.gguf}
+  # Qwen3-VL-8B-Instruct, 4-bit — ~5.8 ГБ, точнее, но тесно рядом с остальными моделями
+  qwen3vl8b:
+    transformers: {model: Qwen/Qwen3-VL-8B-Instruct, quant: bnb4}
+    llamacpp: {model_file: Qwen3VL-8B-Instruct-Q4_K_M.gguf, mmproj_file: mmproj-Qwen3VL-8B-Instruct-F16.gguf}
+  # (а) Qwen2.5-VL-7B-Instruct-AWQ — ~6.5 ГБ, только «по требованию» (нужен autoawq)
+  qwen25vl7b_awq:
+    transformers: {model: Qwen/Qwen2.5-VL-7B-Instruct-AWQ, quant: awq}
+    llamacpp: {model_file: Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf, mmproj_file: mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf}
+  # Лёгкий запасной: Qwen2.5-VL-3B ЗАПРЕЩЁН (research license) — не добавлять! Qwen3-VL-2B — Apache-2.0.
+  qwen3vl2b:
+    transformers: {model: Qwen/Qwen3-VL-2B-Instruct, quant: none}
+    llamacpp: {model_file: Qwen3VL-2B-Instruct-Q8_0.gguf, mmproj_file: mmproj-Qwen3VL-2B-Instruct-F16.gguf}
+
+transformers:
+  device: cuda               # cuda | cpu
+  allow_cpu: false           # на CPU 4B-модель — минуты на вызов; по умолчанию стадия пропускается
+  dtype: float16
+  attn_implementation: sdpa
+  max_pixels: 200704         # 448*448 — процессор не будет апскейлить
+  min_pixels: 3136
+  skip_quant_modules: [visual, model.visual, lm_head]   # vision-энкодер не квантуем
+  local_files_only: null     # null => берётся из HF_HUB_OFFLINE
+
+llamacpp_server:
+  url: http://127.0.0.1:8081 # llama-server -m <gguf> --mmproj <mmproj> --port 8081 -ngl 99 -c 8192
+  health_timeout_s: 1.5
+  use_json_schema: true      # response_format=json_schema (грамматика llama.cpp); при 400 -> json_object
+  local_only: true           # запрет нелокальных адресов (правило 1: никакого облака)
+
+llamacpp_python:
+  models_dir: weights/vlm    # куда A17 кладёт GGUF
+  chat_handler: Qwen25VLChatHandler   # fallback: Llava15ChatHandler
+  n_gpu_layers: -1
+  n_ctx: 8192
+
+generation:
+  max_new_tokens_verify: 220
+  max_new_tokens_discover: 300
+  temperature: 0.0
+  call_timeout_s: 12.0       # жёсткий потолок на один вызов (generate(max_time=...), HTTP timeout)
+  retries: 1                 # 1 повтор при невалидном JSON (с более строгим суффиксом)
+  est_call_s: 4.0            # априорная оценка длительности вызова (до первых замеров)
+  budget_safety: 1.15        # не начинать вызов, если остаток < est_call_s * safety
+
+frames:
+  max_side: 448              # длинная сторона кадра на входе VLM
+  verify_n_frames: 5         # 4–6 кадров на событие
+  verify_pad_s: 1.0          # окно t_start-1 … t_end+1
+  verify_max_span_s: 12.0    # длинные события: кадры берём из окна вокруг t_peak
+  image_mode: multi          # multi — N картинок; grid — один коллаж (для бэкендов с 1 картинкой)
+  grid_cols: 3
+  draw_boxes: true
+  draw_timestamps: true
+  box_color: [255, 40, 40]   # RGB
+  jpeg_quality: 85           # для llama.cpp (data:image/jpeg;base64)
+
+verify:
+  # Логит-пулинг: logit(p) = logit(p0) + w * logit(p_vlm); p_vlm = c если visible, иначе 1-c
+  vlm_weight: 0.6
+  p_vlm_clip: [0.05, 0.95]
+  strong_rule_conf: 0.75      # сильное событие правил ...
+  strong_floor_ratio: 0.7     # ... не опускается ниже p0 * 0.7 (VLM понижает, но не удаляет)
+  max_drop: 0.45              # и вообще не падает больше чем на 0.45 за один verify
+  max_raise: 0.25             # VLM не поднимает уверенность больше чем на 0.25
+  retype_sources: [temporal, vlm]   # чьи события VLM может переклассифицировать
+  retype_min_conf: 0.7
+  drop_below: null            # null — verify никогда не удаляет события (решает fusion)
+  max_facts: 4
+  dedupe_iou_s: 0.6           # совпадающие по времени события одного типа проверяем один раз
+  priority: uncertain_first   # uncertain_first | confidence_desc | time
+
+discover:
+  enabled: true
+  window_s: 3.0
+  frames_per_window: 4
+  prior: 0.25                 # низкий априор для находок discover
+  vlm_weight: 0.6
+  max_conf: 0.6               # discover сам по себе не даёт «уверенного» события
+  min_vlm_conf: 0.55          # находка ниже этого порога отбрасывается
+  max_events: 4
+  reverify: true              # подтверждать находку вторым вызовом verify (если есть бюджет)
+  motion_weighting: true
+  motion_downscale: 64
+  min_coverage_windows: 3     # минимум окон по равномерной сетке, даже если движения нет
+  merge_gap_s: 1.5
+  checklist:                  # пункт чек-листа -> type_id каталога
+    phone: V05
+    food_drink: V06
+    safe_open_unattended: V03
+    outsider_in_cashier_area: V01
+    cash_unattended: V02
+    bag_handover_violation: V07
+    door_open: V04
+    hands_hidden: V08
+    other: V99
+
+facts_filter:
+  max_len: 220
+  drop_hedges: true           # «вероятно», «скорее всего» — это вывод, а не наблюдение
+
+mock:
+  latency_s: 0.0
+  mode: neutral               # neutral | confirm | reject | garbage | phone (env SENTINEL_VLM_MOCK_MODE)
