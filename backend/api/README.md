@@ -1,6 +1,6 @@
 # A02 — `backend/api/` (FastAPI)
 
-HTTP-слой Kassa Sentinel: API жюри по ТЗ, те же ручки для веб-UI по cookie-сессии, очередь задач с бюджетом времени и watchdog, отдача видео с Range, встроенная резервная страница.
+HTTP-слой Kassa Sentinel: API жюри по ТЗ, те же ручки для веб-UI по cookie-сессии, очередь задач с бюджетом времени, watchdog, отдача видео с Range, приёмка одной командой и замер для L2.
 
 Работает **строго одним процессом** — очередь и тёплые модели живут в памяти.
 
@@ -12,167 +12,213 @@ python -m backend.api --host 127.0.0.1 --port 8000
 # то же: uvicorn backend.api.main:app --workers 1 --no-access-log
 ```
 
+## Одна команда: схема ТЗ + авторизация + жизненный цикл
+
+```bash
+python -m pytest backend/api/tests -q                         # 76 тестов, без GPU и весов
+SENTINEL_API_KEY=... python -m backend.api.tools.acceptance --url http://127.0.0.1:8000 --out runs/acceptance.json
+```
+
+`acceptance` работает по живому URL (локально или через Cloudflare Tunnel). Реальные ролики не нужны: синтетический MOV он делает сам; свой можно передать через `--video x.mov`. Около 28 проверок:
+- **health:** `healthz`, `readyz` (WARN, если пайплайн fake).
+- **авторизация:** 401 без ключа и с неверным ключом; 404 на неизвестный job.
+- **плохие файлы:**
+  - 415 — `.txt`, мусор с расширением `.mov`, обрезанный MOV (проверяется декодером);
+  - 400 — пустой файл;
+  - 413 — заявлен `Content-Length` 400 МБ (ответ до чтения тела);
+  - обрыв загрузки посередине → задача не создаётся.
+- **полный цикл:**
+  - поля ТЗ есть на **каждом** опросе;
+  - `done|failed` за ≤ 300 с от приёма;
+  - ответ ≤ 3 МБ, кадры — валидный JPEG.
+- **идемпотентность:** повторная загрузка того же файла → тот же job.
+- **Range:** 206, `bytes=-10`, 416; видео без ключа → 401.
+- **UI:** без сессии 401 даже с same-origin-заголовками; неверный секрет → 401; вход ставит HttpOnly/SameSite cookie, токен в тело не попадает; видео по cookie + Range → 206; POST без CSRF → 403.
+- **CORS** для чужого Origin закрыт.
+
+Код выхода 0 — FAIL нет. Ключ берётся **только из env** (`SENTINEL_API_KEY` или первый из `SENTINEL_API_KEYS`), в argv и в отчёт он не попадает.
+
+Проверено в этой сессии (синтетика, без GPU):
+
+| Прогон | Результат |
+|---|---|
+| `acceptance` против `SENTINEL_FAKE_PIPELINE=1` | 27 PASS, 1 WARN (сам fake), 0 FAIL |
+| `acceptance` против **настоящего `backend.pipeline` из ветки A03** в mock-режиме (`SENTINEL_MOCK=1 SENTINEL_ALLOW_MOCK=1`, временная сборка, не коммитилась) | 27 PASS, 0 WARN, 0 FAIL |
+| `eval.jury_sim` из ветки A16 против этого API (`SENTINEL_DEDUP=0`) | 8/8 PASS: auth, 415, 404, sequential 5, bounded stress 5, 150 МБ мусора → 415 |
+| Ранний отказ (401/415) при загрузке через `requests`: быстрой 150 МБ и медленной chunked 30 МБ | Клиент получает код, а не обрыв соединения: uvicorn дочитывает тело |
+
+## Замер для L2 (реальные видео + GPU есть только у L2)
+
+```bash
+# 1) сервер в боевом режиме (без fake/mock), ключ в env
+SENTINEL_API_KEYS=<ключ> SENTINEL_DEDUP=0 python -m backend.api
+# 2) приёмка
+SENTINEL_API_KEY=<ключ> python -m backend.api.tools.acceptance --url http://127.0.0.1:8000 --out runs/accept_L2.json
+# 3) 5+ реальных видео: сначала по одному, потом пачкой 5 (как жюри); время каждого
+SENTINEL_API_KEY=<ключ> python -m backend.api.tools.loadtest --url http://127.0.0.1:8000 \
+    --videos <папка с .mov> --n 6 --mode both --batch 5 --force-first --out runs/load_L2.json
+```
+
+**Что сравниваем:**
+- `sequential` — чистое время одного видео;
+- `batch5` — время от приёма каждого job **с учётом очереди** против лимита 300 с.
+
+**Выход:** `runs/load_L2.json` + `.csv`, по строке на видео:
+- `status`, `verdict`, `n_violations`, `type_id`/таймкоды;
+- `upload_s`, `accept_to_result_s`, `queue_wait_s`, `processing_s`, `deadline_s`;
+- `gpu_peak_mb`, `response_bytes`;
+- тайминги стадий A03 (`meta.timings`).
+
+**Итоговые метрики:**
+- done / failed / не завершено;
+- сколько > 300 с;
+- latency p50 / p90 / max;
+- пик активных задач и пик VRAM (опрос `/readyz` раз в секунду).
+
+Кадров и описаний в отчёте **нет**.
+
+**FP/FN, попадание таймкода и тип** считает eval A16 по тем же job (`python -m eval.run --api URL`). Сам API их не оценивает.
+
+**Чего нельзя обещать без этого замера:**
+- сколько видео сервер обрабатывает одновременно и укладываются ли 5–8 в 300 с;
+- время ответа VLM на полный JSON;
+- пик VRAM.
+
+Все бюджеты (`budget_s=270`, `job_cap_s=120`, `max_queue=12`, честная доля) — это **настройки, а не измеренные цифры**. После замера L2 их нужно пересмотреть.
+
 ## API из ТЗ (не менялось)
 
 ```bash
-# 1) загрузить видео -> job_id
-curl -X POST http://localhost:8000/api/v1/analyze \
-  -H "X-API-Key: $SENTINEL_API_KEYS" \
-  -F "file=@X-1.mov"
+curl -X POST http://localhost:8000/api/v1/analyze -H "X-API-Key: $KEY" -F "file=@X-1.mov"
 # {"job_id":"0f3c...","status":"processing"}
-
-# 2) опрашивать статус / забрать результат
-curl http://localhost:8000/api/v1/jobs/0f3c... -H "X-API-Key: $SENTINEL_API_KEYS"
-# пока идёт анализ:
-# {"job_id":"0f3c...","status":"processing","stage":"detect","progress":0.42,"queue_position":null,"elapsed_s":12.3}
-# готово:
-# {"job_id":"0f3c...","status":"done","verdict":"violation",
-#  "violations":[{"type":"...","timecode_sec":22.0,"description":"...",
-#                 "evidence_frames":[{"timestamp_sec":22.0,"image_base64":"/9j/..."}],
-#                 "type_id":"V01","confidence":0.81,"t_start":20.4,"t_end":25.0,"rules":[...]}],
-#  "timeline":[[0.0,0.1],...],"meta":{...,"api":{"queue_wait_s":..,"total_s":..,"frames":[...]}}}
-# не удалось завершить:
-# {"job_id":"0f3c...","status":"failed","verdict":null,"violations":[],"error":"timeout: ..."}
+curl http://localhost:8000/api/v1/jobs/0f3c... -H "X-API-Key: $KEY"
+# идёт:   {"job_id","status":"processing","verdict":null,"violations":[],"stage":"detect","progress":0.42,"queue_position":null,"elapsed_s":12.3}
+# готово: {"job_id","status":"done","verdict":"violation","violations":[{"type","timecode_sec","description","evidence_frames":[{"timestamp_sec","image_base64"}], "type_id","confidence","t_start","t_end","rules":[...]}],"timeline":[...],"meta":{...}}
+# не удалось: {"job_id","status":"failed","verdict":null,"violations":[],"error":"timeout: ..."}
 ```
 
-- Без ключа или с неверным ключом — **401** с JSON `{"detail": ...}`. Принимается и `Authorization: Bearer <key>`.
-- Обязательные поля — ровно как в ТЗ. Дополнительные: `type_id`, `confidence`, `t_start`, `t_end`, `rules[]`, `timeline`, `meta`, а во время обработки — `stage`, `progress`, `queue_position`, `elapsed_s`.
-- Ответ на POST: HTTP 200 и `{"job_id","status":"processing"}`.
+- **`verdict` и `violations` есть всегда**, на любом статусе. Это схема A01 (`contracts/api_schema.json`); в фазе 1 у `processing` их не было.
+- **Профиль ответа жюри** (`SENTINEL_JURY_PROFILE`):
+  - `extended` (по умолчанию) — поля ТЗ + доп. поля, которые ТЗ разрешает. На них опирается eval A16: `type_id`, `confidence`, `rules`, `meta`.
+  - `strict` — ровно поля ТЗ, как `contracts.serialize.result_to_jury_api`; норма `rules[0]` дописывается в `description`.
+  - Для разовой проверки можно передать `?profile=strict`.
+- Ошибки загрузки:
+  - **400** — пусто, нет поля `file` или multipart оборван;
+  - **413** — больше 300 МБ;
+  - **415** — не то расширение, нет сигнатуры или декодер не прочитал кадр;
+  - **503** — backlog полон (с `Retry-After`) или нет декодера;
+  - **507** — нет места на диске.
+- Принимаются `.mov` / `.MOV` / `.mp4` / `.m4v`, `video/quicktime`, имена на кириллице, в том числе `filename*=UTF-8''…`.
+- `POST` отвечает сразу после записи файла: проверка — один кадр декодером, без полного прохода. Это укладывается в таймаут Cloudflare около 100 с.
 
 | Ручка (`/api/v1/...` с `X-API-Key`) | Назначение |
 |---|---|
-| `POST /analyze` | multipart `file` (.mov/.mp4/.m4v, ≤ 300 МБ). Принимается и «сырое» тело с `Content-Type: video/*` и `X-Filename` |
-| `GET /jobs/{id}` | Статус и результат по схеме ТЗ |
-| `GET /jobs` | Последние задачи (история) |
-| `GET/HEAD /jobs/{id}/video` | Исходник с **HTTP Range** (206/416). Если в папке задачи есть `preview.mp4`, отдаётся он; `?original=1` — принудительно исходник |
-| `GET /jobs/{id}/frames/{i}.jpg` | Кадр-доказательство №`i`. Нумерация сквозная по `violations[*].evidence_frames[*]` (см. `meta.api.frames`) |
-| `POST /jobs/{id}/ask` | `{"question": "..."}` → роутер A14 (`copilot.router.make_router`, вместе с `GET /copilot/status` и `GET /jobs/{id}/report`) под той же авторизацией. Нет модуля `copilot` — **501** |
-| `GET /catalog` | `norms.load_catalog()` (A13). Если недоступен — 503 |
-| `GET /healthz` | Liveness, без ключа |
-| `GET /readyz` | **200 только если пайплайн импортирован и прогрет.** Иначе **503** с полем `state`: `loading`, `warming`, `unavailable` (нет `backend.pipeline` или весов) или `warmup_failed` |
-| `GET /docs` | Swagger с кнопкой Authorize для X-API-Key |
+| `POST /analyze[?force=1]` | Загрузка. Тот же файл (sha256) при той же версии пайплайна возвращает **тот же job** (`"deduplicated": true`). `force=1` — новый прогон |
+| `GET /jobs/{id}[?profile=strict]` | Статус и результат |
+| `GET /jobs` | История |
+| `GET/HEAD /jobs/{id}/video` | Исходник с HTTP Range (206/416) |
+| `GET /jobs/{id}/frames/{i}.jpg` | Кадр-доказательство `i` (сквозная нумерация, см. `meta.api.frames`) |
+| `POST /jobs/{id}/ask`, `GET /copilot/status`, `GET /jobs/{id}/report` | Роутер A14 (`copilot.router.make_router`) под нашей авторизацией. Нет модуля — 501 |
+| `GET /catalog` | `norms.load_catalog()` |
+| `GET /healthz` | Liveness |
+| `GET /readyz` | **200 только когда пайплайн загружен, прогрет, не mock и GPU не захвачен зависшей задачей.** Иначе 503 с `state` и понятным `detail`: `loading`, `warming`, `unavailable`, `warmup_failed`, `mock_not_allowed`, `gpu_hung` |
 
-Коды ошибок загрузки:
-- **400** — пустой файл, нет поля `file` или битый multipart.
-- **413** — больше 300 МБ.
-- **415** — не то расширение, нет сигнатуры ISO-BMFF/QuickTime или **декодер не прочитал ни одного кадра**.
-- **503** — на сервере нет декодера (при `video_validation=required`) или переполнен backlog (с заголовком `Retry-After`).
-- **507** — нет места на диске.
+## Решения фазы 2 (каждое — отдельный флаг в `config.yaml`)
 
-## Веб-UI: ключ не попадает в бандл, URL и логи (согласовать с A15)
+| Решение | По умолчанию | Почему |
+|---|---|---|
+| **Честный исход** (как `resolve_outcome` у A01) | вкл. | `done` бывает только по-честному: нет вердикта и нарушений → `failed` (`no_violation` не выдумываем); `violation` без нарушения с конечным таймкодом → `failed`; `no_violation` при неполном анализе → `failed`; при `no_violation` найденные кандидаты уходят в `candidates` (только UI); нарушение без таймкода отбрасывается (0.0 не подставляем) |
+| **Полнота** = `meta.completeness` (A01) + `meta.coverage` (число 0..1 или `{ratio \| analyzed_s/duration_s}`) + для итогового результата флаги A03 (`meta.complete`, статусы `required_stages`) | `min_coverage: 0.95` | unknown ≠ false: если сведений нет, совместимость (результат принимается); любой источник «неполный» → неполный |
+| **partial.json → done** (watchdog или исключение) | **выкл.** (`partial_accept: false`) | Новый режим — до замера L2. Включённый: только при полноте ≥ `min_coverage` и прохождении политики исхода, с `meta.partial=true`. Иначе `failed` с причиной (покрытие, флаг), а `partial` — только в UI-ответе, без base64 |
+| **Fake/mock в проде** | запрещены | Fake — только явный `SENTINEL_FAKE_PIPELINE=1`. `SENTINEL_MOCK=1` без `SENTINEL_ALLOW_MOCK=1` → `/readyz` 503 `mock_not_allowed`, задачи `failed`. Результат с `meta.mock` / `provenance.mock` / origin `mock` → `failed` |
+| **Дедлайн 300 с от приёма, очередь включена** | вкл. | Отсчёт идёт с начала запроса загрузки. В `run()` передаётся `deadline_at=приём+budget_s`, если сигнатура его принимает (A03 принимает). После рестарта бюджет **не обнуляется**: опоздавшие → `failed: deadline passed`, остальные в очереди с остатком (`restart_fresh_budget: false`) |
+| **Один владелец GPU (вместе с A03)** | вкл. | `run()` идёт под семафором (1 слот). Зависший после таймаута `run()` **держит GPU** (`zombie_release_gpu: false`): следующие задачи честно получают `failed` по таймауту, а не запускаются параллельно. `/readyz` → 503 `gpu_hung` через `hung_gpu_s` — сигнал A17 перезапустить сервис. Если пайплайн экспортирует `GPU_LOCK`/`GPU_SEMAPHORE`, API `run()` не оборачивает |
+| **Падение воркера** | вкл. | Исключение вне `run()` или умерший поток → `failed: worker crashed`, поток пересоздаётся; `BaseException` из `run()` (в т.ч. `SystemExit` библиотеки) ловится; зависших задач нет — watchdog закрывает каждую с причиной |
+| **Идемпотентность по sha256** | вкл. (`dedup`) | Ключ = sha256 + версия пайплайна (`PIPELINE_VERSION`), чтобы новая версия не отдавала старый результат. `failed` не переиспользуется. Для замеров — `?force=1` или `SENTINEL_DEDUP=0` |
+| **Ответ ≤ 3 МБ** | `max_response_mb: 3` | По шагам: не больше 3 кадров на нарушение (ТЗ) → кадры кандидатов → прореживание `timeline` → крупные ключи `meta` → перекодирование кадров 640/480/360 px → 1 кадр → усечение списка. Каждый шаг пишется в `meta.warnings` |
+| **Время только по PTS** | вкл. | Длительность берётся из контейнера (`mvhd`), а не frames/fps (fps переменный). Запасной кадр-доказательство ищется проходом по PTS (`CAP_PROP_POS_MSEC` после `grab`), а не по номеру кадра |
+| **Имя файла — не признак** | — | Пайплайн получает `data/jobs/<id>/video.<ext>`. Исходное имя (и нормализованное Х→X) попадает только в `meta.api` для сопоставления в eval |
 
-Ручки `/ui/v1/*` — **те же**, что `/api/v1/*`. Доступ по cookie с флагами **HttpOnly; SameSite=Strict; Path=/ui/v1** (`Secure` — при https или за cloudflared). Cookie выдаётся **только после проверки API-ключа или пароля UI**. CORS и same-origin здесь **не** аутентификация, а лишь дополнительная защита от CSRF.
+## Веб-UI (согласовано с A15)
 
-```js
-// 1. вход: проверяющий вводит ключ/пароль; значение уходит один раз и в JS не хранится
-await fetch("/ui/v1/session", {method: "POST", headers: {"Content-Type": "application/json"},
-  body: JSON.stringify({api_key: value})});          // или {password: value}
-// -> 200 {"authenticated":true,"expires_at":..., "csrf_token":"..."} + Set-Cookie ks_session (12 ч)
-// -> 401 неверно, 429 слишком много попыток (10/мин на IP)
-
-// 2. при загрузке страницы: я залогинен?  GET /ui/v1/session -> 200 {csrf_token} | 401
-// 3. POST/DELETE — обязательно заголовок X-CSRF-Token (из ответа шага 1 или 2)
-xhr.open("POST", "/ui/v1/analyze"); xhr.setRequestHeader("X-CSRF-Token", csrf); xhr.send(formData);
-// 4. GET — только cookie (браузер шлёт её сам на same-origin):
-fetch(`/ui/v1/jobs/${id}`)
-// 5. ПЛЕЕР: обычный <video src> не добавит X-API-Key, но cookie отправит -> Range работает
-<video src="/ui/v1/jobs/ID/video" controls></video>
-// 6. выход: DELETE /ui/v1/session
-```
-
-- Если задача `failed`, на `/ui/v1/jobs/{id}` дополнительно приходит `partial` — подробности неполного анализа из `partial.json`, чтобы UI мог объяснить, что произошло. **В API жюри этого нет.**
-- Rate-limit на IP: вход 10/мин, загрузка 12/мин, вопросы ассистенту (ask) 20/мин, чтение 600/мин. Неудачные попытки API-ключа — 300/мин. Всё настраивается в конфиге.
-- Если `frontend/dist` нет, на `/` отдаётся встроенная страница `backend/api/static/index.html`. Это рабочий пример всего потока: вход, загрузка с прогрессом, опрос статуса, кадры и плеер на cookie-эндпоинте видео. Если `frontend/dist` есть, он монтируется на `/` с SPA-fallback: `index.html` с `no-cache`, `/assets/*` с `immutable`.
-
-## Очередь, бюджет времени, честные статусы
-
-- **Отсчёт времени** начинается **с начала запроса загрузки**, поэтому лимит 300 с включает и загрузку, и ожидание в очереди.
-- **Очередь и GPU.** Задачи идут по FIFO на `SENTINEL_WORKERS=1` потоков. Одновременно на GPU — **1** задача (`gpu_slots`); семафор держится на всё время `pipeline.run`.
-- **Deadline для пайплайна:**
-  `deadline_s = min(270 − ожидание, job_cap_s=120, честная доля)`, но не меньше `min_deadline_s=15`.
-  - Честная доля — остаток бюджета, поделённый на задачи, ждущие за текущей. Если жюри пришлёт 8 видео разом, каждое получит ≈ 270/8 ≈ 34 с — а не «первое всё, шестое ничего».
-- **Backlog.** Больше `max_queue=12` активных задач → **503 + Retry-After**.
-- **`done`** — только если `backend.pipeline.run()` вернул результат. Он сериализуется через `contracts.serialize.result_to_api` (fallback — своя сериализация строго по ТЗ), затем проверяется и чинится формат: типы, base64 JPEG, отсутствующий `verdict` выводится из `violations`. Содержание API не придумывает.
-  - Если у нарушения нет кадра-доказательства, API вырезает его через cv2 в момент `timecode_sec` и пишет предупреждение в `meta.warnings`.
-- **`failed`** — в этих случаях:
-  - пайплайн не импортировался (нет весов или модуля);
-  - `run()` бросил исключение, вернул `status="failed"` или мусор;
-  - сработал **watchdog**: 285 с от загрузки или `deadline_s + 20 с` от старта задачи.
-  - `partial.json` по watchdog **не** превращается в `done`; частичный результат попадает только в `partial` для UI.
-- **Зависший `run()`.** После срабатывания watchdog `progress()` бросает `JobCancelled` (это **BaseException**), и `run()` сворачивается. Если `run()` висит, не вызывая `progress()`, слот и GPU освобождаются и запускается подменный воркер (не больше `max_zombie_workers`).
-- **Рестарт.** Незавершённые задачи из SQLite заново встают в очередь со свежим бюджетом — до `max_attempts=3` раз.
-- **Фейковый пайплайн** — **только** при явном `SENTINEL_FAKE_PIPELINE=1` (изолированные тесты, демо UI). В результате `meta.fake_pipeline=true`, в `/readyz` — `"pipeline":"fake"`. **Автоматически он никогда не подставляется.**
-
-Хранение:
-- `data/jobs/<job_id>/`: `video.<ext>`, `result-*.json`, `frames/<i>.jpg`, `partial.json` (от пайплайна), `failed_details.json`.
-- `data/jobs.sqlite3` в режиме WAL; поля: id, status, stage, progress, created/queued/started/finished, error, result_path, attempts, deadline_s, video_meta.
-- Очистка по TTL (`job_ttl_h=72`).
+Ручки `/ui/v1/*` — те же, что `/api/v1/*`. Доступ по cookie **HttpOnly; SameSite=Strict; Path=/ui/v1** (`Secure` за https). Cookie выдаётся **только** после `POST /ui/v1/session {api_key | password}`. CORS и same-origin — не аутентификация, а лишь защита от CSRF.
+- POST/DELETE требуют `X-CSRF-Token` (из ответа входа или `GET /ui/v1/session`).
+- Плеер: `<video src="/ui/v1/jobs/ID/video">` — cookie + Range.
+- Rate-limit на IP: вход 10/мин, загрузка 12/мин, вопросы ассистенту (ask) 20/мин, чтение 600/мин.
+- UI-ответ на `/ui/v1/jobs/{id}` — полный отчёт: `candidates`, `analysis_complete`, `meta`.
+- У `failed` UI дополнительно получает `partial`: `partial.json` пайплайна или отвергнутый результат с причиной. Base64-кадров там нет.
+- Эталон потока — `backend/api/static/index.html`.
 
 ## Конфигурация
 
-Всё лежит в `backend/api/config.yaml`; любой ключ переопределяется переменной `SENTINEL_<KEY>`. Главное:
+`backend/api/config.yaml`, любой ключ переопределяется `SENTINEL_<KEY>`. Новое в фазе 2:
+- `SENTINEL_ALLOW_MOCK` (0)
+- `SENTINEL_PARTIAL_ACCEPT` (0)
+- `SENTINEL_MIN_COVERAGE` (0.95)
+- `SENTINEL_JURY_PROFILE` (extended)
+- `SENTINEL_MAX_RESPONSE_MB` (3)
+- `SENTINEL_DEDUP` (1)
+- `SENTINEL_ZOMBIE_RELEASE_GPU` (0)
+- `SENTINEL_HUNG_GPU_S` (60)
+- `SENTINEL_RESTART_FRESH_BUDGET` (0)
+- `SENTINEL_PASS_DEADLINE_AT` (1)
 
-| env | по умолчанию | |
-|---|---|---|
-| `SENTINEL_API_KEYS` | — | Ключи через запятую. Иначе берётся `data/api_keys.txt`; если нет и его — ключ генерируется туда (права 0600), в лог попадает только отпечаток |
-| `SENTINEL_UI_PASSWORD` | — | Пароль для входа в UI (опционально; API-ключ тоже подходит) |
-| `SENTINEL_UI_SECRET` | авто (`data/ui_secret`) | HMAC-секрет сессий UI; смена разлогинивает всех |
-| `SENTINEL_DATA_DIR` | `data` | |
-| `SENTINEL_WORKERS` / `SENTINEL_GPU_SLOTS` | 1 / 1 | |
-| `SENTINEL_BUDGET_S` / `SENTINEL_WATCHDOG_S` / `SENTINEL_JOB_CAP_S` | 270 / 285 / 120 | |
-| `SENTINEL_MAX_QUEUE` | 12 | Backlog |
-| `SENTINEL_MAX_UPLOAD_MB` | 300 | |
-| `SENTINEL_VIDEO_VALIDATION` | `required` | `required` — cv2/PyAV/ffprobe должен декодировать кадр; `best_effort`; `off` |
-| `SENTINEL_PIPELINE` | `backend.pipeline` | Модуль (`run`, `warmup`) или `module:function` |
-| `SENTINEL_FAKE_PIPELINE` | 0 | Только для тестов и демо |
-| `SENTINEL_CORS_ORIGINS` | пусто | Dev-origin'ы (например `http://localhost:5173`). CORS — не аутентификация |
-| `SENTINEL_TRUSTED_PROXIES` | `127.0.0.1,::1` | Кому верить в `CF-Connecting-IP` / `X-Forwarded-*` (cloudflared работает локально) |
-| `SENTINEL_JOB_TTL_H` | 72 | |
-| `SENTINEL_LOG_JSON` / `SENTINEL_LOG_LEVEL` | 1 / INFO | |
+Из фазы 1:
+- `SENTINEL_API_KEYS` / `SENTINEL_API_KEY`
+- `SENTINEL_UI_PASSWORD`, `SENTINEL_UI_SECRET`
+- `SENTINEL_DATA_DIR`
+- `SENTINEL_WORKERS` / `SENTINEL_GPU_SLOTS` (1/1)
+- `SENTINEL_BUDGET_S` (270; синоним A17 — `SENTINEL_DEADLINE_S`)
+- `SENTINEL_WATCHDOG_S` (285), `SENTINEL_JOB_CAP_S` (120)
+- `SENTINEL_MAX_QUEUE` (12)
+- `SENTINEL_MAX_UPLOAD_MB` (300)
+- `SENTINEL_VIDEO_VALIDATION` (required)
+- `SENTINEL_FAKE_PIPELINE` (0)
+- `SENTINEL_CORS_ORIGINS`
+- `SENTINEL_TRUSTED_PROXIES`
+- `SENTINEL_FRONTEND_DIR` (синоним `SENTINEL_FRONTEND_DIST`)
+- `SENTINEL_JOB_TTL_H`
 
-Логи — JSON в stderr с `request_id` (он же в заголовке `X-Request-ID`): метод, путь **без query**, статус, мс, IP, job_id. Ключи, пароли, cookie и содержимое видео не пишутся; поля с именами key/token/secret/password маскируются как `***`.
+Логи — JSON с `request_id`, путь без query. Ключи, пароли, cookie и содержимое видео не пишутся.
 
-## Тесты (без GPU и весов)
+## Тесты
 
-```bash
-python -m pytest backend/api/tests -q
-```
-
-Всего 44 теста:
-- **Авторизация.** 401 без ключа и с неверным ключом на всех ручках. `/ui/v1` закрыт без cookie, даже с same-origin-заголовками. Вход по ключу или паролю ставит HttpOnly/SameSite cookie. Без CSRF и с чужим Origin — 403. Подделанный или просроченный токен отклоняется. Rate-limit входа → 429. Ключей нет в логах.
-- **Состояния пайплайна.** Нет модели → `readyz=503`, задача `failed` (а не фейк). Ошибка `warmup` → `readyz=503`. Исключение инференса → `failed`. Таймаут → `failed`, `partial` только в UI, `run()` отменяется через `progress()`. Зависший `run()` не блокирует очередь.
-- **Очередь и хранение.** Полный цикл со сверкой со схемой ТЗ. 5 параллельных загрузок. Backlog → 503. Честная доля deadline. Рестарт заново ставит задачи в очередь. Очистка по TTL.
-- **Загрузка.** `.txt`, PNG и не-ISO данные → 415. Пустой файл → 400. Сверх лимита → 413, мусор на диске не остаётся. Стриминг больше 3 МБ — размер и sha256 сходятся. **Настоящий MOV** из `cv2.VideoWriter` декодируется. Файл, где валиден только `ftyp`, отклоняется декодером (415). Нет декодера → 503.
-- **Медиа и раздача.** Range-запросы: `0-99`, `-10`, `N-`, выход за конец, 416, HEAD. Видео для UI по cookie → 206. Кадры, copilot 501/200, SPA-fallback, request-id, CORS выключен по умолчанию.
-
-Тесты, которым нужен cv2, при его отсутствии пропускаются автоматически (`pytest.importorskip`).
+`python -m pytest backend/api/tests -q` — 76 тестов. Нужны только Python-пакеты из `requirements.txt` (с cv2 — включая тесты настоящего MOV); GPU, весов и данных не нужно.
+- `test_auth.py` — ключи, UI-сессия, CSRF, rate-limit, ключи не попадают в логи.
+- `test_jobs.py` — полный цикл, нет модели / warmup / исключение / таймаут, один владелец GPU, рестарт, backlog, честная доля дедлайна.
+- `test_uploads.py` — 415/400/413, стриминг, настоящий MOV, нет декодера.
+- `test_media.py` — Range, кадры, copilot (A14), SPA, CORS.
+- `test_phase2.py`:
+  - обязательные поля на всех статусах; политика исхода (11 случаев); кандидаты скрыты от жюри;
+  - partial (по умолчанию выкл. / по покрытию); mock в проде;
+  - `deadline_at`; рестарт без обнуления бюджета;
+  - идемпотентность; лимит 3 МБ (6 нарушений × 4 кадра шума → ≤ 1 МБ при валидных JPEG);
+  - падение воркера; обрыв загрузки; обрезанный multipart и MOV;
+  - кириллица `filename*`; кадр по PTS; длительность из контейнера; строгий профиль с нормой.
 
 ## Модели
 
-Нет: `models.json` = `[]`. Сам API ML не запускает. Декодер — OpenCV (Apache-2.0); PyAV (BSD) и ffprobe — опционально.
+Нет: `models.json` = `[]`. Декодер — OpenCV (Apache-2.0); PyAV (BSD) и ffprobe — опционально.
 
 ## Ограничения / известные TODO
-- Воркеры — только потоки. Зависший `run()` нельзя убить: он отменяется кооперативно через `progress()`, а при жёстком зависании подменяется новым потоком (GPU тогда может делиться с «зомби», пока тот не завершится). Режим процессов с kill — TODO.
-- `deadline_s` передаётся один раз при старте. Если во время работы первого видео придут новые, его deadline не сократится — поэтому есть потолок `job_cap_s=120`.
-- Сессия UI stateless (HMAC): отозвать её можно только TTL или сменой `SENTINEL_UI_SECRET`.
+- Воркеры — потоки. Зависший `run()` нельзя убить из API. По `progress()` он отменяется кооперативно; иначе GPU остаётся за ним, пока `run()` не вернётся, и `/readyz` = 503 `gpu_hung`. У A03 свой процесс-исполнитель с kill по таймауту, так что это крайний случай.
+- `deadline_s` передаётся один раз при старте. Честная доля учитывает только тех, кто уже в очереди.
+- Сессия UI stateless (HMAC): отзыв — только TTL или смена `SENTINEL_UI_SECRET`.
 
 ## Для интегратора
-1. **Запуск одним процессом**: `python -m backend.api` или, как в PR A17, `uvicorn backend.api.main:app --workers 1`. Это совместимо: `POST /analyze` отвечает сразу после сохранения файла.
-   - Синонимы env из `deploy/`: `SENTINEL_FRONTEND_DIST` → `frontend_dir`, `SENTINEL_DEADLINE_S` → `budget_s` (если `SENTINEL_BUDGET_S` не задан), `SENTINEL_API_KEY` добавляется к `SENTINEL_API_KEYS`.
-   - Если cloudflared в другом контейнере (не localhost), добавьте его адрес в `SENTINEL_TRUSTED_PROXIES` или uvicorn `--forwarded-allow-ips` — иначе cookie останется без флага `Secure`. Задать `SENTINEL_API_KEYS` (или `data/api_keys.txt`), опционально `SENTINEL_UI_PASSWORD`. **`SENTINEL_FAKE_PIPELINE` в проде не ставить.** cloudflared → `http://127.0.0.1:8000`; `SENTINEL_TRUSTED_PROXIES=127.0.0.1,::1` оставить (нужно для IP за туннелем и флага Secure у cookie).
-2. **A03 (`backend.pipeline`)**: API вызывает `run(video_path, job_id, progress, deadline_s)` в потоке-воркере, а `warmup()` — один раз в фоне при старте.
-   - `video_path` = `data/jobs/<id>/video.mov`.
-   - `partial.json` класть в **`Path(video_path).parent`**: это неполный результат только для UI, в `done` он не превратится.
-   - `progress(stage, 0..1)` после таймаута может бросить `backend.api.worker.JobCancelled` (BaseException) — `BaseException` не глотать.
-   - GPU = 1. API держит семафор на всё время `run()`. Если пайплайн экспортирует свой `GPU_LOCK`/`GPU_SEMAPHORE`/`gpu_lock`, API не оборачивает `run()` (во избежание deadlock). Параллельных GPU-задач внутри `run()` не запускать.
-   - `preview.mp4` (H.264) в папке задачи будет отдаваться плееру UI вместо исходного `.mov`.
-3. **A01**: если есть `contracts.serialize.result_to_api`, используется он, иначе встроенный сериализатор. После мерджа удалить `backend/api/_contract_fallback.py` (импорт уже идёт с fallback).
-4. **A15 (frontend)**: использовать только `/ui/v1/*` с cookie-авторизацией (см. раздел «Веб-UI» выше). Плеер — `<video src="/ui/v1/jobs/ID/video">`. API-ключ нигде не запрашивать сверх формы входа и не хранить — ни в бандле, ни в URL, ни в localStorage. Эталон — `backend/api/static/index.html`. Для Vite dev: `SENTINEL_CORS_ORIGINS=http://localhost:5173` + `credentials: "include"`, а лучше Vite-proxy на `/ui`.
-   - Сверено с PR A15 (`frontend/src/api/client.ts`). Совпадает: `POST /ui/v1/session {api_key, password}`, `csrf_token` из ответа, `password_login` в ответе 401 на `GET /ui/v1/session`, `X-CSRF-Token` на POST, `<video src=/ui/v1/jobs/ID/video>`, `GET /ui/v1/jobs`.
-   - `X-UI-Token` API не выдаёт: токен существует только в HttpOnly cookie, поэтому ветка A15 с ним просто не сработает.
-   - Запасной путь A15 `settings.apiKey` → `X-API-Key` с A02 не нужен: ключ не стоит сохранять в настройках или localStorage.
-5. **A14 (copilot)**: подключено под интерфейс из PR A14. Если импортируется `copilot.router.make_router`, API монтирует его **дважды**: `prefix="/api/v1"` с `Depends(require_api_key)` и `prefix="/ui/v1"` с cookie+CSRF. Провайдер задач `get_job(job_id)` отдаёт JSON ответа ТЗ (`processing` / `done` / `failed`) или `None` (→ 404). Роутер A14 регистрируется раньше ручек API, поэтому его `/jobs/{id}/ask` приоритетнее встроенного.
-   - Проверено на ветке A14 (извлечение во временную папку): status 401 без ключа и 200 с ключом; ask 501 `disabled` при `COPILOT_ENABLED=0`; report 200; неизвестная задача — 404.
-   - Если `make_router` нет, встроенный `/ask` ищет callable `ask` / `answer` / `handle_ask` / `answer_question` и вызывает его, иначе отдаёт 501.
-6. **A16 (eval)**: `meta.api.video.filename_normalized` (Х→X) — для сопоставления с разметкой; `meta.api.total_s` / `queue_wait_s` / `deadline_s` — тайминги.
-7. Цель — Python 3.11: синтаксиса 3.12+ в коде нет. Проверено на Python 3.13, FastAPI 0.143, Starlette 1.6.
+1. **Ветка и PR.** Ветка начата до появления `main` (история отдельная), поэтому GitHub не даёт открыть PR в `main` ("no history in common"). По указанию «разные истории объединит интегратор» `main` в ветку я не вливал. Код — только `backend/api/**` и пустой `backend/__init__.py`.
+2. **Запуск** — один процесс (`--workers 1`, как в `deploy/` A17). В проде **не** ставить `SENTINEL_FAKE_PIPELINE`, `SENTINEL_MOCK`, `SENTINEL_ALLOW_MOCK`. Чтобы при зависшем GPU сервис перезапускался, healthcheck A17 должен смотреть `/readyz` (503 `gpu_hung`, `mock_not_allowed`, `unavailable`).
+3. **A03:**
+   - API вызывает `run(video_path, job_id, progress, deadline_s, deadline_at=приём+270)`;
+   - `partial.json` — в `data/jobs/<id>/` (тот же `SENTINEL_DATA_DIR`). По умолчанию он **не** становится `done`. Если включить `partial_accept`, то только при `meta.coverage`/`meta.completeness` ≥ 0.95. Флаги `complete`/`partial` у partial не учитываются — там они «ложь» по определению;
+   - просьба: заполнять `meta.completeness` (A01) или `meta.coverage` — иначе полнота «неизвестна»;
+   - `JobCancelled` (BaseException) из `progress()` не глотать.
+4. **A01:** обязательные поля на `processing`/`failed` теперь есть. `contracts.serialize.result_to_api` (UI-report) используется, если доступен. Строгий ответ жюри — `SENTINEL_JURY_PROFILE=strict`: по умолчанию extended, потому что eval A16 читает `type_id`/`rules`/`meta` из `/api/v1/jobs/{id}`. Нужно согласовать A01 и A16; переключение — одна переменная. После мерджа контрактов удалить `backend/api/_contract_fallback.py`.
+5. **A16:**
+   - в `eval/jury_sim.py::_judge` строка `(r.get("accept_to_done_s") or 1e9) > self.limit_s` считает задачу за 0.0 с (готовый результат по sha256) «> лимита» → ложный FAIL. Нужно `is None`;
+   - до исправления для замеров запускать API с `SENTINEL_DEDUP=0` или слать `?force=1`.
+6. **A15:**
+   - у `failed` в UI-ответе есть `partial` (без кадров);
+   - у `no_violation` найденное лежит в `candidates` — показывать как «отклонённые кандидаты», а не как нарушения;
+   - кадры кандидатов брать из `frames`, если нужны.
+7. **A14:** без изменений — `make_router` монтируется под `/api/v1` (ключ) и `/ui/v1` (cookie + CSRF).
