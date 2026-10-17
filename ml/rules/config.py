@@ -24,6 +24,9 @@ __all__ = [
     "ConfigError",
     "DEFAULT_RULES_PATH",
     "load_rules_config",
+    "build_config",
+    "hypothesis_overrides",
+    "profile_hypotheses",
     "parse_rules_config",
     "apply_overrides",
     "read_raw_config",
@@ -33,6 +36,7 @@ __all__ = [
 
 DEFAULT_RULES_PATH = Path(__file__).with_name("rules.yaml")
 ENV_RULES_PATH = "SENTINEL_RULES_YAML"
+ENV_RULES_PROFILE = "SENTINEL_RULES_PROFILE"
 T_PEAK_POLICIES = ("evidence", "transition", "onset", "onset_plus", "max", "center")
 SMOOTH_METHODS = ("none", "median", "mean")
 RULE_KINDS = ("violation", "observation")
@@ -162,6 +166,10 @@ class RulesConfig:
     known_signals: frozenset[str] = frozenset(SIGNALS)
     source_path: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
+    profile: str = "baseline"
+    active_hypotheses: list[str] = field(default_factory=list)
+    hypotheses: dict[str, dict[str, Any]] = field(default_factory=dict)
+    profiles: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def enabled_rules(self) -> list[RuleSpec]:
@@ -257,6 +265,25 @@ def apply_overrides(raw: Mapping[str, Any], sets: Sequence[str]) -> dict[str, An
             node = nxt
         node[parts[-1]] = val
     return out
+
+
+def hypothesis_overrides(raw: Mapping[str, Any], names: Sequence[str]) -> list[str]:
+    """Переопределения для списка гипотез (``hypotheses.<H>.set``)."""
+    hyps = raw.get("hypotheses") or {}
+    out: list[str] = []
+    for name in names:
+        h = hyps.get(name)
+        if not isinstance(h, Mapping):
+            raise ConfigError(f"Нет гипотезы {name!r} (есть: {', '.join(sorted(hyps)) or '—'})")
+        out += [str(x) for x in (h.get("set") or [])]
+    return out
+
+
+def profile_hypotheses(raw: Mapping[str, Any], profile: str) -> list[str]:
+    profiles = raw.get("profiles") or {"baseline": []}
+    if profile not in profiles:
+        raise ConfigError(f"Нет профиля {profile!r} (есть: {', '.join(sorted(profiles))})")
+    return [str(x) for x in (profiles.get(profile) or [])]
 
 
 def _compile(r: Mapping[str, Any], key: str, where: str) -> Optional[CompiledExpr]:
@@ -476,19 +503,36 @@ def parse_rules_config(raw: Mapping[str, Any], source_path: Optional[str] = None
     return cfg
 
 
-_CACHE: dict[tuple[str, float], RulesConfig] = {}
+_CACHE: dict[tuple[str, float, str, tuple[str, ...]], RulesConfig] = {}
 
 
-def load_rules_config(path: Optional[str | os.PathLike] = None, overrides: Sequence[str] = ()) -> RulesConfig:
-    """Загрузить rules.yaml (кэш по пути+mtime, если нет переопределений)."""
+def build_config(raw: Mapping[str, Any], src: Optional[str] = None, profile: Optional[str] = None,
+                 hypotheses: Sequence[str] = (), overrides: Sequence[str] = ()) -> RulesConfig:
+    """Профиль → его гипотезы → дополнительные гипотезы → ручные переопределения (в этом порядке)."""
+    prof = profile or str(raw.get("default_profile") or "baseline")
+    hyps = profile_hypotheses(raw, prof) + [h for h in hypotheses if h not in profile_hypotheses(raw, prof)]
+    sets = hypothesis_overrides(raw, hyps) + list(overrides)
+    cfg = parse_rules_config(apply_overrides(raw, sets) if sets else raw, source_path=src)
+    cfg.profile = prof
+    cfg.active_hypotheses = hyps
+    cfg.hypotheses = {str(k): dict(v) for k, v in (raw.get("hypotheses") or {}).items() if isinstance(v, Mapping)}
+    cfg.profiles = {str(k): [str(x) for x in (v or [])] for k, v in (raw.get("profiles") or {}).items()}
+    return cfg
+
+
+def load_rules_config(path: Optional[str | os.PathLike] = None, overrides: Sequence[str] = (),
+                      profile: Optional[str] = None, hypotheses: Sequence[str] = ()) -> RulesConfig:
+    """Загрузить rules.yaml с профилем (аргумент → env SENTINEL_RULES_PROFILE → default_profile).
+
+    Production никогда не включает гипотезы сам: только явный профиль или переменная окружения.
+    """
     p = Path(path or os.environ.get(ENV_RULES_PATH) or DEFAULT_RULES_PATH)
-    key = (str(p.resolve()), p.stat().st_mtime)
+    prof = profile or os.environ.get(ENV_RULES_PROFILE) or None
+    key = (str(p.resolve()), p.stat().st_mtime, prof or "", tuple(hypotheses))
     if not overrides and key in _CACHE:
         return _CACHE[key]
     raw, src = read_raw_config(p)
-    if overrides:
-        raw = apply_overrides(raw, overrides)
-    cfg = parse_rules_config(raw, source_path=src)
+    cfg = build_config(raw, src, prof, hypotheses, overrides)
     if not overrides:
         _CACHE[key] = cfg
     return cfg
