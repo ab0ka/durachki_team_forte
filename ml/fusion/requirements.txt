@@ -1,0 +1,7 @@
+# ml/fusion (A12). Моделей/весов нет. Лицензии: numpy BSD-3, OpenCV Apache-2.0, PyYAML MIT, Pillow MIT-CMU (HPND).
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<6
+PyYAML>=6.0,<7
+Pillow>=10.0,<13
+# тесты
+pytest>=8.0
