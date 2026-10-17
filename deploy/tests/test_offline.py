@@ -162,15 +162,17 @@ def test_scripts_portable():
         assert data.startswith(b"#!") and b"\r\n" not in data, p
 
 
-def test_ps1_parse_with_pwsh():
+def test_ps1_parse_with_pwsh(tmp_path):
     """Синтаксис .ps1 парсером PowerShell (если pwsh есть: PATH или SENTINEL_TEST_PWSH)."""
     pwsh = os.environ.get("SENTINEL_TEST_PWSH") or shutil.which("pwsh")
     if not pwsh:
         pytest.skip("pwsh не установлен")
     files = [str(p) for p in sorted((ROOT / "deploy").rglob("*.ps1"))]
-    script = ("$bad=0; foreach($f in $args){$t=$null;$e=$null;"
-              "[void][System.Management.Automation.Language.Parser]::ParseFile($f,[ref]$t,[ref]$e);"
-              "foreach($x in $e){$bad++; Write-Output ($f+':'+$x.Extent.StartLineNumber+': '+$x.Message)}}; exit $bad")
-    r = subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-Command", script, *files], capture_output=True, text=True,
-                       timeout=120)
+    checker = tmp_path / "parse.ps1"
+    checker.write_text("$bad=0; foreach($f in $args){$t=$null;$e=$null;"
+                       "[void][System.Management.Automation.Language.Parser]::ParseFile($f,[ref]$t,[ref]$e);"
+                       "foreach($x in $e){$bad++; Write-Output ($f+':'+$x.Extent.StartLineNumber+': '+$x.Message)}}"
+                       "; exit $bad\n", encoding="ascii")
+    r = subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-File", str(checker), *files], capture_output=True,
+                       text=True, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
