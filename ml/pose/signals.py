@@ -574,6 +574,89 @@ def _handover(series_list: list[_Series], zones_iso: dict[str, list], cfg: dict[
 # ---------------------------------------------------------------- public
 
 
+def _item_placements(series_list: list[_Series], tracks: Sequence[Track], zones_iso: dict[str, list],
+                     aspect: float, cfg: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
+    """Предмет положен на стол: объект-трек «лёг» (неподвижен ≥ persist_s) в зоне desk, перед этим к нему
+    подходила кисть человека, затем ушла. None — неопределимо (нет зоны desk или объект-треков).
+
+    Не событие: предмет лежал с начала видео; новый трек на месте старого (смена id); кисти рядом не было.
+    """
+    p = cfg["signals"]["item_placed_on_desk"]
+    desks = [poly for nm in p.get("zone_names", ["desk"]) for poly in zones_iso.get(nm, [])]
+    labels = set(p.get("labels", []))
+    objs = [tr for tr in tracks or [] if tr.label in labels and tr.boxes]
+    if not desks or not objs:
+        return None
+    t_video0 = min([float(s.times[0]) for s in series_list if len(s.times)] +
+                   [float(min(t for t, _ in tr.boxes)) for tr in tracks or [] if tr.boxes] or [0.0])
+    persist, stable = float(p["persist_s"]), float(p["stable_dist"])
+    events: list[dict[str, Any]] = []
+    for tr in objs:
+        items = sorted(((float(t), bbox_to_iso(b, aspect)) for t, b in tr.boxes), key=lambda x: x[0])
+        ts = np.array([x[0] for x in items])
+        cs = np.array([[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] for _, b in items])
+        settle = None
+        for k in range(len(items)):
+            if ts[-1] < ts[k] + persist - 0.25:
+                break
+            win = (ts >= ts[k]) & (ts <= ts[k] + persist)
+            if np.all(np.linalg.norm(cs[win] - cs[k], axis=1) <= stable) and any(
+                    point_polygon_dist(cs[k], d) <= float(p["zone_margin"]) for d in desks):
+                settle = k
+                break
+        if settle is None:
+            continue
+        t_s, box_s = float(ts[settle]), items[settle][1]
+        if settle == 0 and t_s - t_video0 <= 0.5:
+            continue  # лежал с начала видео
+        reid = False
+        for other in objs:
+            if other is tr or other.label != tr.label:
+                continue
+            for t_o, b_o in other.boxes:
+                bo = bbox_to_iso(b_o, aspect)
+                c_o = np.array([(bo[0] + bo[2]) / 2, (bo[1] + bo[3]) / 2])
+                if t_s - float(p["reid_gap_s"]) <= float(t_o) < t_s and np.linalg.norm(c_o - cs[settle]) <= 2 * stable:
+                    reid = True
+                    break
+            if reid:
+                break
+        if reid:
+            continue  # тот же предмет под новым id
+        best = None
+        for s in series_list:
+            t_near = None
+            for j, g in enumerate(s.geoms):
+                t = float(s.times[j])
+                if not (t_s - float(p["pre_s"]) <= t <= t_s + float(p["post_s"])):
+                    continue
+                wr = g.wrists()
+                if wr and min(point_box_dist(w, box_s) for _, w in wr) / g.s <= float(p["near"]):
+                    t_near = t
+                    break
+            if t_near is None:
+                continue
+            released = False
+            for j, g in enumerate(s.geoms):
+                t = float(s.times[j])
+                if t_near < t <= t_s + float(p["release_s"]):
+                    wr = g.wrists()
+                    if wr and min(point_box_dist(w, box_s) for _, w in wr) / g.s >= float(p["far"]):
+                        released = True
+                        break
+            if released and (best is None or t_near < best[0]):
+                best = (t_near, s)
+        if best is None:
+            continue
+        t_on, who = best
+        x1, y1, x2, y2 = (float(v) for v in items[settle][1])  # iso → нормированный bbox
+        events.append({"t_start": round(t_on, 3), "t_settle": round(t_s, 3),
+                       "t_end": round(t_s + float(p["hold_s"]), 3), "person_track_id": who.tid, "role": who.role,
+                       "object_track_id": int(tr.track_id), "label": tr.label,
+                       "bbox": (x1 / aspect, y1, x2 / aspect, y2)})
+    return events
+
+
 def _run_at(runs: Sequence[tuple[float, float, float]], t: float) -> Optional[dict[str, float]]:
     for t_a, t_b, t_pk in runs:
         if t_a - 1e-6 <= t <= t_b + 1e-6:
@@ -629,6 +712,8 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
     from .status import status as _pose_status
 
     pose_status = _pose_status().get("state", "unknown")
+    placements = (_item_placements(series_list, tracks, zones_iso, aspect, cfg)
+                  if extras_on.get("item_placed_on_desk", False) else None)
     states: list[PoseSceneState] = []
     for key in sorted(tkeys):
         t = key / _TKEY
@@ -687,6 +772,13 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
                 run = _run_at(pair_runs.get(pair, []), t)
                 if run:
                     extra["runs"]["handover_motion"] = run
+        if extras_on.get("item_placed_on_desk", False):
+            if placements is None:
+                extra["item_placed_on_desk"] = None  # нет зоны desk или объект-треков — unknown
+            else:
+                act = [e for e in placements if e["t_start"] - 1e-6 <= t <= e["t_end"] + 1e-6]
+                extra["item_placed_on_desk"] = 1.0 if act else 0.0
+                extra["placements"] = act
         extra["unknown"] = [nm for nm in enabled if nm not in signals]
         states.append(PoseSceneState(t=t, signals=signals, extra=extra))
     return states
