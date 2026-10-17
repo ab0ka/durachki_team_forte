@@ -19,7 +19,7 @@ from typing import Any, Iterable, Optional
 from . import NORMS_DIR
 
 TEXT_SUFFIXES = (".html", ".htm", ".md", ".txt")
-_ADILET_CODE_RE = re.compile(r"\b([VZPKU]\d{9,10}_?)\b")
+_ADILET_CODE_RE = re.compile(r"(?<![A-Za-z0-9])([VZPKU]\d{9,10}_?)(?!\d)", re.I)
 _HEADING_RE = re.compile(r"^\s*((?:Глава|Параграф|Раздел)\s+\d+[\-\d]*\.?.*)$", re.I)
 _CLAUSE_RE = re.compile(r"^\s*(\d{1,3}(?:-\d{1,2})?)\.\s+(\S.*)$")
 
@@ -48,7 +48,7 @@ class Clause:
 
 def adilet_code(s: str) -> Optional[str]:
     m = _ADILET_CODE_RE.search(s)
-    return m.group(1) if m else None
+    return m.group(1).upper() if m else None
 
 
 def _doc_index(catalog: Optional[dict[str, Any]]) -> dict[str, tuple[str, str]]:

@@ -107,3 +107,21 @@ def test_import_then_validate_flags_missing_quotes(fetched_dir: Path, tmp_path: 
     status = {(q.type_id, q.index): q.status for q in rep.quotes}
     assert status[("V08", 0)] == "OK" and status[("V09", 0)] == "OK"
     assert status[("V08", 1)] == "NOT_FOUND" and not rep.ok  # полный текст выявляет неподтверждённую цитату
+
+
+@pytest.mark.parametrize("name,code", [
+    ("V1900019680.html", "V1900019680"),
+    ("V1900019680_full.html", "V1900019680_"),
+    ("bizup_v1900019680.txt", "V1900019680"),
+    ("Z950002444_.md", "Z950002444_"),
+    ("no_code_here.md", None),
+])
+def test_adilet_code_detection(name: str, code):
+    assert texts.adilet_code(name) == code
+
+
+def test_suffixed_filename_maps_to_catalog_doc(tmp_path: Path):
+    d = tmp_path / "f"
+    d.mkdir()
+    (d / "V1900019680_full.html").write_text(_html(SYNTH), encoding="utf-8")
+    assert texts.load_dir(d, norms.load_catalog())[0].doc_id == "nbrk_231_2019"
