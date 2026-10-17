@@ -6,20 +6,66 @@
 Низкая уверенность или окклюзия → **unknown**, а не ложный ноль и не нарушение. Production никогда
 не переключается на mock сам; неполный анализ позы виден в `status()["coverage"]`.
 
+## Доступность сейчас (честно; аудит integration-cloud 2055fc4)
+
+Импорт `ml.pose` **не означает**, что поза доступна. Бэкенд готов, только если одновременно найден файл весов
+и установлен пакет — это показывает `ml.pose.availability()`, без загрузки моделей.
+
+| бэкенд | нужно | у L1/L2 сейчас | итог |
+|---|---|---|---|
+| `rtmpose_onnx` (порядок по умолчанию) | `*rtmpose-m*.onnx` в `$SENTINEL_WEIGHTS_DIR/pose/` или `SENTINEL_POSE_ONNX` + пакет `onnxruntime` | веса **не скачаны** | недоступен → `stage_status: skipped` |
+| `mediapipe` (opt-in) | `pose_landmarker_full.task` + пакет `mediapipe` (в lock L1 нет, сейчас не добавляем) | нет | недоступен |
+| `mock` | только `SENTINEL_MOCK=1` / `SENTINEL_POSE_BACKEND=mock` | — | тесты/демо, в статусе `mock` |
+
+**Текущий безопасный режим без новых весов** (ничего включать не нужно): `enabled: auto` → `estimate()` = `[]`,
+`status()["state"] == "unavailable"`, `stage_status == "skipped"`, причина «веса не найдены локально»;
+`pose_signals()` — все сигналы позы **unknown** (ключей нет), никаких координат рук/головы и скелетов.
+Чтобы и `meta` у A03 честно показал пропуск (пока A03 не читает статус позы, см. «Для интегратора»):
+`SENTINEL_PIPELINE_CONFIG=ml/pose/presets/a03_pose_off.yaml` (`stages.pose: false` → `disabled` → `skipped`).
+
+**Включение настоящего бэкенда — только после локальной проверки у L2:**
+
+```bash
+# 1) положить веса (один раз, офлайн), проверить готовность без загрузки модели
+python -c "import ml.pose as p, json; print(json.dumps(p.availability(), ensure_ascii=False, indent=1))"
+# 2) проверить качество на своих кадрах локально (картинки — только на локальный диск)
+python -m ml.pose.ab --video <ролик> --out <локальная папка> --backends rtmpose_onnx
+# 3) включить: поза обязательна в этом запуске (нет бэкенда → failed, а не тихий skipped)
+SENTINEL_POSE_ENABLED=1 SENTINEL_POSE_BACKEND=rtmpose_onnx SENTINEL_POSE_ONNX=<путь к .onnx> <команда запуска>
+```
+
 ## Публичные функции (сигнатуры контракта v1 не менялись)
 
 ```python
-from ml.pose import estimate, pose_signals, warmup, status
+from ml.pose import estimate, pose_signals, warmup, status, availability, model_info
 
 poses  = estimate(clip, tracks)               # -> list[PoseFrame] (фактически PoseFrameX, наследник)
 states = pose_signals(poses, tracks, zones)   # -> list[SceneState] (фактически PoseSceneState, наследник)
-warmup()   # -> bool: загрузить и прогреть бэкенд; False — выключен или недоступен
-status()   # -> dict: итог последнего estimate(): state, stage_status, backend, error, warnings, coverage
+warmup()        # -> bool: загрузить и прогреть бэкенд; False — выключен или недоступен
+status()        # -> dict: итог последнего estimate(): state, stage_status, available, error, warnings, coverage
+availability()  # -> dict: готов ли реальный бэкенд сейчас (веса + пакет), без загрузки моделей
+model_info()    # -> dict: хук A03 (identity и ключ кэша): checkpoint, available, stage_status, флаги, config_sha
 ```
 
-`estimate` никогда не бросает исключение из-за позы. Нет весов или сбой → `[]`, причина в `status()`
-и в логгере `ml.pose`. Импорт пакета без побочных эффектов: numpy, cv2, onnxruntime и mediapipe
-импортируются лениво.
+`estimate` никогда не бросает исключение из-за позы. Нет весов или сбой → `[]` (или позы до сбоя), причина
+в `status()` и в логгере `ml.pose`. Импорт пакета без побочных эффектов: numpy, cv2, onnxruntime и
+mediapipe импортируются лениво.
+
+| `status()["state"]` | `stage_status` | когда |
+|---|---|---|
+| `disabled` | `skipped` | `enabled: false` / `SENTINEL_POSE_ENABLED=0` |
+| `unavailable` | `skipped` | `auto`: весов/пакета нет |
+| `unavailable` | `failed` | веса есть, но бэкенд не поднялся; или `enabled: 1`, а бэкенда нет |
+| `no_persons` | `ok` | нет person-треков |
+| `ok` / `partial` | `ok` | поза посчитана (`partial` — шаг по сэмплам > 1 из-за бюджета, см. `coverage.stride`) |
+| `partial` | `timeout` | упёрлись в `max_crops_total`: конец видео без позы (`coverage.analyzed_until_sec`) |
+| `no_poses` | `ok` | бэкенд отработал, но ни одной уверенной позы — сигналы unknown |
+| `failed` | `failed` | сбой инференса посреди прогона (позы до сбоя — настоящие, `coverage.stopped_early`) |
+| `mock` | `mock` | явный mock-режим |
+
+Что модуль **не выдаёт** как позу: нулевой скелет «поза не найдена» (max score < `min_pose_score`), точки
+далеко за bbox своего трека (score 0, `geometry_margin`), позу из невалидного bbox (NaN, перевёрнутый,
+не 0..1 — в `status()["invalid_boxes"]`), битые точки (не 3 числа, NaN — score 0).
 
 Инструмент замера: `python -m ml.pose.ab` (см. раздел «Замер для L2»).
 
@@ -126,8 +172,9 @@ python -m ml.pose.ab --video data/raw/<ролик>.mov [--video ...] --out <ло
 ```
 
 Выход: `ab_report.md` / `ab_report.json` (только числа и имена файлов), `per_crop.csv`, а также
-`overlays/<вариант>/*.jpg` — скелеты с размытыми головами, только на локальный диск (в папку кладётся
-`.gitignore` с `*`; `--no-overlays` отключает картинки). Недоступный вариант (нет весов) помечается
+`overlays/<вариант>/*.jpg` — скелеты, только на локальный диск (в папку кладётся `.gitignore` с `*`;
+`--no-overlays` отключает картинки). Голова размывается только по найденным точкам головы; если их нет,
+место головы не угадывается — размывается весь bbox человека (счётчики — `overlay_blur` в JSON). Недоступный вариант (нет весов) помечается
 `unavailable` и не прерывает прогон. `mediapipe` vs `mediapipe_noup` измеряет пользу апскейла.
 Согласие между бэкендами (PCK@0.5) — не точность: эталона нет.
 
@@ -159,8 +206,14 @@ pip install --no-deps "mediapipe==0.10.35" && pip install absl-py flatbuffers ce
 
 ## Проверено / не проверено
 
-* Проверено в песочнице (CPU, Python 3.11, numpy 2.4, opencv-python-headless 4.14, PyYAML 6.0, pytest 9.1):
-  `python -m pytest ml/pose/tests` — 78 passed, 1 skipped (real-smoke MediaPipe пропускается без модели).
+* Аудит 2055fc4 (песочница, синтетика): `python -m pytest ml/pose/tests` — 105 passed, 1 skipped
+  (real-smoke MediaPipe без модели). Тот же набор внутри `integration-cloud` с каноническим контрактом A01 —
+  105 passed, 1 skipped; тесты A03 `backend/pipeline/tests -m "not gpu and not slow"` с этой версией позы —
+  54 passed, 2 skipped (нет пакета `av`), 12 deselected. `testkit.e2e_stub --no-backend` (mock): стадии
+  pose/pose_signals — real, без проблем; итоговый `status=failed` у стаба одинаков и с прежней версией
+  `ml/pose` — причина вне модуля позы, не исследовалась.
+* Ранее (фаза 2; CPU, Python 3.11, numpy 2.4, opencv-python-headless 4.14, PyYAML 6.0, pytest 9.1):
+  78 passed, 1 skipped.
   С моделью (`SENTINEL_POSE_MP_TASK`) проходит и он: настоящий mediapipe 0.10.35 Tasks API создаёт
   PoseLandmarker и обрабатывает синтетический кадр. Установка `--no-deps` с opencv < 5 проверена в чистом
   venv. `python -m ml.pose.ab` прогнан с настоящим MediaPipe на синтетических кадрах (без людей, поэтому
@@ -186,10 +239,29 @@ pip install --no-deps "mediapipe==0.10.35" && pip install absl-py flatbuffers ce
    не открывает. Вливать по `scripts/merge_order.md` A01:
    `git merge --no-ff --allow-unrelated-histories origin/claude/nice-gates-fjt926`. Конфликт возможен
    только по пустому `ml/__init__.py` — берите любую сторону.
-2. **A03 (pipeline):** `ml.pose.warmup()` в warmup; после `estimate` записать
-   `meta.completeness.stages["pose"] = status()["stage_status"]` и `status()["coverage"]`. Позу **не**
-   включать в `required_stages`: это необязательная стадия, её `skipped`/`failed` не должен лишать
-   вердикта. Но и не превращать «поза не посчитана» в «нарушений нет».
+2. **A03 (pipeline) — несовместимости на границе, воспроизведены на `integration-cloud` 2055fc4** (синтетика,
+   без весов, `SENTINEL_POSE_*` не заданы):
+   * **B1. Пропуск позы выглядит как `ok`.** `backend/pipeline/orchestrator.py::_stage` ставит
+     `rec.status = "ok"` при любом успешном вызове; `estimate()` без весов честно возвращает `[]`, а
+     `coverage.py::stage_coverage` (поза в `_CLIP_WIDE`) приравнивает покрытие позы к покрытию кадров.
+     Вход: 1 person-трек, нет RTMPose. Сейчас: `meta.stages.pose.status = ok`, `coverage.by_stage.pose ≈ 1.0`.
+     Ожидается: `skipped` с причиной «веса не найдены локально», покрытие позы 0/None. Данные у A03 уже есть:
+     `ctx.identities["pose"]["model_info"]["stage_status"]` (мой `model_info()`, собирается до вызова) или
+     `ml.pose.status()["stage_status"]` после вызова через executor. До исправления — пресет
+     `SENTINEL_PIPELINE_CONFIG=ml/pose/presets/a03_pose_off.yaml`.
+   * **B2. `extra` теряется.** `backend/pipeline/serde.py::load_pose/load_state` собирают голые
+     `PoseFrame`/`SceneState` (при `cache.normalize_outputs: true`), поэтому `PoseSceneState.extra`
+     (`pose_status`, `runs`, `gestures`, `motion`, `placements`, `track_ids`, `boxes`) и `PoseFrameX.extra`
+     (`bbox`, `frame_wh`, `source`) не доходят до A08/A09/A12. Ожидается: сохранять `extra`, как `load_event`.
+   * **B3. Provenance заявляет неиспользованные модели.** `orchestrator.py::_provenance` берёт
+     `meta.provenance.models` из `models.json` модуля — для позы это RTMPose-m и MediaPipe даже без весов.
+     Ожидается: для позы брать `model_info()["models_loaded"]` (пусто — моделей нет).
+   * Уже закрыто с моей стороны: `model_info()` даёт A03 `checkpoint` (→ `checkpoint_sig`), флаги
+     `SENTINEL_POSE_*` и `config_sha` — ключ кэша стадии меняется при появлении весов и при смене флагов
+     (иначе плечи A/B «поза вкл/выкл» с общим кэшем получали бы один и тот же результат).
+   * Позу **не** включать в `required_stages`; `ml.pose.warmup()` возвращает False без весов — это норма.
+   * Размытие голов на кадрах-доказательствах (A12) возможно только при найденных точках головы; когда поза
+     пропущена, точек нет — A12 честно пишет warning «нет ключевых точек головы», и обещать размытие нельзя.
 3. **A06:** возвращать в `tracks` объект-треки (`cell_phone`, `cup`, `bottle`, `food`, `bag`, `cash_bag`,
    `cash`, `document`, `keys`) — без них предметные сигналы и `placements` остаются unknown. Роль
    `cashier` — по поведению и зоне.
@@ -228,4 +300,12 @@ pip install --no-deps "mediapipe==0.10.35" && pip install absl-py flatbuffers ce
 * Таймкод — начало перехода (`t_start`), пик — отдельно (`t_peak`); выбор политики — замером.
 * `item_placed_on_desk` и `motion` — новые режимы, по умолчанию выключены. Признаки — только геометрия в
   масштабах тела и зоны из `zones`; без пиксельных координат, цвета одежды и яркости.
-* `ml.pose.ab` пишет картинки только в локальную папку с `.gitignore` `*`, головы размыты.
+* `ml.pose.ab` пишет картинки только в локальную папку с `.gitignore` `*`.
+
+Аудит (2055fc4):
+* «Модуль импортируется» ≠ «поза доступна»: `availability()`/`model_info()` проверяют файл весов и пакет
+  (`find_spec`, без загрузки); `verified` — только после реальной загрузки в процессе.
+* Не выдаём «скелет» там, где позы нет: нулевые/неуверенные позы, точки за bbox трека, позы из невалидных
+  bbox не попадают в выход; битые точки → score 0. Сбой посреди прогона — `failed`, а не `ok`.
+* `item_placed_on_desk = 0.0` только при наличии позы в момент t; без поз — `None` (unknown).
+* Оверлеи `ab`: без точек головы размывается весь человек — «верх bbox» на потолочной камере не голова.
