@@ -70,16 +70,53 @@ load_video(path, sample_fps, *, config=None, backend=None, progress=None)  # key
 `FrameRef.timestamp_sec` возвращается фактический PTS. Округление — только при показе (контакт-листы,
 предупреждения, тайминги). `frame_index/fps` временем не считается нигде.
 
-* **Начало и конец.** `t < 0` или `t > duration` → крайний кадр с `out_of_range=True`.
-  Последний кадр доступен до `duration` (его показ длится шаг кадра).
-* **Пробелы покрытия.** Соседние PTS дальше, чем `max(min_gap_s, gap_factor·медианный шаг)`;
-  кадры в начале; хвост неполного файла. Всё это попадает в `clip.coverage["gaps"]` с предупреждением.
+* **Длительность.** `clip.duration` — НОМИНАЛЬНАЯ длительность видеопотока (контейнер: ffprobe → PyAV → OpenCV),
+  а не декодированный отрезок. Если декодирование не дошло до конца (обрезанный/битый файл),
+  недекодированный хвост остаётся внутри `[0, duration]` и виден потребителю: у A03 `times` кончаются раньше
+  `duration`, а в `clip.coverage["unknown_spans"]` лежит хвост. Если контейнер занижает длительность,
+  берётся декодированный отрезок (максимум из двух). Для дедлайна и покрытия длительность использовать
+  можно и нужно; как ML-признак — нельзя.
+* **Начало и конец.** `t < 0` или `t > duration` → крайний кадр (первый или ПОСЛЕДНИЙ декодированный)
+  с `out_of_range=True`. Момент внутри недекодированного хвоста → последний декодированный кадр с
+  `in_gap=True`. Первый кадр при выходе за конец не возвращается.
+* **Пробелы покрытия.** Внутренние: соседние PTS дальше, чем `max(min_gap_s, gap_factor·медианный шаг)`
+  (не путать с дрожанием VFR). Голова и хвост: недекодированное начало или конец длиннее 1,5 медианного
+  шага кадра. Всё это попадает в `clip.coverage["gaps"]` и `["unknown_spans"]` с предупреждением.
   Кадр дальше `frame_at.max_offset_s` (0,25 с) от запрошенного t помечается `in_gap=True`;
   при `strict=True` — `FrameGapError(code="frame_gap")`. Сэмплы внутри дыры не выдумываются.
 * **unknown ≠ false.** Пробел — это «неизвестно», а не «нарушений нет». Пайплайн должен смотреть
   `clip.coverage` (и `WindowRead.complete` в coarse-to-fine), прежде чем выдавать `no_violation`.
 * **Дубликаты кадров.** Несколько запросов, попавших в один кадр, дают один и тот же
   `timestamp_sec`; `distinct_frames_at` отбрасывает повторы, чтобы A12 не взял три копии одного кадра.
+
+## Поля и единицы (передача L2 / A03 / A12 / A11)
+
+Все времена — секунды float от первого кадра потока (PTS первого кадра = 0.0), без округления.
+Поле `Clip` → `meta` → `coverage`:
+
+| поле | тип, единицы | смысл |
+|---|---|---|
+| `clip.duration` | float, с | номинальная длительность видеопотока (≥ декодированного; см. выше) |
+| `clip.times` | list[float], с | фактические PTS сэмплов (по возрастанию; первый = 0.0) |
+| `clip.source_times` | list[float], с | PTS всех декодированных кадров |
+| `clip.fps` | float, кадр/с | средний fps потока из контейнера (информативно, НЕ для вычисления времени) |
+| `clip.frame_at_ts(t)` | (ndarray, float с) | точный кадр + фактический PTS |
+| `clip.read_exact(t, strict)` | FrameRef | `timestamp_sec`, `requested_sec`, `offset_sec`, `in_gap`, `out_of_range`, `ok`; strict → `FrameGapError` |
+| `clip.coverage["duration"]` | float, с | = `clip.duration` |
+| `clip.coverage["declared_duration"]` | float, с | длительность видеопотока из контейнера (0.0 — неизвестна) |
+| `clip.coverage["decoded_span"]` | float, с | последний декодированный PTS + медианный шаг кадра |
+| `clip.coverage["coverage"]` | float 0..1 | `decoded_span / declared_duration` (1.0, если длительность неизвестна) |
+| `clip.coverage["complete"]` | bool | `coverage >= decode.warn_coverage` (0.98). При True малые `unknown_spans` (< 2%) допустимы |
+| `clip.coverage["unknown_spans"]` | list[[t0, t1]], с | не декодировано: голова, внутренние дыры, хвост (формат A01 `Coverage.unknown_spans`) |
+| `clip.coverage["gaps"]` | list[(t0, t1)], с | то же, кортежами |
+| `clip.coverage["source_times_complete"]` | bool | False при `skip_nonref`: внутренние дыры не считаются, голова и хвост — считаются |
+| `clip.meta["t0_pts_sec"]` | float, с | абсолютный PTS первого кадра (смещение старта, уже вычтено) |
+| `clip.meta["median_frame_dt"]` | float, с | медианный шаг между PTS кадров |
+| `clip.meta["warnings"]` | list[str] | по-русски, в т.ч. «видео неполное: …», «пробелы покрытия: …» |
+
+Ошибки: `ml.ingest.IngestError` (`.code`, `.message`, `.details`): `decode_failed`, `incomplete_video`
+(декодировано < `decode.min_coverage`), `probe_failed`, `no_video_stream`, `duration_out_of_range`,
+`file_not_found`, `frame_gap` (только strict).
 
 ## Решения (фаза 1, сохранены)
 
@@ -163,7 +200,7 @@ python -m ml.ingest.split_blinks --videos data/extra/incoming --journal data/ext
 
 ## Проверки и замеры (фактически выполнено)
 
-`python -m pytest ml/ingest/tests -q` → **156 passed** (~70 с). Linux-контейнер, 4 vCPU, Python 3.11.17,
+`python -m pytest ml/ingest/tests -q` → **164 passed** (~60 с). Linux-контейнер, 4 vCPU, Python 3.11.17,
 версии из lock L1: av 18.1.0, opencv-python-headless 4.14.0.94, numpy 2.4.6, PyYAML 6.0.3, pytest 9.1.1;
 ffmpeg 6.1.1. Фаза 1 проходила и на opencv 5.0.0.93.
 
@@ -228,12 +265,25 @@ ffmpeg 6.1.1. Фаза 1 проходила и на opencv 5.0.0.93.
 * **A12.** `EvidenceFrame.timestamp_sec = ref.timestamp_sec` из `clip.read_exact(t)` или `frame_at_ts`,
   не запрошенное t. Кадры брать через `clip.distinct_frames_at(times, min_separation_s=...)`.
   `ref.in_gap` / `ref.out_of_range` — не показывать как доказательство (или `strict=True`).
-* **A03.**
+* **A03 — граница, проверено на `claude/integration-cloud` @ 2055fc4.**
+  * `backend/pipeline/worker.py:165` (`_clip_info`) передаёт оркестратору только
+    `duration/fps/width/height/times/source`. `clip.meta["warnings"]` («видео неполное: …») и
+    `clip.coverage` теряются. С исправленной `duration` хвост теперь виден и так. Синтетика: файл, обрезанный
+    до 96%, раньше давал в `canonical_coverage` `ratio=1.0, complete=True`, теперь `ratio=0.96, complete=False`.
+    Чтобы были видны и хвосты меньше шага сэмплов, и тексты предупреждений, нужно пробросить
+    `getattr(clip, "coverage", None)` и `getattr(clip, "warnings", [])` в `_clip_info`. Тогда
+    `coverage["unknown_spans"]` идут в `compute_coverage(unknown_spans=…)`. Ожидание: для обрезанного файла
+    `meta.coverage.unknown_spans` содержит `[decoded_span, duration]`.
+  * `backend/pipeline/coverage.py` (`covered_intervals`) считает покрытым хвост короче 1,5 шага сэмплов
+    (0,3 с при 5 fps). Такой хвост ingest всё равно перечисляет в `unknown_spans`.
   * Загрузка: `load_video(path, sample_fps, progress=...)`; ловить `IngestError` (`.code`, `.message`).
   * Перед `no_violation` проверять `clip.coverage`: `complete` и `gaps`. При пробелах — частичный результат
     с предупреждением, а не «нарушений нет».
   * Coarse-to-fine: `from ml.ingest import coarse_fine as CF; if CF.enabled(cfg): plan, reads = CF.run(clip, candidates)`.
     Обзорные кадры — `clip.frame(i)` по `plan.coarse_indices`; окна — `reads[k].frames` (точные), `reads[k].complete`.
+* **A11.** `ml/vlm/frames.py:55` (`get_frame`) берёт `clip.frame_at(t)` — только картинку. В
+  недекодированном хвосте это последний декодированный кадр без пометки. Нужен фактический момент — брать
+  `clip.read_exact(t)` и пропускать `not ref.ok`.
 * **A02.** Коды ошибок в HTTP 422: `file_not_found`, `probe_failed`, `no_video_stream`,
   `duration_out_of_range`, `decode_failed`, `incomplete_video`; `frame_gap` — внутренний.
 * **A08.** `clip.quality[i]["motion_energy"]`; метрики не зависят от ориентации. Яркость — не признак
