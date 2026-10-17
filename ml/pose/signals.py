@@ -52,6 +52,7 @@ class _Series:
     values: dict[str, list[Optional[float]]] = field(default_factory=dict)
     gestures: dict[str, list[Optional[float]]] = field(default_factory=dict)
     extras: dict[str, list[Optional[float]]] = field(default_factory=dict)
+    runs: dict[str, list[tuple[float, float, float]]] = field(default_factory=dict)  # (t_start, t_end, t_peak)
 
 
 class _ObjectIndex:
@@ -183,12 +184,17 @@ def _apply_gate(series: _Series, name: str, ev: Sequence[Optional[float]], p: di
         vals, mask = gated_values(series.times[idx], [ev[i] for i in idx], p)
         for k, i in enumerate(idx):
             out[i] = float(vals[k])
+        runs = []
         for a, b in runs_from_mask(mask):
             t_a, t_b = series.times[idx[a]], series.times[idx[b]]
             fill = float(vals[a:b + 1].mean())
+            seg = [ev[idx[k]] for k in range(a, b + 1)]
+            t_peak = float(series.times[idx[a + int(np.argmax(seg))]])
+            runs.append((float(t_a), float(t_b), t_peak))
             for j in range(n):
                 if out[j] is None and t_a <= series.times[j] <= t_b:
                     out[j] = fill
+        series.runs[name] = runs
     series.values[name] = out
 
 
@@ -240,6 +246,10 @@ def _phone_to_ear(series: _Series, objs: _ObjectIndex, cfg: dict[str, Any]) -> N
             span = [j for j in range(n) if t_a <= series.times[j] <= t_b]
             confirmed = any(phone_near[j] for j in span)
             fill = float(vals[a:b + 1].mean())
+            if confirmed:
+                seg = [gesture[known[k]] for k in range(a, b + 1)]
+                series.runs.setdefault("phone_to_ear", []).append(
+                    (float(t_a), float(t_b), float(series.times[known[a + int(np.argmax(seg))]])))
             for j in span:
                 in_run[j] = True
                 gest_out[j] = fill
@@ -321,18 +331,21 @@ def _eating(series: _Series, objs: _ObjectIndex, cfg: dict[str, Any]) -> list[di
                         cycles.append(cur)
                     cur = None
                     last_far = (t, w.copy(), None if head is None else head.copy()) if d >= far else None
-    # предмет у кисти/рта во время подхода
+    # предмет (cup/bottle/food) должен быть У РТА, пока кисть у рта (dwell), а не у кисти в начале движения:
+    # стакан на столе у руки + «поправила волосы» / «почесала ухо» не дают питья
     food_labels = sc.get("food_labels", ["cup", "bottle", "food"])
     for c in cycles:
         c["object"] = False
         for j, g in enumerate(series.geoms):
             t = float(series.times[j])
-            if not (c["t_start"] - tol <= t <= c["t_end"] + tol):
+            if not (c["t_enter"] - tol <= t <= c["t_last_near"] + tol):
                 continue
-            pts = [w for _, w in g.wrists()]
             m = g.mouth()
-            if m is not None:
-                pts.append(m)
+            if m is None:
+                continue
+            pts = [m]
+            if g.ok(c["wrist"]) and g.dist(g.xy(c["wrist"]), m) <= mid:
+                pts.append(g.xy(c["wrist"]))
             for box in objs.boxes(food_labels, t - tol, t + tol):
                 if pts and min(point_box_dist(q, box) for q in pts) / g.s <= float(p["object_near"]):
                     c["object"] = True
@@ -372,6 +385,12 @@ def _eating(series: _Series, objs: _ObjectIndex, cfg: dict[str, Any]) -> list[di
         if m is not None and len(wr) == 2 and min(g.dist(w, m) for _, w in wr) > near:
             ev[j] = 0.0  # рот и обе кисти видны, кисти не у рта — наблюдаемое «нет»
     _apply_gate(series, "eating_drinking", ev, p)
+    fixed = []
+    for t_a, t_b, t_pk in series.runs.get("eating_drinking", []):
+        enters = [c["t_enter"] for c in cycles if c["object"] and t_a - 1e-6 <= c["t_enter"] <= t_b + 1e-6]
+        fixed.append((t_a, t_b, float(min(enters)) if enters else t_pk))
+    if fixed:
+        series.runs["eating_drinking"] = fixed
     series.gestures["hand_to_mouth"] = gest
     return cycles
 
@@ -440,11 +459,12 @@ def _facing_away(series: _Series, zones_iso: dict[str, list], cfg: dict[str, Any
     _apply_gate(series, "cashier_facing_away", ev, p)
 
 
-def _bending_and_posture(series: _Series, zones_iso: dict[str, list], cfg: dict[str, Any]) -> None:
+def _bending_and_posture(series: _Series, zones_iso: dict[str, list], cfg: dict[str, Any],
+                         bending: bool = True) -> None:
     sc = cfg["signals"]
     pb = sc["bending_to_safe"]
     pp = sc["posture"]
-    safes = zones_iso.get("safe", [])
+    safes = zones_iso.get("safe", []) if bending else []
     n = len(series.times)
     head_hip = []
     for g in series.geoms:
@@ -498,7 +518,7 @@ def _bending_and_posture(series: _Series, zones_iso: dict[str, list], cfg: dict[
 
 
 def _handover(series_list: list[_Series], zones_iso: dict[str, list], cfg: dict[str, Any]
-              ) -> dict[tuple[int, int], tuple[np.ndarray, list[Optional[float]]]]:
+              ) -> dict[tuple[int, int], tuple[np.ndarray, list[Optional[float]], list[tuple[float, float, float]]]]:
     p = cfg["signals"]["handover_motion"]
     zone_polys = [poly for name in p.get("zone_names", []) for poly in zones_iso.get(name, [])]
     by_time: dict[int, list[tuple[_Series, int]]] = defaultdict(list)
@@ -541,17 +561,24 @@ def _handover(series_list: list[_Series], zones_iso: dict[str, list], cfg: dict[
                     pair_ev[pair][key] = e
                 else:
                     pair_ev[pair][key] = None  # не все кисти видны — «нет передачи» не утверждаем
-    out: dict[tuple[int, int], tuple[np.ndarray, list[Optional[float]]]] = {}
+    out: dict[tuple[int, int], tuple[np.ndarray, list[Optional[float]], list[tuple[float, float, float]]]] = {}
     for pair, d in pair_ev.items():
         keys = sorted(d)
         fake = _Series(tid=-999, role="unknown", times=np.array([k / _TKEY for k in keys]),
                        kps=np.zeros((0, 17, 3)), bboxes=[])
         _apply_gate(fake, "handover_motion", [d[k] for k in keys], p)
-        out[pair] = (np.array(keys), fake.values["handover_motion"])
+        out[pair] = (np.array(keys), fake.values["handover_motion"], fake.runs.get("handover_motion", []))
     return out
 
 
 # ---------------------------------------------------------------- public
+
+
+def _run_at(runs: Sequence[tuple[float, float, float]], t: float) -> Optional[dict[str, float]]:
+    for t_a, t_b, t_pk in runs:
+        if t_a - 1e-6 <= t <= t_b + 1e-6:
+            return {"t_start": round(t_a, 3), "t_end": round(t_b, 3), "t_peak": round(t_pk, 3)}
+    return None
 
 
 def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zones: Sequence[Zone],
@@ -559,6 +586,8 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
     """Реализация pose_signals с явным конфигом (для тестов/тюнинга)."""
     cfg = cfg or load_config()
     sc = cfg["signals"]
+    enabled = [nm for nm in POSE_SIGNALS if nm in set(sc.get("enabled", POSE_SIGNALS))]
+    extras_on = sc.get("extras", {}) or {}
     poses = list(poses or [])
     tracks = list(tracks or [])
     aspect = _aspect_from_poses(poses, float(sc.get("default_aspect_wh", 0.5472)))
@@ -567,14 +596,20 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
     series_list = _build_series(poses, tracks, aspect, cfg)
     staff_roles = set(sc.get("staff_roles", ["cashier"]))
     for s in series_list:
-        _phone_to_ear(s, objs, cfg)
-        _phone_in_hand(s, objs, cfg)
-        _eating(s, objs, cfg)
-        _hands_hidden(s, cfg)
-        _facing_away(s, zones_iso, cfg)
-        _bending_and_posture(s, zones_iso, cfg)
-    pairs = _handover(series_list, zones_iso, cfg)
+        if "phone_to_ear" in enabled:
+            _phone_to_ear(s, objs, cfg)
+        if "phone_in_hand" in enabled:
+            _phone_in_hand(s, objs, cfg)
+        if "eating_drinking" in enabled:
+            _eating(s, objs, cfg)
+        if "hands_hidden" in enabled:
+            _hands_hidden(s, cfg)
+        if "cashier_facing_away" in enabled:
+            _facing_away(s, zones_iso, cfg)
+        _bending_and_posture(s, zones_iso, cfg, bending=bool(extras_on.get("bending_to_safe", False)))
+    pairs = _handover(series_list, zones_iso, cfg) if "handover_motion" in enabled else {}
     roles = {s.tid: s.role for s in series_list}
+    staff_enabled = [nm for nm in STAFF_SIGNALS if nm in enabled]
 
     # все моменты времени: позы + наблюдения person-треков (там, где позы нет, всё unknown)
     tkeys = {_tkey(p.t) for p in poses}
@@ -586,7 +621,8 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
         for j, t in enumerate(s.times):
             index[_tkey(t)].append((s, j))
     pair_index: dict[int, list[tuple[tuple[int, int], Optional[float]]]] = defaultdict(list)
-    for pair, (keys, vals) in pairs.items():
+    pair_runs = {pair: runs for pair, (_, _, runs) in pairs.items()}
+    for pair, (keys, vals, _) in pairs.items():
         for k, v in zip(keys, vals):
             pair_index[int(k)].append((pair, v))
 
@@ -598,20 +634,20 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
         t = key / _TKEY
         signals: dict[str, float] = {}
         extra: dict[str, Any] = {"n_posed": len(index.get(key, [])), "pose_status": pose_status,
-                                 "by_track": {}, "gestures": {}, "track_ids": {}, "boxes": {},
+                                 "by_track": {}, "gestures": {}, "track_ids": {}, "boxes": {}, "runs": {},
                                  "bending_to_safe": None, "sitting": None, "standing": None,
-                                 "handover_pairs": []}
+                                 "handover_pairs": [], "enabled": list(enabled)}
         staff_items = [(s, j) for s, j in index.get(key, []) if s.role in staff_roles]
         extra["staff_track_ids"] = [s.tid for s, _ in staff_items]
         for s, j in index.get(key, []):
             entry = {"role": s.role,
-                     "signals": {nm: s.values[nm][j] for nm in STAFF_SIGNALS if s.values.get(nm) and s.values[nm][j] is not None},
+                     "signals": {nm: s.values[nm][j] for nm in staff_enabled if s.values.get(nm) and s.values[nm][j] is not None},
                      "gestures": {gn: gv[j] for gn, gv in s.gestures.items() if gv[j] is not None},
                      "bending_to_safe": s.extras.get("bending_to_safe", [None] * (j + 1))[j],
                      "sitting": s.extras.get("sitting", [None] * (j + 1))[j],
                      "bbox": s.bboxes[j]}
             extra["by_track"][s.tid] = entry
-        for nm in STAFF_SIGNALS:
+        for nm in staff_enabled:
             best, best_s = None, None
             for s, j in staff_items:
                 v = s.values.get(nm, [None] * (j + 1))[j]
@@ -623,6 +659,9 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
                     extra["track_ids"][nm] = [best_s[0].tid]
                     if best_s[0].bboxes[best_s[1]]:
                         extra["boxes"][nm] = best_s[0].bboxes[best_s[1]]
+                    run = _run_at(best_s[0].runs.get(nm, []), t)
+                    if run:
+                        extra["runs"][nm] = run  # t_start — начало перехода (таймкод события), t_peak — максимум
         for gn in ("hand_at_head", "hand_to_mouth", "hands_not_visible"):
             vals = [s.gestures.get(gn, [None] * (j + 1))[j] for s, j in staff_items]
             vals = [v for v in vals if v is not None]
@@ -645,7 +684,10 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
                                                     roles.get(pr[1], "unknown"), round(float(vv), 4)])
             if v >= 0.5:
                 extra["track_ids"]["handover_motion"] = [pair[0], pair[1]]
-        extra["unknown"] = [nm for nm in POSE_SIGNALS if nm not in signals]
+                run = _run_at(pair_runs.get(pair, []), t)
+                if run:
+                    extra["runs"]["handover_motion"] = run
+        extra["unknown"] = [nm for nm in enabled if nm not in signals]
         states.append(PoseSceneState(t=t, signals=signals, extra=extra))
     return states
 
