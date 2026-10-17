@@ -279,9 +279,14 @@ def test_dark_video_warning(tmp_path: Path) -> None:
     assert any("тёмное" in w for w in clip.warnings)
 
 
-def test_synthetic_uri_and_progress(cfr_video: str) -> None:
+def test_synthetic_uri_and_progress(cfr_video: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SENTINEL_MOCK", raising=False)
+    with pytest.raises(IngestError):  # production сам на мок не переключается
+        load_video("synthetic://4")
+    monkeypatch.setenv("SENTINEL_MOCK", "1")  # явно помеченный мок для тестов/демо
     syn = load_video("synthetic://4")
     assert isinstance(syn, SyntheticClip) and len(syn) == 20 and syn.frame(0).shape == (848, 464, 3)
+    assert syn.meta["mock"] is True
     calls: list[float] = []
     load_video(cfr_video, progress=calls.append)
     assert calls and calls[-1] == 1.0

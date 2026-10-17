@@ -36,7 +36,9 @@ DEFAULTS: dict[str, Any] = {
         "copy_on_access": True,
         "encode_workers": 4,
     },
-    "frame_at": {"cache_size": 32, "cache_mb": 128, "forward_window_s": 1.5},
+    "frame_at": {"cache_size": 32, "cache_mb": 128, "forward_window_s": 1.5,
+                 "max_offset_s": 0.25, "gap_factor": 3.0, "min_gap_s": 0.25},
+    "mock": {"allow_synthetic_uri": False},
     "quality": {
         "analysis_width": 160,
         "blur_ksize": 5,

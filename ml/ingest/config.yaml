@@ -30,6 +30,12 @@ frame_at:
   cache_size: 32           # LRU точных кадров (доказательства)
   cache_mb: 128
   forward_window_s: 1.5    # следующий t в пределах окна — декодируем вперёд без seek
+  max_offset_s: 0.25       # |PTS кадра − запрошенное t| больше — FrameRef.in_gap (strict: FrameGapError)
+  gap_factor: 3.0          # пробел покрытия: соседние PTS дальше, чем gap_factor * медианный шаг ...
+  min_gap_s: 0.25          # ... и не меньше min_gap_s
+
+mock:
+  allow_synthetic_uri: false  # load_video("synthetic://N") только в тестах/демо (или env SENTINEL_MOCK=1)
 
 quality:
   analysis_width: 160      # ширина серого кадра для метрик (меньше = быстрее)

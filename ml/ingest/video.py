@@ -38,7 +38,7 @@ import numpy as np
 
 from . import quality as Q
 from .config import load_config
-from .errors import DecodeError, IngestError, NoVideoStreamError, VideoProbeError
+from .errors import DecodeError, FrameGapError, IngestError, NoVideoStreamError, VideoNotFoundError, VideoProbeError
 from .orientation import IDENTITY, Orientation
 from .probe import probe_and_validate, pyav_frame_orientation
 
@@ -51,12 +51,18 @@ class FrameRef:
     """Точный кадр + его фактический таймкод (для доказательств)."""
 
     image: np.ndarray
-    timestamp_sec: float  # фактический PTS выбранного кадра, сек от первого кадра
+    timestamp_sec: float  # фактический PTS выбранного кадра, сек от первого кадра (без округления)
     requested_sec: float  # что просили
+    in_gap: bool = False        # |timestamp − requested| > frame_at.max_offset_s: в этот момент кадра нет
+    out_of_range: bool = False  # requested вне [0, duration]: отдан крайний кадр
 
     @property
     def offset_sec(self) -> float:
         return self.timestamp_sec - self.requested_sec
+
+    @property
+    def ok(self) -> bool:
+        return not (self.in_gap or self.out_of_range)
 
 
 # ----------------------------------------------------------------------------- caches / storage
@@ -726,39 +732,87 @@ class Clip:
         ref = self.read_exact(t)
         return ref.image, ref.timestamp_sec
 
-    def read_exact(self, t: float) -> FrameRef:
-        return self.frames_at([t])[0]
+    def read_exact(self, t: float, strict: bool = False) -> FrameRef:
+        """Точный кадр + фактический PTS. strict=True: нет кадра в момент t -> FrameGapError."""
+        return self.frames_at([t], strict=strict)[0]
 
-    def frames_at(self, times: Sequence[float]) -> list[FrameRef]:
-        """Несколько точных кадров за один проход (отсортировано внутри, порядок ответа = порядок times)."""
+    def frames_at(self, times: Sequence[float], strict: bool = False) -> list[FrameRef]:
+        """Точные кадры исходника (полный размер) для моментов ``times``; порядок ответа = порядок times.
+
+        Цепочка: t -> ближайший PTS таймлайна загрузки (без округления) -> декод именно этого кадра.
+        Запросы, попавшие в один и тот же кадр, декодируются один раз (одинаковый timestamp_sec).
+        Вне [0, duration] — крайний кадр с ``out_of_range``; в пробеле покрытия — ``in_gap``;
+        strict=True в обоих случаях бросает :class:`FrameGapError`.
+        """
         req = [float(t) for t in times]
-        t_max = self.source_times[-1] if self.source_times else math.inf
+        max_off = float(self._cfg["frame_at"].get("max_offset_s", 0.25))
+        st = self.source_times
+        exact_timeline = bool(st) and bool(self.meta.get("source_times_complete", True))
+        t_hi = st[-1] if st else math.inf
 
-        def key_of(t: float) -> float:  # вне [0, последний PTS] -> крайний кадр
-            return round(min(max(0.0, t), t_max), 4)
+        def target_of(t: float) -> float:
+            tc = min(max(t, 0.0), t_hi)
+            return self.snap_time(tc) if exact_timeline else tc
 
+        targets = [target_of(t) for t in req]
         found: dict[float, tuple[np.ndarray, float]] = {}
-        missing = []
-        for t in req:
-            key = key_of(t)
-            hit = self._exact.get(key)
+        missing: list[float] = []
+        for tg in targets:
+            if tg in found or tg in missing:
+                continue
+            hit = self._exact.get(tg)
             if hit is not None:
-                found[key] = hit
-            elif key not in missing:
-                missing.append(key)
+                found[tg] = hit
+            else:
+                missing.append(tg)
         if missing:
             with self._reader_lock:
                 if self._reader is None:
                     raise DecodeError("Clip закрыт: точный доступ к кадрам недоступен", path=self.path)
-                for key in sorted(missing):
-                    img, ts = self._reader.read_one(key)
-                    found[key] = (img, ts)
-                    self._exact.put(key, (img, ts), img.nbytes)
+                for tg in sorted(missing):
+                    img, ts = self._reader.read_one(tg)
+                    found[tg] = (img, ts)
+                    self._exact.put(tg, (img, ts), img.nbytes)
         out = []
-        for t in req:
-            img, ts = found[key_of(t)]
-            out.append(FrameRef(img.copy() if self._copy else img, float(ts), t))
+        for t, tg in zip(req, targets):
+            img, ts = found[tg]
+            oor = t < -_EPS or t > self.duration + _EPS
+            gap = (not oor) and abs(ts - t) > max_off
+            if strict and (oor or gap):
+                where = "вне видео" if oor else "в пробеле покрытия"
+                raise FrameGapError(
+                    f"Нет кадра в t={t:.3f} с ({where}); ближайший кадр t={ts:.3f} с", path=self.path,
+                    details={"requested_sec": t, "nearest_sec": ts, "duration": self.duration,
+                             "gaps": self.meta.get("coverage_gaps", [])},
+                )
+            out.append(FrameRef(img.copy() if self._copy else img, float(ts), t, in_gap=gap, out_of_range=oor))
         return out
+
+    def distinct_frames_at(self, times: Sequence[float], min_separation_s: float = 0.0,
+                           strict: bool = False) -> list[FrameRef]:
+        """Как :meth:`frames_at`, но без повторов одного и того же кадра (по фактическому PTS)
+        и, при ``min_separation_s > 0``, без кадров ближе этого интервала. Порядок — как в times."""
+        out: list[FrameRef] = []
+        for ref in self.frames_at(times, strict=strict):
+            if all(abs(ref.timestamp_sec - o.timestamp_sec) > max(min_separation_s, _EPS) for o in out):
+                out.append(ref)
+        return out
+
+    def window_indices(self, t0: float, t1: float) -> list[int]:
+        """Индексы сэмплов с t0 <= times[i] <= t1."""
+        lo = bisect.bisect_left(self.times, t0 - _EPS)
+        hi = bisect.bisect_right(self.times, t1 + _EPS)
+        return list(range(lo, hi))
+
+    @property
+    def coverage(self) -> dict[str, Any]:
+        """Полнота декодирования — проверять до вывода «нарушений нет»."""
+        m = self.meta
+        return {"complete": bool(m.get("complete", True)), "coverage": float(m.get("coverage", 1.0)),
+                "decoded_span": float(m.get("decoded_span", self.duration)),
+                "declared_duration": float(m.get("declared_duration", 0.0)),
+                "gaps": list(m.get("coverage_gaps", [])),
+                "source_times_complete": bool(m.get("source_times_complete", True))}
 
     def snap_time(self, t: float) -> float:
         """PTS ближайшего кадра исходника к t (по таймлайну, собранному при загрузке)."""
@@ -871,6 +925,26 @@ def _median_dt(times: Sequence[float], fallback: float) -> float:
     return float(np.median(np.diff(np.asarray(times, dtype=np.float64))))
 
 
+def find_gaps(source_times: Sequence[float], declared: float, dt: float, gap_factor: float = 3.0,
+              min_gap_s: float = 0.25) -> list[tuple[float, float]]:
+    """Пробелы покрытия [(a, b)]: между соседними PTS (a — последний кадр до дыры, b — первый после),
+    в начале (0, первый PTS) и в хвосте (конец декодированного, заявленная длительность)."""
+    if not source_times:
+        return [(0.0, float(declared))] if declared > 0 else []
+    thr = max(float(min_gap_s), float(gap_factor) * float(dt))
+    st = np.asarray(source_times, dtype=np.float64)
+    gaps: list[tuple[float, float]] = []
+    if st[0] > thr:
+        gaps.append((0.0, float(st[0])))
+    d = np.diff(st)
+    for k in np.nonzero(d > thr)[0]:
+        gaps.append((float(st[k]), float(st[k + 1])))
+    end = float(st[-1] + dt)
+    if declared > 0 and declared - end > thr:
+        gaps.append((end, float(declared)))
+    return gaps
+
+
 def _build_clip(
     path: str,
     info: dict[str, Any],
@@ -897,10 +971,10 @@ def _build_clip(
     def collect(t: float, result: tuple[Any, dict[str, float], np.ndarray]) -> None:
         payload, metrics, gray = result
         store.append(payload)
-        entry: dict[str, Any] = {"t": round(t, 6), **metrics, **Q.motion_metrics(prev_gray[0], gray, qcfg)}
+        entry: dict[str, Any] = {"t": t, **metrics, **Q.motion_metrics(prev_gray[0], gray, qcfg)}
         prev_gray[0] = gray
         quality.append(Q.finalize_flags(entry, qcfg))
-        times.append(round(t, 6))
+        times.append(t)  # без округления: округляем только при показе
 
     pool = None
     if workers > 1:
@@ -967,6 +1041,11 @@ def _build_clip(
     vfr = bool(info.get("vfr_suspected")) or bool(diffs.size and float(diffs.std()) > 0.05 * max(float(diffs.mean()), 1e-6))
     summary, qwarn = Q.summarize(quality, qcfg)
     warnings.extend(qwarn)
+    fa = cfg["frame_at"]
+    gaps = find_gaps(source_times, declared, dt, float(fa.get("gap_factor", 3.0)), float(fa.get("min_gap_s", 0.25)))
+    if gaps and not stats.skip_nonref:
+        total_gap = sum(b - a for a, b in gaps)
+        warnings.append(f"пробелы покрытия: {len(gaps)} шт., всего {total_gap:.2f} с (кадров нет)")
 
     sample_h, sample_w = store.get(0).shape[:2] if len(store) else (0, 0)
     window = float(cfg["frame_at"].get("forward_window_s", 1.5))
@@ -989,7 +1068,10 @@ def _build_clip(
         "vfr": vfr,
         "t0_pts_sec": stats.t0_abs,
         "declared_duration": declared,
+        "decoded_span": decoded_span,
         "coverage": coverage,
+        "coverage_gaps": gaps if not stats.skip_nonref else [],
+        "median_frame_dt": dt,
         "complete": complete,
         "sample_size": [int(sample_w), int(sample_h)],
         "storage": {"mode": store.mode, "ram_bytes": store.ram_bytes, "disk_bytes": store.disk_bytes},
@@ -1029,12 +1111,15 @@ def load_video(
     ``sample_fps <= 0`` — брать каждый кадр. Ошибки — подклассы :class:`IngestError`.
     """
     path = str(path)
+    t_all = time.perf_counter()
+    cfg = load_config(config)
     if path.startswith("synthetic://"):
+        # мок: только явно (тесты/демо). Production сам на синтетику не переключается.
+        if not (os.environ.get("SENTINEL_MOCK") == "1" or cfg.get("mock", {}).get("allow_synthetic_uri")):
+            raise VideoNotFoundError("synthetic:// разрешён только в тестах/демо (SENTINEL_MOCK=1)", path=path)
         from .synthetic import synthetic_clip_from_uri
 
         return synthetic_clip_from_uri(path, sample_fps)
-    t_all = time.perf_counter()
-    cfg = load_config(config)
     t_probe = time.perf_counter()
     info = probe_and_validate(path, cfg)
     probe_s = time.perf_counter() - t_probe

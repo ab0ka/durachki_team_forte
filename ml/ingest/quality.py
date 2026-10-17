@@ -168,7 +168,7 @@ def activity_segments(
             segments[-1][1] = max(segments[-1][1], t1)
         else:
             segments.append([t0, t1])
-    return [(round(a, 3), round(b, 3)) for a, b in segments]
+    return [(float(a), float(b)) for a, b in segments]
 
 
 def gated_indices(
