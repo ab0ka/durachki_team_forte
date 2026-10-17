@@ -56,6 +56,7 @@ class StageRecord:
     error: str = ""
     version: str = ""
     vram_peak_mb: Optional[float] = None
+    cold: Optional[bool] = None      # первый вызов в процессе-воркере: время включает загрузку модели
 
     def as_dict(self) -> dict:
         d = {k: v for k, v in self.__dict__.items() if v not in (None, "")}
@@ -92,6 +93,7 @@ class RunContext:
     _progress_done: float = 0.0
     partial_written: list[str] = field(default_factory=list)
     cancel: threading.Event = field(default_factory=threading.Event)
+    queue_wait_s: float = 0.0
 
     def cancelled(self) -> bool:
         return self.cancel.is_set()
@@ -261,7 +263,9 @@ def _run(ctx: RunContext) -> AnalysisResult:
     ctx.executor = get_executor(cfg)
     lease_timeout = cfg_get(cfg, "executor.lease_timeout_s", None)
     lease_timeout = ctx.budget.remaining() - 2.0 if lease_timeout is None else float(lease_timeout)
+    t_queue = time.perf_counter()
     with ctx.executor.lease(timeout=max(0.0, lease_timeout), cancel=ctx.cancel) as leased:
+        ctx.queue_wait_s = time.perf_counter() - t_queue
         if not leased:
             if ctx.cancelled():
                 return _failed(ctx.job_id, "задача отменена в очереди", _meta(ctx))
@@ -544,6 +548,7 @@ def _stage(ctx: RunContext, stage: str, calls: list[tuple[str, str, tuple, dict]
         args = tuple(_subst(a, ctx, stage, outputs) for a in args)
         res = ctx.executor.call(module, func, args, kwargs, ctx.budget.timeout(stage))
         rec.origin = res.origin or rec.origin
+        rec.cold = bool(rec.cold) or bool(getattr(res, "cold", False))
         if res.vram_peak_mb is not None:
             rec.vram_peak_mb = max(rec.vram_peak_mb or 0.0, res.vram_peak_mb)
         if not res.ok:
@@ -718,6 +723,25 @@ def _finalize(ctx: RunContext, result: Optional[AnalysisResult]) -> AnalysisResu
     return result
 
 
+def _vlm_usage(ctx: RunContext) -> dict:
+    """Сводка VLM для замера L2: вызовы/токены (extra.vlm.budget модуля A11) и статусы проверки."""
+    out: dict[str, Any] = {}
+    for stage in ("vlm_verify", "vlm_discover"):
+        evs = (ctx.outputs.get(stage) or ([],))[0]
+        if not evs:
+            continue
+        statuses: dict[str, int] = {}
+        budget = None
+        for e in evs:
+            v = (getattr(e, "extra", {}) or {}).get("vlm") or {}
+            if isinstance(v, dict):
+                st = str(v.get("status", "?"))
+                statuses[st] = statuses.get(st, 0) + 1
+                budget = budget or v.get("budget")
+        out[stage] = {"events": len(evs), "statuses": statuses, "budget": budget}
+    return out
+
+
 def _required(ctx: RunContext) -> list[str]:
     return [s for s in STAGE_ORDER if is_required(s, ctx.cfg)]
 
@@ -780,6 +804,10 @@ def _meta(ctx: RunContext) -> dict:
         meta["vram_events"] = ctx.outputs["vram_events"]
     if ctx.outputs.get("refine_stats"):
         meta["refine"] = ctx.outputs["refine_stats"]
+    meta["queue_wait_s"] = round(ctx.queue_wait_s, 3)
+    vlm = _vlm_usage(ctx)
+    if vlm:
+        meta["vlm"] = vlm
     meta["modes"] = {"refine": bool(cfg_get(ctx.cfg, "refine.enabled", False)),
                      "timecode_policy": str(cfg_get(ctx.cfg, "timecode.policy", "module"))}
     if reg is not None:

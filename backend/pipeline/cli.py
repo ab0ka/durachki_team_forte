@@ -179,7 +179,21 @@ def cmd_profile(args: argparse.Namespace) -> int:
     over = _overrides(args)
     over.setdefault("cache", {})["mode"] = "off" if not args.with_cache else "read_write"
     over.setdefault("partial", {})["enabled"] = False
-    result, ctx = run_with_context(args.video, args.job_id or "profile", None, float(args.deadline),
+    reports = []
+    rc = 0
+    for k in range(max(1, int(args.repeat))):
+        rep, status = _profile_once(args, over, f"{args.job_id or 'profile'}-{k + 1}", k)
+        reports.append(rep)
+        rc = rc or (0 if status == "done" else 2)
+    if args.json:
+        print(json.dumps(reports if len(reports) > 1 else reports[0], ensure_ascii=False, indent=2))
+    return rc
+
+
+def _profile_once(args: argparse.Namespace, over: dict, job_id: str, k: int) -> tuple[dict, str]:
+    from .orchestrator import run_with_context
+
+    result, ctx = run_with_context(args.video, job_id, None, float(args.deadline),
                                    config_path=args.config, overrides=over)
     rows = []
     for name in STAGE_ORDER:
@@ -188,27 +202,29 @@ def cmd_profile(args: argparse.Namespace) -> int:
             continue
         rows.append({"stage": name, "status": st.get("status"), "seconds": st.get("seconds", 0.0),
                      "vram_peak_mb": st.get("vram_peak_mb"), "origin": st.get("origin", ""),
-                     "n_out": st.get("n_out")})
+                     "n_out": st.get("n_out"), "cold": bool(st.get("cold"))})
     report = {"video": result.meta.get("video", {}), "device": result.meta.get("device"),
               "sample_fps": result.meta.get("sample_fps"), "total_s": result.meta.get("timings", {}).get("total"),
               "status": result.status, "verdict": result.verdict, "stages": rows,
               "peak_rss_mb": _peak_rss_mb(), "executor": result.meta.get("executor"),
-              "vram_events": result.meta.get("vram_events", [])}
-    if args.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
-    else:
-        print(f"{'стадия':<14}{'статус':<10}{'сек':>9}{'VRAM пик, МБ':>14}  происхождение / выход")
+              "vram_events": result.meta.get("vram_events", []), "run": k + 1,
+              "queue_wait_s": result.meta.get("queue_wait_s"), "vlm": result.meta.get("vlm"),
+              "coverage": result.meta.get("coverage"), "modes": result.meta.get("modes")}
+    if not args.json:
+        print(f"--- прогон {k + 1} ({'холодный' if k == 0 else 'тёплый'}; cold=первый вызов в воркере)")
+        print(f"{'стадия':<14}{'статус':<10}{'сек':>9}{'VRAM пик, МБ':>14}  cold  происхождение / выход")
         for r in rows:
             vram = "—" if r["vram_peak_mb"] is None else f"{r['vram_peak_mb']:.0f}"
             print(f"{r['stage']:<14}{str(r['status']):<10}{r['seconds']:>9.2f}{vram:>14}  "
-                  f"{r['origin']} / {r['n_out'] if r['n_out'] is not None else '—'}")
+                  f"{'да ' if r['cold'] else '   '}  {r['origin']} / {r['n_out'] if r['n_out'] is not None else '—'}")
         print(f"{'ИТОГО':<24}{report['total_s'] or 0:>9.2f}   device={report['device']} "
               f"sample_fps={report['sample_fps']} кадров={report['video'].get('n_sampled')} "
               f"peak RSS (оркестратор)={report['peak_rss_mb']} МБ")
         print("VRAM меряется в процессе-воркере (torch.cuda.max_memory_allocated по стадии); «—» = CPU/нет torch.")
+        print(f"очередь: {report['queue_wait_s']} с; VLM: {report['vlm'] or '—'}")
         for w in result.meta.get("warnings", [])[:10]:
             print(f"  warning: {w}")
-    return 0 if result.status == "done" else 2
+    return report, result.status
 
 
 def _peak_rss_mb() -> Optional[float]:
@@ -293,6 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--job-id")
     p.add_argument("--json", action="store_true")
     p.add_argument("--with-cache", action="store_true", help="не отключать кэш (по умолчанию — честный холодный прогон)")
+    p.add_argument("--repeat", type=int, default=1, help="прогонов подряд: 1-й холодный (загрузка моделей), далее тёплые")
     common(p)
     p.set_defaults(func=cmd_profile)
 

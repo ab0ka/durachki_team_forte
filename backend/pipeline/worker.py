@@ -97,6 +97,7 @@ class CallResult:
     identity: dict = field(default_factory=dict)
     vram_peak_mb: Optional[float] = None
     trace: str = ""
+    cold: bool = False               # первый вызов функции в этом процессе-воркере (≈ загрузка модели)
 
     @property
     def ok(self) -> bool:
@@ -116,6 +117,7 @@ class Runtime:
         self.clip: Any = None
         self.clip_key: Optional[tuple] = None
         self._windows: dict[tuple, WindowClip] = {}
+        self._called: set[tuple[str, str]] = set()
 
     # ---------------------------------------------------------------- клип
     def load_clip(self, path: str, sample_fps: float) -> dict:
@@ -212,6 +214,8 @@ class Runtime:
         real_kwargs = {k: (self._resolve_clip(v) if isinstance(v, ClipRef) else v) for k, v in (kwargs or {}).items()}
         if any(isinstance(a, ClipRef) for a in args) and self.clip is None:
             return CallResult("error", error="клип не загружен", origin=origin, identity=ident)
+        cold = (module, func) not in self._called
+        self._called.add((module, func))
         torch = _torch_cuda()
         if torch is not None:
             with contextlib.suppress(Exception):
@@ -220,14 +224,14 @@ class Runtime:
             value = fn(*real_args, **real_kwargs)
         except Exception as exc:  # noqa: BLE001
             return CallResult("error", error=f"{type(exc).__name__}: {exc}", seconds=time.perf_counter() - t0,
-                              origin=origin, identity=ident, trace=traceback.format_exc(limit=8))
+                              origin=origin, identity=ident, trace=traceback.format_exc(limit=8), cold=cold)
         peak = None
         torch = _torch_cuda()
         if torch is not None:
             with contextlib.suppress(Exception):
                 peak = round(torch.cuda.max_memory_allocated() / _MB, 1)
         return CallResult("ok", value=value, seconds=time.perf_counter() - t0, origin=origin,
-                          identity=ident, vram_peak_mb=peak)
+                          identity=ident, vram_peak_mb=peak, cold=cold)
 
     # ---------------------------------------------------------------- память
     def vram(self) -> dict:

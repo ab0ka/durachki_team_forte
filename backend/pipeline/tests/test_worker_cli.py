@@ -128,3 +128,12 @@ def test_process_worker_refine_windows(synth_video, monkeypatch):
     assert st in ("ok", "skipped"), res.meta["stages"]["refine"]
     if st == "ok":
         assert res.meta["refine"]["processed"] >= 1
+
+
+def test_cli_profile_repeat_cold_warm(synth_video):
+    p = _cli("profile", synth_video, "--mock", "--inline", "--json", "--repeat", "2")
+    assert p.returncode == 0, p.stderr
+    reps = json.loads(p.stdout)
+    assert [r["run"] for r in reps] == [1, 2]
+    det = [next(s for s in r["stages"] if s["stage"] == "detect") for r in reps]
+    assert det[0]["cold"] is True and det[1]["cold"] is False
