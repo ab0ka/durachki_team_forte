@@ -474,7 +474,7 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
     if ctx.budget.near_deadline():
         _partial(ctx, candidates + ev_verify, risk, "before_vlm_discover")
     dv = _stage(ctx, "vlm_discover", [("ml.vlm", "discover", (CLIP, "$budget"), {})], upstream=["ingest"])
-    ev_discover = dv[0] if dv else []
+    ev_discover = _filter_types(ctx, dv[0] if dv else [], cfg_get(cfg, "vlm_discover_types", None))
 
     events = list(candidates) + apply_timecode_policy(list(ev_verify) + list(ev_discover), cfg)
     ctx.outputs["events_all"] = events
@@ -484,6 +484,16 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
 
 
 # ============================================================== стадии
+
+def _filter_types(ctx: RunContext, events: list[Event], types: Optional[list]) -> list[Event]:
+    """Допуск типов из пути VLM (экспериментальные профили): после стадии, ключ кэша стадии не меняется."""
+    if not types or not events:
+        return list(events)
+    keep = [e for e in events if e.type_id in set(types)]
+    ctx.outputs["vlm_discover_filter"] = {"types": list(types), "in": len(events), "kept": len(keep)}
+    ctx.warn(f"vlm_discover: в слияние допущены только типы {', '.join(types)} ({len(keep)} из {len(events)} событий)")
+    return keep
+
 
 def _seqrules_outputs(ctx: RunContext, sq: Optional[tuple]) -> list[Event]:
     """События seqrules + наблюдения для UI (data/jobs/<id>/observations.json). Ошибка правила при обязательной

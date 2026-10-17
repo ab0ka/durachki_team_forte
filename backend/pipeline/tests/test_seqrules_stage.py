@@ -77,3 +77,18 @@ def test_seqrules_outputs_roundtrip_through_cache(tmp_path):
     events2, obs2 = hit
     assert events2[0].type_id == "V05" and events2[0].extra["rule"] == "A_phone"
     assert obs2 == json.loads(json.dumps(serde.to_jsonable(obs)))
+
+
+def test_vlm_discover_type_allowlist_filters_before_fusion(fake_ml, synth_video):
+    """vlm_discover_types: из пути VLM в слияние доходят только разрешённые типы; стадия и её ключ не меняются."""
+    def discover(clip, budget=None):
+        mk = lambda t, typ: Event(type_id=typ, t_start=t, t_end=t + 1, t_peak=t, confidence=0.9, source="vlm",
+                                  facts=["синтетика"], extra={"assessment": "candidate_violation"})
+        return [mk(1.0, "V01"), mk(2.0, "V05")]
+
+    fake_ml({"ml.vlm.discover": discover, "ml.rules.run_rules": lambda *a: [], "ml.temporal.score": lambda clip: ([], [])})
+    res = run(synth_video, "job-vlm-types", None, 60,
+              overrides={"stages": {"vlm_discover": True, "temporal": False}, "vlm_discover_types": ["V01"]})
+    assert res.meta["stages"]["vlm_discover"]["status"] == "ok"
+    assert {v.type_id for v in res.violations} <= {"V01"}
+    assert any("допущены только типы V01 (1 из 2" in w for w in res.meta["warnings"])

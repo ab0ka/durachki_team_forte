@@ -36,6 +36,9 @@ def main() -> int:
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
     name, rest = sys.argv[1], sys.argv[2:]
+    extra = None
+    if rest[:1] == ["--extra-env"]:          # локальные уточнения поверх профиля (напр. путь конфига, под которым лежит кэш)
+        extra, rest = rest[1], rest[2:]
     os.environ.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1",
                        "HF_HUB_DISABLE_TELEMETRY": "1", "DO_NOT_TRACK": "1", "PYTHONUTF8": "1"})
     os.environ.setdefault("SENTINEL_WEIGHTS", str(REPO / "weights"))
@@ -44,6 +47,11 @@ def main() -> int:
     os.environ.setdefault("HF_HUB_CACHE", str(Path(os.environ["HF_HOME"]) / "hub"))
     os.environ["SENTINEL_PROFILE"] = name
     os.environ.update(load_profile(name))
+    if extra:
+        for raw in Path(extra).read_text(encoding="utf-8").splitlines():
+            if raw.strip() and not raw.lstrip().startswith("#") and "=" in raw:
+                k, v = raw.split("=", 1)
+                os.environ[k.strip()] = v.strip()
     sys.path.insert(0, str(REPO))
     from backend.pipeline.cli import main as cli_main
 
