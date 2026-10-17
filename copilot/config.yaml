@@ -17,6 +17,11 @@ corpus:
   chunk_max_chars: 900
   chunk_overlap_chars: 120
   chunk_min_chars: 40
+  # Формат A13: разделы-не-нормы и служебные строки не цитируются; преамбулу под H1 пропускаем
+  skip_sections_regex: 'не\s+цитат|пересказ|todo|реквизит|статус|провенанс'
+  skip_lines_regex: '^\s*(?:провенанс|источник|\*\*внимание|внимание:)'
+  skip_preamble: true
+  cite_disabled: false     # нормы типов с legal_status=disabled не цитируем (честно «без пункта»)
 
 embed:
   # auto: e5 (sentence-transformers / transformers), если веса есть локально; иначе hashing.
