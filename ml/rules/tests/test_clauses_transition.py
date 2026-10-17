@@ -98,3 +98,11 @@ def test_global_policy_override_for_ab() -> None:
 def test_strength_and_predicates_are_exclusive() -> None:
     with pytest.raises(ConfigError):
         _cfg(dict(RULE, strength="cash_visible"))
+
+
+def test_transition_ignores_earlier_brief_episode_in_lookback() -> None:
+    """Кассир на 1 с отходил в 16 с и вернулся; настоящий уход — в 20 с. t_peak = 20, а не 16."""
+    cfg = _cfg(RULE)
+    evs = _ev(cfg, [(16.0, 17.0, {"cashier_in_workplace": 0.0}), (20.0, 30.0, {"cashier_in_workplace": 0.0})])
+    assert len(evs) == 1 and evs[0].t_peak == pytest.approx(20.0)
+    assert evs[0].extra["trace"]["evidence"]["kind"] == "false→true"

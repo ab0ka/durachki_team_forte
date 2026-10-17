@@ -32,7 +32,7 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 
 from .catalog import legal_basis_of, norm_status, resolve_catalog, type_info
-from .config import RuleSpec, RulesConfig, load_rules_config
+from .config import Clause, RuleSpec, RulesConfig, load_rules_config
 from .expr import EvalContext
 from .signals import SignalSeries, build_series, derive_from_tracks, polygon_bbox, track_box_at
 
@@ -378,23 +378,24 @@ def _peak_index(rule: RuleSpec, times: np.ndarray, strength: np.ndarray, i0: int
 
 def _transition_index(times: np.ndarray, tlo: np.ndarray, thi: np.ndarray, i0: int, i1: int,
                       lookback_s: float) -> tuple[Optional[int], str]:
-    """Наблюдаемый переход trigger: доказанно ложен → доказанно истинен (``false→true``).
+    """Наблюдаемое начало действия: где trigger стал доказанно истинным для ЭТОГО события.
 
-    Ищется в ``[t_start − lookback_s, t_end]``. Если перед истинным значением было только
-    «неизвестно» — ``unknown→true`` (начало могло быть раньше). Если trigger истинен с начала
-    окна/ролика — перехода не видно (``None``), используется fallback-политика.
+    Берётся первый кадр сегмента, где trigger истинен, и от него назад — начало непрерывного
+    отрезка «trigger истинен» (не раньше ``t_start − lookback_s``). Перед ним доказанно ложно →
+    ``false→true``; «неизвестно» → ``unknown→true`` (начало могло быть раньше). Если отрезок тянется
+    за границу окна или с начала ролика — перехода не видно (``None``), используется fallback.
+    Более ранние короткие эпизоды trigger в окне не выбираются.
     """
+    true_idx = np.nonzero(tlo[i0:i1 + 1] >= 0.5)[0]
+    if true_idx.size == 0:
+        return None, "trigger_not_true"
+    j = i0 + int(true_idx[0])
     j_start = int(np.searchsorted(times, float(times[i0]) - lookback_s - 1e-9, side="left"))
-    weak: Optional[int] = None
-    for j in range(max(j_start, 1), i1 + 1):
-        if tlo[j] >= 0.5 and tlo[j - 1] < 0.5:
-            if thi[j - 1] < 0.5:
-                return j, "false→true"
-            if weak is None:
-                weak = j
-    if weak is not None:
-        return weak, "unknown→true"
-    return None, "not_observed"
+    while j - 1 >= j_start and tlo[j - 1] >= 0.5:
+        j -= 1
+    if j == 0 or j - 1 < j_start:
+        return None, "not_observed"
+    return j, ("false→true" if thi[j - 1] < 0.5 else "unknown→true")
 
 
 def _clause_status(lo: float, hi: float) -> str:
@@ -513,6 +514,14 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
         "derived_signals": {n: series.derived[n] for n in rule.names if n in series.derived},
     }
     clauses = []
+    if ("legacy", "strength") in aux:
+        clauses.append(_clause_trace("predicate", Clause("strength", rule.comment[:80] or "условие правила",
+                                                         rule.strength), aux[("legacy", "strength")], i0, i1, ip))
+    if ("legacy", "gate") in aux and rule.gate is not None:
+        kind = "applicability" if rule.gate_mode == "strict" else "gate_lenient"
+        clauses.append(_clause_trace(kind, Clause("gate", "условие применимости" if kind == "applicability"
+                                                  else "мягкое условие (блокирует, только если доказанно не выполнено)",
+                                                  rule.gate), aux[("legacy", "gate")], i0, i1, ip))
     if rule.applicability is not None and "app" in aux:
         clauses.append(_clause_trace("applicability", rule.applicability, aux["app"], i0, i1, ip))
     for c in rule.predicates:
@@ -598,6 +607,10 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
     events: list[Any] = []
     base_assessment, base_reasons = _assess(rule, catalog, cfg)
     aux: dict[Any, Any] = {}
+    if not rule.predicates:  # старый формат: strength — единственный обязательный предикат, gate — условие
+        aux[("legacy", "strength")] = rule.strength.bounds(ctx)
+        if rule.gate is not None:
+            aux[("legacy", "gate")] = rule.gate.bounds(ctx)
     if rule.applicability is not None:
         aux["app"] = rule.applicability.expr.bounds(ctx)
     for c in rule.predicates:

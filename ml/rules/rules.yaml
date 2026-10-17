@@ -18,6 +18,11 @@
 #   train/calibration через `python -m ml.rules.replay ... --set ...`.
 # * Все числовые пороги ниже — стартовые значения без замеров на реальных данных.
 #
+# ФАЗА 2: новые правила/режимы добавлены ВЫКЛЮЧЕННЫМИ и включаются гипотезами H0..H9 (раздел
+# hypotheses ниже) — по одной для A/B-замера L2 (`replay --hypotheses all`) или профилем phase2.
+# По умолчанию действует профиль baseline (= поведение фазы 1). Профиль в проде — только явно:
+# env SENTINEL_RULES_PROFILE или default_profile.
+#
 # Плейсхолдеры в facts: {t_start} {t_end} {t_peak} {duration} {strength} {strength_max}
 # {confidence} {type_name} и для каждого сигнала правила + n_persons: {sig} (в t_peak),
 # {sig_mean} {sig_min} {sig_max} (по сегменту). Если значение неизвестно — факт не печатается.
@@ -28,6 +33,9 @@ version: 1
 
 global:
   ffill_max_s: 1.0            # пропуск сигнала дольше — «неизвестно», а не последнее значение
+  known_min_conf: 0.5         # SceneStateEx: значение берётся, только если known=True / conf ≥ порога
+  observed_one_sided: true    # observed.* < 0.5 = «не наблюдали» (неизвестно), а не «нет»
+  t_peak_policy_override: null  # A/B: evidence | transition | onset — одна политика для всех правил
   merge_policy: max           # слияние состояний с одним t из разных модулей
   derive_from_tracks: true    # грубые сигналы из треков/зон, если сигнала нет в states
   presence_tol_s: 0.6
@@ -53,7 +61,17 @@ signal_ranges:
 # Явные исключения «нет ключа = значение». По умолчанию пусто: отсутствие = неизвестно.
 signal_defaults: {}
 
-extra_signals: []
+# Сигналы вне контракта SIGNALS: observed.* и quality от A08 (SceneStateEx), V09 (личные вещи).
+extra_signals:
+  - unknown_person_in_cashier_area
+  - workplace_empty
+  - workplace_empty_conf
+  - workplace_track_lost
+  - safe_unattended
+  - frame_quality
+  - personal_items_on_desk
+
+default_profile: baseline
 
 defaults:
   kind: observation
@@ -86,6 +104,7 @@ rules:
     gate_mode: lenient
     min_duration_s: 2.0
     merge_gap_s: 2.0
+    t_peak: {policy: evidence, trigger: "outsider_in_cashier_area > 0.5", lookback_s: 3}
     confidence: {base: 0.4, w_strength: 0.35, w_duration: 0.2, tau_s: 5.0}
     facts:
       - "С {t_start:.1f} по {t_end:.1f} с в зоне кассира находится человек, не определённый системой как кассир или инкассатор."
@@ -106,6 +125,7 @@ rules:
       известны ≥ 80% кадров; длительность ≥ min_duration_s.
     strength: "max(workplace_unattended_with_cash, min(cash_visible, not cashier_present))"
     anchor: "cash_visible > 0.5"
+    t_peak: {policy: evidence, trigger: "cashier_present < 0.3", lookback_s: 10}
     inaction:
       before: "cashier_present > 0.5"
       before_window_s: 30
@@ -135,6 +155,7 @@ rules:
     gate: "not (collector_present > 0.5 and n_persons <= 2)"
     gate_mode: lenient
     anchor: "safe_open > 0.5"
+    t_peak: {policy: evidence, trigger: "safe_open > 0.5 and outsider_in_cashier_area > 0.5", lookback_s: 3}
     min_duration_s: 1.5
     confidence: {base: 0.4, w_strength: 0.35, w_duration: 0.2, tau_s: 5.0}
     facts:
@@ -152,6 +173,7 @@ rules:
       V03 — кассир вышел, сейф остался открытым без присмотра (по бездействию).
     strength: "min(safe_open, not cashier_present)"
     anchor: "safe_open > 0.5"
+    t_peak: {policy: evidence, trigger: "cashier_present < 0.3", lookback_s: 10}
     inaction:
       before: "safe_open > 0.5 and cashier_present > 0.5"
       before_window_s: 30
@@ -177,6 +199,7 @@ rules:
     comment: >-
       V04 (наблюдение) — дверь кассового помещения открыта, при этом видны наличные/сейф открыт/сумка.
     strength: "min(door_open, max(cash_visible, safe_open, cash_bag_visible))"
+    t_peak: {policy: evidence, trigger: "door_open > 0.5", lookback_s: 3}
     min_duration_s: 5.0
     merge_gap_s: 2.0
     facts:
@@ -209,6 +232,7 @@ rules:
       V05 (наблюдение) — телефон в руке ≥ 2 с, при этом доказано: кассир на рабочем месте или видны наличные.
     strength: "phone_in_hand"
     gate: "cashier_in_workplace > 0.5 or cash_visible > 0.5"
+    t_peak: {policy: evidence, trigger: "phone_in_hand > 0.5", lookback_s: 3}
     min_duration_s: 2.0
     facts:
       - "С {t_start:.1f} по {t_end:.1f} с в руке на рабочем месте виден мобильный телефон."
@@ -257,6 +281,7 @@ rules:
       V07 — инкассатор оставил сумку и вышел, сумка без присмотра (по бездействию).
     strength: "min(cash_bag_visible, not collector_present, not cashier_present)"
     anchor: "cash_bag_visible > 0.5"
+    t_peak: {policy: evidence, trigger: "collector_present < 0.3 and cashier_present < 0.3", lookback_s: 10}
     inaction:
       before: "collector_present > 0.5"
       before_window_s: 60
@@ -324,3 +349,242 @@ rules:
     comment: "Заглушка V99: правило по сигналам отсутствует намеренно."
     strength: "false"
     facts: []
+
+  # ================================================================== ФАЗА 2 (выключено; см. hypotheses)
+  - id: V02_left_cash_after_departure
+    type_id: V02
+    kind: violation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H1 (спецификация «ушла и оставила»): ждёт замера L2 на реальных данных.
+    comment: >-
+      V02 — наблюдаемый уход кассира с рабочего места, после которого на столе видны наличные или
+      инкассаторская сумка. Тот же уход с пустым столом — ничего. Стол после ухода не виден
+      (свет выключен, окклюзия) — insufficient_context, а не «чисто».
+    predicates:
+      - {id: away, label: "кассир вне рабочего места (уход подтверждён A08)", expr: "cashier_in_workplace < 0.3"}
+      - {id: desk_valuables, label: "на столе наличные или инкассаторская сумка", expr: "cash_visible > 0.5 or cash_bag_visible > 0.5"}
+    anchor: "cashier_in_workplace < 0.3"
+    inaction: {before: "cashier_in_workplace > 0.7", before_window_s: 30, edge_s: 1.0, min_coverage: 0.8}
+    min_duration_s: 3.0
+    merge_gap_s: 2.0
+    t_peak: {policy: evidence, trigger: "cashier_in_workplace < 0.3", lookback_s: 10}
+    confidence: {base: 0.4, w_strength: 0.3, w_duration: 0.25, tau_s: 8.0}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с кассир вне рабочего места; на столе видны наличные или инкассаторская сумка."
+    facts_stage:
+      - "До ухода кассир наблюдался на рабочем месте."
+    highlight: ["label:cash", "label:cash_bag", "zone:desk", "zone:cash_tray"]
+
+  - id: V03_left_safe_open_after_departure
+    type_id: V03
+    kind: violation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H1 (спецификация «ушла и оставила», сейф открыт): ждёт замера L2.
+    comment: >-
+      V03 — наблюдаемый уход кассира с рабочего места при открытом сейфе. Уход с закрытым сейфом —
+      ничего; состояние сейфа неизвестно — insufficient_context.
+    predicates:
+      - {id: away, label: "кассир вне рабочего места (уход подтверждён A08)", expr: "cashier_in_workplace < 0.3"}
+      - {id: safe_open, label: "сейф открыт", expr: "safe_open > 0.5"}
+    anchor: "cashier_in_workplace < 0.3"
+    inaction: {before: "cashier_in_workplace > 0.7", before_window_s: 30, edge_s: 1.0, min_coverage: 0.8}
+    min_duration_s: 3.0
+    merge_gap_s: 2.0
+    t_peak: {policy: evidence, trigger: "cashier_in_workplace < 0.3", lookback_s: 10}
+    confidence: {base: 0.4, w_strength: 0.3, w_duration: 0.25, tau_s: 8.0}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с кассир вне рабочего места, сейф открыт."
+    facts_stage:
+      - "До ухода кассир наблюдался на рабочем месте."
+    highlight: ["label:safe_open", "label:safe", "zone:safe"]
+
+  - id: V03_work_with_safe_open
+    type_id: V03
+    kind: violation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H2 («работа за столом при открытом сейфе за спиной»): порог длительности
+      10 с — стартовый, отличает от короткой работы с сейфом; ждёт замера L2.
+    comment: >-
+      V03 — кассир на рабочем месте, сейф открыт дольше min_duration_s. Исключение — инкассация
+      (инкассатор в кадре доказан). Сейф неизвестен — ничего (неизвестное ≠ открыт).
+    predicates:
+      - {id: at_desk, label: "кассир на рабочем месте", expr: "cashier_in_workplace > 0.7"}
+      - {id: safe_open, label: "сейф открыт", expr: "safe_open > 0.5"}
+    exclusions:
+      - {id: collection, label: "идёт инкассация (инкассатор в кадре)", expr: "collector_present > 0.5"}
+    min_duration_s: 10.0
+    merge_gap_s: 2.0
+    t_peak: {policy: evidence, trigger: "safe_open > 0.5 and cashier_in_workplace > 0.7", lookback_s: 3}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с (≈{duration:.0f} с) кассир на рабочем месте, сейф открыт."
+    highlight: ["role:cashier", "label:safe_open", "zone:safe"]
+
+  - id: V01_unknown_role_in_cashier_area
+    type_id: V01
+    kind: observation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H3: человек с неопределённой ролью в зоне кассира — наблюдение для человека/VLM
+      (неизвестная роль ≠ неуполномоченный), не нарушение.
+    comment: "V01 (наблюдение) — observed.unknown_person_in_cashier_area от A08 ≥ 2 с."
+    strength: "unknown_person_in_cashier_area > 0.5"
+    min_duration_s: 2.0
+    t_peak: {policy: evidence, trigger: "unknown_person_in_cashier_area > 0.5", lookback_s: 3}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с в зоне кассира находится человек, роль которого система не определила."
+    highlight: ["role:unknown", "zone:cashier_area"]
+
+  - id: V04_entry_while_valuables_open
+    type_id: V04
+    kind: violation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H4 («вход при открытых ценностях»): дверь открылась и людей стало больше, пока
+      сейф открыт или видна инкассаторская сумка; кассир был в кадре до входа. Ждёт замера L2.
+    comment: >-
+      V04 — вход в кассовое помещение при открытом сейфе/сумке. Клиент у окна со своей стороны —
+      не вход (нужна открытая дверь). Инкассатор в кадре (процедура) — исключение.
+    predicates:
+      - {id: door_open, label: "дверь кассового помещения открыта", expr: "door_open > 0.5"}
+      - {id: entered, label: "людей в кадре стало больше (вход)", expr: "n_persons >= prev_min(n_persons, 3) + 1"}
+      - {id: cashier_before, label: "кассир был в кадре до входа", expr: "prev_min(cashier_present, 3) > 0.7"}
+      - {id: valuables_open, label: "сейф открыт или видна инкассаторская сумка", expr: "safe_open > 0.5 or cash_bag_visible > 0.5"}
+    exclusions:
+      - {id: collection, label: "инкассатор в кадре (процедура инкассации)", expr: "collector_present > 0.5"}
+    min_duration_s: 0.4
+    merge_gap_s: 3.0
+    smooth: {method: none}
+    t_peak: {policy: evidence, trigger: "door_open > 0.5", lookback_s: 3}
+    facts:
+      - "Около {t_peak:.1f} с открылась дверь и в кадре стало больше людей; в это время сейф открыт или видна инкассаторская сумка."
+    highlight: ["label:door_open", "label:safe_open", "label:cash_bag", "zone:door"]
+
+  - id: V01_second_outsider_during_service
+    type_id: V01
+    kind: violation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H5 («второй посторонний во время обслуживания»): ≥ 3 человек в кадре при кассире
+      на рабочем месте; риск FP (клиенты вдвоём) — включать только по замеру L2.
+    comment: >-
+      V01 — во время обслуживания (кассир на рабочем месте) в кадре не меньше трёх человек. Исключение —
+      инкассаторы (процедура).
+    predicates:
+      - {id: service, label: "кассир на рабочем месте (обслуживание)", expr: "cashier_in_workplace > 0.7"}
+      - {id: crowd, label: "в кадре не меньше трёх человек", expr: "n_persons >= 3"}
+    exclusions:
+      - {id: collection, label: "инкассатор в кадре", expr: "collector_present > 0.5"}
+    min_duration_s: 3.0
+    merge_gap_s: 2.0
+    t_peak: {policy: evidence, trigger: "n_persons >= 3", lookback_s: 3}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с во время работы кассира в кадре находятся до {n_persons_max:.0f} человек."
+    highlight: ["role:visitor", "role:unknown", "role:cashier"]
+
+  - id: V06_food_drink_with_valuables
+    type_id: V06
+    kind: violation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H7: еда/питьё (A08 подтверждает предметом cup/bottle/food) у кассира на рабочем
+      месте при видимых ценностях. Рука у лица без предмета — не сигнал. Ждёт замера L2.
+    comment: "V06 — eating_drinking ≥ 2 с, кассир на рабочем месте, видны наличные/сумка/открытый сейф."
+    predicates:
+      - {id: eating, label: "приём пищи/напитков (предмет в руке)", expr: "eating_drinking > 0.6"}
+      - {id: at_desk, label: "кассир на рабочем месте", expr: "cashier_in_workplace > 0.7"}
+      - {id: valuables, label: "видны наличные, сумка или открытый сейф", expr: "cash_visible > 0.5 or cash_bag_visible > 0.5 or safe_open > 0.5"}
+    min_duration_s: 2.0
+    t_peak: {policy: evidence, trigger: "eating_drinking > 0.6", lookback_s: 3}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с у кассира на рабочем месте наблюдаются признаки приёма пищи или напитков при видимых ценностях."
+    highlight: ["label:cup", "label:bottle", "label:food", "role:cashier"]
+
+  - id: V09_personal_items_on_desk
+    type_id: V09
+    kind: violation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H8: личные вещи (сумка, куртка) на кассовом столе ≥ 10 с. Сигнал
+      personal_items_on_desk — extra от A08 или производный из треков (bag в зоне desk). Ждёт замера L2.
+    comment: "V09 — личные вещи на кассовом столе. Инкассаторская сумка (доказанная) — исключение."
+    predicates:
+      - {id: personal_items, label: "на кассовом столе личные вещи", expr: "personal_items_on_desk > 0.5"}
+    exclusions:
+      - {id: cash_bag, label: "это инкассаторская сумка", expr: "cash_bag_visible > 0.5"}
+    min_duration_s: 10.0
+    merge_gap_s: 3.0
+    t_peak: {policy: evidence, trigger: "personal_items_on_desk > 0.5", lookback_s: 3}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с на кассовом столе находятся личные вещи."
+    highlight: ["label:bag", "zone:desk"]
+
+  - id: V07_bag_left_after_handover
+    type_id: V07
+    kind: violation
+    enabled: false
+    status_reason: >-
+      Фаза 2, гипотеза H9 («сумка оставлена» вместо «из рук в руки и сразу в сейф»): после ухода
+      инкассатора сумка видна ≥ 15 с, сейф при этом не открыт. Ждёт замера L2.
+    comment: >-
+      V07 — передача сумки вне процедуры: сумка осталась лежать. Открытый сейф (сумку убирают) —
+      исключение. Сумка после ухода инкассатора не видна — insufficient_context.
+    predicates:
+      - {id: bag, label: "инкассаторская сумка видна", expr: "cash_bag_visible > 0.6"}
+      - {id: collector_gone, label: "инкассатора в кадре нет", expr: "collector_present < 0.3"}
+    exclusions:
+      - {id: into_safe, label: "сейф открыт (сумку убирают в сейф)", expr: "safe_open > 0.5"}
+    anchor: "collector_present < 0.3 and was(collector_present, 60) > 0.7"
+    inaction: {before: "collector_present > 0.7 and cash_bag_visible > 0.5", before_window_s: 60, edge_s: 1.0, min_coverage: 0.8}
+    min_duration_s: 15.0
+    merge_gap_s: 3.0
+    t_peak: {policy: evidence, trigger: "collector_present < 0.3", lookback_s: 20}
+    facts:
+      - "С {t_start:.1f} по {t_end:.1f} с инкассаторская сумка лежит, инкассатора в кадре нет, сейф не открыт."
+    facts_stage:
+      - "До этого инкассатор наблюдался в кадре с сумкой."
+    highlight: ["label:cash_bag", "zone:desk"]
+
+# ---------------------------------------------------------------------- гипотезы фазы 2
+# Каждая — одно проверяемое изменение. `python -m ml.rules.replay ... --hypotheses all` считает
+# baseline, baseline + каждую гипотезу отдельно и профиль phase2. Включать в профиль по умолчанию —
+# только после замера L2 (FP/FN, попадание таймкода, тип).
+hypotheses:
+  H0_tpeak_transition:
+    what: "t_peak = наблюдаемый переход trigger (отошла/вошёл/поднесла) вместо evidence"
+    set: ["global.t_peak_policy_override=transition"]
+  H1_left_after_departure:
+    what: "«ушла и оставила»: уход + на столе наличные/сумка или открыт сейф (V02/V03)"
+    set: ["rules.V02_left_cash_after_departure.enabled=true", "rules.V03_left_safe_open_after_departure.enabled=true"]
+  H2_work_with_safe_open:
+    what: "работа за столом при открытом сейфе ≥ 10 с (V03)"
+    set: ["rules.V03_work_with_safe_open.enabled=true"]
+  H3_unknown_role_observation:
+    what: "человек с неопределённой ролью в зоне кассира — наблюдение для человека (V01)"
+    set: ["rules.V01_unknown_role_in_cashier_area.enabled=true"]
+  H4_entry_while_valuables_open:
+    what: "вход при открытом сейфе/сумке (V04)"
+    set: ["rules.V04_entry_while_valuables_open.enabled=true"]
+  H5_second_outsider:
+    what: "второй посторонний во время обслуживания: ≥ 3 человек при кассире на месте (V01)"
+    set: ["rules.V01_second_outsider_during_service.enabled=true"]
+  H6_phone_candidate:
+    what: "мобильный в руке кассира на рабочем месте — кандидат нарушения (V05), а не только наблюдение"
+    set: ["rules.V05_phone_in_hand_at_workplace.kind=violation"]
+  H7_food_with_valuables:
+    what: "еда/питьё на рабочем месте при видимых ценностях — кандидат (V06)"
+    set: ["rules.V06_food_drink_with_valuables.enabled=true"]
+  H8_personal_items:
+    what: "личные вещи на кассовом столе ≥ 10 с — кандидат (V09)"
+    set: ["rules.V09_personal_items_on_desk.enabled=true"]
+  H9_bag_left_after_handover:
+    what: "сумка оставлена после ухода инкассатора ≥ 15 с без открытого сейфа (V07)"
+    set: ["rules.V07_bag_left_after_handover.enabled=true"]
+
+profiles:
+  baseline: []
+  phase2: [H0_tpeak_transition, H1_left_after_departure, H2_work_with_safe_open, H3_unknown_role_observation,
+           H4_entry_while_valuables_open, H5_second_outsider, H6_phone_candidate, H7_food_with_valuables,
+           H8_personal_items, H9_bag_left_after_handover]
