@@ -87,11 +87,13 @@ def load_candidates(path: str) -> dict[str, dict[str, Any]]:
 
 
 def _verdict(clip: Any, events_fusion: list[Any], events_plain: list[Any], risk: list[Any], threshold: float,
-             catalog: Optional[dict]) -> dict[str, Any]:
+             catalog: Optional[dict], how: str = "auto") -> dict[str, Any]:
     """Вердикт как в продукте: ml.fusion.fuse (A12) на всех событиях, как их отдаёт A03 (кандидаты + проверенные
     копии). Без fusion — max confidence >= threshold по кандидатам, заменённым проверенными копиями.
     verdict=None (анализ неполный/упал) — это «неизвестно», а не no_violation."""
     try:
+        if how == "threshold":
+            raise ImportError("verdict=threshold")
         from ml.fusion import fuse  # type: ignore
 
         try:
@@ -104,6 +106,8 @@ def _verdict(clip: Any, events_fusion: list[Any], events_plain: list[Any], risk:
             logging.getLogger(__name__).warning("fusion failed: %s", type(e).__name__)
             by = "threshold_after_fusion_error"
     except ImportError:
+        if how == "fusion":
+            raise
         by = "threshold"
     top = max(events_plain, key=lambda e: float(e.confidence), default=None)
     is_v = top is not None and float(top.confidence) >= threshold
@@ -112,7 +116,7 @@ def _verdict(clip: Any, events_fusion: list[Any], events_plain: list[Any], risk:
 
 
 def _run_mode(mode: str, clip: Any, cand: dict[str, Any], budget_s: float, cfg: dict[str, Any], backend: Any,
-              catalog: Optional[dict], threshold: float, dump: Any) -> dict[str, Any]:
+              catalog: Optional[dict], threshold: float, dump: Any, how: str = "auto") -> dict[str, Any]:
     from .discoverer import discover_events
     from .verifier import coverage, verify_events
 
@@ -141,7 +145,7 @@ def _run_mode(mode: str, clip: Any, cand: dict[str, Any], budget_s: float, cfg: 
         if found:
             info["vlm_calls"] += int((found[0].extra["vlm"].get("budget") or {}).get("calls") or 0)
     vlm_s = time.perf_counter() - t0
-    out = _verdict(clip, base + added, plain, cand.get("risk") or [], threshold, catalog)
+    out = _verdict(clip, base + added, plain, cand.get("risk") or [], threshold, catalog, how)
     out.update(info)
     out["vlm_s"] = round(vlm_s, 3)
     return out
@@ -213,6 +217,8 @@ def run(argv: Optional[list[str]] = None) -> dict[str, Any]:
     ap.add_argument("--modes", default="none,json,qa")
     ap.add_argument("--budget", type=float, default=30.0, help="бюджет VLM на ролик, с (как даёт A03)")
     ap.add_argument("--threshold", type=float, default=0.5, help="порог вердикта, если ml.fusion недоступен")
+    ap.add_argument("--verdict", choices=["auto", "fusion", "threshold"], default="auto",
+                    help="auto: ml.fusion, если есть (как в продукте); threshold: чистый эффект VLM без гейтов fusion")
     ap.add_argument("--max-videos", type=int, default=0)
     ap.add_argument("--backend", default=None)
     ap.add_argument("--config", default=None)
@@ -230,7 +236,7 @@ def run(argv: Optional[list[str]] = None) -> dict[str, Any]:
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip() in MODES]
     cfg = load_config(args.config, overrides={"backend": args.backend} if args.backend else None)
-    rep: dict[str, Any] = {"modes": modes, "budget_s": args.budget,
+    rep: dict[str, Any] = {"modes": modes, "budget_s": args.budget, "verdict_how": args.verdict,
                            "note": "разведочная оценка на уже использованных роликах — не независимый тест"}
     be = None
     if any(m != "none" for m in modes):
@@ -280,7 +286,7 @@ def run(argv: Optional[list[str]] = None) -> dict[str, Any]:
                                "n_candidates": len(cands[key]["events"]), "modes": {}, "_md5": h}
         for m in modes:
             row["modes"][m] = _run_mode(m, clip, cands[key], args.budget, cfg, be, catalog, args.threshold,
-                                        dump if m != "none" else None)
+                                        dump if m != "none" else None, args.verdict)
         rows.append(row)
         close = getattr(clip, "close", None)
         if callable(close):

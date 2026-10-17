@@ -46,7 +46,8 @@ def test_compare_counts_fixes_and_breaks(setup, monkeypatch, capsys):
     from ml.vlm.compare import main
     monkeypatch.setenv("SENTINEL_VLM_MOCK_MODE", "confirm")
     rc = main(["--videos", str(setup / "videos"), "--labels", str(setup / "labels.csv"), "--candidates",
-               str(setup / "cands"), "--modes", "none,json,qa", "--dump-dir", str(setup / "dump"),
+               str(setup / "cands"), "--modes", "none,json,qa", "--verdict", "threshold",
+               "--dump-dir", str(setup / "dump"),
                "--out", str(setup / "rep.json")])
     out = capsys.readouterr().out
     rep = json.loads(out)
@@ -64,7 +65,7 @@ def test_compare_reject_fixes_fp(setup, monkeypatch, capsys):
     from ml.vlm.compare import main
     monkeypatch.setenv("SENTINEL_VLM_MOCK_MODE", "reject")
     main(["--videos", str(setup / "videos"), "--labels", str(setup / "labels.csv"), "--candidates",
-          str(setup / "cands"), "--modes", "none,json", "--no-dump"])
+          str(setup / "cands"), "--modes", "none,json", "--verdict", "threshold", "--no-dump"])
     js = json.loads(capsys.readouterr().out)["summary"]["json"]
     assert js["vs_none"]["fp_fixed"] == 1 and js["fp"] == 0
 
@@ -73,3 +74,12 @@ def test_summarize_unknown_not_negative():
     rows = [{"gt": True, "t_gt": 3.0, "modes": {"none": {"verdict": None, "t": None, "vlm_s": 0.0}}}]
     s = summarize(rows, ["none"])["none"]
     assert s["unknown_verdicts"] == 1 and s["fn"] == 0 and s["n"] == 0
+
+
+def test_verdict_fusion_required_but_missing(setup, monkeypatch, capsys):
+    import sys
+    from ml.vlm.compare import main
+    monkeypatch.setitem(sys.modules, "ml.fusion", None)  # fusion недоступен
+    with pytest.raises(ImportError):
+        main(["--videos", str(setup / "videos"), "--labels", str(setup / "labels.csv"), "--candidates",
+              str(setup / "cands"), "--modes", "none", "--verdict", "fusion", "--no-dump"])

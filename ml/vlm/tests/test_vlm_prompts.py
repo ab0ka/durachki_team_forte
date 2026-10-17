@@ -20,7 +20,7 @@ def test_library_has_all_prompts_in_both_languages():
 def test_render_verify_substitutes_everything(lang):
     system, user = render_verify("V05", ["Телефон у уха"], [21.0, 21.5, 22.0, 22.5, 23.0], None, lang)
     assert not PH.search(system) and not PH.search(user)
-    assert "V05" in user and FALLBACK_CATALOG["types"]["V05"]["name"] in user
+    assert "V05" in user and catalog_types()["V05"]["name"] in user  # активный каталог (A13 или запасной)
     assert "Телефон у уха" in user
     for tid in catalog_types():
         assert tid in user  # описания всех типов каталога подставлены
@@ -46,7 +46,7 @@ def test_boxes_note_depends_on_boxes():
 
 def test_unknown_candidate_type_falls_back_to_v99():
     _, user = render_verify("V42", [], [1.0], None, "ru")
-    assert FALLBACK_CATALOG["types"]["V99"]["name"] in user
+    assert catalog_types()["V99"]["name"] in user
 
 
 def test_missing_placeholder_raises():
