@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from conftest import BANKNOTE, make_clip, person_dets, person_track, zones_default
+from ml.scene.tests.synth import BANKNOTE, make_clip, person_dets, person_track, zones_default
 from ml.scene._contract import Detection
 from ml.scene.core import scene_states_with_trace
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from conftest import make_clip, zones_default
+from ml.scene.tests.synth import make_clip, zones_default
 from ml.scene import scene_states
 from ml.scene._contract import SIGNALS, SceneState
 from ml.scene.core import scene_states_with_trace

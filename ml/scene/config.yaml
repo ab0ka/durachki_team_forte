@@ -145,4 +145,4 @@ motion:
 learned:
   enabled: true               # использовать обученную модель (train_signals.py), если файл есть
   path: weights/scene/scene_signals.json   # относительно корня репо; env SENTINEL_SCENE_MODEL
-  weight: 1.0                 # 1.0 — заменить ручную фузию, 0.5 — смешать в логит-пространстве
+  weight: 0.5                 # 1.0 — заменить ручную фузию, 0.5 — смешать в логит-пространстве

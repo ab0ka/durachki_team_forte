@@ -17,6 +17,7 @@ from ._contract import SIGNALS
 from .appearance import analyze_roi
 from .config import is_mock, load_config
 from .geometry import BBox, dilate_polygon, expand_bbox, polygon_bbox
+from .learned import feature_matrix, load_model, predict
 from .objects import cash_color_cue, cash_det_cue, det_evidence, door_traffic, green_bag_cue, object_roi
 from .presence import Sig, presence_signals
 from .smoothing import hold_conf, logit, median_filter, runs_above, sigmoid, smooth
@@ -127,7 +128,7 @@ def scene_states_with_trace(
     cfg = load_config(config)
     times = np.asarray(list(getattr(clip, "times", []) or []), dtype=np.float64)
     n = len(times)
-    trace: dict[str, Any] = {"warnings": [], "rois": {}, "raw": {}, "conf_raw": {}, "provenance": {}, "info": {}}
+    trace: dict[str, Any] = {"warnings": [], "rois": {}, "raw": {}, "conf_raw": {}, "provenance": {}, "info": {}, "features": {}}
     if n == 0:
         return [], trace
     dets = list(dets or [])
@@ -207,6 +208,10 @@ def scene_states_with_trace(
 
     raw: dict[str, Sig] = {}
     vis: dict[str, np.ndarray] = {}
+    weighted: set[str] = set()      # p уже взвешено уверенностью (p=0.5 ⇔ нет свидетельств)
+    model = load_model(cfg)
+    if model:
+        trace["info"]["learned_signals"] = sorted(model)
 
     # --- присутствие ---
     pres, pres_extra = presence_signals(tl, zb, workplace, quality, det_ran, cfg)
@@ -224,22 +229,30 @@ def scene_states_with_trace(
             res = analyze_roi(frames, [i for i in idxs if have[i]], n, times, roi_box, person_boxes, quality, shifts, det_lo, det_c, rc, ocfg, use_shape_prior=(name == "safe_open"))
             p, c, v = res.p_open, res.conf, res.visibility
             prov = list(dict.fromkeys(res.provenance))
-            trace["info"][name] = {"p_a_open": res.p_a_open, "label_conf": res.label_conf, "two_states": res.has_two_states, **{k: v2 for k, v2 in res.info.items() if k != "ref_idx"}}
+            trace["info"][name] = {"p_a_open": res.p_a_open, "label_conf": res.label_conf, "two_states": res.has_two_states, **{k: v2 for k, v2 in res.info.items() if k not in ("ref_idx", "features")}}
             trace["raw"][name + "_change"] = np.nan_to_num(res.change, nan=-1.0)
+            feats = dict(res.info.get("features", {}))
+            feats.update({"change": res.change, "state_b": res.state_b})
         else:
             z = float(ocfg["w_det"]) * det_c * det_lo
             p, c = sigmoid(z), np.clip(float(ocfg["w_det"]) * det_c, 0.0, 1.0)
             v = np.ones(n) if roi_box is None else np.array([1.0 - R.occlusion_fraction(expand_bbox(roi_box, 0.1), person_boxes[i]) for i in range(n)])
             prov = ["det"] if (det_c > 0).any() else ["none"]
+            feats = {}
+        feats.update({"visibility": v, "quality": quality, "det_lo": det_lo, "det_c": det_c})
         if name == "door_open":
             tp, tc, crossings = door_traffic(tl, zb, cfg["door"], cfg["presence"])
             z = c * logit(p) + float(cfg["door"]["w_traffic"]) * tc * logit(tp)
             p, c = sigmoid(z), np.clip(c + float(cfg["door"]["w_traffic"]) * tc, 0.0, 1.0)
             trace["info"]["door_crossings"] = crossings
+            feats.update({"traffic_lo": np.where(tc > 0, logit(tp), 0.0), "traffic_c": tc})
             if (tc > 0).any():
                 prov.append("traffic")
+        p, c = _apply_learned(name, p, c, feats, v, quality, model, cfg, prov)
+        trace["features"][name] = feats
         raw[name] = Sig(p, c, prov)
         vis[name] = v
+        weighted.add(name)
 
     # --- наличные: детекции в зоне стола + запасной цвет/форма-классификатор ---
     cc = cfg["cash"]
@@ -256,15 +269,21 @@ def scene_states_with_trace(
     c_absent = np.where(s_det > 0, 0.0, float(cc["det_absent_c"]) * desk_vis * quality * det_ran)
     z = z + c_absent * logit(float(cc["det_absent_p"]))
     prov_cash = ["det"] if (s_det > 0).any() else []
+    feats_cash: dict[str, np.ndarray] = {"det_score": s_det, "colour_lo": np.zeros(n), "colour_c": np.zeros(n)}
     if cc.get("color", True) and desk_box is not None and have.any():
         pc_, ccol, dv = cash_color_cue(frames, [i for i in idxs if have[i]], n, desk_box, tl, quality, shifts, cc, float(rc["person_pad"]))
         z = z + float(cc["w_color"]) * ccol * logit(pc_)
         c_cash = c_cash + float(cc["w_color"]) * ccol
         desk_vis = np.minimum(desk_vis, dv)
+        feats_cash.update({"colour_lo": np.where(ccol > 0, logit(pc_), 0.0), "colour_c": ccol})
         if (ccol > 0).any():
             prov_cash.append("colour")
-    raw["cash_visible"] = Sig(sigmoid(z), np.clip(c_cash + c_absent, 0.0, 1.0), prov_cash or ["none"])
+    feats_cash.update({"visibility": desk_vis, "quality": quality})
+    p_cash, c_cash_t = _apply_learned("cash_visible", sigmoid(z), np.clip(c_cash + c_absent, 0.0, 1.0), feats_cash, desk_vis, quality, model, cfg, prov_cash)
+    trace["features"]["cash_visible"] = feats_cash
+    raw["cash_visible"] = Sig(p_cash, c_cash_t, prov_cash or ["none"])
     vis["cash_visible"] = desk_vis
+    weighted.add("cash_visible")
 
     # --- инкассаторская сумка ---
     bc = cfg["cash_bag"]
@@ -283,6 +302,7 @@ def scene_states_with_trace(
         if (gc > 0).any():
             prov_bag.append("colour")
     raw["cash_bag_visible"] = Sig(sigmoid(zb_), np.clip(cb, 0.0, 1.0), prov_bag or ["none"])
+    weighted.add("cash_bag_visible")
 
     # --- motion_energy ---
     if m_clip is not None:
@@ -309,7 +329,7 @@ def scene_states_with_trace(
             out_c[name] = sig.c
             continue
         spec = _smooth_spec(name, cfg)
-        out_p[name] = smooth(sig.p, times, spec, conf=sig.c)
+        out_p[name] = smooth(sig.p, times, spec, conf=None if name in weighted else sig.c)
         out_c[name] = hold_conf(sig.c, times, tau) if spec.get("method") == "hmm" else sig.c
 
     # --- составной: оставленные без присмотра наличные (трёхзначная логика) ---
@@ -351,6 +371,24 @@ def scene_states_with_trace(
     trace["info"]["mock"] = is_mock()
     trace["times"] = times
     return states, trace
+
+
+def _apply_learned(name: str, p: np.ndarray, c: np.ndarray, feats: dict[str, np.ndarray], vis: np.ndarray, quality: np.ndarray, model: Optional[dict[str, Any]], cfg: dict[str, Any], prov: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Смешать ручную фузию с обученной моделью (если есть) в логит-пространстве."""
+    m = (model or {}).get(name)
+    if not m:
+        return p, c
+    n = len(p)
+    try:
+        pl = predict(m, feature_matrix(feats, list(m["features"]), n))
+    except (KeyError, ValueError) as e:
+        log.warning("learned model for %s ignored: %s", name, e)
+        return p, c
+    cl = np.clip(vis * quality, 0.0, 1.0) * float(m.get("reliability", 1.0))
+    lam = float(np.clip(cfg["learned"]["weight"], 0.0, 1.0))
+    z = (1.0 - lam) * logit(p) + lam * cl * logit(pl)
+    prov.append("learned")
+    return sigmoid(z), np.clip((1.0 - lam) * c + lam * cl, 0.0, 1.0)
 
 
 def _smooth_spec(name: str, cfg: dict[str, Any]) -> dict[str, Any]:

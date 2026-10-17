@@ -114,7 +114,7 @@ def analyze_roi(
     res.change = d_a
 
     center, scale = float(cfg_obj["roi_center"]), float(cfg_obj["roi_scale"])
-    d_hi, d_lo = center + scale, center - scale
+    d_hi = center + scale
     good = np.array([i in cur and np.isfinite(d_a[i]) and quality[i] >= float(cfg_obj.get("min_quality", 0.35)) for i in range(n)])
 
     # --- альтернативный вид B: устойчивые участки с d > d_hi ---
@@ -149,6 +149,18 @@ def analyze_roi(
         fit = 1.0 if close < d_hi else 0.3   # ни на A, ни на B не похоже — слабое свидетельство
         a_conf[i] = fit * vis[i] * float(quality[i])
     res.state_b = p_b
+    feats = {k: np.full(n, np.nan) for k in ("dark_rel", "edge", "ring_vert", "change_b")}
+    rel = float(cfg_obj.get("dark_rel", 0.55))
+    for i, c in cur.items():
+        ci, mi, co, mo = c[4], c[1], c[5], c[3]
+        ring_vals = co[mo > 0] if (mo > 0).sum() > 16 else co.ravel()
+        vals = ci[mi > 0] if (mi > 0).sum() > 16 else ci.ravel()
+        feats["dark_rel"][i] = float(np.mean(vals < rel * float(np.median(ring_vals))))
+        feats["edge"][i] = R.edge_density(c[0], mi)
+        feats["ring_vert"][i] = R.vertical_edge_energy(c[2], mo)
+        if has_b and ref_b is not None:
+            feats["change_b"][i] = 1.0 - R.cs_ssim(c[0], ref_b, mi, win)
+    res.info["features"] = feats
 
     # --- какое состояние «открыто»: абсолютные свидетельства ---
     in_a = good & (p_b < 0.5)

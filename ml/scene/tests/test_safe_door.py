@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import pytest
 
-from conftest import SAFE, H, W, affine_zones, make_clip, person_track, person_dets, zones_default
+from ml.scene.tests.synth import SAFE, H, W, affine_zones, make_clip, person_track, person_dets, zones_default
 from ml.scene._contract import Detection
 from ml.scene.core import scene_states_with_trace
 
