@@ -82,6 +82,37 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
 
   useImperativeHandle(ref, () => ({ seek }), [seek]);
 
+  // Горячие клавиши (когда фокус не в поле ввода): Space — пауза, ←/→ — ±5 с, N/P — следующий/предыдущий эпизод.
+  const keyState = useRef({ t, d });
+  keyState.current = { t, d };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(el.tagName) || el.getAttribute("role") === "slider")) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (document.querySelector('[role="dialog"]')) return;
+      const cur = keyState.current.t;
+      const code = e.code;
+      if (code === "Space") {
+        e.preventDefault();
+        toggleRef.current();
+      } else if (code === "ArrowRight") {
+        e.preventDefault();
+        seek(cur + 5);
+      } else if (code === "ArrowLeft") {
+        e.preventDefault();
+        seek(cur - 5);
+      } else if (code === "KeyN" || code === "KeyP") {
+        const peaks = violations.map((v) => v.timecode_sec).sort((a, b) => a - b);
+        const target = code === "KeyN" ? peaks.find((x) => x > cur + 0.3) : [...peaks].reverse().find((x) => x < cur - 0.3);
+        if (target !== undefined) seek(target);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [seek, violations]);
+
+  const toggleRef = useRef<() => void>(() => undefined);
   const toggle = () => {
     const v = videoRef.current;
     if (virtual) {
@@ -93,6 +124,8 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
     if (v.paused) void v.play().catch(() => undefined);
     else v.pause();
   };
+
+  toggleRef.current = toggle;
 
   const onVideoError = async () => {
     if (source?.fallback && !fallbackTried) {
@@ -177,7 +210,10 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
           <span className="font-semibold">{formatTimecode(t)}</span>
           <span className="text-slate-400"> / {formatTimecode(d)}</span>
         </div>
-        <div className="ml-auto flex overflow-hidden rounded-lg border border-slate-200 text-xs dark:border-white/10">
+        <span className="hidden text-[11px] text-slate-400 lg:ml-auto lg:inline" title="Горячие клавиши">
+          Space · ←/→ ±5 с · N/P эпизоды
+        </span>
+        <div className="ml-auto flex overflow-hidden rounded-lg border border-slate-200 text-xs dark:border-white/10 lg:ml-3">
           {SPEEDS.map((s) => (
             <button
               key={s}

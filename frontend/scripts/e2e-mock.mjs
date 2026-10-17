@@ -156,6 +156,19 @@ try {
     const txt = await page.locator("div.font-mono.text-sm").first().innerText();
     assert.ok(txt.includes("00:12.4"), `время плеера: ${txt}`);
   });
+  await step("горячие клавиши: ← назад, N — к следующему эпизоду", async () => {
+    await page.locator("body").click({ position: { x: 5, y: 300 } });
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("ArrowLeft");
+    await page.waitForTimeout(150);
+    const back = await page.locator("div.font-mono.text-sm").first().innerText();
+    assert.ok(back.startsWith("00:00.0"), `после ←×3: ${back}`);
+    await page.keyboard.press("n");
+    await page.waitForTimeout(150);
+    const fwd = await page.locator("div.font-mono.text-sm").first().innerText();
+    assert.ok(fwd.startsWith("00:12.4"), `после N: ${fwd}`);
+  });
   await step("кадр открывается в лайтбоксе, норма видна", async () => {
     await page.locator("article button[aria-label^='Открыть кадр']").first().click();
     await page.getByRole("dialog", { name: "Кадр-доказательство" }).waitFor({ timeout: 3000 });
