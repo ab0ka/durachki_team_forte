@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CircleAlert, CircleCheck, Info, X } from "lucide-react";
 import { HttpBackend, type Backend } from "./api/client";
 import { DemoBackend, isDemoMode } from "./api/demo";
 import type { JobResult, SessionInfo } from "./api/types";
@@ -11,12 +12,11 @@ import JobScreen from "./components/JobScreen";
 import AboutScreen from "./components/AboutScreen";
 import ReplayScreen from "./components/ReplayScreen";
 import SettingsDialog from "./components/SettingsDialog";
-import { cx } from "./components/ui";
 
 /** Постоянная пометка: синтетическое демо не подменяет реальную загрузку/результат. */
 function DemoRibbon() {
   return (
-    <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 bg-amber-400 px-4 py-1.5 text-center text-xs font-bold uppercase tracking-wider text-amber-950 print:static">
+    <div className="ks-ribbon-demo print:static" role="note">
       <span>Синтетическое демо</span>
       <span className="hidden font-medium normal-case tracking-normal sm:inline">данные сгенерированы в браузере, сервер анализа не используется</span>
       <a className="rounded bg-amber-950/10 px-2 py-0.5 font-semibold normal-case tracking-normal underline-offset-2 hover:underline" href="./#/">
@@ -31,6 +31,10 @@ interface Toast {
   text: string;
   tone: "info" | "error" | "success";
 }
+
+// error — событие/ошибка (красный); success — только подтверждённое действие (зелёный); info — нейтрально
+const TOAST_ICON = { info: Info, error: CircleAlert, success: CircleCheck } as const;
+const TOAST_MS = { info: 4200, success: 4200, error: 6500 } as const; // ошибку дольше: её надо успеть прочитать
 
 export default function App() {
   const demo = useMemo(() => isDemoMode(), []);
@@ -88,11 +92,15 @@ export default function App() {
 
   const disableCopilot = useCallback(() => setCopilotEnabled(false), []);
 
-  const toast = useCallback((text: string, tone: Toast["tone"] = "info") => {
-    const id = ++toastSeq.current;
-    setToasts((t) => [...t, { id, text, tone }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4200);
-  }, []);
+  const dismissToast = useCallback((id: number) => setToasts((t) => t.filter((x) => x.id !== id)), []);
+  const toast = useCallback(
+    (text: string, tone: Toast["tone"] = "info") => {
+      const id = ++toastSeq.current;
+      setToasts((t) => [...t.slice(-2), { id, text, tone }]); // на экране не больше трёх
+      setTimeout(() => dismissToast(id), TOAST_MS[tone] ?? TOAST_MS.info);
+    },
+    [dismissToast],
+  );
 
   const ctx: AppContextValue = {
     backend,
@@ -113,45 +121,49 @@ export default function App() {
 
   return (
     <AppContext.Provider value={ctx}>
-      <div className="flex min-h-screen flex-col">
+      {/* Рабочая область: токены и стили U01 действуют только внутри .ks-ws (см. src/index.css). */}
+      <div className="ks-ws ks-ws-page flex min-h-screen flex-col">
+        <button className="ks-skip-link" onClick={() => document.getElementById("main")?.focus()}>
+          Перейти к содержимому
+        </button>
         <div className="sticky top-0 z-40">
           {demo && <DemoRibbon />}
           <Header route={route} />
         </div>
-        <main className="mx-auto w-full max-w-[1320px] flex-1 px-4 pb-16 pt-6 sm:px-6 lg:px-8">
+        <main id="main" tabIndex={-1} className="ks-container ks-main flex-1 outline-none">
           {route.name === "upload" && <UploadScreen />}
           {route.name === "job" && <JobScreen key={route.id} jobId={route.id} />}
           {route.name === "about" && <AboutScreen />}
           {route.name === "replay" && <ReplayScreen />}
         </main>
-        <footer className="no-print border-t border-slate-200/70 py-6 text-center text-xs text-slate-500 dark:border-white/5 dark:text-slate-500">
-          Kassa Sentinel · результат — подсказка для проверяющего, не юридическое заключение · видео не покидает локальный контур
-        </footer>
-      </div>
-      <SettingsDialog
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        onSaved={() => {
-          setSettingsOpen(false);
-          void initSession();
-          toast("Настройки сохранены", "success");
-        }}
-      />
-      <div className="no-print pointer-events-none fixed inset-x-0 bottom-4 z-[60] flex flex-col items-center gap-2 px-4">
-        {toasts.map((t) => (
-          <div
-            key={t.id}
-            className={cx(
-              "pointer-events-auto animate-fade-in rounded-xl px-4 py-2.5 text-sm font-medium shadow-lift",
-              t.tone === "error" && "bg-rose-600 text-white",
-              t.tone === "success" && "bg-emerald-600 text-white",
-              t.tone === "info" && "bg-ink-900 text-white dark:bg-white dark:text-ink-900",
-            )}
-            role="status"
-          >
-            {t.text}
+        <footer className="ks-footer no-print py-6 text-center text-xs">
+          <div className="ks-container">
+            Kassa Sentinel · результат — подсказка для проверяющего, не юридическое заключение · видео не покидает локальный контур
           </div>
-        ))}
+        </footer>
+        <SettingsDialog
+          open={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          onSaved={() => {
+            setSettingsOpen(false);
+            void initSession();
+            toast("Настройки сохранены", "success");
+          }}
+        />
+        <div className="ks-toasts no-print" aria-label="Уведомления">
+          {toasts.map((t) => {
+            const Icon = TOAST_ICON[t.tone] ?? Info;
+            return (
+              <div key={t.id} className="ks-toast" data-tone={t.tone} role={t.tone === "error" ? "alert" : "status"}>
+                <Icon aria-hidden />
+                <span className="min-w-0 flex-1">{t.text}</span>
+                <button className="-mr-1 -mt-0.5 rounded-md p-0.5 text-ks-text-3 hover:text-ks-text" onClick={() => dismissToast(t.id)} aria-label="Закрыть уведомление">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
       </div>
     </AppContext.Provider>
   );
