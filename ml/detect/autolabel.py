@@ -111,9 +111,37 @@ def propose(images: Iterable[Path], backend: Any, classes: Sequence[str] = FINET
     return coco
 
 
+DEFAULT_DATASET = Path("datasets/det/annotations.json")   # ручная разметка (Дамир), COCO
+
+
 def is_verified(coco: dict[str, Any]) -> bool:
     info = coco.get("info") or {}
     return bool(info.get("verified")) and all(bool(a.get("verified")) for a in coco.get("annotations", []))
+
+
+def has_proposal_markers(coco: dict[str, Any]) -> bool:
+    """Следы псевдоразметки: info.kind=proposals, verified=false или score без verified у аннотаций."""
+    info = coco.get("info") or {}
+    if str(info.get("kind", "")).lower() == "proposals":
+        return True
+    return any(a.get("verified") is False or ("score" in a and "verified" not in a) for a in coco.get("annotations", []))
+
+
+def label_status(coco: dict[str, Any], annotator: Optional[str] = None) -> str:
+    """verified (autolabel mark-verified) | manual (ручная разметка, указан аннотатор) | proposals | unknown."""
+    if is_verified(coco):
+        return "verified"
+    if has_proposal_markers(coco):
+        return "proposals"
+    if annotator and annotator.strip():
+        return "manual"
+    return "unknown"
+
+
+def default_images_root(ann_path: str | Path) -> Path:
+    """Корень изображений для COCO file_name: <dir>/images, если есть, иначе папка аннотаций."""
+    d = Path(ann_path).parent
+    return d / "images" if (d / "images").is_dir() else d
 
 
 def mark_verified(coco: dict[str, Any], reviewer: str) -> dict[str, Any]:

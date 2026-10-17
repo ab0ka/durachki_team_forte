@@ -1,9 +1,9 @@
 """Дообучение RT-DETRv2 под домен (cash, cash_bag, safe_open, money_counter, cell_phone) — ОПЦИОНАЛЬНО.
 
-Принимает ТОЛЬКО проверенную человеком разметку (autolabel.py mark-verified): на непроверенных
-псевдометках обучение запрещено (UnverifiedLabelsError) — иначе модель выучит ошибки предложений.
+Принимает ТОЛЬКО человеческую разметку: ручную (datasets/det/annotations.json, COCO, с --annotator) или
+проверенные предложения (autolabel.py mark-verified). На псевдометках обучение запрещено (UnverifiedLabelsError).
 
-    python -m ml.detect.finetune train --coco data/autolabel/verified.json --frames data/frames \
+    python -m ml.detect.finetune train --coco datasets/det/annotations.json --annotator "<имя>" \
         --out runs/detect_ft --epochs 30 --batch 8
     python -m ml.detect.finetune export --model runs/detect_ft/hf --out "$SENTINEL_WEIGHTS/detect/finetuned"
     SENTINEL_DETECT_EXTRAS=finetuned python -m ml.detect video.mov    # подключение в рантайме
@@ -22,7 +22,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from .autolabel import FINETUNE_CLASSES, is_verified, video_key
+from .autolabel import DEFAULT_DATASET, FINETUNE_CLASSES, default_images_root, label_status, video_key
 from .config import load_config
 from .weights import local_model_dir, pretrained_kwargs
 
@@ -33,13 +33,22 @@ class UnverifiedLabelsError(ValueError):
     pass
 
 
-def load_verified(path: str | Path) -> dict[str, Any]:
+def load_verified(path: str | Path, annotator: Optional[str] = None) -> dict[str, Any]:
+    """Только человеческая разметка: verified (mark-verified) или ручная (manual) с указанным аннотатором.
+    Псевдоразметка (proposals) и файл неизвестного происхождения без --annotator — отказ."""
     coco = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not is_verified(coco):
+    status = label_status(coco, annotator)
+    if status in ("verified", "manual"):
+        coco.setdefault("info", {})
+        coco["info"]["label_status"] = status
+        if status == "manual":
+            coco["info"]["annotator"] = annotator
+        return coco
+    if status == "proposals":
         raise UnverifiedLabelsError(
-            f"{path}: разметка не проверена человеком (info.verified/annotation.verified). "
-            "Псевдоразметка — только предложения; сначала ручная проверка и autolabel mark-verified.")
-    return coco
+            f"{path}: это псевдоразметка (предложения модели). Сначала ручная проверка и autolabel mark-verified.")
+    raise UnverifiedLabelsError(
+        f"{path}: происхождение разметки неизвестно. Для ручной разметки укажите аннотатора (--annotator <имя>).")
 
 
 def split_by_video(coco: dict[str, Any], val_frac: float = 0.2, seed: int = 0) -> tuple[list[int], list[int]]:
@@ -123,11 +132,11 @@ def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 def train(coco_path: str | Path, frames_root: str | Path, out_dir: str | Path, base_model: Optional[str] = None,
           classes: Sequence[str] = FINETUNE_CLASSES, epochs: int = 30, batch: int = 8, lr: float = 1e-4,
           max_steps: int = -1, val_frac: float = 0.2, augment: bool = True, model: Any = None,
-          processor: Any = None, seed: int = 0) -> Path:
+          processor: Any = None, seed: int = 0, annotator: Optional[str] = None) -> Path:
     import torch
     from transformers import Trainer, TrainingArguments
 
-    coco = load_verified(coco_path)
+    coco = load_verified(coco_path, annotator)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     classes = list(classes)
@@ -163,7 +172,8 @@ def train(coco_path: str | Path, frames_root: str | Path, out_dir: str | Path, b
     (out / "train_meta.json").write_text(json.dumps({
         "base_model": base, "classes": classes, "n_train_images": len(ds_tr), "n_val_images": len(va_ids),
         "val_videos": sorted({video_key(coco_im["file_name"]) for coco_im in coco["images"] if coco_im["id"] in set(va_ids)}),
-        "labels_reviewer": info.get("reviewer"), "labels_verified_at": info.get("verified_at"),
+        "labels_status": info.get("label_status"), "labels_reviewer": info.get("reviewer") or info.get("annotator"),
+        "labels_verified_at": info.get("verified_at"),
         "epochs": epochs, "max_steps": max_steps, "lr": lr, "batch": batch,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return hf_dir
@@ -224,8 +234,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m ml.detect.finetune")
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train")
-    t.add_argument("--coco", required=True)
-    t.add_argument("--frames", required=True)
+    t.add_argument("--coco", default=str(DEFAULT_DATASET), help="COCO (по умолчанию datasets/det/annotations.json)")
+    t.add_argument("--frames", default="", help="корень изображений (по умолчанию <dir>/images)")
+    t.add_argument("--annotator", default=None, help="автор ручной разметки (обязателен для файла без mark-verified)")
     t.add_argument("--out", required=True)
     t.add_argument("--base", default=None)
     t.add_argument("--epochs", type=int, default=30)
@@ -238,7 +249,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     if a.cmd == "train":
-        print(train(a.coco, a.frames, a.out, a.base, epochs=a.epochs, batch=a.batch, lr=a.lr, augment=not a.no_augment))
+        frames = a.frames or str(default_images_root(a.coco))
+        print(train(a.coco, frames, a.out, a.base, epochs=a.epochs, batch=a.batch, lr=a.lr, augment=not a.no_augment,
+                    annotator=a.annotator))
     else:
         print(export_onnx(a.model, a.out))
 

@@ -9,13 +9,16 @@ import pytest
 def _isolate(monkeypatch, tmp_path):
     """Каждый тест: пустой SENTINEL_WEIGHTS, без mock/extras по умолчанию, чистый кэш бэкендов."""
     from ml.detect.backends import clear_cache
+    from ml.detect.inventory import clear_cache as clear_inv_cache
 
     monkeypatch.setenv("SENTINEL_WEIGHTS", str(tmp_path / "weights"))
     for k in ("SENTINEL_MOCK", "SENTINEL_DETECT_EXTRAS", "SENTINEL_DETECT_CONFIG", "SENTINEL_DETECT_BUDGET_S"):
         monkeypatch.delenv(k, raising=False)
     clear_cache()
+    clear_inv_cache()
     yield
     clear_cache()
+    clear_inv_cache()
 
 
 @pytest.fixture

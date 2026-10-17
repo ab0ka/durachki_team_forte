@@ -96,3 +96,41 @@ class MockColorDetector:
 
     def predict(self, frames: Sequence[np.ndarray]) -> list[RawDets]:
         return [self.predict_one(f) for f in frames]
+
+
+class MockOpenVocabScorer:
+    """Mock сырого open-vocab скоринга (только тесты/демо, SENTINEL_MOCK=1): компоненты цветов палитры →
+    боксы; скор запроса = high, если цвет компоненты входит в группу запроса, иначе low."""
+
+    def __init__(self, texts: Sequence[str], text_colors: dict[str, list[Sequence[int]]], tolerance: int = 28,
+                 min_area_px: int = 30, high: float = 0.9, low: float = 0.05, name: str = "mock:owl"):
+        self.texts = list(texts)
+        self.text_colors = {t: [np.asarray(c, np.int16) for c in cs] for t, cs in text_colors.items()}
+        self.colors: list[np.ndarray] = []
+        for cs in self.text_colors.values():
+            for c in cs:
+                if not any(np.array_equal(c, x) for x in self.colors):
+                    self.colors.append(c)
+        self.tol, self.min_area_px, self.high, self.low, self.name = int(tolerance), int(min_area_px), high, low, name
+
+    def score(self, frames: Sequence[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray]]:
+        import cv2
+
+        out = []
+        for f in frames:
+            h, w = f.shape[:2]
+            f16 = f.astype(np.int16)
+            boxes, probs = [], []
+            for c in self.colors:
+                mask = np.all(np.abs(f16 - c) <= self.tol, axis=-1).astype(np.uint8)
+                n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+                for j in range(1, n):
+                    x, y, bw, bh, a = (int(v) for v in stats[j])
+                    if a < self.min_area_px:
+                        continue
+                    boxes.append([x / w, y / h, (x + bw) / w, (y + bh) / h])
+                    probs.append([self.high if any(np.array_equal(c, tc) for tc in self.text_colors.get(t, []))
+                                  else self.low for t in self.texts])
+            out.append((np.asarray(boxes, np.float32).reshape(-1, 4),
+                        np.asarray(probs, np.float32).reshape(-1, len(self.texts))))
+        return out
