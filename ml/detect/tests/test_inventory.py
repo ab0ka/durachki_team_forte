@@ -7,10 +7,7 @@ import numpy as np
 import pytest
 
 from ml.detect import desk_inventory, safe_door_state
-try:
-    from contracts.sentinel_contracts import Zone
-except ImportError:  # ветка A05 без contracts/ (в интеграции fallback-копия удалена)
-    from ml.detect._contract_fallback import Zone
+from contracts.sentinel_contracts import Zone
 from ml.detect.inventory import KINDS, box_zone_fraction, zone_occlusion, zone_polys
 from ml.detect.synth import SynthObject, synth_clip
 
