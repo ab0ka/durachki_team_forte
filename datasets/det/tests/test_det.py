@@ -180,3 +180,38 @@ def test_select_respects_target_min_per_video_and_previous():
     assert (round(v["x"], 6), round(v["y"], 6), round(v["width"], 6)) == (10.0, 10.0, 10.0)
     assert task["data"]["image"].startswith("/data/local-files/?d=frames/")
     json.dumps(task)
+
+
+def test_apply_review_decisions():
+    import apply_review
+
+    cands = {"X-1/a.jpg": {"width": 464, "height": 848, "cands": [
+        {"n": 1, "xyxy": [10, 10, 50, 50], "src": "owl"}, {"n": 2, "xyxy": [11, 11, 50, 50], "src": "extra"},
+        {"n": 3, "xyxy": [100, 100, 200, 300], "src": "extra"}, {"n": 4, "xyxy": [240, 70, 255, 90], "src": "extra"},
+        {"n": 5, "xyxy": [60, 350, 140, 430], "src": "owl"}, {"n": 6, "xyxy": [150, 410, 206, 446], "src": "owl"}]}}
+    decisions = [
+        {"file": "X-1/a.jpg", "keep": {"1": "cash", "2": "cash", "3": "person", "4": "person", "5": "money_counter",
+                                    "6": "money_counter", "9": "cup"},
+         "add": [{"label": "cell_phone", "xyxy": [500, 20, 440, 60]}, {"label": "bottle", "xyxy": [0, 0, 9, 9]}]},
+        {"file": "X-9/zz.jpg", "keep": {}},
+    ]
+    out, errors = apply_review.apply(cands, decisions)
+    boxes = out["X-1/a.jpg"]["boxes"]
+    assert [(b["label"], b["src"]) for b in boxes] == [("cash", "owl"), ("person", "extra"), ("money_counter", "owl"),
+                                                       ("cell_phone", "added")]
+    assert [b["xyxy"] for b in boxes if b["label"] == "money_counter"] == [[60, 350, 140, 430]]   # крупная
+    assert boxes[3]["xyxy"] == [440.0, 20.0, 464.0, 60.0]                     # упорядочено и обрезано краем
+    assert len(errors) == 3 and any("#9" in e for e in errors) and any("X-9" in e for e in errors)
+    res = apply_review.ls_result(boxes[:1], 464, 848)[0]["value"]
+    assert res["rectanglelabels"] == ["cash"] and abs(res["x"] - 10 / 464 * 100) < 1e-9
+
+
+def test_coco_status_in_info():
+    images, anns = _imgs({"X-1": (1, [1])})
+    for im in images:
+        im.update(width=464, height=848, video_id="X-1", t_sec=0.0, dense=0)
+    for a in anns:
+        a.update(bbox=[0, 0, 10, 10], area=100, iscrowd=0)
+    coco = export_coco.build_coco(images, anns, {"X-1": "train"}, status="черновик")
+    assert coco["info"]["status"] == "черновик" and "черновик" in export_coco.stats_md(coco, {})
+    assert export_coco.build_coco(images, anns, {"X-1": "train"})["info"]["status"] == export_coco.HUMAN

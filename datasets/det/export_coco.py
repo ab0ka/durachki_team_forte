@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import CAT_ID, CLASSES, DET_DIR, FRAMES_DIR, INDEX_CSV, LS_DIR  # noqa: E402
 
 STATS_BEGIN, STATS_END = "<!-- STATS:BEGIN -->", "<!-- STATS:END -->"
+HUMAN = "проверено человеком в Label Studio (Submit)"
 
 
 def task_file(task: dict) -> str:
@@ -127,7 +128,7 @@ def assign_split(images: list[dict], anns: list[dict], fixed: dict[str, str], va
     return split
 
 
-def build_coco(images: list[dict], anns: list[dict], split: dict[str, str]) -> dict:
+def build_coco(images: list[dict], anns: list[dict], split: dict[str, str], status: str = HUMAN) -> dict:
     images = sorted(images, key=lambda im: im["file_name"])
     for i, im in enumerate(images, 1):
         im["id"] = i
@@ -142,7 +143,8 @@ def build_coco(images: list[dict], anns: list[dict], split: dict[str, str]) -> d
                  "images_root": "data/frames",
                  "file_name": "относительно images_root (от корня репо); кадры в git не хранятся — "
                               "воспроизводятся datasets/det/extract_frames.py",
-                 "split": "по видео (группы одинаковых по md5 файлов вместе), datasets/det/split.json"},
+                 "split": "по видео (группы одинаковых по md5 файлов вместе), datasets/det/split.json",
+                 "status": status},
         "licenses": [],
         "categories": [{"id": CAT_ID[c["name"]], "name": c["name"], "supercategory": "object",
                         "contract_label": c["contract"]} for c in CLASSES],
@@ -169,7 +171,8 @@ def stats_md(coco: dict, dups: dict[str, str]) -> str:
     n_tr = sum(split_of[a["image_id"]] == "train" for a in coco["annotations"])
     rows.append(f"| | **всего** | | **{n_ann}** | {n_tr} | {n_ann - n_tr} | |")
     with_boxes = {a["image_id"] for a in coco["annotations"]}
-    lines = [f"Экспорт: {coco['info']['date_created']}.", "", *rows, ""]
+    lines = [f"Экспорт: {coco['info']['date_created']}. Статус разметки: **{coco['info'].get('status', HUMAN)}**.",
+             "", *rows, ""]
     for part in ("train", "val"):
         ims = [im for im in coco["images"] if im["split"] == part]
         vids = sorted({im["group"] for im in ims}, key=lambda v: (len(v), v))
@@ -205,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--resplit", action="store_true", help="забыть split.json и распределить заново")
     ap.add_argument("--val", nargs="*", help="задать val вручную: группы видео (X-3 X-17 ...)")
+    ap.add_argument("--status", default=HUMAN, help="кем проверена разметка (пишется в info.status и README)")
     args = ap.parse_args(argv)
 
     tasks = json.loads(args.export.read_text(encoding="utf-8"))
@@ -220,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.val is not None:
         fixed = {im["group"]: ("val" if im["group"] in args.val else "train") for im in images}
     split = assign_split(images, anns, fixed, args.val_frac)
-    coco = build_coco(images, anns, split)
+    coco = build_coco(images, anns, split, args.status)
 
     dump = {"indent": None, "ensure_ascii": False, "separators": (",", ":")}
     (args.out_dir / "annotations.json").write_text(json.dumps(coco, **dump), encoding="utf-8")
