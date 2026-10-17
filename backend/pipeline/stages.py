@@ -136,10 +136,57 @@ def module_identity(module: Any, origin: str = "module") -> dict:
         paths = ckpt if isinstance(ckpt, (list, tuple)) else ([ckpt] if ckpt else [])
         ident["model_info"] = info
         ident["checkpoint_sig"] = [_file_sig(str(p)) for p in paths]
+    if origin == "module":
+        ident["models"] = module_models(module)
     for env in ("SENTINEL_FOLD", "SENTINEL_SPLIT"):
         if os.environ.get(env):
             ident[env.lower()] = os.environ[env]
     return ident
+
+
+def _hf_cache_dirs() -> list[Path]:
+    dirs = []
+    for env in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(env):
+            dirs.append(Path(os.environ[env]))
+    if os.environ.get("HF_HOME"):
+        dirs.append(Path(os.environ["HF_HOME"]) / "hub")
+    dirs += [REPO_ROOT / "weights" / "hf" / "hub", Path.home() / ".cache" / "huggingface" / "hub"]
+    return dirs
+
+
+def hf_revision(hf_id: str) -> Optional[str]:
+    """Ревизия (commit) офлайн-снапшота модели в HF-кэше: models--org--name/refs/main. Нет — None."""
+    if not hf_id or "://" in hf_id or "/" not in hf_id:
+        return None
+    name = "models--" + hf_id.strip("/").replace("/", "--")
+    for d in _hf_cache_dirs():
+        ref = d / name / "refs" / "main"
+        try:
+            return ref.read_text(encoding="utf-8").strip()[:40] or None
+        except OSError:
+            continue
+    return None
+
+
+def module_models(module: Any) -> list[dict]:
+    """Модели из <пакет модуля>/models.json (+ ревизия весов из HF-кэша) — для ключа кэша и provenance."""
+    file = getattr(module, "__file__", None)
+    if not file:
+        return []
+    path = Path(file).parent / "models.json"
+    try:
+        items = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for m in items if isinstance(items, list) else []:
+        if not isinstance(m, dict):
+            continue
+        hf = str(m.get("hf_id_or_url") or m.get("hf_id") or "")
+        out.append({"name": str(m.get("name", hf)), "hf_id_or_url": hf, "license": m.get("license"),
+                    "revision": hf_revision(hf)})
+    return out
 
 
 def catalog_hash(catalog: Mapping) -> str:

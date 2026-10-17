@@ -76,9 +76,14 @@ class Runtime:
         from .media import LockedClip, SimpleClip
         from .stages import ModuleMissing, resolve
 
-        key = (path, float(sample_fps))
-        if self.clip is not None and self.clip_key == key:
-            return self._clip_info(self.clip, getattr(self, "_clip_source", "ml.ingest"), [])
+        try:
+            st = os.stat(path)
+            key = (path, float(sample_fps), st.st_size, st.st_mtime_ns)
+        except OSError:
+            key = (path, float(sample_fps), None, None)
+        if self.clip is not None and self.clip_key == key:  # тот же файл/fps — клип переиспользуется
+            return self._clip_info(self.clip, getattr(self, "_clip_source", "ml.ingest"),
+                                   list(getattr(self, "_clip_warnings", [])))
         self.clip = None
         gc.collect()
         warnings: list[str] = []
@@ -104,6 +109,7 @@ class Runtime:
         self.clip = LockedClip(clip, cache_mb=self.frame_cache_mb)
         self.clip_key = key
         self._clip_source = source
+        self._clip_warnings = list(warnings)
         return self._clip_info(self.clip, source, warnings)
 
     @staticmethod
@@ -302,6 +308,10 @@ class WorkerTimeout(Exception):
     pass
 
 
+class WorkerCancelled(Exception):
+    pass
+
+
 class WorkerCrashed(Exception):
     pass
 
@@ -316,10 +326,34 @@ class _BaseExecutor:
         self.restarts = 0
         self.kills = 0
         self.poisoned = False
+        self.cancel_event: Optional[threading.Event] = None
+
+    def cancelled(self) -> bool:
+        ev = self.cancel_event
+        return ev is not None and ev.is_set()
+
+    def release(self) -> dict:
+        """Освободить GPU: остановить воркер (process) или выгрузить модели (inline)."""
+        self.shutdown()
+        return {"mode": self.mode, "action": "shutdown"}
 
     @contextlib.contextmanager
-    def lease(self, timeout: Optional[float]) -> Iterator[bool]:
-        ok = self._lease.acquire(timeout=-1 if timeout is None else max(0.0, timeout))
+    def lease(self, timeout: Optional[float], cancel: Optional[threading.Event] = None) -> Iterator[bool]:
+        """Аренда исполнителя задачей. Ожидание прерывается отменой задачи (cancel)."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        ok = False
+        while not (cancel is not None and cancel.is_set()):
+            if self._lease.acquire(blocking=False):   # свободный воркер берём сразу, даже при timeout=0
+                ok = True
+                break
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                break
+            if self._lease.acquire(timeout=0.25 if left is None else max(0.001, min(0.25, left))):
+                ok = True
+                break
+        if ok:
+            self.cancel_event = cancel
         if ok and getattr(self, "_pending_restart", False):
             self._pending_restart = False
             self.shutdown()
@@ -328,6 +362,7 @@ class _BaseExecutor:
         finally:
             if ok:
                 self._job = None
+                self.cancel_event = None
                 self._lease.release()
 
     # интерфейс
@@ -379,16 +414,20 @@ class InlineExecutor(_BaseExecutor):
 
         th = threading.Thread(target=target, name="sentinel-inline-stage", daemon=True)
         th.start()
-        th.join(timeout=max(0.0, timeout))
+        end = time.monotonic() + max(0.0, timeout)
+        while th.is_alive() and time.monotonic() < end and not self.cancelled():
+            th.join(timeout=min(0.25, max(0.0, end - time.monotonic())))
         if th.is_alive():
             self.poisoned = True
-            return "timeout", None
+            return ("cancelled" if self.cancelled() else "timeout"), None
         if "exc" in box:
             return "error", (box["exc"], box.get("trace", ""))
         return "ok", box.get("value")
 
     def load_clip(self, path: str, sample_fps: float, timeout: float) -> dict:
         status, value = self._run(lambda: self.rt.load_clip(path, sample_fps), timeout)
+        if status == "cancelled":
+            raise WorkerCancelled("ingest")
         if status == "timeout":
             raise WorkerTimeout(f"ingest не уложился в {timeout:.1f} с")
         if status == "error":
@@ -399,6 +438,9 @@ class InlineExecutor(_BaseExecutor):
     def call(self, module: str, func: str, args: tuple, kwargs: Optional[dict], timeout: float) -> CallResult:
         t0 = time.perf_counter()
         status, value = self._run(lambda: self.rt.call(module, func, args, kwargs), timeout)
+        if status == "cancelled":
+            return CallResult("cancelled", error="задача отменена (inline: поток не остановлен)",
+                              seconds=time.perf_counter() - t0)
         if status == "timeout":
             return CallResult("timeout", error=f"таймаут {timeout:.1f} с (inline: поток не остановлен, "
                                                f"GPU может быть занят)", seconds=time.perf_counter() - t0)
@@ -410,6 +452,8 @@ class InlineExecutor(_BaseExecutor):
 
     def request(self, cmd: str, payload: dict, timeout: float) -> Any:
         status, value = self._run(lambda: getattr(self.rt, cmd)(**payload), timeout)
+        if status == "cancelled":
+            raise WorkerCancelled(cmd)
         if status == "timeout":
             raise WorkerTimeout(cmd)
         if status == "error":
@@ -419,6 +463,12 @@ class InlineExecutor(_BaseExecutor):
     def restart(self) -> None:
         self.rt.drop_clip()
         self.restarts += 1
+
+    def release(self) -> dict:
+        """inline: выгрузить модели всех модулей ml.* (хуки unload + реестр), сбросить клип."""
+        mods = sorted(m for m in sys.modules if m.startswith("ml.") and m.count(".") == 1)
+        self.rt.drop_clip()
+        return {"mode": self.mode, "action": "unload", **self.rt.unload(mods)}
 
     def reconfigure(self, cfg: Mapping) -> None:
         from .config import cfg_get
@@ -520,7 +570,16 @@ class ProcessExecutor(_BaseExecutor):
     def _send_recv(self, cmd: str, payload: dict, timeout: float) -> Any:
         try:
             self._conn.send((cmd, payload))
-            ready = self._conn.poll(max(0.0, timeout))
+            end = time.monotonic() + max(0.0, timeout)
+            ready = False
+            while not ready:
+                if self.cancelled():
+                    self.kill()  # отмена: процесс умирает → CUDA-контекст и модели выгружены
+                    raise WorkerCancelled(f"{cmd}: задача отменена — воркер остановлен")
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                ready = self._conn.poll(min(0.25, left))
         except (OSError, EOFError, BrokenPipeError) as exc:
             self.kill()
             raise WorkerCrashed(f"канал воркера: {exc}") from exc
@@ -549,6 +608,8 @@ class ProcessExecutor(_BaseExecutor):
                                 timeout)
         except WorkerTimeout as exc:
             return CallResult("timeout", error=str(exc), seconds=time.perf_counter() - t0)
+        except WorkerCancelled as exc:
+            return CallResult("cancelled", error=str(exc), seconds=time.perf_counter() - t0)
         except WorkerCrashed as exc:
             return CallResult("crashed", error=str(exc), seconds=time.perf_counter() - t0)
         except Exception as exc:  # noqa: BLE001

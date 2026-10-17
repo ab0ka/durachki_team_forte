@@ -83,6 +83,15 @@ reserve_s:
 optional_stages: [pose, temporal, vlm_verify, vlm_discover]  # пропускаются по бюджету (с warning)
 min_start_fraction: 0.6      # необязательная стадия стартует, если влезает ≥ 60% её (масштабированного) бюджета
 
+# Полнота: meta.coverage — доля длительности, реально проанализированная стадией (по таймстемпам
+# её выхода/кадров); неизвестно → null. Гейт: обязательная стадия с покрытием < min_required делает
+# анализ неполным → никогда не no_violation (failed или degraded violation).
+coverage:
+  gate: true
+  min_required: 0.9
+  max_gap_s: 2.0               # разрыв между кадрами/состояниями больше этого — непокрытое время
+  container_tolerance: 0.15    # контейнер длиннее декодированного на >15% → декодер не дошёл до конца
+
 partial:
   enabled: true
   milestones: [after_core, after_vlm_verify]  # когда писать data/jobs/<id>/partial.json

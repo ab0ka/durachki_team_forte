@@ -72,6 +72,55 @@ def ascii_safe_path(path: str, workdir: Path, mode: str = "auto", tag: str = "in
     return str(target)
 
 
+def _pts_seconds(cap: Any, cv2: Any) -> Optional[float]:
+    try:
+        ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+    except Exception:  # noqa: BLE001
+        return None
+    return ms / 1000.0 if ms == ms and ms >= 0 else None
+
+
+def read_frame_at_pts(path: str, t: float, preroll_s: float = 1.0) -> tuple[Any, Optional[float]]:
+    """Кадр с PTS, ближайшим к t (переменный fps: индекс×fps врёт). Seek чуть раньше t, затем
+    декодирование вперёд по PTS; если seek «перелетел» t — декодирование с начала файла."""
+    try:
+        import cv2  # noqa: WPS433
+    except Exception:  # noqa: BLE001
+        return None, None
+    t = max(0.0, float(t))
+    for start in (max(0.0, t - preroll_s), 0.0):
+        cap = cv2.VideoCapture(str(path))
+        try:
+            if not cap.isOpened():
+                return None, None
+            if start > 0:
+                cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+            best, best_pts, first = None, None, True
+            while True:
+                if not cap.grab():
+                    break
+                pts = _pts_seconds(cap, cv2)
+                if pts is None:
+                    break
+                if first and start > 0 and pts > t + 1e-3:
+                    best = "overshoot"
+                    break
+                first = False
+                if best_pts is not None and abs(pts - t) > abs(best_pts - t):
+                    break  # прошли ближайший кадр
+                ok, frame = cap.retrieve()
+                if ok and frame is not None:
+                    best, best_pts = frame, pts
+                if pts >= t:
+                    break
+            if isinstance(best, str):
+                continue
+            return best, best_pts
+        finally:
+            cap.release()
+    return None, None
+
+
 class SimpleClip:
     """Запасной декодер (если ml.ingest недоступен/упал). Сэмплированные кадры хранятся как JPEG
     в памяти (≈60 КБ/кадр), frame_at() делает точный seek. Поворот учитывает сам OpenCV ≥ 4.5."""
@@ -87,32 +136,40 @@ class SimpleClip:
             raise RuntimeError(f"не удалось открыть видео: {path}")
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) or 30.0
         self.fps = fps
-        sample_fps = max(0.1, float(sample_fps))
-        step = fps / sample_fps
+        step_s = 1.0 / max(0.1, float(sample_fps))
+        half_frame = 0.5 / fps
         self.times: list[float] = []
         self._jpegs: list[bytes] = []
         next_pick = 0.0
         idx = 0
+        last_pts = -1.0
         width = height = 0
         while True:
             ok = cap.grab()
             if not ok:
                 break
-            if idx + 1e-6 >= next_pick:
+            # время — только из PTS (переменный fps); индекс/fps — лишь запасной вариант
+            pts = _pts_seconds(cap, cv2)
+            if pts is None or pts <= last_pts:
+                pts = (last_pts + 1.0 / fps) if last_pts >= 0 else idx / fps
+            if pts + half_frame >= next_pick:
                 ok, frame = cap.retrieve()
                 if ok and frame is not None:
                     height, width = frame.shape[:2]
                     okj, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
                     if okj:
-                        self.times.append(round(idx / fps, 4))
+                        self.times.append(round(pts, 4))
                         self._jpegs.append(buf.tobytes())
-                next_pick += step
+                while next_pick <= pts + half_frame:
+                    next_pick += step_s
+            last_pts = pts
             idx += 1
         cap.release()
         if not self._jpegs:
             raise RuntimeError(f"в видео нет декодируемых кадров: {path}")
         self.n_source_frames = idx
-        self.duration = idx / fps
+        self.duration = round(last_pts + 1.0 / fps, 4)
+        self.timebase = "pts"
         self.width = int(width)
         self.height = int(height)
         self._np = np
@@ -127,17 +184,9 @@ class SimpleClip:
         return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
     def frame_at(self, t: float) -> Any:
-        import cv2  # noqa: WPS433
-
         with self._lock:
-            cap = cv2.VideoCapture(self.path)
-            try:
-                target = max(0, min(self.n_source_frames - 1, int(round(float(t) * self.fps))))
-                cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-                ok, frame = cap.read()
-            finally:
-                cap.release()
-        if ok and frame is not None:
+            frame, _pts = read_frame_at_pts(self.path, t)
+        if frame is not None:
             return frame
         nearest = min(range(len(self.times)), key=lambda k: abs(self.times[k] - float(t)))
         return self.frame(nearest)
