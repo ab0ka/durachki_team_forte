@@ -212,7 +212,7 @@ def blur_regions(img: np.ndarray, regions: Sequence[tuple[int, int, int, int]]) 
         if roi.size == 0:
             continue
         rh, rw = roi.shape[:2]
-        small = cv2.resize(roi, (max(1, rw // 10), max(1, rh // 10)), interpolation=cv2.INTER_AREA)
+        small = cv2.resize(roi, (max(1, rw // 6), max(1, rh // 6)), interpolation=cv2.INTER_AREA)
         pix = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
         k = max(3, (min(rw, rh) // 4) | 1)
         out[y1:y2, x1:x2] = cv2.GaussianBlur(pix, (k, k), 0)
