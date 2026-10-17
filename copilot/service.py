@@ -21,7 +21,7 @@ import time
 from typing import Any, Iterator, Optional, Sequence
 
 from .config import copilot_enabled, default_config, is_mock
-from .corpus import Corpus, load_corpus
+from .corpus import Corpus, load_corpus, norm_url
 from .extractive import classify, compose, refusal_for, target_violations
 from .guard import UNVERIFIED_ANSWER, check_answer, complete_prefix
 from .llm import LLMBusy, LLMTimeout, make_llm
@@ -44,14 +44,19 @@ ERROR_MESSAGES = {
 
 
 def source_label(cite: dict[str, Any]) -> str:
-    """Читаемая подпись источника для UI: «[1] Документ, п. 9 — url»."""
+    """Читаемая подпись источника для UI: «[1] Документ, п. 9 — url (норма каталога; не сверено)»."""
     label = f"[{cite.get('ref')}] " if cite.get("ref") else ""
-    label += str(cite.get("document") or "")
+    label += str(cite.get("short") or cite.get("document") or "")
     if cite.get("clause"):
         label += f", {cite['clause']}"
     if cite.get("url"):
         label += f" — {cite['url']}"
-    return label
+    tags = ["норма каталога" if cite.get("relation") == "catalog" else "найдено поиском"]
+    if cite.get("status") == "candidate":
+        tags.append("кандидат")
+    if not cite.get("verified"):
+        tags.append("не сверено")
+    return f"{label} ({'; '.join(tags)})"
 
 
 class CopilotService:
@@ -179,11 +184,11 @@ class CopilotService:
         max_refs = int(self.cfg.get("llm", {}).get("max_norm_refs", 6))
         targets = target_violations(question, result)
         type_ids = [str(v.get("type_id")) for v in targets if v.get("type_id")]
-        chunks: list[tuple[Any, float]] = []
+        chunks: list[tuple[Any, float, str]] = []
         # 1) нормы каталога по типам нарушений, о которых спрашивают
         for tid in dict.fromkeys(type_ids):
             for c in corpus.rules_for_type(tid)[:2]:
-                chunks.append((c, 1.0))
+                chunks.append((c, 1.0, "catalog"))
         # 2) нормы, уже приложенные к результату (A12 берёт их из каталога) — перепроверяем
         for v in targets:
             for r in v.get("rules") or []:
@@ -192,8 +197,10 @@ class CopilotService:
                 hit = corpus.find(r.get("document"), r.get("clause"), r.get("url"))
                 if hit is None:
                     warnings.append(f"норма из результата не найдена в каталоге: {r.get('document')} {r.get('clause') or ''}".strip())
+                elif hit.kind == "catalog_rule" or set(hit.type_ids) & set(type_ids):
+                    chunks.append((hit, 0.9, "catalog"))
                 else:
-                    chunks.append((hit, 0.9))
+                    chunks.append((hit, 0.9, "retrieved"))
         # 3) RAG по вопросу (+ предыдущий вопрос для коротких уточнений)
         query = question
         last_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
@@ -205,15 +212,21 @@ class CopilotService:
         except Exception as exc:  # RAG не должен ронять ответ
             warnings.append(f"поиск по нормам недоступен: {type(exc).__name__}")
             hits = []
-        chunks.extend((h.chunk, h.score) for h in hits)
+        # фрагмент источника, связанный с типом события через каталог (тот же URL+пункт), — тоже «каталог»
+        chunks.extend((h.chunk, h.score, "catalog" if set(h.chunk.type_ids) & set(type_ids) else "retrieved")
+                      for h in hits)
         refs: list[NormRef] = []
         seen: set[Any] = set()
-        for c, score in chunks:
-            key = c.key if c.key[1] else (c.key[0], c.id)
-            if key in seen:
+        for c, score, relation in chunks:
+            keys = {c.key if c.key[1] else (c.key[0], c.id)}
+            if c.url and c.key[1]:
+                keys.add((norm_url(c.url), c.key[1]))  # одна норма из каталога и из источника — один раз
+            if keys & seen:
                 continue
-            seen.add(key)
-            refs.append(NormRef(n=len(refs) + 1, chunk=c, score=float(score)))
+            seen |= keys
+            events = [int(v["_n"]) for v in result.get("violations") or []
+                      if relation == "catalog" and v.get("type_id") in c.type_ids]
+            refs.append(NormRef(n=len(refs) + 1, chunk=c, score=float(score), relation=relation, events=events))
             if len(refs) >= max_refs:
                 break
         return refs

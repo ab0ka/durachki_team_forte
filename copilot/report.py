@@ -30,14 +30,15 @@ def _verified_rules(v: dict[str, Any], corpus: Optional[Corpus]) -> tuple[list[d
             continue
         if hit.key not in seen:
             seen.add(hit.key)
+            # статус берём из каталога (корпуса), а не со слов результата
             out.append({"document": hit.document, "clause": hit.clause, "url": hit.url,
-                        "quote": r.get("quote") or hit.text, "verified": bool(r.get("verified", hit.verified))})
+                        "quote": hit.text, "verified": hit.verified, "status": hit.status, "note": hit.note})
     if not out and corpus is not None and v.get("type_id"):
         for c in corpus.rules_for_type(str(v["type_id"])):
             if c.key not in seen:
                 seen.add(c.key)
                 out.append({"document": c.document, "clause": c.clause, "url": c.url, "quote": c.text,
-                            "verified": c.verified})
+                            "verified": c.verified, "status": c.status, "note": c.note})
     return out, dropped
 
 
@@ -94,11 +95,22 @@ def report(job_result: Any, corpus: Optional[Corpus] = None, cfg: Optional[dict[
                 for r in rules:
                     ref = f"{_md(r['document'])}" + (f", {_md(r['clause'])}" if r.get("clause") else "")
                     link = f"[{ref}]({r['url']})" if r.get("url") else ref
-                    mark = "" if r.get("verified") else " _(цитата требует сверки с первоисточником)_"
+                    tags = []
+                    if r.get("status") == "candidate":
+                        tags.append("норма-кандидат")
+                    if not r.get("verified"):
+                        tags.append("цитата требует сверки с первоисточником")
+                    mark = f" _({'; '.join(tags)})_" if tags else ""
                     quote = f" — «{_md(r['quote'])}»" if r.get("quote") else ""
                     lines.append(f"  - {link}{quote}{mark}")
             else:
-                lines.append("- **Нормы:** в источниках нет подтверждённой нормы для этого случая")
+                lines.append("- **Норма:** без пункта — в каталоге нет подтверждённого пункта для этого типа")
+            info = corpus.type_info(tid) if corpus is not None and tid else {}
+            if info.get("legal_note"):
+                lines.append(f"- **Пояснение каталога (не текст нормы):** {_md(info['legal_note'])}")
+            excl = [str(x) for x in info.get("exclusions") or [] if str(x).strip()]
+            if excl:
+                lines.append("- **Когда это не нарушение (каталог):** " + "; ".join(_md(x) for x in excl))
             if dropped:
                 lines.append(f"- _Отброшено ссылок, не найденных в каталоге норм: {dropped}_")
             lines.append("")

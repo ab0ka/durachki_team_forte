@@ -271,7 +271,13 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
         if f"[{order.index(n) + 1}]" not in answer:
             continue  # сноска ушла вместе с вырезанным предложением
         cite = r.chunk.citation()
-        cite.update({"ref": order.index(n) + 1, "quote": r.chunk.text, "verified": r.chunk.verified})
+        cite.update({"ref": order.index(n) + 1, "quote": r.chunk.text, "verified": r.chunk.verified,
+                     "relation": r.relation, "status": r.chunk.status, "note": r.status_ru,
+                     "events": list(r.events)})
+        if corpus is not None:
+            short = corpus.short_name(r.chunk.document, r.chunk.url)
+            if short != r.chunk.document:
+                cite["short"] = short
         citations.append(cite)
 
     raw_invalid = bool(removed)

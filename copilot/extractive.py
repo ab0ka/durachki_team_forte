@@ -101,18 +101,31 @@ def refusal_for(intent: str, result: dict[str, Any], corpus: Optional[Corpus]) -
     return None
 
 
+def _catalog_refs(v: dict[str, Any], refs: Sequence[NormRef]) -> list[NormRef]:
+    return [r for r in refs if r.relation == "catalog" and v.get("_n") in r.events]
+
+
+def _norm_phrase(r: NormRef) -> str:
+    tags = []
+    if r.chunk.status == "candidate" or not r.chunk.verified:
+        tags.append("требует сверки")
+    return f"{r.marker}" + (f" ({', '.join(tags)})" if tags else "")
+
+
 def _viol_line(v: dict[str, Any], refs: Sequence[NormRef], corpus: Optional[Corpus]) -> str:
     tid = v.get("type_id") or ""
     name = v.get("type") or (corpus.type_name(tid) if corpus and tid else "") or "возможное нарушение"
-    marks = " ".join(r.marker for r in refs if tid and tid in r.chunk.type_ids)
+    own = _catalog_refs(v, refs)
     conf = v.get("confidence")
     conf_s = f", уверенность {float(conf):.2f}" if conf not in (None, "") else ""
     desc = str(v.get("description") or "").strip().rstrip(".")
     line = f"- [V{v.get('_n')}] {name}{conf_s}"
     if desc:
         line += f". Что видно: {desc}"
-    if marks:
-        line += f". Норма: {marks}"
+    if own:
+        line += ". Норма: " + ", ".join(_norm_phrase(r) for r in own)
+    elif corpus is not None and tid:
+        line += ". Норма: без пункта (в каталоге нет подтверждённого пункта для этого типа)"
     return line + "."
 
 
@@ -143,12 +156,28 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
         return "В источниках: " + " ".join(f"«{r.chunk.text}» {r.marker}" for r in hits[:2])
 
     if intent == "norm":
-        rel = [r for r in refs if not targets or any(t.get("type_id") in r.chunk.type_ids for t in targets)] or list(refs)
-        if not rel:
+        cat = [r for r in refs if r.relation == "catalog" and (not targets or any(t.get("_n") in r.events for t in targets))]
+        found = [r for r in refs if r.relation != "catalog"]
+        missing = [str(t.get("type") or (corpus.type_name(str(t.get("type_id"))) if corpus else "") or t.get("type_id"))
+                   for t in targets if t.get("type_id") and not _catalog_refs(t, refs)]
+        lines: list[str] = []
+        if missing and not cat:
+            lines.append(f"{REFUSAL_NO_DATA}: " + "; ".join(
+                f"для «{m}» в каталоге нет подтверждённого пункта — без пункта" for m in missing) + ".")
+        if cat:
+            lines.append("Нормы каталога для этого типа:")
+            for r in cat[:3]:
+                lines.append(f"- {r.chunk.document}" + (f", {r.chunk.clause}" if r.chunk.clause else "")
+                             + f": «{r.chunk.text}» {_norm_phrase(r)}")
+            for m in missing:
+                lines.append(f"Для «{m}» в каталоге нет подтверждённого пункта — без пункта.")
+        if found and not cat:
+            lines.append("Найдено поиском по текстам норм (связь с нарушением каталогом не подтверждена):")
+            for r in found[:2]:
+                lines.append(f"- {r.chunk.document}" + (f", {r.chunk.clause}" if r.chunk.clause else "")
+                             + f": «{r.chunk.text}» {r.marker} (возможно относится, требует сверки)")
+        if not lines:
             return f"{REFUSAL_SOURCES}."
-        lines = ["Относящиеся нормы из источников:"]
-        for r in rel[:3]:
-            lines.append(f"- {r.chunk.document}" + (f", {r.chunk.clause}" if r.chunk.clause else "") + f": «{r.chunk.text}» {r.marker}")
         return "\n".join(lines)
 
     if not viols:
@@ -192,7 +221,7 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
     head = (f"Вердикт: {verdict_text(result)}; возможных нарушений: {len(viols)}."
             if intent in {"summary", "general"} else "Основания (только наблюдаемые факты):")
     lines = [head] + [_viol_line(v, refs, corpus) for v in targets]
-    if not any(r for r in refs if any(t.get("type_id") in r.chunk.type_ids for t in targets)):
+    if corpus is None and not any(_catalog_refs(t, refs) for t in targets):
         lines.append("Норма для этого случая в источниках не найдена.")
     lines.append("Это признаки возможного нарушения, решение принимает проверяющий.")
     return "\n".join(lines)

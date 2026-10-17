@@ -8,7 +8,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 from .corpus import Chunk, Corpus
@@ -29,7 +29,10 @@ SYSTEM_PROMPT = f"""Ты — Sentinel Copilot, локальный ассисте
 6. Если ответа нет в результате или нужной нормы нет в разделе «НОРМЫ», ответь: «{REFUSAL_NO_DATA}»
    и коротко укажи, каких данных не хватает.
 7. Говори «признаки возможного нарушения», а не «нарушение доказано». Ответ — подсказка, не юридическое заключение.
-8. Людей не идентифицируй; роли (кассир, посетитель, инкассатор) — только как в результате анализа."""
+8. Людей не идентифицируй; роли (кассир, посетитель, инкассатор) — только как в результате анализа.
+9. У каждой нормы есть пометки (из каталога или найдено поиском; сверено или нет). Несверенную норму называй
+   «требует сверки», найденную поиском — «возможно относится». Если для типа нарушения указано «без пункта» —
+   так и скажи, пункт не подбирай."""
 
 
 def to_float(x: Any, default: Optional[float] = None) -> Optional[float]:
@@ -142,10 +145,32 @@ class NormRef:
     n: int
     chunk: Chunk
     score: float = 0.0
+    relation: str = "retrieved"      # catalog — норма каталога для типа события; retrieved — найдено поиском
+    events: list[int] = field(default_factory=list)  # номера нарушений [Vk], к которым относится норма
 
     @property
     def marker(self) -> str:
         return f"[N{self.n}]"
+
+    @property
+    def status_ru(self) -> str:
+        return norm_status_ru(self.chunk, self.relation)
+
+
+def norm_status_ru(chunk: Chunk, relation: str) -> str:
+    """Честные пометки нормы для промпта, ответа и отчёта."""
+    parts = ["норма каталога для этого типа" if relation == "catalog"
+             else "найдено поиском по тексту, связь с нарушением каталогом не подтверждена"]
+    if chunk.status == "confirmed":
+        parts.append("статус в каталоге: подтверждена")
+    elif chunk.status == "candidate":
+        parts.append("статус в каталоге: кандидат, требует сверки")
+    if not chunk.verified:
+        parts.append("цитата не сверена с полным текстом")
+    for note in (chunk.note or "").split("; "):
+        if note and not note.startswith("цитата не сверена"):
+            parts.append(note)
+    return "; ".join(dict.fromkeys(parts))
 
 
 def verdict_text(result: dict[str, Any]) -> str:
@@ -202,9 +227,14 @@ def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optio
             frames = [fmt_tc(f.get("timestamp_sec")) for f in v.get("evidence_frames") or []]
             if frames:
                 lines.append(f"    Кадры-доказательства: {', '.join(frames)}")
-            own = [r.marker for r in refs if tid and tid in r.chunk.type_ids]
+            own = [r.marker for r in refs if r.relation == "catalog" and n in r.events]
             if own:
-                lines.append(f"    Относящиеся нормы: {', '.join(own)}")
+                lines.append(f"    Нормы каталога для этого типа: {', '.join(own)}")
+            elif corpus is not None and tid and not corpus.rules_for_type(tid):
+                lines.append("    Норма: без пункта (в каталоге нет подтверждённого пункта для этого типа)")
+            note = corpus.type_info(tid).get("legal_note") if corpus is not None and tid else None
+            if note:
+                lines.append(f"    Пояснение каталога (не текст нормы): {note}")
     else:
         lines.append("Возможные нарушения: нет")
     lines.append("По видео НЕ устанавливается: " + "; ".join(unobservable_items(result, corpus)))
@@ -214,6 +244,7 @@ def build_context(result: dict[str, Any], refs: Sequence[NormRef], corpus: Optio
         for r in refs:
             c = r.chunk
             lines.append(f"{r.marker} {c.document}" + (f", {c.clause}" if c.clause else "") + (f" — {c.url}" if c.url else ""))
+            lines.append(f"    Пометки: {r.status_ru}")
             lines.append(f"    «{c.text}»")
     else:
         lines.append("НОРМЫ: в источниках не найдено подходящих фрагментов.")
