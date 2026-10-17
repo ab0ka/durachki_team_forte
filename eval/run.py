@@ -316,6 +316,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--kind", default=None, help="exploratory | holdout_frozen (по умолчанию из config)")
     ap.add_argument("--ablation-id", default=None)
     args = ap.parse_args(argv)
+    if args.kind == "holdout_frozen":  # только замороженный hold-out (eval.extra freeze), открытый с --final
+        man_p = Path(args.splits).with_name(Path(args.splits).stem + "_manifest.json")
+        frozen = man_p.exists() and bool(read_json(man_p).get("frozen"))
+        if not (frozen and args.subset == "holdout" and args.final):
+            print("ВНИМАНИЕ: --kind holdout_frozen допустим только для --subset holdout --final по split'у из "
+                  "eval.extra freeze; помечаю как exploratory.")
+            args.kind = "exploratory"
     cfg = load_config(args.config, {"dataset": {"evaluation_kind": args.kind}} if args.kind else None)
     env_applied = apply_env(cfg, args.pipeline_config, args.env)
     if args.raw:  # до протокола: обе руки абляции фиксируют одинаковое окружение
