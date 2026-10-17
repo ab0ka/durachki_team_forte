@@ -68,7 +68,11 @@ def creds() -> dict:
     if CREDS.is_file():
         return json.loads(CREDS.read_text(encoding="utf-8"))
     LS_DATA.mkdir(parents=True, exist_ok=True)
-    c = {"username": "annotator@local", "password": secrets.token_urlsafe(12), "token": secrets.token_hex(20)}
+    # email с доменом без точки («@local») не проходит валидатор формы входа Django → «email and password don't match»;
+    # пароль без похожих символов (l/I/1, O/0), чтобы его можно было набрать с экрана
+    readable = "abcdefghjkmnpqrstuvwxyz23456789"
+    c = {"username": "annotator@localhost", "password": "kassa-" + "".join(secrets.choice(readable) for _ in range(8)),
+         "token": secrets.token_hex(20)}
     CREDS.write_text(json.dumps(c, indent=1), encoding="utf-8")
     return c
 
