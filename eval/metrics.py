@@ -637,6 +637,38 @@ def evaluate_dirs(labels_csv: str | Path, preds_dir: str | Path, types_csv: Opti
     return evaluate(gt, preds, info, cfg, load_catalog(cfg), versions=versions, subset=subset)
 
 
+def public_summary(res: dict, proxy: Optional[dict] = None) -> dict:
+    """Агрегированная сводка БЕЗ кадров, описаний и ID видео — единственное, что можно отдавать
+    вне локальной машины (в т.ч. облачным агентам/LLM). Полные preds/HTML-отчёты — только локально."""
+    s, v = res["summary"], res["summary"]["video"]
+    loc, lat = s["localization"], s["latency"]
+    keep = ("n", "n_pos", "n_neg", "tp", "tn", "fp", "fn", "failed", "timeouts", "degraded", "precision", "recall",
+            "f1", "accuracy", "specificity", "precision_ci95", "recall_ci95", "specificity_ci95")
+    out = {
+        "note": "Агрегаты без кадров/описаний/ID видео. Результат — подсказка, не юридическое заключение.",
+        "scorecard": res.get("scorecard"),
+        "video": {k: v.get(k) for k in keep} | {"label_conflicts": len(v.get("label_conflict_ids") or [])},
+        "localization": {k: loc.get(k) for k in ("events_total", "events_matched", "abs_dt_matched",
+                                                  "mean_signed_dt_matched", "hit_events_all", "hit_events_tp",
+                                                  "extra_candidates_total", "match_window_s", "caveat")},
+        "evidence": s["evidence"],
+        "types": {k: s["types"].get(k) for k in ("available", "n_events", "accuracy", "accuracy_ci95", "per_type",
+                                                  "pred_distribution", "note")},
+        "norms": s["norms"],
+        "schema": {"n": s["schema"]["n"], "valid_rate": s["schema"]["valid_rate"],
+                   "n_with_errors": len(s["schema"]["errors"])},
+        "language": {k: s["language"].get(k) for k in ("n", "hedged_rate", "forbidden_rate")},
+        "latency": {k: lat.get(k) for k in ("n", "mean", "median", "p90", "max", "sla_s", "within_sla_rate")}
+        | {"n_over_sla": len(lat.get("over_sla_ids") or [])},
+        "categories": {c: len(ids) for c, ids in s["categories"].items()},
+    }
+    if proxy:
+        out["proxy_score"] = {"value": proxy.get("proxy_score"), "disclaimer": proxy.get("disclaimer"),
+                              "components": {k: {x: c.get(x) for x in ("points", "weight", "source")}
+                                             for k, c in (proxy.get("components") or {}).items()}}
+    return out
+
+
 def _f(x: Any) -> str:
     return "—" if x is None else (f"{x:.3f}" if isinstance(x, float) else str(x))
 
