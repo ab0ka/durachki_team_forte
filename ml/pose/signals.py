@@ -232,6 +232,7 @@ def _phone_to_ear(series: _Series, objs: _ObjectIndex, cfg: dict[str, Any]) -> N
     if known:
         times_k = series.times[known]
         vals, mask = gated_values(times_k, [gesture[i] for i in known], p)
+        pos = {j: k for k, j in enumerate(known)}
         in_run = np.zeros(n, dtype=bool)
         for a, b in runs_from_mask(mask):
             run_idx = [known[k] for k in range(a, b + 1)]
@@ -243,7 +244,7 @@ def _phone_to_ear(series: _Series, objs: _ObjectIndex, cfg: dict[str, Any]) -> N
                 in_run[j] = True
                 gest_out[j] = fill
                 if confirmed:  # предмет подтверждён — сигнал; иначе только жест (unknown)
-                    out[j] = float(vals[known.index(j)]) if j in known else fill
+                    out[j] = float(vals[pos[j]]) if j in pos else fill
         for k, i in enumerate(known):
             if not in_run[i]:
                 gest_out[i] = float(vals[k])
