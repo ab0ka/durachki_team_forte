@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from .common import load_config, normalize_video_id, read_json, video_sort_key, write_json
 from .labels import LABEL_VIOLATION, GroundTruth, load_ground_truth
-from .schema import check_api_response, decode_jpeg_b64
+from .schema import check_api_response, coverage_problem, coverage_ratio, decode_jpeg_b64
 
 CATEGORIES = ("TP", "TN", "FP", "FN", "early", "late", "wrong_type", "failed", "partial", "label_conflict",
               "label_unknown")
@@ -144,7 +144,12 @@ class VideoEval:
     coverage: Optional[float] = None            # meta.coverage: доля проанализированного видео (None — не сообщено)
     partial: bool = False                       # no_violation при неполном анализе — НЕ «чисто»
     invalid_verdict: bool = False               # status=done, но verdict не из схемы — как failed
-    vram_peak_mb: Optional[float] = None
+    vram_process_peak_mb: Optional[float] = None    # процесс/воркер пайплайна
+    vram_process_source: Optional[str] = None
+    vram_device_peak_mb: Optional[float] = None     # устройство целиком (все процессы)
+    vram_device_baseline_mb: Optional[float] = None
+    coverage_problem: Optional[str] = None
+    mock: bool = False
     policy_dt: dict[str, Optional[float]] = field(default_factory=dict)   # |Δt| при разных политиках таймкода
 
     @property
@@ -188,27 +193,44 @@ def _duration(api: dict, info: dict) -> Optional[float]:
     return None
 
 
-def _coverage(api: dict) -> Optional[float]:
-    """meta.coverage: число 0..1 или dict {стадия/кадры: доля} → минимум. None — пайплайн не сообщил."""
-    cov = (api.get("meta") or {}).get("coverage")
-    if isinstance(cov, dict):
-        vals = [_num(v) for v in cov.values() if _num(v) is not None]
-        for k in ("frames", "video", "total", "fraction"):
-            if _num(cov.get(k)) is not None:
-                return _num(cov.get(k))
-        return min(vals) if vals else None
-    return _num(cov)
+def _vram_split(api: dict, info: dict) -> dict:
+    """Две разные величины, НЕ смешиваются и НЕ подменяются нулём:
 
-
-def _vram(api: dict, info: dict) -> Optional[float]:
+    * процесс/воркер пайплайна — A03 meta.stages[*].vram_peak_mb (torch.max_memory_allocated воркера),
+      иначе meta.vram_peak_mb / meta.resources|gpu.vram_peak_mb, иначе пик процесса eval (inproc --inline);
+    * устройство целиком (все процессы на карте, включая чужие) — сэмплер nvidia-smi из runinfo, с фоном.
+    """
     meta = api.get("meta") or {}
-    cands = [info.get("vram_peak_mb"), meta.get("vram_peak_mb"), meta.get("vram_mb")]
-    for sub in ("gpu", "resources", "timings"):
-        d = meta.get(sub)
-        if isinstance(d, dict):
-            cands += [d.get("vram_peak_mb"), d.get("peak_mb"), d.get("max_memory_mb"), d.get("vram_mb")]
-    vals = [_num(v) for v in cands if _num(v) is not None]
-    return max(vals) if vals else None
+    out: dict[str, Any] = {"process_peak_mb": None, "process_source": None,
+                           "device_peak_mb": _num(info.get("vram_device_peak_mb", info.get("vram_peak_mb"))),
+                           "device_baseline_mb": _num(info.get("vram_device_baseline_mb"))}
+    stages = meta.get("stages") if isinstance(meta.get("stages"), dict) else {}
+    st = [_num(v.get("vram_peak_mb")) for v in stages.values() if isinstance(v, dict)]
+    st = [v for v in st if v is not None]
+    if st:
+        out.update(process_peak_mb=max(st), process_source="pipeline_stages")
+        return out
+    cands = [meta.get("vram_peak_mb")] + [(meta.get(k) or {}).get("vram_peak_mb") for k in ("resources", "gpu")
+                                          if isinstance(meta.get(k), dict)]
+    cands = [_num(v) for v in cands if _num(v) is not None]
+    if cands:
+        out.update(process_peak_mb=max(cands), process_source="pipeline_meta")
+        return out
+    ev = _num(info.get("vram_eval_process_peak_mb", info.get("vram_torch_peak_mb")))
+    if ev is not None:
+        out.update(process_peak_mb=ev, process_source="eval_process")
+    return out
+
+
+def _is_mock(api: dict) -> bool:
+    meta = api.get("meta") or {}
+    try:
+        from contracts.extensions import is_mock_result  # type: ignore
+    except ImportError:
+        is_mock_result = None
+    if is_mock_result is not None:
+        return bool(is_mock_result(meta))
+    return meta.get("mock") is True or (isinstance(meta.get("provenance"), dict) and meta["provenance"].get("mock") is True)
 
 
 def _texts(api: dict, info: dict) -> list[str]:
@@ -263,7 +285,10 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
     ve = VideoEval(video_id=gt.video_id, gt_label=gt.label, gt_times=list(gt.times), gt_types=list(gt.types),
                    members=list(gt.members or [gt.video_id]), conflict=gt.conflict, pred_id=pred_id)
     ve.latency_s = _latency(api or {}, info or {})
-    ve.vram_peak_mb = _vram(api or {}, info or {})
+    vr = _vram_split(api or {}, info or {})
+    ve.vram_process_peak_mb, ve.vram_process_source = vr["process_peak_mb"], vr["process_source"]
+    ve.vram_device_peak_mb, ve.vram_device_baseline_mb = vr["device_peak_mb"], vr["device_baseline_mb"]
+    ve.mock = _is_mock(api or {})
     ve.error = (info or {}).get("error")
     ve.events_total = len(gt.events or [[t] for t in gt.times]) if gt.positive else 0
     texts = _texts(api or {}, info or {})
@@ -289,12 +314,10 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
         ve.invalid_verdict = True
         ve.category = "failed"
         return ve
-    ve.coverage = _coverage(api)
-    cov_cfg = cfg.get("coverage") or {}
-    if ve.verdict == "no_violation" and (
-            (ve.coverage is not None and ve.coverage < float(cov_cfg.get("min", 0.95)) - 1e-9)
-            or (ve.coverage is None and bool(cov_cfg.get("require", False)))):
-        ve.partial = True       # неполный анализ ≠ «нарушений нет»
+    ve.coverage = coverage_ratio(api.get("meta"))
+    if ve.verdict == "no_violation":
+        ve.coverage_problem = coverage_problem(api.get("meta"), cfg)
+        ve.partial = ve.coverage_problem is not None      # неполный анализ ≠ «нарушений нет»
     vios = [v for v in (api.get("violations") or []) if isinstance(v, dict)]
     ve.n_violations = len(vios)
     ve.violations_brief = [{"t": _num(v.get("timecode_sec")), "type_id": v.get("type_id") or "",
@@ -635,9 +658,22 @@ def summarize(evals_all: list[VideoEval], cfg: dict, dup_check: Optional[list[di
                                         for k in cfg.get("hit_windows_s", [0.5, 1, 2, 3])}}
     timecode_policy["note"] = ("«что если» на тех же предсказаниях (TP, ближайшее нарушение, без one-to-one): "
                                "какую точку отдавать как timecode_sec — решать замером, не на глаз")
-    vr = [e.vram_peak_mb for e in evals_all if e.vram_peak_mb is not None]
-    resources = {"vram_peak_mb": _stats(vr), "vram_source": "meta/runinfo (пайплайн или сэмплер nvidia-smi)" if vr
-                 else "не измерено"}
+    vp = [e.vram_process_peak_mb for e in evals_all if e.vram_process_peak_mb is not None]
+    vd = [e.vram_device_peak_mb for e in evals_all if e.vram_device_peak_mb is not None]
+    vdelta = [e.vram_device_peak_mb - e.vram_device_baseline_mb for e in evals_all
+              if e.vram_device_peak_mb is not None and e.vram_device_baseline_mb is not None]
+    resources = {
+        "vram_process_peak_mb": _stats(vp),
+        "vram_process_sources": sorted({e.vram_process_source for e in evals_all if e.vram_process_source}),
+        "vram_process_not_measured": sum(e.vram_process_peak_mb is None for e in evals_all if e.status != "missing"),
+        "vram_device_peak_mb": _stats(vd), "vram_device_delta_mb": _stats(vdelta),
+        "vram_device_not_measured": sum(e.vram_device_peak_mb is None for e in evals_all if e.status != "missing"),
+        "note": "процесс/воркер — память пайплайна (A03 meta.stages); устройство — memory.used всей карты "
+                "(все процессы, включая чужие), delta = пик − фон до старта; None = не измерено (не 0)",
+    }
+    mock_ids = [e.video_id for e in evals_all if e.mock]
+    video["mock_results"] = len(mock_ids)
+    video["mock_ids"] = mock_ids
     out = {"video": video, "localization": localization, "localization_alt": localization_alt,
            "conflict_groups": _conflict_block(evals), "resources": resources, "timecode_policy": timecode_policy,
            "evidence": evidence, "types": types, "norms": norms, "schema": schema, "language": language,
@@ -679,7 +715,7 @@ def collect_versions(preds: dict[str, dict], labels_csv: Optional[str | Path] = 
 def scorecard(summary: dict, versions: Optional[dict] = None) -> dict:
     """Главная сводка: реальные P/R/FP/FN/failed/timeouts/latency/VRAM с числом примеров, видом оценки и версиями."""
     v, lat, loc = summary["video"], summary["latency"], summary["localization"]
-    vr = (summary.get("resources") or {}).get("vram_peak_mb") or {}
+    res = summary.get("resources") or {}
     return {
         "evaluation_kind": v.get("evaluation_kind"), "kind_note": v.get("kind_note"),
         "n_videos": v["n"], "n_pos": v["n_pos"], "n_neg": v["n_neg"],
@@ -695,7 +731,11 @@ def scorecard(summary: dict, versions: Optional[dict] = None) -> dict:
         "types_available": (summary.get("types") or {}).get("available", False),
         "type_accuracy": (summary.get("types") or {}).get("accuracy"),
         "latency_s": {k: lat.get(k) for k in ("n", "median", "p90", "max")}, "over_sla": len(lat["over_sla_ids"]),
-        "vram_peak_mb_max": vr.get("max"),
+        "vram_process_peak_mb_max": (res.get("vram_process_peak_mb") or {}).get("max"),
+        "vram_process_sources": res.get("vram_process_sources") or [],
+        "vram_device_peak_mb_max": (res.get("vram_device_peak_mb") or {}).get("max"),
+        "vram_device_delta_mb_max": (res.get("vram_device_delta_mb") or {}).get("max"),
+        "mock_results": v.get("mock_results", 0),
         "label_conflicts": len(v["label_conflict_ids"]), "conflict_groups": len(summary.get("conflict_groups") or []),
         "label_unknown": len(v.get("label_unknown_ids") or []),
         "versions": versions or {},
@@ -774,7 +814,7 @@ def public_summary(res: dict, proxy: Optional[dict] = None) -> dict:
         "latency": {k: lat.get(k) for k in ("n", "mean", "median", "p90", "max", "sla_s", "within_sla_rate")}
         | {"n_over_sla": len(lat.get("over_sla_ids") or [])},
         "categories": {c: len(ids) for c, ids in s["categories"].items()},
-        "resources": s.get("resources"),
+        "resources": {k: v for k, v in (s.get("resources") or {}).items()},
         "conflict_groups": len(s.get("conflict_groups") or []),
     }
     if proxy:
@@ -786,6 +826,10 @@ def public_summary(res: dict, proxy: Optional[dict] = None) -> dict:
 
 def _f(x: Any) -> str:
     return "—" if x is None else (f"{x:.3f}" if isinstance(x, float) else str(x))
+
+
+def _mb(x: Any) -> str:
+    return "не измерено" if x is None else f"{x:.0f} МБ"
 
 
 def format_scorecard(sc: dict) -> str:
@@ -808,8 +852,12 @@ def format_scorecard(sc: dict) -> str:
         f"конфликтных групп={sc.get('conflict_groups', 0)}",
         f"  тип: {('acc=' + _f(sc.get('type_accuracy'))) if sc.get('types_available') else 'n/a (нет GT типов)'}",
         f"  latency: n={lat['n']} median={_f(lat['median'])} p90={_f(lat['p90'])} max={_f(lat['max'])} с; "
-        f"> SLA: {sc['over_sla']};  VRAM peak={_f(sc.get('vram_peak_mb_max'))} МБ",
-    ])
+        f"> SLA: {sc['over_sla']}",
+        f"  VRAM процесс/воркер пайплайна: peak={_mb(sc.get('vram_process_peak_mb_max'))} "
+        f"({', '.join(sc.get('vram_process_sources') or []) or 'источник —'});  устройство (все процессы на карте): "
+        f"peak={_mb(sc.get('vram_device_peak_mb_max'))}, прирост над фоном={_mb(sc.get('vram_device_delta_mb_max'))}",
+    ] + ([f"  ⚠ {sc['mock_results']} результат(ов) получены на MOCK — это проверка кода, не измерение качества"]
+         if sc.get("mock_results") else []))
 
 
 def format_summary(s: dict) -> str:

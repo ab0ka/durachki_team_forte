@@ -32,14 +32,18 @@ from .common import REPO_ROOT, list_videos, load_config, normalize_video_id, rea
 
 # ----------------------------------------------------------------------------- сериализация
 def result_to_api(result: Any) -> dict:
+    """Сериализатор A01 (политика вердикта: no_violation только при подтверждённой полноте и т.д.).
+
+    Fallback на asdict — ТОЛЬКО если модуля A01 нет (автономная ветка). Исключение самого сериализатора
+    не маскируется: вызывающий записывает видео как failed с причиной (production-политику не обходим).
+    """
     try:
         from contracts.serialize import result_to_api as _r  # type: ignore
-
-        return _r(result)
-    except Exception:  # noqa: BLE001 — A01 ещё не смерджен: asdict(AnalysisResult) ⊇ схема ТЗ
+    except ImportError:  # A01 не смерджен: asdict(AnalysisResult) ⊇ схема ТЗ
         from .common import to_jsonable
 
         return to_jsonable(result)
+    return _r(result)
 
 
 def _full_meta(result: Any) -> dict:
@@ -88,8 +92,8 @@ class InprocRunner:
             api = {"job_id": job_id, "status": "failed", "verdict": None, "violations": [], "error": repr(e)[:500]}
             info["error"] = repr(e)[:500]
         info["latency_s"] = round(time.perf_counter() - t0, 3)
-        info["vram_peak_mb"] = sampler.peak_mb            # вся карта (nvidia-smi); None без nvidia-smi
-        info["vram_torch_peak_mb"] = torch_peak_mb()       # только этот процесс (torch уже импортирован пайплайном)
+        info.update(sampler.as_info())                     # устройство: все процессы (nvidia-smi); None — не измерено
+        info["vram_eval_process_peak_mb"] = torch_peak_mb()  # процесс eval (при --inline у A03 — и пайплайн)
         return api, info
 
 
@@ -137,7 +141,7 @@ class ApiRunner:
             info["error"] = f"timeout {self.timeout_s:.0f} s (status={api.get('status')})"
         info["latency_s"] = round(time.perf_counter() - t_acc, 3)  # от приёма, включая очередь
         sampler.__exit__()
-        info["vram_peak_mb"] = sampler.peak_mb
+        info.update(sampler.as_info())   # устройство целиком; процесс/воркер — из meta ответа (если сервис отдаёт)
         return api, info
 
 

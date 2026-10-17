@@ -13,7 +13,34 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-os.environ.setdefault("SENTINEL_MOCK", "1")
+# Окружение процесса при импорте НЕ меняем (раньше тут ставился SENTINEL_MOCK=1 на всю сессию — это включало
+# mock у чужих модулей в общем прогоне). Mock — только явно, через фикстуру mock_mode (monkeypatch, с откатом).
+
+
+@pytest.fixture(autouse=True)
+def _isolate_eval_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Каждый тест eval стартует без SENTINEL_* хоста и без GPU-измерителей хоста (nvidia-smi/torch):
+    иначе состояние чужой видеокарты (например, 7.6 ГБ занято) попадает в юниттест. Всё откатывается."""
+    for k in [k for k in os.environ if k.startswith("SENTINEL_")]:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("SENTINEL_EVAL_DEVICE_METERS", "off")
+
+
+@pytest.fixture
+def mock_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Явный mock-режим (A01: mock-результаты допустимы только при SENTINEL_MOCK=1) — только в этом тесте."""
+    monkeypatch.setenv("SENTINEL_MOCK", "1")
+
+
+def canonical_coverage(duration: float, stages: Optional[dict] = None) -> dict:
+    """meta.coverage в каноне A01 (contracts.extensions.compute_coverage), полный анализ."""
+    stages = stages or {"ingest": "ok", "detect": "ok", "fusion": "ok"}
+    try:
+        from contracts.extensions import compute_coverage
+    except ImportError:  # автономная ветка без A01: та же форма вручную
+        return {"ratio": 1.0, "analyzed_sec": duration, "duration_sec": duration, "unknown_spans": [],
+                "stages": stages, "required": [], "complete": True, "source": "test"}
+    return compute_coverage(duration, duration, stages=stages, source="test")
 
 
 def pytest_configure(config: Any) -> None:
@@ -68,10 +95,11 @@ def make_violation(t: float, type_id: str = "V01", frames: Optional[list[float]]
 def make_pred(job_id: str, violations: Optional[list[dict]] = None, verdict: Optional[str] = None,
               status: str = "done", duration: float = 60.0, timeline: Optional[list] = None, meta: Optional[dict] = None
               ) -> dict:
+    """Синтетический ответ API. По умолчанию — полный анализ (канон A01 meta.coverage); meta перекрывает."""
     violations = violations or []
     if verdict is None:
         verdict = "violation" if violations else "no_violation"
-    m = {"duration": duration}
+    m = {"duration": duration, "coverage": canonical_coverage(duration)}
     m.update(meta or {})
     return {"job_id": job_id, "status": status, "verdict": verdict if status == "done" else None,
             "violations": violations, "timeline": timeline or [[0.0, 0.1], [duration, 0.1]], "meta": m}

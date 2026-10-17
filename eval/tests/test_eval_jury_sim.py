@@ -173,3 +173,84 @@ def test_unfinished_and_too_few(videos):
     res = _sim(videos[:2], behaviour="hang", skip_stress=True, big_mb=0, cfg=_cfg(total_limit_s=0.3, grace_s=0.2))
     assert "FAIL" in _st(res, "завершены") and "NOT RUN" in _st(res, "≥ 5")
     assert res["summary"]["overall"] == "FAIL"
+
+
+def test_judge_zero_seconds_is_valid_not_timeout():
+    """Регрессия: `(accept_to_done_s or 1e9)` превращал мгновенный ответ 0.0 с (dedup/кэш) в таймаут."""
+    from eval.jury_sim import FAIL, NOT_RUN, PASS, judge_accept_to_done
+
+    assert judge_accept_to_done([{"video": "X-1", "accept_to_done_s": 0.0}], 300)[0] == PASS
+    assert judge_accept_to_done([{"video": "X-1", "accept_to_done_s": 0.0},
+                                 {"video": "X-2", "accept_to_done_s": 12.5}], 300)[0] == PASS
+    st, detail = judge_accept_to_done([{"video": "X-1", "accept_to_done_s": None}], 300)
+    assert st == NOT_RUN and "не измерено" in detail and "X-1" in detail      # нет времени ≠ таймаут и ≠ PASS
+    assert judge_accept_to_done([{"video": "X-1", "accept_to_done_s": 0.0},
+                                 {"video": "X-2", "accept_to_done_s": None}], 300)[0] == NOT_RUN
+    assert judge_accept_to_done([{"video": "X-1", "accept_to_done_s": 301.0},
+                                 {"video": "X-2", "accept_to_done_s": None}], 300)[0] == FAIL
+    assert judge_accept_to_done([], 300)[0] == NOT_RUN
+
+
+def _dedup_server():
+    """Сервис с dedup по содержимому: повторная загрузка того же файла сразу отдаёт done (0 с ожидания)."""
+    import hashlib
+
+    seen: dict[str, str] = {}
+    done: dict[str, float] = {}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if self.headers.get("X-API-Key") != KEY:
+                return self._send(401, {})
+            if not re.search(rb'filename="[^"]+\.(mov|mp4)"', body):
+                return self._send(415, {})
+            boundary = self.headers.get("Content-Type", "").split("boundary=")[-1].encode()
+            content = body.split(b"\r\n\r\n", 1)[-1].rsplit(b"\r\n--" + boundary, 1)[0]   # байты файла
+            h = hashlib.md5(content).hexdigest()
+            if h not in seen:
+                seen[h] = uuid.uuid4().hex
+                done[seen[h]] = time.time() + 0.2
+            self._send(200, {"job_id": seen[h]})
+
+        def do_GET(self):
+            if self.headers.get("X-API-Key") != KEY:
+                return self._send(401, {})
+            jid = self.path.rstrip("/").split("/")[-1]
+            if jid not in done:
+                return self._send(404, {})
+            if time.time() < done[jid]:
+                return self._send(200, {"job_id": jid, "status": "processing"})
+            self._send(200, _result(jid, "good"))
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_dedup_instant_answer_passes(videos):
+    pytest.importorskip("requests")
+    from eval.jury_sim import format_table, run_jury_sim
+
+    srv = _dedup_server()
+    try:
+        same = [videos[0]] * 5                      # 5 загрузок одного файла: 2..5 — мгновенный ответ из dedup
+        res = run_jury_sim(f"http://127.0.0.1:{srv.server_port}", KEY, same, _cfg(), session=_session(),
+                           skip_stress=True, big_mb=0)
+    finally:
+        srv.shutdown()
+    seq = next(c for c in res["checks"] if c["name"].startswith("sequential: ≤"))
+    times = seq["data"]["accept_to_done_s"]
+    assert min(times) < 0.1                          # действительно мгновенно
+    assert seq["status"] == "PASS", format_table(res)

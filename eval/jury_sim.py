@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .common import ffprobe_info, list_videos, load_config, video_id_for_path, write_json
-from .schema import check_api_response
+from .schema import check_api_response, coverage_problem, coverage_ratio
 
 PASS, WARN, FAIL, NOT_RUN = "PASS", "WARN", "FAIL", "NOT RUN"
 CF_ERRORS = (520, 521, 522, 523, 524)
@@ -65,7 +65,7 @@ def jpeg_size(raw: bytes) -> Optional[tuple[int, int]]:
     return None
 
 
-def inspect_result(res: dict, video_info: dict, min_coverage: float = 0.95) -> dict:
+def inspect_result(res: dict, video_info: dict, cfg: Optional[dict] = None) -> dict:
     """Проверки одного ответа (без сети): PTS-границы, JPEG/ориентация, mock, явные ошибки, partial."""
     out: dict[str, Any] = {"pts_issues": [], "jpeg_issues": [], "mock": None, "models_known": False,
                            "error_explained": None, "partial_as_clean": False, "coverage": None}
@@ -103,14 +103,30 @@ def inspect_result(res: dict, video_info: dict, min_coverage: float = 0.95) -> d
         or str(meta.get("backend") or "").lower() in MOCK_MARKERS
     if res.get("status") == "failed":
         out["error_explained"] = bool(res.get("error") or res.get("detail") or meta.get("error") or meta.get("errors"))
-    cov = meta.get("coverage")
-    if isinstance(cov, dict):
-        vals = [float(x) for x in cov.values() if isinstance(x, (int, float))]
-        cov = min(vals) if vals else None
-    out["coverage"] = cov if isinstance(cov, (int, float)) else None
-    if res.get("verdict") == "no_violation" and out["coverage"] is not None and out["coverage"] < min_coverage:
-        out["partial_as_clean"] = True
+    out["coverage"] = coverage_ratio(meta)                       # канон A01: meta.coverage.ratio
+    out["coverage_reported"] = meta.get("coverage") is not None or meta.get("complete") is not None
+    if res.get("verdict") == "no_violation" and out["coverage_reported"]:
+        out["coverage_problem"] = coverage_problem(meta, cfg)       # та же семантика, что у сериализатора A01
+        out["partial_as_clean"] = out["coverage_problem"] is not None
     return out
+
+
+def judge_accept_to_done(accepted: list[dict], limit_s: float) -> tuple[str, str]:
+    """≤ limit от приёма (вкл. очередь). 0.0 с (мгновенный ответ, dedup/кэш) — валидное время, не таймаут;
+    None — время не измерено: такой job не PASS и не таймаут, пункт NOT RUN (критичный)."""
+    if not accepted:
+        return NOT_RUN, "нет принятых задач"
+    known = [r for r in accepted if r.get("accept_to_done_s") is not None]
+    unknown = [r["video"] for r in accepted if r.get("accept_to_done_s") is None]
+    slow = [r["video"] for r in known if float(r["accept_to_done_s"]) > limit_s]
+    mx = max((float(r["accept_to_done_s"]) for r in known), default=None)
+    detail = (f"max {mx:.1f} с" if mx is not None else "время не измерено") + \
+        f"; > лимита: {slow or '—'}; не измерено: {unknown or '—'}"
+    if slow:
+        return FAIL, detail
+    if unknown:
+        return NOT_RUN, detail
+    return PASS, detail
 
 
 class JurySim:
@@ -120,7 +136,7 @@ class JurySim:
         full = cfg or load_config()
         self.url, self.key = url.rstrip("/"), key
         self.cfg = full.get("jury_sim") or {}
-        self.min_cov = float((full.get("coverage") or {}).get("min", 0.95))
+        self.full_cfg = full
         self.s = session or requests.Session()
         self.req_timeout = float(self.cfg.get("request_timeout_s", 120))
         self.poll_s = float(self.cfg.get("poll_s", 2.0))
@@ -245,7 +261,7 @@ class JurySim:
         rec["verdict"] = res.get("verdict")
         rec["n_violations"] = len(res.get("violations") or [])
         rec["schema_errors"] = check_api_response(res, require_done=False).errors[:5]
-        rec.update(inspect_result(res, self.probe(p), self.min_cov))
+        rec.update(inspect_result(res, self.probe(p), self.full_cfg))
         return rec
 
     def _judge(self, phase: str, recs: list[dict], wall: float) -> None:
@@ -255,11 +271,16 @@ class JurySim:
         def ids(pred) -> list[str]:  # noqa: ANN001
             return [r["video"] for r in recs if pred(r)]
 
-        up = [r.get("upload_s") or 0 for r in recs]
-        cf_bad = ids(lambda r: (r.get("upload_s") or 0) >= self.cf_s or r.get("upload_http") in CF_ERRORS)
-        cf_warn = ids(lambda r: 0.6 * self.cf_s <= (r.get("upload_s") or 0) < self.cf_s)
-        self.add(f"{phase}: загрузка < {self.cf_s:g} с (таймаут Cloudflare)", FAIL if cf_bad else (WARN if cf_warn else PASS),
-                 f"max {max(up, default=0):.1f} с; ≥ лимита: {cf_bad or '—'}; ≥ 60%: {cf_warn or '—'}", wall,
+        up = [r.get("upload_s") for r in recs]                  # None — не измерено (не 0)
+        up_known = [u for u in up if u is not None]
+        cf_bad = ids(lambda r: (r.get("upload_s") is not None and r["upload_s"] >= self.cf_s)
+                     or r.get("upload_http") in CF_ERRORS)
+        cf_warn = ids(lambda r: r.get("upload_s") is not None and 0.6 * self.cf_s <= r["upload_s"] < self.cf_s)
+        up_none = ids(lambda r: r.get("upload_s") is None)
+        self.add(f"{phase}: загрузка < {self.cf_s:g} с (таймаут Cloudflare)",
+                 FAIL if cf_bad else (NOT_RUN if not up_known else (WARN if cf_warn or up_none else PASS)),
+                 (f"max {max(up_known):.1f} с" if up_known else "время загрузки не измерено")
+                 + f"; ≥ лимита: {cf_bad or '—'}; ≥ 60%: {cf_warn or '—'}; не измерено: {up_none or '—'}", wall,
                  data={"upload_s": up})
         not_acc = ids(lambda r: r.get("state") == "not_accepted")
         self.add(f"{phase}: все файлы приняты", FAIL if not_acc else PASS, f"не приняты: {not_acc or '—'}")
@@ -268,11 +289,9 @@ class JurySim:
         unfinished = ids(lambda r: r.get("state") == "unfinished")
         self.add(f"{phase}: все принятые задачи завершены", FAIL if unfinished else (PASS if acc else NOT_RUN),
                  f"незавершённых: {unfinished or '—'} из {len(acc)}")
-        slow = ids(lambda r: r.get("state") != "not_accepted" and (r.get("accept_to_done_s") or 1e9) > self.limit_s)
-        mx = max((r.get("accept_to_done_s") or 0 for r in fin), default=0)
-        self.add(f"{phase}: ≤ {self.limit_s:g} с от приёма, включая очередь", FAIL if slow else (PASS if fin else NOT_RUN),
-                 f"max {mx:.1f} с; > лимита: {slow or '—'}", data={"accept_to_done_s": [r.get("accept_to_done_s")
-                                                                                       for r in recs]})
+        verdict_t, detail_t = judge_accept_to_done(acc, self.limit_s)
+        self.add(f"{phase}: ≤ {self.limit_s:g} с от приёма, включая очередь", verdict_t, detail_t,
+                 data={"accept_to_done_s": [r.get("accept_to_done_s") for r in recs]})
         if not fin:
             for name in ("схема ТЗ", "таймкоды и кадры в пределах длительности (PTS)", "кадры — JPEG в ориентации видео",
                          "настоящие модели (не mock)", "failed — с явной причиной",
@@ -299,7 +318,7 @@ class JurySim:
         self.add(f"{phase}: failed — с явной причиной", FAIL if unexplained else PASS,
                  f"failed: {len(failed)}; без причины: {unexplained or '—'}")
         pc = [r["video"] for r in fin if r.get("partial_as_clean")]
-        cov_unknown = [r["video"] for r in fin if r.get("verdict") == "no_violation" and r.get("coverage") is None]
+        cov_unknown = [r["video"] for r in fin if r.get("verdict") == "no_violation" and not r.get("coverage_reported")]
         self.add(f"{phase}: неполный анализ не выдан за no_violation", FAIL if pc else (WARN if cov_unknown else PASS),
                  f"partial→no_violation: {pc or '—'}; no_violation без meta.coverage: {cov_unknown or '—'}",
                  data={"jobs": recs})

@@ -5,7 +5,8 @@ protocol.json рядом с metrics.json: git SHA (+dirty), хэш и содер
 вид оценки (exploratory / holdout_frozen), режим, subset. Сравнение двух прогонов допустимо, только если
 совпадают inputs_sha и labels_sha256 (eval.ablate это проверяет).
 
-VramSampler — пик memory.used по nvidia-smi (вся видеокарта, включая другие процессы — это и есть бюджет 8 ГБ).
+VramSampler — занятость УСТРОЙСТВА по nvidia-smi (все процессы на карте) с фоном до старта; память процесса/воркера
+пайплайна — отдельно (A03: meta.stages[*].vram_peak_mb). Нет измерения — None, не 0.
 """
 from __future__ import annotations
 
@@ -142,33 +143,57 @@ def same_procedure(a: dict, b: dict) -> list[str]:
     return probs
 
 
-class VramSampler:
-    """Пик memory.used (МБ) GPU 0 по nvidia-smi, опрос раз в interval_s. Без nvidia-smi — None."""
+DEVICE_METERS_ENV = "SENTINEL_EVAL_DEVICE_METERS"   # off/0/false — не трогать GPU-измерители (юниттесты)
 
-    def __init__(self, interval_s: float = 0.5, gpu_index: int = 0) -> None:
+
+def device_meters_enabled() -> bool:
+    return os.environ.get(DEVICE_METERS_ENV, "on").strip().lower() not in ("0", "off", "false", "no")
+
+
+def _nvidia_smi_used_mb(gpu_index: int = 0) -> Optional[float]:
+    try:
+        r = subprocess.run(["nvidia-smi", f"--id={gpu_index}", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=5, check=False)
+        return float(r.stdout.strip().splitlines()[0])
+    except Exception:  # noqa: BLE001 — нет измерения ≠ 0: вернём None
+        return None
+
+
+class VramSampler:
+    """Занятость УСТРОЙСТВА (memory.used по nvidia-smi: все процессы на карте, включая чужие) во время задачи.
+
+    ``baseline_mb`` — первое измерение (фон до/в начале задачи), ``peak_mb`` — пик. Это НЕ память процесса/воркера
+    пайплайна (её отдаёт A03 в meta.stages[*].vram_peak_mb). Нет nvidia-smi / измерители выключены — None, не 0.
+    """
+
+    def __init__(self, interval_s: float = 0.5, gpu_index: int = 0, reader: Optional[Any] = None) -> None:
         self.interval_s, self.gpu_index = interval_s, gpu_index
         self.peak_mb: Optional[float] = None
+        self.baseline_mb: Optional[float] = None
+        self.n_samples = 0
         self._stop = threading.Event()
         self._t: Optional[threading.Thread] = None
-        self.available = bool(shutil.which("nvidia-smi"))
+        self._reader = reader or (lambda: _nvidia_smi_used_mb(self.gpu_index))
+        self.available = device_meters_enabled() and (reader is not None or bool(shutil.which("nvidia-smi")))
 
-    def _read(self) -> Optional[float]:
-        try:
-            r = subprocess.run(["nvidia-smi", f"--id={self.gpu_index}", "--query-gpu=memory.used",
-                                "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5, check=False)
-            return float(r.stdout.strip().splitlines()[0])
-        except Exception:  # noqa: BLE001
-            return None
+    def sample(self) -> None:
+        v = self._reader()
+        if v is None:
+            return
+        v = float(v)
+        self.n_samples += 1
+        if self.baseline_mb is None:
+            self.baseline_mb = v
+        self.peak_mb = v if self.peak_mb is None else max(self.peak_mb, v)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            v = self._read()
-            if v is not None:
-                self.peak_mb = v if self.peak_mb is None else max(self.peak_mb, v)
+            self.sample()
             self._stop.wait(self.interval_s)
 
     def __enter__(self) -> "VramSampler":
         if self.available:
+            self.sample()          # фон до старта задачи
             self._t = threading.Thread(target=self._loop, daemon=True)
             self._t.start()
         return self
@@ -177,10 +202,19 @@ class VramSampler:
         self._stop.set()
         if self._t:
             self._t.join(timeout=5)
+        if self.available:
+            self.sample()
+
+    def as_info(self) -> dict:
+        return {"vram_device_peak_mb": self.peak_mb, "vram_device_baseline_mb": self.baseline_mb,
+                "vram_device_samples": self.n_samples}
 
 
 def torch_peak_mb(reset: bool = False) -> Optional[float]:
-    """torch.cuda.max_memory_allocated — только если torch УЖЕ импортирован пайплайном (eval torch не тянет)."""
+    """Пик памяти ЭТОГО процесса (torch.cuda.max_memory_allocated) — только если torch уже импортирован
+    пайплайном и измерители включены. Воркер A03 — отдельный процесс: его пик берётся из meta.stages."""
+    if not device_meters_enabled():
+        return None
     torch = sys.modules.get("torch")
     if torch is None:
         return None

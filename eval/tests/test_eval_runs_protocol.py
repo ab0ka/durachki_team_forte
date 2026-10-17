@@ -39,3 +39,38 @@ def test_protocol_helpers(tmp_path: Path):
     b = dict(a, inputs={"inputs_sha": "other"})
     assert any("inputs_sha" in p for p in same_procedure(a, b))
     assert sha256_json({"a": 1, "b": 2}) == sha256_json({"b": 2, "a": 1})
+
+
+def test_vram_sampler_device_baseline_and_none(monkeypatch):
+    from eval.protocol import VramSampler, torch_peak_mb
+
+    monkeypatch.setenv("SENTINEL_EVAL_DEVICE_METERS", "on")
+    vals = iter([3000.0, 5200.0, 4100.0, None, 3900.0])
+    s = VramSampler(reader=lambda: next(vals, None))
+    s.sample(); s.sample(); s.sample(); s.sample(); s.sample()
+    info = s.as_info()
+    assert info["vram_device_baseline_mb"] == 3000.0 and info["vram_device_peak_mb"] == 5200.0
+    assert info["vram_device_samples"] == 4                     # None пропущен, а не записан нулём
+    empty = VramSampler(reader=lambda: None)
+    empty.sample()
+    assert empty.as_info()["vram_device_peak_mb"] is None
+    monkeypatch.setenv("SENTINEL_EVAL_DEVICE_METERS", "off")
+    off = VramSampler(reader=lambda: 9999.0)
+    with off:
+        pass
+    assert off.available is False and off.peak_mb is None and torch_peak_mb() is None
+
+
+def test_conftest_import_has_no_env_side_effects(tmp_path):
+    """eval/tests/conftest.py при импорте не ставит SENTINEL_MOCK (раньше — на всю pytest-сессию)."""
+    import os
+    import subprocess
+    import sys
+
+    from eval.common import REPO_ROOT
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SENTINEL_")}
+    code = "import os, eval.tests.conftest as c; print(repr(os.environ.get('SENTINEL_MOCK')))"
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(REPO_ROOT), env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "None"

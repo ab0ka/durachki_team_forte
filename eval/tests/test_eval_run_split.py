@@ -47,10 +47,13 @@ def test_split_groups_never_cross(tmp_path: Path):
 
 
 def _fake_pipeline(calls: list) -> types.ModuleType:
-    """Фейковый backend.pipeline: нарушение у нечётных X-n на 1.0 с (по имени файла)."""
+    """Фейковый backend.pipeline (MOCK, явно помечен): нарушение у нечётных X-n на 1.0 с (по имени файла).
+
+    Ответы — по контракту A01: done/no_violation только с подтверждённой полнотой (канонический meta.coverage),
+    meta.mock=True → сериализатор A01 принимает их лишь при явном SENTINEL_MOCK=1 (фикстура mock_mode)."""
     from eval._contracts import AnalysisResult, EvidenceFrame, Violation
 
-    from .conftest import jpeg
+    from .conftest import canonical_coverage, jpeg
 
     mod = types.ModuleType("backend.pipeline")
 
@@ -64,7 +67,8 @@ def _fake_pipeline(calls: list) -> types.ModuleType:
                           description="Признаки возможного нарушения: в зоне кассира второй человек.", type_id="V01",
                           confidence=0.9)] if n % 2 else []
         return AnalysisResult(job_id=job_id, status="done", verdict="violation" if vios else "no_violation",
-                              violations=vios, meta={"version": "fake-1", "duration": 3.0,
+                              violations=vios, meta={"version": "fake-1", "duration": 3.0, "mock": True,
+                                                     "coverage": canonical_coverage(3.0),
                                                      "scores_raw": {"max": 0.9 if vios else 0.1}})
 
     mod.run = run
@@ -72,7 +76,7 @@ def _fake_pipeline(calls: list) -> types.ModuleType:
     return mod
 
 
-def test_run_inproc_end_to_end(tmp_path: Path, monkeypatch, capsys):
+def test_run_inproc_end_to_end(tmp_path: Path, monkeypatch, capsys, mock_mode):
     pytest.importorskip("cv2")
     from eval import run as runmod
 
@@ -112,8 +116,10 @@ def test_run_inproc_end_to_end(tmp_path: Path, monkeypatch, capsys):
     log = [json.loads(x) for x in (tmp_path / "reports" / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
     assert log[-1]["label"] == "baseline-mock" and log[-1]["metrics"]["fn"] == 1
     assert "image_base64" not in json.dumps(log) and "Признаки" not in json.dumps(log)
-    runs = [r["vram_peak_mb"] for r in json.loads((out / "preds" / "_runinfo.json").read_text()).values()]
-    assert all(v is None or v > 0 for v in runs)          # без nvidia-smi — None, не 0
+    info = list(json.loads((out / "preds" / "_runinfo.json").read_text()).values())
+    # измерители хоста в юниттесте выключены (фикстура): состояние чужой GPU не попадает в метрики; None, не 0
+    assert all(r["vram_device_peak_mb"] is None and r["vram_eval_process_peak_mb"] is None for r in info)
+    assert m["scorecard"]["mock_results"] == 7 and m["scorecard"]["vram_process_peak_mb_max"] is None
 
 
 def test_holdout_requires_final(tmp_path: Path):

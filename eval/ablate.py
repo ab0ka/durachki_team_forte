@@ -39,6 +39,35 @@ def mcnemar_exact(b: int, c: int) -> Optional[float]:
     return round(min(1.0, 2 * p), 4)
 
 
+ARM_KEYS = ("fn", "fp", "recall", "precision", "failed", "partial", "timeouts", "hit_events_all", "evidence_ok_all",
+            "latency_s", "vram_process_peak_mb_max", "vram_process_sources", "vram_device_peak_mb_max",
+            "vram_device_delta_mb_max", "mock_results")
+
+
+def vram_check(sc: dict, budget_mb: float) -> dict:
+    """Бюджет VRAM — по памяти ПРОЦЕССА/ВОРКЕРА пайплайна (A03 meta.stages). Если её нет — по приросту занятости
+    устройства над фоном (пик − фон до старта). Сырой пик устройства (с чужими процессами) — только предупреждение.
+    Нет ни одного измерения — NOT MEASURED (не 0 и не PASS). Бюджет не подгоняется под результат."""
+    proc, dev, delta = sc.get("vram_process_peak_mb_max"), sc.get("vram_device_peak_mb_max"), sc.get("vram_device_delta_mb_max")
+    warnings = []
+    if dev is not None and dev > budget_mb and (proc is None or proc <= budget_mb):
+        warnings.append(f"устройство (все процессы на карте) занято до {dev:.0f} МБ > {budget_mb:.0f} МБ; прирост над фоном "
+                        f"{'не измерен' if delta is None else f'{delta:.0f} МБ'} — проверьте чужие процессы на GPU")
+    if proc is not None:
+        status = "FAIL" if proc > budget_mb else "OK"
+        return {"status": status, "measure": "процесс/воркер пайплайна", "value_mb": proc, "budget_mb": budget_mb,
+                "sources": sc.get("vram_process_sources") or [], "warnings": warnings,
+                "note": f"пик VRAM процесса/воркера {proc:.0f} МБ {'>' if status == 'FAIL' else '≤'} бюджета {budget_mb:.0f} МБ"}
+    if delta is not None:
+        status = "FAIL" if delta > budget_mb else "OK"
+        return {"status": status, "measure": "прирост занятости устройства над фоном", "value_mb": delta,
+                "budget_mb": budget_mb, "warnings": warnings,
+                "note": f"прирост VRAM устройства над фоном {delta:.0f} МБ {'>' if status == 'FAIL' else '≤'} "
+                        f"бюджета {budget_mb:.0f} МБ (память процесса пайплайна не сообщена)"}
+    return {"status": "NOT MEASURED", "measure": None, "value_mb": None, "budget_mb": budget_mb, "warnings": warnings,
+            "note": "VRAM не измерен (нет meta.stages[*].vram_peak_mb и нет фона/пика nvidia-smi) — бюджет не проверен"}
+
+
 def _sc(m: dict) -> dict:
     return m.get("scorecard") or {}
 
@@ -77,7 +106,8 @@ def compare(base: dict, cand: dict, cfg: Optional[dict] = None, prot_base: Optio
         "hit": {k: (None if hit_a.get(k) is None or hit_b.get(k) is None else round(hit_b[k] - hit_a[k], 4))
                 for k in sorted(set(hit_a) | set(hit_b), key=float)},
         "latency_p90_s": d("p90", lat_a, lat_b), "latency_p50_s": d("median", lat_a, lat_b),
-        "vram_peak_mb": d("vram_peak_mb_max"), "extra_candidates": d("extra_candidates_total"),
+        "vram_process_peak_mb": d("vram_process_peak_mb_max"), "vram_device_peak_mb": d("vram_device_peak_mb_max"),
+        "extra_candidates": d("extra_candidates_total"),
     }
     n = int(sa.get("n_videos") or 0)
     fp_tol = max(float(a_cfg.get("fp_tolerance_abs", 1)), float(a_cfg.get("fp_tolerance_rel", 0.05)) * n)
@@ -93,9 +123,12 @@ def compare(base: dict, cand: dict, cfg: Optional[dict] = None, prot_base: Optio
     p90b = lat_b.get("p90")
     if p90b is not None and p90b > float(a_cfg.get("sla_p90_s", 60.0)):
         reasons_fail.append(f"p90 латентности {p90b:g} с > SLA {a_cfg.get('sla_p90_s', 60.0)} с")
-    vb = sb.get("vram_peak_mb_max")
-    if vb is not None and vb > float(a_cfg.get("vram_budget_mb", 7500)):
-        reasons_fail.append(f"пик VRAM {vb:g} МБ > бюджета {a_cfg.get('vram_budget_mb', 7500)} МБ")
+    vram = vram_check(sb, float(a_cfg.get("vram_budget_mb", 7500)))
+    not_measured = []
+    if vram["status"] == "FAIL":
+        reasons_fail.append(vram["note"])
+    elif vram["status"] == "NOT MEASURED":
+        not_measured.append(vram["note"])
     gain_quality = ((deltas["fn"] or 0) < 0 or ((deltas["fp"] or 0) < 0 and (deltas["fn"] or 0) <= 0)
                     or (deltas["hit"].get("2") or 0) >= float(a_cfg.get("min_hit2_gain", 0.05)))
     p90a = lat_a.get("p90")
@@ -122,23 +155,24 @@ def compare(base: dict, cand: dict, cfg: Optional[dict] = None, prot_base: Optio
     diff_keys = sorted(k for k in set(env_a) | set(env_b) if env_a.get(k) != env_b.get(k))
     if (prot_base or {}).get("pipeline_config_sha") != (prot_cand or {}).get("pipeline_config_sha"):
         diff_keys.append("pipeline_config")
-    warnings = []
+    warnings = list(vram.get("warnings") or [])
+    for arm, sc in (("baseline", sa), ("candidate", sb)):
+        if sc.get("mock_results"):
+            warnings.append(f"{arm}: {sc['mock_results']} результат(ов) на MOCK — проверка кода, не измерение качества")
     if len(diff_keys) > 1:
         warnings.append(f"изменено больше одного параметра: {diff_keys} — «одно изменение за раз»")
     if not diff_keys and prot_base and prot_cand:
         warnings.append("руки не отличаются ни флагами, ни конфигом пайплайна")
     return {
         "verdict": verdict, "reasons_fail": reasons_fail, "reasons_pass": reasons_pass, "invalid": same,
-        "warnings": warnings, "changed_params": diff_keys,
+        "warnings": warnings, "not_measured": not_measured, "vram_check": vram, "changed_params": diff_keys,
         "n_videos": n, "evaluation_kind": sa.get("evaluation_kind"),
         "paired": {"n_common": len(common), "fixed": len(fixed), "broken": len(broken),
                    "mcnemar_p": mcnemar_exact(len(fixed), len(broken)),
                    "fixed_ids": fixed, "broken_ids": broken, "category_changes": changed},
         "deltas": deltas, "fp_tolerance": fp_tol,
-        "baseline": {k: sa.get(k) for k in ("fn", "fp", "recall", "precision", "failed", "partial", "timeouts",
-                                            "hit_events_all", "evidence_ok_all", "latency_s", "vram_peak_mb_max")},
-        "candidate": {k: sb.get(k) for k in ("fn", "fp", "recall", "precision", "failed", "partial", "timeouts",
-                                             "hit_events_all", "evidence_ok_all", "latency_s", "vram_peak_mb_max")},
+        "baseline": {k: sa.get(k) for k in ARM_KEYS},
+        "candidate": {k: sb.get(k) for k in ARM_KEYS},
         "note": "Разведочная оценка на одних и тех же видео; p-value Макнемара при n≈40 — ориентир, не доказательство.",
     }
 
@@ -155,15 +189,20 @@ def format_compare(c: dict) -> str:
     dl = c["deltas"]
     lines = [f"АБЛЯЦИЯ: {c['verdict']}  (n={c['n_videos']}, {c['evaluation_kind']}; изменено: {c['changed_params'] or '—'})",
              f"  baseline : FN={c['baseline']['fn']} FP={c['baseline']['fp']} hit={c['baseline']['hit_events_all']} "
-             f"p90={(c['baseline']['latency_s'] or {}).get('p90')} VRAM={c['baseline']['vram_peak_mb_max']}",
+             f"p90={(c['baseline']['latency_s'] or {}).get('p90')} VRAM процесс={c['baseline']['vram_process_peak_mb_max']} "
+             f"устройство={c['baseline']['vram_device_peak_mb_max']}",
              f"  candidate: FN={c['candidate']['fn']} FP={c['candidate']['fp']} hit={c['candidate']['hit_events_all']} "
-             f"p90={(c['candidate']['latency_s'] or {}).get('p90')} VRAM={c['candidate']['vram_peak_mb_max']}",
+             f"p90={(c['candidate']['latency_s'] or {}).get('p90')} VRAM процесс={c['candidate']['vram_process_peak_mb_max']} "
+             f"устройство={c['candidate']['vram_device_peak_mb_max']}",
              f"  Δ: FN={dl['fn']} FP={dl['fp']} failed={dl['failed']} partial={dl['partial']} recall={dl['recall']} "
-             f"precision={dl['precision']} hit={dl['hit']} p90={dl['latency_p90_s']} с VRAM={dl['vram_peak_mb']} МБ",
+             f"precision={dl['precision']} hit={dl['hit']} p90={dl['latency_p90_s']} с "
+             f"VRAM процесс={dl['vram_process_peak_mb']} МБ",
+             f"  VRAM-бюджет: {c['vram_check']['status']} — {c['vram_check']['note']}",
              f"  по видео: исправлено {c['paired']['fixed']}, сломано {c['paired']['broken']}, "
              f"p(Макнемар)={c['paired']['mcnemar_p']}"]
     lines += [f"  FAIL: {r}" for r in c["reasons_fail"]] + [f"  +: {r}" for r in c["reasons_pass"]]
-    lines += [f"  ⚠ {w}" for w in c["warnings"]] + [f"  INVALID: {x}" for x in c["invalid"]]
+    lines += [f"  ⚠ {w}" for w in c["warnings"]] + [f"  NOT MEASURED: {x}" for x in c.get("not_measured") or []]
+    lines += [f"  INVALID: {x}" for x in c["invalid"]]
     return "\n".join(lines)
 
 

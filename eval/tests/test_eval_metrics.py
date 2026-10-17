@@ -180,7 +180,7 @@ def test_failed_partial_invalid_never_clean(tmp_path: Path):
         "X-2": make_pred("b", [], meta={"coverage": 0.4}),                       # partial → не «чисто»
         "X-3": {"job_id": "c", "status": "done", "verdict": None, "violations": []},   # невалидный вердикт
         "X-4": make_pred("d", [], meta={"coverage": {"frames": 0.5, "vlm": 0.0}}),  # partial на позитиве → FN
-        "X-5": make_pred("e", [], meta={"coverage": 1.0, "vram_peak_mb": 4700}),
+        "X-5": make_pred("e", [], meta={"coverage": 1.0, "vram_peak_mb": 4700}),   # legacy число coverage
         "X-6": make_pred("f", [make_violation(3.0)]),
     }
     res = evaluate(load_ground_truth(p), preds, {}, load_config())
@@ -192,12 +192,21 @@ def test_failed_partial_invalid_never_clean(tmp_path: Path):
     assert cats["X-2"] == "partial" and cats["X-3"] == "failed" and cats["X-1"] == "failed" and cats["X-5"] == "TN"
     sc = res["scorecard"]
     assert sc["evaluation_kind"] == "exploratory" and "не независимый" in sc["kind_note"]
-    assert sc["vram_peak_mb_max"] == 4700 and sc["coverage_unknown"] == 0
+    assert sc["vram_process_peak_mb_max"] == 4700 and sc["vram_process_sources"] == ["pipeline_meta"]
+    assert sc["vram_device_peak_mb_max"] is None                                      # не измерено ≠ 0
+    assert sc["coverage_unknown"] == 1          # X-4: coverage без ratio (не канон A01) — доля неизвестна
     assert "РАЗВЕДОЧНАЯ" in format_scorecard(sc)
-    # require: нет coverage → partial
-    res2 = evaluate(load_ground_truth(p), {"X-5": make_pred("e", [])}, {},
-                    load_config(overrides={"coverage": {"require": True}}))
+    # канон A01 (require по умолчанию): no_violation без meta.coverage не подтверждён → partial, не «чисто»
+    res2 = evaluate(load_ground_truth(p), {"X-5": make_pred("e", [], meta={"coverage": None})}, {}, load_config())
     assert {e["video_id"]: e["category"] for e in res2["per_video"]}["X-5"] == "partial"
+    # канонический объект A01 с ratio ниже порога / complete=false — partial
+    for cov in ({"ratio": 0.5, "complete": True}, {"ratio": 1.0, "complete": False}):
+        r3 = evaluate(load_ground_truth(p), {"X-5": make_pred("e", [], meta={"coverage": cov})}, {}, load_config())
+        assert {e["video_id"]: e["category"] for e in r3["per_video"]}["X-5"] == "partial"
+    # старые прогоны без coverage — только явно coverage.require=false
+    r4 = evaluate(load_ground_truth(p), {"X-5": make_pred("e", [], meta={"coverage": None})}, {},
+                  load_config(overrides={"coverage": {"require": False}}))
+    assert {e["video_id"]: e["category"] for e in r4["per_video"]}["X-5"] == "TN"
 
 
 def test_l1_labels_format_and_policy_whatif(tmp_path: Path):
