@@ -99,7 +99,8 @@ def raw_blocks(fs: FeatureSet, bank: TextBank, spec: InputSpec) -> dict[str, np.
     emb = _view_emb(fs, spec.views)
     blocks: dict[str, np.ndarray] = {}
     if "sims" in spec.groups:
-        s = np.einsum("tvd,pd->tvp", np.nan_to_num(emb, nan=0.0), bank.emb)
+        T, V, D = emb.shape
+        s = (np.nan_to_num(emb, nan=0.0).reshape(T * V, D) @ bank.emb.T).reshape(T, V, -1)
         s[np.isnan(emb[:, :, 0])] = np.nan
         ts, _ = type_scores(fs, bank)
         blocks["sims"] = np.concatenate([s.reshape(len(s), -1), ts], axis=1)
@@ -122,7 +123,7 @@ def _project(blocks: dict[str, np.ndarray], spec: InputSpec) -> np.ndarray:
         b = blocks[g]
         if g == "emb":
             if spec.pca_comp is not None:
-                b = np.einsum("tvd,vdk->tvk", b - spec.pca_mean[None], spec.pca_comp)
+                b = np.stack([(b[:, v] - spec.pca_mean[v]) @ spec.pca_comp[v] for v in range(b.shape[1])], axis=1)
             b = b.reshape(len(b), -1)
         parts.append(b.astype(np.float32))
     return np.concatenate(parts, axis=1) if parts else np.zeros((0, 0), np.float32)
@@ -141,13 +142,14 @@ def fit_spec(sets: Sequence[FeatureSet], bank: TextBank, cfg: dict) -> InputSpec
     if "emb" in spec.groups and spec.pca_dim > 0:
         k = min(spec.pca_dim, spec.dim)
         means, comps = [], []
-        for vi in range(len(views)):
-            E = np.concatenate([_view_emb(fs, views)[:, vi] for fs in sets], axis=0)
-            E = E[~np.isnan(E[:, 0])]
+        for v in views:
+            parts = [fs.emb[:, fs.views.index(v)] for fs in sets if v in fs.views]
+            E = np.concatenate(parts, axis=0).astype(np.float32) if parts else np.zeros((0, spec.dim), np.float32)
             mu = E.mean(axis=0) if len(E) else np.zeros(spec.dim, np.float32)
-            if len(E) > k:
-                _, _, vt = np.linalg.svd(E - mu, full_matrices=False)
-                comp = vt[:k].T
+            if len(E) > k:  # PCA через ковариацию (D×D) — быстрее SVD по всем кадрам
+                Ec = E - mu
+                evals, evecs = np.linalg.eigh((Ec.T @ Ec).astype(np.float64))
+                comp = evecs[:, ::-1][:, :k].astype(np.float32)
             else:
                 comp = np.eye(spec.dim, k, dtype=np.float32)
             means.append(mu); comps.append(comp)

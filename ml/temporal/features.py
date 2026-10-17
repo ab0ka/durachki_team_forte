@@ -248,7 +248,8 @@ class FeatureSet:
 
 def sims(fs: FeatureSet, bank: TextBank) -> np.ndarray:
     """Косинусные сходства (T, V, P)."""
-    return np.einsum("tvd,pd->tvp", fs.emb, bank.emb).astype(np.float32)
+    T, V, D = fs.emb.shape
+    return (fs.emb.reshape(T * V, D) @ bank.emb.T).reshape(T, V, -1).astype(np.float32)
 
 
 def type_scores(fs: FeatureSet, bank: TextBank) -> tuple[np.ndarray, list[str]]:
