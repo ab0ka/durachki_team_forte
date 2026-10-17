@@ -103,3 +103,6 @@ def test_ablate_end_to_end_inproc(tmp_path: Path, monkeypatch):
     rows = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
     assert [r["role"] for r in rows] == ["baseline", "candidate", "ablation"]
     assert (tmp_path / "reports" / "runs.html").exists()
+    ch = (tmp_path / "abl" / "compare.html").read_text(encoding="utf-8")
+    assert "ТОЛЬКО ЛОКАЛЬНО" in ch and "X-3" in ch and "baseline/report.html" in ch
+    assert (tmp_path / "abl" / "candidate" / "report.html").exists()

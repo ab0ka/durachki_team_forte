@@ -24,7 +24,8 @@ python -m eval.ablate --name H07-<гипотеза> --candidate-env SENTINEL_<FL
 **Выход** (`runs/ablate/H07/`):
 * `baseline/`, `candidate/` — `preds/` (кадры, описания — **только локально**), `metrics.json`, `protocol.json`,
   `proxy_score.json`, `summary_public.json`;
-* `compare.json` (локально, с ID видео) и `compare_public.json` (только агрегаты — можно передать в облако);
+* `compare.html` + `baseline/report.html`, `candidate/report.html` (подробно, с кадрами — **только локально**),
+  `compare.json` (локально, с ID видео) и `compare_public.json` (только агрегаты — можно передать в облако);
 * строки в `reports/runs.jsonl` (агрегаты) и график `reports/runs.html`.
 
 **Метрики:** FN/FP, recall/precision/specificity с 95% CI, failed/partial/timeouts, hit@1/2/3 с (one-to-one),

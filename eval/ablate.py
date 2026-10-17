@@ -167,6 +167,25 @@ def format_compare(c: dict) -> str:
     return "\n".join(lines)
 
 
+def compare_html(cmp: dict, arm_reports: dict[str, str]) -> str:
+    """Локальный отчёт абляции (с ID видео; кадры — в отчётах рук по ссылкам)."""
+    import html
+
+    rows = "".join(f"<tr><td>{html.escape(c['video_id'])}</td><td>{html.escape(c['baseline'])}</td>"
+                   f"<td>{html.escape(c['candidate'])}</td></tr>" for c in cmp["paired"]["category_changes"])
+    links = " · ".join(f'<a href="{html.escape(v)}">{html.escape(k)}</a>' for k, v in arm_reports.items())
+    return ("<!doctype html><html lang=ru><head><meta charset=utf-8><meta name=viewport content='width=device-width,"
+            "initial-scale=1'><title>Абляция</title><style>:root{--s:#fcfcfb;--t:#0b0b0b;--g:#e4e3df}"
+            "@media (prefers-color-scheme:dark){:root{--s:#1a1a19;--t:#f0efec;--g:#383835}}"
+            "body{background:var(--s);color:var(--t);font:14px/1.45 system-ui,sans-serif;padding:16px;max-width:1000px}"
+            "pre{border:1px solid var(--g);padding:8px;overflow-x:auto}td,th{border-bottom:1px solid var(--g);"
+            "padding:3px 8px;text-align:left}a{color:inherit}</style></head><body>"
+            f"<h1>Абляция: {html.escape(cmp['verdict'])}</h1><p><b>ТОЛЬКО ЛОКАЛЬНО</b> (ID видео; отчёты рук — с кадрами). "
+            f"Отчёты рук: {links}</p><pre>{html.escape(format_compare(cmp))}</pre>"
+            "<h2>Смены категорий по видео</h2><table><tr><th>видео</th><th>baseline</th><th>candidate</th></tr>"
+            f"{rows or '<tr><td colspan=3>нет</td></tr>'}</table></body></html>")
+
+
 def _arm_args(args: argparse.Namespace, arm: str, out: Path) -> list[str]:
     a = ["--videos", args.videos, "--labels", args.labels, "--types", args.types, "--out", str(out),
          "--role", arm, "--label", f"{args.name}:{arm}", "--log", args.log, "--ablation-id", args.name]
@@ -258,6 +277,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         cmp["sanity_error"] = repr(e)[:300]
     write_json(out / "compare.json", cmp)
     write_json(out / "compare_public.json", public(cmp))
+    arm_reports = {}
+    try:  # подробные локальные отчёты по обеим рукам (с кадрами — не выносить)
+        from .metrics import load_predictions
+        from .report import build_report
+
+        for arm, d in (("baseline", base_dir), ("candidate", out / "candidate")):
+            rp = d / "report.html"
+            rp.write_text(build_report(read_json(d / "metrics.json"), load_predictions(d / "preds")[0],
+                                       title=f"{args.name}: {arm}", sanity=cmp.get("sanity")), encoding="utf-8")
+            arm_reports[arm] = str(rp.resolve().relative_to(out.resolve())) if rp.resolve().is_relative_to(
+                out.resolve()) else rp.resolve().as_uri()
+        (out / "compare.html").write_text(compare_html(cmp, arm_reports), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — отчёт не должен ронять замер
+        print(f"отчёт не построен: {e!r}")
     from .runs import append, load, render_html
 
     append(args.log, {"role": "ablation", "ablation_id": args.name, "label": args.name, "verdict": cmp["verdict"],
@@ -269,7 +302,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         from .sanity import format_sanity
 
         print(format_sanity(cmp["sanity"]))
-    print(f"→ {out}/compare.json (локально), compare_public.json (агрегаты), {html_path}")
+    print(f"→ {out}/compare.html, compare.json (локально), compare_public.json (агрегаты), {html_path}")
     return 0 if cmp["verdict"] in ("PASS", "INCONCLUSIVE", "FAIL") else 2
 
 
