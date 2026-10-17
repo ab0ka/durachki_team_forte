@@ -119,7 +119,8 @@ def test_invalid_configs_rejected() -> None:
         {**raw, "rules": [{"id": "x", "type_id": "V01", "strength": "a", "on": 0.3, "off": 0.6}]},
         {**raw, "rules": [{"id": "x", "type_id": "V01", "strength": "a", "facts": ["{a.__class__}"]}]},
         {**raw, "rules": [{"id": "x", "type_id": "V01", "strength": "a", "t_peak": {"policy": "guess"}}]},
-        {**raw, "rules": [{"id": "x", "type_id": "V01", "strength": "a"}, {"id": "x", "type_id": "V01", "strength": "a"}]},
+        {**raw, "rules": [{"id": "x", "type_id": "V01", "strength": "a"},
+                          {"id": "x", "type_id": "V01", "strength": "a"}]},
     ]
     for v in bad_variants:
         with pytest.raises(ConfigError):

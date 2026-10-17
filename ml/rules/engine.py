@@ -443,7 +443,8 @@ def _assess(rule: RuleSpec, catalog: Mapping[str, Any], cfg: RulesConfig) -> tup
         return REVIEW, ["правило-наблюдение: само по себе не доказывает нарушение"]
     norm = norm_status(catalog, rule.type_id)
     if cfg.require_verified_norm and norm["status"] != "verified":
-        return REVIEW, [f"нет проверенной применимой нормы для {rule.type_id} в каталоге A13 (статус: {norm['status']})"]
+        return REVIEW, [f"нет проверенной применимой нормы для {rule.type_id} в каталоге A13 "
+                        f"(статус: {norm['status']})"]
     return CANDIDATE, []
 
 
@@ -462,7 +463,8 @@ def _stage_reasons(rule: RuleSpec, series: SignalSeries, s_lo: np.ndarray, s_hi:
         lo_idx = int(np.searchsorted(times, t_start - ina.before_window_s - 1e-9, side="left"))
         window = before_lo[lo_idx:i0]
         if window.size == 0 or not bool((window >= 0.5).any()):
-            reasons.append(f"предшествующее состояние ({ina.before.source}) не наблюдалось за {ina.before_window_s:g} с")
+            reasons.append(f"предшествующее состояние ({ina.before.source}) "
+                           f"не наблюдалось за {ina.before_window_s:g} с")
     # кадр «не наблюдён», если условие не доказано, но возможно (неизвестные сигналы);
     # отсутствующая OR-альтернатива при доказанной другой ветви покрытие не портит
     unknown = (s_lo[i0:i1 + 1] < rule.on) & (s_hi[i0:i1 + 1] >= rule.on)

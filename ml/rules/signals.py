@@ -288,7 +288,8 @@ def derive_from_tracks(
                 box = boxes[int(nearest[i])][1]
                 if role == "cashier":
                     cashier[i] = max(cashier[i], conf)
-                    if workplace_zone and in_zone(box, workplace_zone, desk_margin if workplace_zone == "desk" else 0.0):
+                    margin = desk_margin if workplace_zone == "desk" else 0.0
+                    if workplace_zone and in_zone(box, workplace_zone, margin):
                         cashier_wp[i] = max(cashier_wp[i], conf)
                 elif role == "collector":
                     collector[i] = max(collector[i], conf)

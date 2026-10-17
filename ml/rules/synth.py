@@ -85,8 +85,10 @@ def make_zones() -> list[Any]:
     ]
 
 
-def make_tracks(duration_s: float = 60.0, fps: float = 5.0,
-                spans: Sequence[tuple[int, str, str, float, float, tuple[float, float, float, float]]] = ()) -> list[Any]:
+Span = tuple[int, str, str, float, float, tuple[float, float, float, float]]
+
+
+def make_tracks(duration_s: float = 60.0, fps: float = 5.0, spans: Sequence[Span] = ()) -> list[Any]:
     """``spans``: (track_id, label, role, t0, t1, bbox) — трек с постоянным боксом на [t0, t1)."""
     tracks = []
     for tid, label, role, t0, t1, box in spans:

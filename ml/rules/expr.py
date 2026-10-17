@@ -200,7 +200,8 @@ def _div(a: Interval, b: Interval) -> Interval:
     qs = [_safe_div_scalar(x, y) for x in a for y in b]
     lo = np.minimum.reduce(np.broadcast_arrays(*qs))
     hi = np.maximum.reduce(np.broadcast_arrays(*qs))
-    straddle = np.less(b[0], 0) & np.greater(b[1], 0) | (np.not_equal(b[0], b[1]) & (np.equal(b[0], 0) | np.equal(b[1], 0)))
+    touches_zero = np.not_equal(b[0], b[1]) & (np.equal(b[0], 0) | np.equal(b[1], 0))
+    straddle = (np.less(b[0], 0) & np.greater(b[1], 0)) | touches_zero
     if np.any(straddle):
         lo = np.where(straddle, -np.inf, lo)
         hi = np.where(straddle, np.inf, hi)
