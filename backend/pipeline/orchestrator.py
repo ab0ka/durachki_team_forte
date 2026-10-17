@@ -25,7 +25,7 @@ from .budget import TimeBudget, choose_sample_fps
 from .cache import STAGE_FILES, StageCache, sha256_file, stable_hash
 from .config import STAGE_ORDER, cache_root, cfg_get, data_root, load_config
 from .contract import AnalysisResult, Event
-from .coverage import completeness, coverage_gate, reference_duration, stage_coverage
+from .coverage import canonical_coverage, completeness, coverage_gate, reference_duration
 from .fallbacks import EvidenceClip, derive_risk, fallback_fuse, states_from_detections
 from .media import ascii_safe_path, probe_video
 from .registry import ModelRegistry
@@ -693,10 +693,11 @@ def _partial(ctx: RunContext, events: list[Event], risk: list, milestone: str) -
 
 
 def _finalize(ctx: RunContext, result: Optional[AnalysisResult]) -> AnalysisResult:
-    cov = stage_coverage(ctx.records, ctx.outputs, ctx.clip_info, ctx.probe, ctx.cfg)
-    ok_required = [s for s in _required(ctx) if s in ctx.records and ctx.records[s].status in OK_STATUSES]
-    for reason in coverage_gate(cov, ok_required, ctx.cfg):
-        ctx.incomplete.append(f"покрытие — {reason}")
+    if all(s in ctx.records and ctx.records[s].status in OK_STATUSES for s in _required(ctx)):
+        cov = canonical_coverage(ctx.records, ctx.outputs, ctx.clip_info, ctx.probe, ctx.cfg, _required(ctx),
+                                 {n: r.as_dict() for n, r in ctx.records.items()})
+        for reason in coverage_gate(cov, ctx.cfg):
+            ctx.incomplete.append(f"покрытие — {reason}")
     meta = _meta(ctx)
     complete = meta["completeness"]["complete"]
     policy = str(cfg_get(ctx.cfg, "on_required_failure", "violation_only"))
@@ -786,10 +787,12 @@ def _meta(ctx: RunContext) -> dict:
         "partial_written": list(ctx.partial_written),
     }
     # ---- полнота (contracts/extensions.py, A01) + покрытие по стадиям
-    cov = stage_coverage(ctx.records, ctx.outputs, ctx.clip_info, ctx.probe, ctx.cfg)
+    cov = canonical_coverage(ctx.records, ctx.outputs, ctx.clip_info, ctx.probe, ctx.cfg, _required(ctx),
+                             meta["stages"])
     duration = reference_duration(ctx.clip_info, ctx.probe)
     times = ctx.clip_info.get("times") or []
     complete = _is_complete(ctx)
+    cov["complete"] = bool(cov.get("complete")) and complete
     reason = None if complete else ("Базовый анализ не завершён: " + "; ".join(ctx.incomplete) if ctx.incomplete
                                     else "обязательные стадии не выполнены")
     meta["coverage"] = cov

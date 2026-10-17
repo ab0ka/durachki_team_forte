@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from backend.pipeline import mocks, run
 from backend.pipeline.contract import Event, SceneState
-from backend.pipeline.coverage import interval_coverage
+from backend.pipeline.coverage import covered_intervals, interval_coverage
 
 
 def test_interval_coverage_basics():
@@ -24,8 +24,11 @@ def test_meta_completeness_coverage_provenance(fake_ml, synth_video):
                                       "required_stages", "reason"}
     assert m["completeness"]["stages"]["detect"] in ("ok", "mock")
     assert m["duration_sec"] and m["duration_sec"] > 3
-    assert m["coverage"]["ingest"] >= 0.9 and m["coverage"]["scene"] >= 0.9
-    assert m["coverage"]["vlm_discover"] is None                      # неизвестно ≠ 0 и ≠ 1
+    cov = m["coverage"]                                                # формат contracts.extensions (A01)
+    assert cov["ratio"] >= 0.98 and cov["complete"] is True and cov["unknown_spans"] == [] and cov["gaps"] == []
+    assert set(cov) >= {"ratio", "analyzed_sec", "duration_sec", "unknown_spans", "stages", "required", "complete"}
+    assert cov["by_stage"]["ingest"] >= 0.98 and cov["by_stage"]["scene"] >= 0.98
+    assert cov["by_stage"]["vlm_discover"] is None                    # неизвестно ≠ 0 и ≠ 1
     assert m["provenance"]["pipeline_version"] and "sources" in m["provenance"]
 
 
@@ -38,7 +41,9 @@ def test_partial_scene_coverage_blocks_no_violation(fake_ml, synth_video):
     fake_ml({"ml.scene.scene_states": _half_scene, "ml.rules.run_rules": lambda *a: [],
              "ml.temporal.score": lambda clip: ([], [])})
     res = run(synth_video, "job-halfcov", None, 60)
-    assert res.meta["coverage"]["scene"] < 0.9
+    cov = res.meta["coverage"]
+    assert cov["by_stage"]["scene"] < 0.9 and cov["ratio"] < 0.9
+    assert cov["analyzed_sec"] < cov["duration_sec"] and cov["gaps"] and cov["complete"] is False
     assert res.status == "failed" and res.verdict is None
     assert "покрытие" in res.meta["error"] and res.meta["completeness"]["complete"] is False
 
@@ -86,3 +91,12 @@ def test_inference_does_not_read_labels(fake_ml, synth_video, tmp_path, monkeypa
     monkeypatch.setattr(builtins, "open", spy)
     run(synth_video, "job-nogt", None, 60)
     assert not [f for f in opened if "label" in f.lower() or f.lower().endswith(".csv")]
+
+
+def test_covered_intervals_grid_tolerance():
+    ts = [0.13 + i * 0.2 for i in range(19)]                  # сетка сдвинута: начало и хвост < шага
+    assert covered_intervals(ts, 4.0) == [[0.0, 4.0]]
+    ts = [i * 0.2 for i in range(10)] + [3.0 + i * 0.2 for i in range(5)]  # провал 2.0..3.0 с
+    iv = covered_intervals(ts, 4.0)
+    assert iv[0] == [0.0, 2.0] and iv[1][0] == 3.0 and iv[1][1] == 4.0
+    assert covered_intervals([0.0, 0.2, 0.4], 10.0)[-1][1] < 1.0     # длинный хвост — не покрыт
