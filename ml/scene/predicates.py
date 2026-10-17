@@ -54,7 +54,7 @@ TYPE_HINT = {
     "safe_open_while_working": "V03",
     "mobile_phone_in_hand": "V05",
     "eating_at_workplace_with_valuables": "V06",
-    "personal_item_on_desk": "V99",
+    "personal_item_on_desk": "V09",   # по спецификации команды; если ключа нет в norms/catalog.yaml — A12 сводит к V99
     "bag_left_unattended": "V07",
 }
 
