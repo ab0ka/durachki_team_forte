@@ -34,7 +34,7 @@ from typing import Any, Optional, Sequence
 
 from .cache_io import hash_videos, load_cache_dir, load_labels, load_name_map, normalize_video_id
 from .catalog import FALLBACK_CATALOG, resolve_catalog
-from .config import apply_overrides, build_config, read_raw_config
+from .config import build_config, read_raw_config
 from .engine import CANDIDATE, INSUFFICIENT, REVIEW, assessment_of, evaluate
 
 MAX_SWEEP = 500
@@ -264,8 +264,9 @@ def _print_report(res: dict[str, Any], tol: float, show_events: bool, catalog_sr
     if show_events or show_trace:
         for v in res["videos"]:
             for e in v.get("events", []):
+                moment = e["evidence"].get("kind") or e["evidence"].get("policy")
                 print(f"  {v['name']}: {e['type_id']} {e['detection']}/{e['assessment']} [{e['t_start']:.1f}–"
-                      f"{e['t_end']:.1f}] t_peak={e['t_peak']:.1f} ({e['evidence'].get('kind') or e['evidence'].get('policy')})"
+                      f"{e['t_end']:.1f}] t_peak={e['t_peak']:.1f} ({moment})"
                       f" conf={e['confidence']:.2f} {','.join(e['rule_ids'])} {e['clauses']}")
                 if show_trace and e.get("trace"):
                     for c in e["trace"].get("clauses", []):
@@ -285,7 +286,8 @@ def _print_report(res: dict[str, Any], tol: float, show_events: bool, catalog_sr
     print(f"таймкод (TP, без конфликтов): {hits}; mean|Δt|={_fmt(s['mean_abs_dt'], 2)} "
           f"median|Δt|={_fmt(s['median_abs_dt'], 2)}")
     if s["median_gt_minus_t_peak"] is not None:
-        print(f"медиана (GT − t_peak) = {s['median_gt_minus_t_peak']:+.2f} с — справочно (сдвиг — только по train/calib)")
+        print(f"медиана (GT − t_peak) = {s['median_gt_minus_t_peak'] + 0.0:+.2f} с — справочно "
+              f"(сдвиг — только по train/calib)")
     print(f"типы на TP: {s['types_on_tp'] or '—'} | latency правил: mean={_fmt(s['latency_ms']['mean'], 1)} мс, "
           f"max={_fmt(s['latency_ms']['max'], 1)} мс | VRAM: 0 (CPU)")
     fires = s.get("rule_fires") or res.get("rule_fires")
@@ -318,7 +320,8 @@ def run_ablation(cache: dict, labels: dict, raw: dict, src: str, catalog: dict, 
                "types": s["types_on_tp"], "latency_ms": s["latency_ms"]["mean"]}
         if base is None:
             base = row
-        row["d_joint"] = (row["joint"] - base["joint"]) if row["joint"] is not None and base["joint"] is not None else None
+        both = row["joint"] is not None and base["joint"] is not None
+        row["d_joint"] = (row["joint"] - base["joint"]) if both else None
         row["d_fp"] = row["fp"] - base["fp"]
         row["d_fn"] = row["fn"] - base["fn"]
         results.append(row)
@@ -465,16 +468,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.hypotheses:
         rows = run_ablation(cache, labels, raw, src, catalog, args.hypotheses, args.sets, args.tol, args.min_conf,
                             args.verdict)
-        print(_table([[r["variant"], r["tp"], r["fp"], r["fn"], r["tn"], r["recall"], r["det_score"],
-                       r["time_score"], r["joint"], r["d_joint"], r["d_fp"], r["hit1"], r["hit2"],
-                       r["median_abs_dt"], json.dumps(r["types"], ensure_ascii=False), r["latency_ms"]]
+        f3 = (lambda x: None if x is None else f"{x:.3f}")  # noqa: E731
+        print(_table([[r["variant"], r["tp"], r["fp"], r["fn"], r["tn"], f3(r["recall"]), f3(r["det_score"]),
+                       f3(r["time_score"]), f3(r["joint"]), f3(r["d_joint"]), r["d_fp"], f3(r["hit1"]), f3(r["hit2"]),
+                       f3(r["median_abs_dt"]), json.dumps(r["types"], ensure_ascii=False), r["latency_ms"]]
                       for r in rows],
                      ["вариант", "TP", "FP", "FN", "TN", "recall", "det", "time", "joint", "Δjoint", "ΔFP",
                       "hit≤1", "hit≤2", "med|Δt|", "типы на TP", "мс/видео"]))
         print("VRAM: 0 (правила — CPU). Решение о включении гипотезы: Δjoint > 0 без роста FP; "
               "размеченные ролики уже использованы в разведке — подтверждать на отложенных/LOO.")
         if args.json_out:
-            Path(args.json_out).write_text(json.dumps(rows, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+            Path(args.json_out).write_text(json.dumps(rows, ensure_ascii=False, indent=1, default=str),
+                                           encoding="utf-8")
         return 0
     if args.propose:
         props = propose_edits(cache, labels, raw, src, catalog, args.profile, args.hyps, args.sets, args.tol,

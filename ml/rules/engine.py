@@ -519,7 +519,7 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
     if ("legacy", "gate") in aux and rule.gate is not None:
         kind = "applicability" if rule.gate_mode == "strict" else "gate_lenient"
         clauses.append(_clause_trace(kind, Clause("gate", "условие применимости" if kind == "applicability"
-                                                  else "исключение (блокирует, только если доказано ложным gate)",
+                                                  else "мягкое условие (блокирует, только если доказанно не выполнено)",
                                                   rule.gate), aux[("legacy", "gate")], i0, i1, ip))
     if rule.applicability is not None and "app" in aux:
         clauses.append(_clause_trace("applicability", rule.applicability, aux["app"], i0, i1, ip))
