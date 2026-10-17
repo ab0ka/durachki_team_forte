@@ -42,9 +42,9 @@ def test_schedule_grid_and_dense_window():
 def test_read_timecodes(tmp_path):
     p = tmp_path / "labels.csv"
     p.write_text("video_id,file,label,t_sec,t_all\nХ-3,Х-3.mov,violation,12,12;30\n"
-                 "X-4,X-4.mov,no_violation,,\n,clip_a.mp4,violation,7.5,\n", encoding="utf-8")
+                 "X-4,X-4.mov,no_violation,,\n,clip_a.mp4,violation,7.5,\n,EXT-002.mov,clean,3,\n", encoding="utf-8")
     tc = read_timecodes([p, tmp_path / "missing.csv"])
-    assert tc == {"X-3": [12.0, 30.0], "X-4": [], "clip_a": [7.5]}
+    assert tc == {"X-3": [12.0, 30.0], "X-4": [], "clip_a": [7.5], "EXT-002": []}
 
 
 def _task(file, results, cancelled=False, tid=1):
@@ -214,4 +214,10 @@ def test_coco_status_in_info():
         a.update(bbox=[0, 0, 10, 10], area=100, iscrowd=0)
     coco = export_coco.build_coco(images, anns, {"X-1": "train"}, status="черновик")
     assert coco["info"]["status"] == "черновик" and "черновик" in export_coco.stats_md(coco, {})
-    assert export_coco.build_coco(images, anns, {"X-1": "train"})["info"]["status"] == export_coco.HUMAN
+    human = export_coco.build_coco(images, anns, {"X-1": "train"})
+    assert human["info"]["status"] == export_coco.HUMAN and "kind" not in human["info"]
+    assert all("verified" not in a for a in human["annotations"])
+    draft = export_coco.build_coco(images, anns, {"X-1": "train"}, status="черновик", proposals="owlv2+claude-review")
+    # так ml/detect (A05) распознаёт псевдоразметку и не учится на ней
+    assert draft["info"]["kind"] == "proposals" and draft["info"]["verified"] is False
+    assert all(a["verified"] is False and a["source"] == "owlv2+claude-review" for a in draft["annotations"])

@@ -128,7 +128,10 @@ def assign_split(images: list[dict], anns: list[dict], fixed: dict[str, str], va
     return split
 
 
-def build_coco(images: list[dict], anns: list[dict], split: dict[str, str], status: str = HUMAN) -> dict:
+def build_coco(images: list[dict], anns: list[dict], split: dict[str, str], status: str = HUMAN,
+               proposals: str = "") -> dict:
+    """proposals — имя генератора, если разметка не проверена человеком: тогда info.kind=proposals и
+    verified=false у каждой аннотации — по этим полям ml/detect (A05) отказывается на ней учиться и калиброваться."""
     images = sorted(images, key=lambda im: im["file_name"])
     for i, im in enumerate(images, 1):
         im["id"] = i
@@ -136,7 +139,8 @@ def build_coco(images: list[dict], anns: list[dict], split: dict[str, str], stat
     id_of = {im["file_name"]: im["id"] for im in images}
     out_anns = []
     for i, a in enumerate(sorted(anns, key=lambda a: (id_of[a["file"]], a["category_id"], a["bbox"])), 1):
-        out_anns.append({"id": i, "image_id": id_of[a["file"]], **{k: v for k, v in a.items() if k != "file"}})
+        out_anns.append({"id": i, "image_id": id_of[a["file"]], **{k: v for k, v in a.items() if k != "file"},
+                         **({"source": proposals, "verified": False} if proposals else {})})
     return {
         "info": {"description": "Kassa Sentinel: детектор сверху (кассовый узел), ручная разметка поверх OWLv2",
                  "version": dt.date.today().isoformat(), "date_created": dt.datetime.now().isoformat(timespec="seconds"),
@@ -144,7 +148,8 @@ def build_coco(images: list[dict], anns: list[dict], split: dict[str, str], stat
                  "file_name": "относительно images_root (от корня репо); кадры в git не хранятся — "
                               "воспроизводятся datasets/det/extract_frames.py",
                  "split": "по видео (группы одинаковых по md5 файлов вместе), datasets/det/split.json",
-                 "status": status},
+                 "status": status,
+                 **({"kind": "proposals", "verified": False, "generator": proposals} if proposals else {})},
         "licenses": [],
         "categories": [{"id": CAT_ID[c["name"]], "name": c["name"], "supercategory": "object",
                         "contract_label": c["contract"]} for c in CLASSES],
@@ -209,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--resplit", action="store_true", help="забыть split.json и распределить заново")
     ap.add_argument("--val", nargs="*", help="задать val вручную: группы видео (X-3 X-17 ...)")
     ap.add_argument("--status", default=HUMAN, help="кем проверена разметка (пишется в info.status и README)")
+    ap.add_argument("--proposals", default="", help="генератор, если разметка НЕ проверена человеком "
+                    "(info.kind=proposals, verified=false — так её распознаёт ml/detect)")
     args = ap.parse_args(argv)
 
     tasks = json.loads(args.export.read_text(encoding="utf-8"))
@@ -224,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.val is not None:
         fixed = {im["group"]: ("val" if im["group"] in args.val else "train") for im in images}
     split = assign_split(images, anns, fixed, args.val_frac)
-    coco = build_coco(images, anns, split, args.status)
+    coco = build_coco(images, anns, split, args.status, args.proposals)
 
     dump = {"indent": None, "ensure_ascii": False, "separators": (",", ":")}
     (args.out_dir / "annotations.json").write_text(json.dumps(coco, **dump), encoding="utf-8")

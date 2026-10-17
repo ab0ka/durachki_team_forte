@@ -146,7 +146,7 @@ def read_timecodes(paths: list[Path]) -> dict[str, list[float]]:
                     continue
                 key = norm_id(key) or safe_id(key)
                 ts = _parse_times(r.get("t_sec", ""), r.get("t_all", ""))
-                if (r.get("label") or "").strip() == "no_violation":
+                if (r.get("label") or "").strip() in ("no_violation", "clean"):   # clean — datasets/extra
                     ts = []
                 res.setdefault(key, set()).update(ts)
     return {k: sorted(v) for k, v in res.items()}

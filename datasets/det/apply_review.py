@@ -143,7 +143,8 @@ def draft_coco(reviewed: dict[str, dict], index: dict[str, dict], out_dir: Path 
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "review_export.json"
         p.write_text(json.dumps(tasks, ensure_ascii=False), encoding="utf-8")
-        return export_coco.main([str(p), "--status", STATUS, *(["--out-dir", str(out_dir)] if out_dir else [])])
+        return export_coco.main([str(p), "--status", STATUS, "--proposals", MODEL_VERSION,
+                                 *(["--out-dir", str(out_dir)] if out_dir else [])])
 
 
 def main(argv: list[str] | None = None) -> int:
