@@ -32,6 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "other": 0.6,
     },
     "combine": "max",
+    "temporal_mode": "off",
     "agreement": {"min_conf": 0.3, "bonus_per_source": 0.05, "max_bonus": 0.10},
     "vlm": {"reject_factor": 0.6, "reject_min_score": 0.5, "unsure_factor": 1.0},
     "risk": {

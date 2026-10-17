@@ -38,14 +38,27 @@ def test_different_types_not_merged(catalog):
     assert {c.type_id for c in out.reported} == {"V01", "V03"}
 
 
-def test_correlated_sources_max_plus_bounded_bonus(catalog):
+def _cfg(**over):
     cfg = load_config()
+    cfg.update(over)
+    return cfg
+
+
+@pytest.mark.parametrize("mode,expected", [("off", 0.7), ("bonus", 0.75), ("score", 0.75)])
+def test_correlated_sources_max_plus_bounded_bonus(catalog, mode, expected):
+    cfg = _cfg(temporal_mode=mode)
     assert cfg["combine"] == "max"
-    out = run([ev(t=10.0, conf=0.7), ev(t=10.4, conf=0.6, source="temporal")], catalog)
+    out = run([ev(t=10.0, conf=0.7), ev(t=10.4, conf=0.6, source="temporal")], catalog, cfg=cfg)
     c = out.reported[0]
-    # max(1.0*0.7, 0.8*0.6) + bonus 0.05 — не noisy-OR (0.844+)
-    assert c.confidence == pytest.approx(0.75, abs=1e-6)
+    # max(1.0*0.7, 0.8*0.6) (+ бонус 0.05 в bonus/score) — не noisy-OR (0.844+)
+    assert c.confidence == pytest.approx(expected, abs=1e-6)
     assert c.bonus <= cfg["agreement"]["max_bonus"]
+
+
+def test_temporal_off_cannot_raise_weak_rules_event(catalog):
+    events = [ev(t=10.0, conf=0.3), ev(t=10.2, conf=0.95, source="temporal")]
+    assert run(events, catalog, cfg=_cfg(temporal_mode="off")).candidates[0].confidence == pytest.approx(0.3)
+    assert run(events, catalog, cfg=_cfg(temporal_mode="score")).candidates[0].confidence > 0.7
 
 
 def test_vlm_reject_downgrades(catalog):
@@ -81,11 +94,12 @@ def test_temporal_only_event_is_hint(catalog):
     assert set(out.candidates[0].gate) >= {"temporal_only", "no_observable_fact"}
 
 
-def test_risk_supports_rules_event(catalog):
+def test_risk_supports_rules_event_only_in_score_mode(catalog):
     risk = [(t / 5, 0.9) for t in range(300)]
-    out = run([ev(t=10.0, conf=0.5)], catalog, risk=risk)
-    c = out.reported[0]
-    assert "risk_curve" in c.weighted and c.confidence > 0.5
+    off = run([ev(t=10.0, conf=0.5)], catalog, risk=risk).reported[0]
+    assert "risk_curve" in off.weighted and off.confidence == pytest.approx(0.5)
+    on = run([ev(t=10.0, conf=0.5)], catalog, risk=risk, cfg=_cfg(temporal_mode="score")).reported[0]
+    assert on.confidence > 0.5
 
 
 def test_no_fact_no_violation(catalog):

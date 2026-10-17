@@ -462,13 +462,23 @@ def _source_weight(cfg: dict[str, Any], source: str) -> float:
     return _f(weights.get(source, weights.get("other", 0.6)), 0.6)
 
 
+def temporal_mode(cfg: dict[str, Any]) -> str:
+    """off (по умолчанию) | bonus | score — влияние temporal/риск-кривой на скор кластера."""
+    mode = str(cfg.get("temporal_mode", "off")).strip().lower()
+    return mode if mode in {"off", "bonus", "score"} else "off"
+
+
 def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]) -> Candidate:
     """Объединение уверенностей источников в одном кластере."""
     positives = [e for e in group if e.positive]
     pool = positives or list(group)
     type_id = group[0].type_id
-    t_start = min(e.t_start for e in pool)
-    t_end = max(e.t_end for e in pool)
+    tmode = temporal_mode(cfg)
+    # temporal_mode=off|bonus: при наличии фактических источников границы и пик берём по ним
+    factual = [e for e in pool if e.source != "temporal"] if tmode != "score" else []
+    span = factual or pool
+    t_start = min(e.t_start for e in span)
+    t_end = max(e.t_end for e in span)
 
     conf_by_source: dict[str, float] = {}
     for e in positives:
@@ -486,18 +496,27 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
     if positives and "temporal" not in weighted and risk_support >= _f(rcfg.get("support_min", 0.5), 0.5):
         weighted["risk_curve"] = _clamp(_f(rcfg.get("support_weight", 0.6), 0.6) * risk_support, 0.0, 1.0)
 
-    if not weighted:
+    # Какие вклады задают базовый скор. temporal_mode=score — как в фазе 1; bonus — temporal/кривая только
+    # в бонусе согласия; off — temporal/кривая не влияют на скор кластера с фактическими источниками.
+    temporal_keys = {"temporal", "risk_curve"}
+    has_factual = any(k not in temporal_keys for k in weighted)
+    base_parts = {k: v for k, v in weighted.items()
+                  if tmode == "score" or k not in temporal_keys or not has_factual}
+    agree_parts = {k: v for k, v in weighted.items()
+                   if tmode != "off" or k not in temporal_keys or not has_factual}
+
+    if not base_parts:
         base = 0.0
     elif str(cfg.get("combine", "noisy_or")).lower() == "max":
-        base = max(weighted.values())
+        base = max(base_parts.values())
     else:
         prod = 1.0
-        for v in weighted.values():
+        for v in base_parts.values():
             prod *= 1.0 - v
         base = 1.0 - prod
 
     acfg = cfg.get("agreement") or {}
-    n_agree = sum(1 for v in weighted.values() if v >= _f(acfg.get("min_conf", 0.3), 0.3))
+    n_agree = sum(1 for v in agree_parts.values() if v >= _f(acfg.get("min_conf", 0.3), 0.3))
     bonus = 0.0
     if n_agree >= 2:
         bonus = min(_f(acfg.get("max_bonus", 0.15), 0.15),
@@ -526,7 +545,7 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
         prio = SOURCE_PRIORITY.index(e.source) if e.source in SOURCE_PRIORITY else len(SOURCE_PRIORITY)
         return (round(w * e.confidence, 6), -prio)
 
-    peak_ev = max(pool, key=peak_key)
+    peak_ev = max(span, key=peak_key)
 
     # Факты: rules → vlm → temporal → прочие; боксы — с пикового события, затем близкие по времени.
     ordered = sorted(pool, key=lambda e: (SOURCE_PRIORITY.index(e.source) if e.source in SOURCE_PRIORITY
