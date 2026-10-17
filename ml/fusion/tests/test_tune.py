@@ -13,6 +13,7 @@ from ml.fusion.tune import (
     evaluate,
     fit,
     main,
+    predict,
     normalize_id,
     parse_label,
     parse_seconds,
@@ -127,3 +128,38 @@ def test_type_column_accuracy(tmp_path):
     assert labels["X-1"][0].type_id == "V02" and labels["X-2"][0].type_id is None
     s = [Sample("X-1", True, [10.0], [("V02", 0.9, 10.0, 10.0)], "g", type_id="V02")]
     assert evaluate(s, {}, 0.0)["type_accuracy"] == 1.0
+
+
+def test_documented_adapter_recipe_on_a16_rows(catalog, monkeypatch):
+    """Рецепт из README («API подбора порогов»): строки eval.run --raw (A16) → Sample → fit/predict."""
+    monkeypatch.setenv("SENTINEL_FUSION_NO_FRAMES", "1")
+    from ml.fusion.catalog import resolve_catalog
+    from ml.fusion.config import load_config, load_thresholds, threshold_for
+    from ml.fusion.tune import VideoPred, candidates_for
+
+    rows = []
+    for i in range(6):
+        positive = i % 2 == 0
+        events = [ev(t=10.0 + i, conf=0.6 + 0.03 * i)] if positive else [ev(t=5.0 + i, conf=0.2)]
+        res = fuse(FakeClip(duration=30.0), events, [], catalog, f"job{i}")
+        rows.append({"video_id": f"X-{i}", "group": f"X-{i}", "label": "violation" if positive else "no_violation",
+                     "gt_times": [10.0 + i] if positive else [], "scores_raw": res.meta["scores_raw"]})
+
+    cfg, thr0 = load_config(), load_thresholds()
+    default = float(thr0["default"])
+    start = {t: threshold_for(thr0, t) for t in thr0["per_type"]}
+    types, _ = resolve_catalog(catalog)
+
+    def to_sample(row):
+        pred = VideoPred(row["video_id"], row["scores_raw"], fingerprint=row.get("group") or row["video_id"])
+        cands, _ = candidates_for(pred, cfg, types)
+        return Sample(video=row["video_id"], positive=row["label"] == "violation",
+                      seconds=[float(t) for t in row.get("gt_times") or []], cands=cands,
+                      group=row.get("group") or row["video_id"])
+
+    train = [to_sample(r) for r in rows[:4]]
+    thr = fit(train, start, default, target_recall=1.0, bias=0.35, dt_tol=1.0, dt_weight=0.5)
+    assert isinstance(thr, dict) and all(isinstance(v, float) for v in thr.values())
+    hits = predict(to_sample(rows[4]), thr, default)          # list[Cand] над порогом
+    assert bool(hits) is True and hits[0][0] == "V01" and abs(hits[0][2] - 14.0) <= 0.11
+    assert bool(predict(to_sample(rows[5]), thr, default)) is False

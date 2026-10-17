@@ -135,10 +135,41 @@ def test_unknown_type_maps_to_v99(catalog):
     assert c.reported
 
 
-def test_no_catalog_reports_with_warning(no_frames):
-    res = fuse(FakeClip(), [ev(t=5.0)], [], {}, "job")
+@pytest.mark.parametrize("empty", [None, {}, {"version": 1, "types": {}}])
+def test_no_catalog_and_no_norms_uses_fallback(monkeypatch, no_frames, empty):
+    # Независимо от наличия norms в окружении: загрузка A13 недоступна → встроенный fallback без норм
+    import ml.fusion.catalog as catalog_mod
+
+    def unavailable():
+        raise ImportError("norms недоступен (тест)")
+
+    monkeypatch.setattr(catalog_mod, "load_norms_catalog", unavailable)
+    res = fuse(FakeClip(), [ev(t=5.0)], [], empty, "job")
     assert res.verdict == "violation" and res.violations[0].rules == []
-    assert any("norms" in w for w in res.meta["warnings"])
+    assert res.violations[0].type == catalog_mod.FALLBACK_TYPES["V01"]["name"]
+    assert any("norms catalog unavailable" in w for w in res.meta["warnings"])
+
+
+def test_empty_catalog_loads_norms_when_available(monkeypatch, no_frames):
+    # {} / {"types": {}} от A03 = «каталог не передан» → берём norms.load_catalog(), fallback не нужен
+    import ml.fusion.catalog as catalog_mod
+
+    loaded = {"version": 1, "types": {"V01": {"name": "V01 из norms", "rules": []}}}
+    monkeypatch.setattr(catalog_mod, "load_norms_catalog", lambda: loaded)
+    res = fuse(FakeClip(), [ev(t=5.0)], [], {"version": 1, "types": {}}, "job")
+    assert res.verdict == "violation" and res.violations[0].type == "V01 из norms"
+    assert not any("norms catalog unavailable" in w for w in res.meta["warnings"])
+
+
+def test_passed_catalog_is_not_reloaded(monkeypatch, catalog, no_frames):
+    import ml.fusion.catalog as catalog_mod
+
+    def must_not_load():
+        raise AssertionError("непустой каталог не должен перезагружаться из norms")
+
+    monkeypatch.setattr(catalog_mod, "load_norms_catalog", must_not_load)
+    res = fuse(FakeClip(), [ev(t=5.0)], [], catalog, "job")
+    assert res.violations[0].rules[0].clause == "п. 1"
 
 
 def test_per_type_thresholds(tmp_path, monkeypatch, catalog, no_frames):

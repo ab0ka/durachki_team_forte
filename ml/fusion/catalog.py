@@ -97,16 +97,27 @@ def _types_of(catalog: Any) -> dict[str, dict[str, Any]]:
     return {}
 
 
+def load_norms_catalog() -> Any:
+    """Каталог A13 (``norms.load_catalog()``). Единственная точка загрузки — тесты подменяют её monkeypatch-ем."""
+    from norms import load_catalog  # type: ignore[import-not-found]  # lazy, модуль A13
+
+    return load_catalog()
+
+
 def resolve_catalog(catalog: Optional[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], list[str]]:
-    """Возвращает (types, warnings). Пустой каталог → norms.load_catalog() → встроенный fallback."""
+    """Возвращает (types, warnings).
+
+    * Каталог с непустым ``types`` используется как есть (без перезагрузки и без слияния с A13).
+    * ``None`` / ``{}`` / ``{"types": {}}`` (так A03 передаёт недоступный каталог) / мусор → ``norms.load_catalog()``.
+    * A13 недоступен или пуст → встроенный fallback: только названия, шаблоны и серьёзность, ``rules: []``
+      (нормы не выдумываются) + предупреждение ``norms catalog unavailable``.
+    """
     warnings: list[str] = []
     types = _types_of(catalog)
     if not types:
         try:
-            from norms import load_catalog  # type: ignore[import-not-found]  # lazy, модуль A13
-
-            types = _types_of(load_catalog())
-        except Exception:  # noqa: BLE001 — norms может ещё не существовать
+            types = _types_of(load_norms_catalog())
+        except Exception:  # noqa: BLE001 — norms может отсутствовать в окружении
             types = {}
         if not types:
             warnings.append("norms catalog unavailable: используются встроенные названия типов, "

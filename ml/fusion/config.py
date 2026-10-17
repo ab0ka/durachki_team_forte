@@ -145,7 +145,7 @@ DEFAULT_CONFIG["completeness"] = {
     "min_decoded": 0.98,
     "min_sampled": 0.9,
     "max_gap_s": 2.0,
-    "unknown_coverage": "failed",
+    "unknown_coverage": "no_verdict",
 }
 
 DEFAULT_THRESHOLDS: dict[str, Any] = {
