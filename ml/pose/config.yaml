@@ -80,6 +80,7 @@ signals:
   extras:                       # доп. выходы в extra; новые режимы выключены до замера L2
     bending_to_safe: false      # хрупкий жест (наклон к сейфу)
     item_placed_on_desk: false  # новый режим: кто и когда положил предмет на стол (V09/V07-кандидаты)
+    motion: false               # новый режим: sitting/standing/walking + направление движения кассира (V02)
   kp_min_score: 0.3             # точка используется в геометрии, если score >= порога
   default_aspect_wh: 0.5472     # W/H кадра, если неизвестен (портрет 464x848)
   scale:
@@ -181,6 +182,18 @@ signals:
     far: 1.0
     reid_gap_s: 2.0             # новый трек на месте старого того же класса — смена id, не событие
     hold_s: 2.0                 # сколько держать значение после «лёг»
+  motion:                       # extra["motion"]; скорость центра корпуса в масштабах тела s за секунду
+    window_s: 1.0               # окно оценки скорости
+    walk_speed_min: 0.6         # ниже — не идёт (переминается, ёрзает на стуле)
+    walk_speed_full: 1.2        # выше — уверенно идёт
+    thr_on: 0.6
+    thr_off: 0.4
+    min_duration_s: 0.8
+    max_gap_s: 0.4
+    sit_hi: 0.6                 # sitting ≥ sit_hi → «сидит»; ≤ sit_lo → «стоит»
+    sit_lo: 0.4
+    toward_cos: 0.7             # направление отрезка ходьбы к центру зоны (cos ≥) → toward / (≤ -) → away_from
+    zone_names: [door, desk, safe, cashier_area, client_area, cash_tray]
   posture:                      # extra; sitting/standing — эвристика, None при низкой уверенности
     sit_angle_lo_deg: 35        # угол бедро/корпус: ниже — стоит
     sit_angle_hi_deg: 70        # выше — сидит

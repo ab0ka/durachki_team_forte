@@ -53,6 +53,8 @@ class _Series:
     gestures: dict[str, list[Optional[float]]] = field(default_factory=dict)
     extras: dict[str, list[Optional[float]]] = field(default_factory=dict)
     runs: dict[str, list[tuple[float, float, float]]] = field(default_factory=dict)  # (t_start, t_end, t_peak)
+    aspect: float = 0.5472
+    motion: list[Optional[dict[str, Any]]] = field(default_factory=list)
 
 
 class _ObjectIndex:
@@ -161,7 +163,8 @@ def _build_series(poses: Sequence[PoseFrame], tracks: Sequence[Track], aspect: f
         for p in plist:
             bb = (getattr(p, "extra", None) or {}).get("bbox")
             bboxes.append(tuple(float(v) for v in bb) if bb else _box_at(track, float(p.t), tol))
-        s = _Series(tid=tid, role=(track.role if track is not None else "unknown"), times=times, kps=kps, bboxes=bboxes)
+        s = _Series(tid=tid, role=(track.role if track is not None else "unknown"), times=times, kps=kps, bboxes=bboxes,
+                    aspect=aspect)
         s.iso = to_iso(kps, aspect)
         min_score = float(sc.get("kp_min_score", 0.3))
         s.scale = track_scale(list(s.iso), [bbox_to_iso(b, aspect) if b else None for b in bboxes],
@@ -574,6 +577,102 @@ def _handover(series_list: list[_Series], zones_iso: dict[str, list], cfg: dict[
 # ---------------------------------------------------------------- public
 
 
+def _body_point(series: _Series, j: int) -> Optional[np.ndarray]:
+    """Центр корпуса (плечи/таз из позы); иначе центр bbox трека (изотропные координаты)."""
+    g = series.geoms[j]
+    sm, hm = g.shoulder_mid(), g.hip_mid()
+    if sm is not None and hm is not None:
+        return (sm + hm) / 2.0
+    if sm is not None:
+        return sm
+    b = series.bboxes[j] if j < len(series.bboxes) else None
+    if b:
+        bi = bbox_to_iso(b, series.aspect)
+        return np.array([(bi[0] + bi[2]) / 2.0, (bi[1] + bi[3]) / 2.0])
+    return None
+
+
+def _motion(series: _Series, zones_iso: dict[str, list], cfg: dict[str, Any]) -> None:
+    """sitting / standing / walking + направление движения (в масштабах тела, без пикселей и цвета).
+
+    walking — скорость центра корпуса в окне window_s ≥ порогов (гистерезис, ≥ min_duration_s);
+    иначе поза сидя/стоя (эвристика); нет данных — unknown. Направление и «к какой зоне / от какой»
+    считаются по смещению за весь отрезок ходьбы.
+    """
+    p = cfg["signals"]["motion"]
+    n = len(series.times)
+    pts = [_body_point(series, j) for j in range(n)]
+    half = float(p["window_s"]) / 2.0
+    speed: list[Optional[float]] = [None] * n
+    vel: list[Optional[np.ndarray]] = [None] * n
+    tt = np.asarray(series.times, dtype=np.float64)
+    lo = np.searchsorted(tt, tt - half - 1e-9, side="left")
+    hi = np.searchsorted(tt, tt + half + 1e-9, side="right") - 1
+    nxt, prv = [-1] * (n + 1), [-1] * n
+    for k in range(n - 1, -1, -1):
+        nxt[k] = k if pts[k] is not None else nxt[k + 1]
+    for k in range(n):
+        prv[k] = k if pts[k] is not None else (prv[k - 1] if k else -1)
+    for j in range(n):
+        a, b = nxt[int(lo[j])], prv[int(hi[j])]
+        if a < 0 or b < 0 or b <= a:
+            continue
+        dt = float(series.times[b] - series.times[a])
+        if dt < 0.6 * 2 * half:
+            continue
+        v = (pts[b] - pts[a]) / dt / series.scale
+        vel[j], speed[j] = v, float(np.linalg.norm(v))
+    ev = [None if sp is None else ramp(sp, float(p["walk_speed_full"]), float(p["walk_speed_min"])) for sp in speed]
+    _apply_gate(series, "_walking", ev, p)
+    walking = series.values.pop("_walking")
+    runs = series.runs.pop("_walking", [])
+    zone_names = list(p.get("zone_names", []))
+    run_info = []
+    for t_a, t_b, _ in runs:
+        ks = [k for k in range(n) if t_a - 1e-6 <= series.times[k] <= t_b + 1e-6 and pts[k] is not None]
+        info: dict[str, Any] = {"t_start": round(t_a, 3), "t_end": round(t_b, 3), "direction": None,
+                                "toward": None, "away_from": None}
+        if len(ks) >= 2:
+            d = pts[ks[-1]] - pts[ks[0]]
+            nd = float(np.linalg.norm(d))
+            if nd > 1e-9:
+                u = d / nd
+                info["direction"] = (round(float(u[0]), 3), round(float(u[1]), 3))
+                best_to, best_from = (None, float(p["toward_cos"])), (None, -float(p["toward_cos"]))
+                for zn in zone_names:
+                    for poly in zones_iso.get(zn, []):
+                        vz = polygon_centroid(poly) - pts[ks[0]]
+                        if float(np.linalg.norm(vz)) < 1e-6:
+                            continue
+                        cos = float(np.dot(u, vz / np.linalg.norm(vz)))
+                        if cos >= best_to[1]:
+                            best_to = (zn, cos)
+                        if cos <= best_from[1]:
+                            best_from = (zn, cos)
+                info["toward"], info["away_from"] = best_to[0], best_from[0]
+        run_info.append(info)
+    sit = series.extras.get("sitting", [None] * n)
+    out: list[Optional[dict[str, Any]]] = []
+    for j in range(n):
+        t = float(series.times[j])
+        w = walking[j]
+        run = next((r for r in run_info if r["t_start"] - 1e-6 <= t <= r["t_end"] + 1e-6), None)
+        if w is not None and w >= 0.5:
+            state = "walking"
+        elif sit[j] is not None and sit[j] >= float(p["sit_hi"]):
+            state = "sitting"
+        elif sit[j] is not None and sit[j] <= float(p["sit_lo"]):
+            state = "standing"
+        else:
+            state = "unknown"
+        if state == "unknown" and speed[j] is None and pts[j] is None:
+            out.append(None)
+            continue
+        out.append({"state": state, "speed": None if speed[j] is None else round(speed[j], 3),
+                    "run": run if state == "walking" else None})
+    series.motion = out
+
+
 def _item_placements(series_list: list[_Series], tracks: Sequence[Track], zones_iso: dict[str, list],
                      aspect: float, cfg: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
     """Предмет положен на стол: объект-трек «лёг» (неподвижен ≥ persist_s) в зоне desk, перед этим к нему
@@ -690,6 +789,8 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
         if "cashier_facing_away" in enabled:
             _facing_away(s, zones_iso, cfg)
         _bending_and_posture(s, zones_iso, cfg, bending=bool(extras_on.get("bending_to_safe", False)))
+        if extras_on.get("motion", False):
+            _motion(s, zones_iso, cfg)
     pairs = _handover(series_list, zones_iso, cfg) if "handover_motion" in enabled else {}
     roles = {s.tid: s.role for s in series_list}
     staff_enabled = [nm for nm in STAFF_SIGNALS if nm in enabled]
@@ -772,6 +873,12 @@ def compute_pose_signals(poses: Sequence[PoseFrame], tracks: Sequence[Track], zo
                 run = _run_at(pair_runs.get(pair, []), t)
                 if run:
                     extra["runs"]["handover_motion"] = run
+        if extras_on.get("motion", False):
+            main = staff_items[0] if staff_items else None
+            extra["motion"] = (main[0].motion[main[1]] if main is not None and main[0].motion else None)
+            for s, j in index.get(key, []):
+                if s.motion:
+                    extra["by_track"][s.tid]["motion"] = s.motion[j]
         if extras_on.get("item_placed_on_desk", False):
             if placements is None:
                 extra["item_placed_on_desk"] = None  # нет зоны desk или объект-треков — unknown
