@@ -44,6 +44,27 @@ def test_confirmed_type_mapping(dp):
     assert tr.confirmed_type("NONE") == "" and tr.confirmed_type("UNSURE") == "" and tr.confirmed_type(None) == ""
 
 
+def test_confirmed_type_follows_catalog(dp):
+    tr = dp("types_review")
+    assert tr.confirmed_type("V09") == "V09"  # V09 есть в каталоге A13
+    assert tr.confirmed_type("V10") == ""  # неизвестный id не становится разметкой
+    assert tr.confirmed_type("V09", valid={"V01", "V99"}) == ""  # список задаёт каталог, а не код
+
+
+def test_type_catalog_yaml_fallback_and_missing(dp, tmp_path):
+    tc = dp("type_catalog")
+    (tmp_path / "norms").mkdir()
+    (tmp_path / "norms/catalog.yaml").write_text(
+        "version: 1\ntypes:\n  V09:\n    name: \"Личные вещи\"\n  V01:\n    name: \"Посторонний\"\n"
+        "  V99:\n    name: \"Иное\"\n", encoding="utf-8")
+    types, src = tc.load_types(None, tmp_path)
+    assert list(types) == ["V01", "V09", "V99"] and src.endswith("catalog.yaml")
+    types, src = tc.load_types(None, tmp_path / "nowhere")
+    assert "V09" in types and "V99" in types and src == tc.FALLBACK_SOURCE
+    with pytest.raises(FileNotFoundError):
+        tc.load_types(tmp_path / "missing.yaml", tmp_path)
+
+
 def test_label_rows_vlm_never_becomes_ground_truth(dp):
     tr = dp("types_review")
     rows = tr.label_rows([_event("X-1", 22.0), _event("X-2", 10.0)], {}, {})

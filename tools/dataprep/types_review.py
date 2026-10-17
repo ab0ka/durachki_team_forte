@@ -27,7 +27,13 @@ from pathlib import Path
 _spec = importlib.util.spec_from_file_location("vlm_types", Path(__file__).with_name("vlm_types.py"))
 _vt = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_vt)
-CATALOG, fnum, norm_oop, norm_type = _vt.CATALOG, _vt.fnum, _vt.norm_oop, _vt.norm_type
+fnum, norm_oop, norm_type = _vt.fnum, _vt.norm_oop, _vt.norm_type
+_spec_c = importlib.util.spec_from_file_location("type_catalog", Path(__file__).with_name("type_catalog.py"))
+_tc = importlib.util.module_from_spec(_spec_c)
+_spec_c.loader.exec_module(_tc)
+# Типы для подтверждения и валидации — из norms/catalog.yaml (main() перечитывает по --catalog / --root).
+# VLM-гипотезы в промптах vlm_types.CATALOG (V01–V08) намеренно не меняются.
+TYPES: dict[str, str] = dict(_tc.FALLBACK)
 _spec_p = importlib.util.spec_from_file_location("vlm_probe", Path(__file__).with_name("vlm_probe.py"))
 _vp = importlib.util.module_from_spec(_spec_p)
 _spec_p.loader.exec_module(_vp)
@@ -38,7 +44,7 @@ def probe_types(ans: dict | None) -> list[str]:
     """Типы-кандидаты из нейтрального опросника: признаки с ответом yes, привязанные к V0x."""
     if not ans:
         return []
-    return sorted({ATTRS[k][1] for k, v in ans.items() if k in ATTRS and v[0] == "yes" and ATTRS[k][1] in CATALOG})
+    return sorted({ATTRS[k][1] for k, v in ans.items() if k in ATTRS and v[0] == "yes" and ATTRS[k][1] in TYPES})
 
 # type_id заполняется ТОЛЬКО подтверждённым человеком (eval.read_types_csv пропускает строки с пустым type_id);
 # предложение VLM — vlm_type_id, неподтверждённый выбор человека — draft_type_id.
@@ -71,6 +77,10 @@ RULES = {
     "V08": ("hands_hidden, cashier_facing_away, cash_visible, handover_motion",
             "hands_hidden или cashier_facing_away при cash_visible / handover_motion дольше 1.5 с",
             "onset: деньги уходят из обзора камеры"),
+    "V09": ("bag, cell_phone, keys, cup/bottle в зоне desk/cashier_area (детекции + трек)",
+            "личный предмет в зоне рабочего места кассира дольше 10 с при cash_visible; принадлежность по видео "
+            "не устанавливается → только наблюдение для человека",
+            "onset: появление предмета в зоне"),
 }
 
 
@@ -129,12 +139,14 @@ def read_confirmed(p: Path | None) -> dict[tuple, dict]:
     return out
 
 
-def confirmed_type(raw: str | None) -> str:
-    """Выбор человека → type_id для eval: V01..V08/V99 как есть, NEW → V99 (контракт), NONE/UNSURE/пусто → ''."""
+def confirmed_type(raw: str | None, valid: dict | set | None = None) -> str:
+    """Выбор человека → type_id для eval: id из каталога как есть, NEW → V99 (контракт), NONE/UNSURE/пусто/
+    неизвестный id → ''."""
+    ids = TYPES if valid is None else valid
     t = (raw or "").strip().upper()
     if t == "NEW":
-        return "V99"
-    return t if t in CATALOG or t == "V99" else ""
+        t = "V99"
+    return t if t in ids else ""
 
 
 def pair_decision(state: dict | None, vid: str) -> str:
@@ -144,7 +156,8 @@ def pair_decision(state: dict | None, vid: str) -> str:
     return ""
 
 
-def label_rows(events: list[dict], conf_rows: dict, conflict: dict[str, str], state: dict | None = None) -> list[dict]:
+def label_rows(events: list[dict], conf_rows: dict, conflict: dict[str, str], state: dict | None = None,
+               valid: dict | set | None = None) -> list[dict]:
     """Строки data/labels_types.csv. Предложения VLM НЕ становятся разметкой: type_id пуст, пока нет confirmed=1."""
     rows = []
     for e in events:
@@ -153,7 +166,7 @@ def label_rows(events: list[dict], conf_rows: dict, conflict: dict[str, str], st
                     conflict=conflict.get(vid, ""), draft_type_id="")
         c = conf_rows.get((vid, t))
         if c:
-            tid = confirmed_type(c.get("type_id"))
+            tid = confirmed_type(c.get("type_id"), valid)
             notes = s(c.get("notes"))
             if not tid:
                 notes = f"HUMAN:{(c.get('type_id') or 'EMPTY').strip().upper()} (тип не присвоен); {notes}".strip("; ")
@@ -243,15 +256,18 @@ function player(file, t) {
     el('div', {class: 'note', text: 'Если видео не играет — откройте data/raw/' + file + ' в плеере.'}));
 }
 const img = src => src ? el('a', {href: src, target: '_blank'}, el('img', {src, loading: 'lazy'})) : null;
+// типы — из norms/catalog.yaml (D.catalog_source); V99 = «иное», описание в поле new_type
 const TYPES = [['', '— выберите —'], ...Object.entries(D.catalog).map(([k, v]) => [k, k + ' — ' + v]),
-  ['NEW', 'NEW — новый тип (опишите)'], ['NONE', 'нарушения в этом месте не видно'], ['UNSURE', 'неясно']];
+  ...('V99' in D.catalog ? [] : [['NEW', 'NEW — новый тип (опишите)']]),
+  ['NONE', 'нарушения в этом месте не видно'], ['UNSURE', 'неясно']];
+const OTHER = 'V99' in D.catalog ? 'V99' : 'NEW';
 const CONF = [['0.9', 'уверен (0.9)'], ['0.6', 'скорее да (0.6)'], ['0.3', 'сомневаюсь (0.3)']];
 const OOP = [['onset', 'onset — в t действие начинается'], ['peak', 'peak — в t пик действия'],
   ['before', 't раньше действия'], ['after', 't позже действия'], ['unclear', 'неясно']];
 function vkey(e) { return e.video_id + '@' + e.t_sec; }
 function evState(e) {
   const k = vkey(e);
-  if (!S[k]) S[k] = {type_id: ['NEW', 'UNK'].includes(e.type_id) ? (e.type_id === 'NEW' ? 'NEW' : '') : e.type_id,
+  if (!S[k]) S[k] = {type_id: e.type_id in D.catalog ? e.type_id : (e.type_id === 'NEW' ? OTHER : ''),
     confidence: '0.6', onset_or_peak: ['other'].includes(e.onset_or_peak) ? 'unclear' : e.onset_or_peak,
     event_time_sec: Number.isNaN(e.event_time_sec) || e.event_time_sec === null ? '' : String(e.event_time_sec),
     new_type: e.new_type, what_is_visible: e.what_is_visible, actors: e.actors, objects: e.objects, notes: '', confirmed: false};
@@ -289,7 +305,7 @@ function evCard(e) {
       el('div', {class: 'imgs'}, ...e.passes.map(p => img(p.sheet)), img(e.overview)),
       el('div', {},
         field(st, 'type_id', 'Тип нарушения', 'select', TYPES),
-        field(st, 'new_type', 'Новый тип (только для NEW): название и суть', 'text'),
+        field(st, 'new_type', 'Описание (только для ' + OTHER + ' — иное/новый тип): название и суть', 'text'),
         field(st, 'confidence', 'Уверенность', 'select', CONF),
         field(st, 'onset_or_peak', 'Что происходит в размеченную секунду', 'select', OOP),
         field(st, 'event_time_sec', 'Секунда, где действие видно лучше всего', 'number'),
@@ -354,7 +370,8 @@ function render() {
     'браузере. В конце нажмите «labels_types.csv» и запустите: python -I -X utf8 tools/dataprep/types_review.py ' +
     '--root . --confirmed <путь к скачанному файлу>.'}));
   const leg = el('table', {}); for (const [k, v] of Object.entries(D.catalog)) leg.append(el('tr', {}, el('td', {text: k}), el('td', {text: v})));
-  m.append(el('details', {}, el('summary', {text: 'Список типов V01–V08'}), leg));
+  m.append(el('details', {}, el('summary', {text: 'Список типов: ' + Object.keys(D.catalog).join(', ') +
+    ' (источник: ' + (D.catalog_source || '—') + ')'}), leg));
   m.append(el('h3', {text: 'Нарушения (' + D.events.length + ')'}));
   D.events.forEach(e => m.append(evCard(e)));
   if (D.pairs.length) { m.append(el('h3', {text: 'Дубликаты с разными таймкодами'})); D.pairs.forEach(p => m.append(pairCard(p))); }
@@ -374,7 +391,7 @@ function exportTypes() {
     const rec = {video_id: e.video_id, t_sec: e.t_sec, type_id: st.confirmed ? st.type_id : '',
       draft_type_id: st.confirmed ? '' : st.type_id, vlm_type_id: e.type_id, confidence: st.confidence,
       what_is_visible: st.what_is_visible, actors: st.actors, objects: st.objects, onset_or_peak: st.onset_or_peak,
-      event_time_sec: st.event_time_sec, new_type: st.type_id === 'NEW' ? st.new_type : '', alt_type_id: e.alt_type_id,
+      event_time_sec: st.event_time_sec, new_type: ['NEW', 'V99'].includes(st.type_id) ? st.new_type : '', alt_type_id: e.alt_type_id,
       source: st.confirmed ? 'human' : 'vlm', confirmed: st.confirmed ? 1 : 0, conflict: D.conflict[e.video_id] || '',
       notes: st.notes};
     lines.push(csvRow(D.cols.map(c => rec[c])));
@@ -394,8 +411,8 @@ render();
 """
 
 
-def build_html(events, pairs, clean, man, conflict, doubt) -> str:
-    data = dict(catalog=CATALOG, cols=COLS, doubt=doubt, events=events, pairs=pairs, clean=clean, attrs=ATTRS,
+def build_html(events, pairs, clean, man, conflict, doubt, catalog_source="") -> str:
+    data = dict(catalog=TYPES, catalog_source=catalog_source, cols=COLS, doubt=doubt, events=events, pairs=pairs, clean=clean, attrs=ATTRS,
                 files={k: v["file"] for k, v in man.items()},
                 dur={k: round(float(v["duration_s"]), 1) for k, v in man.items()}, conflict=conflict)
     blob = json.dumps(data, ensure_ascii=False, default=lambda o: None, allow_nan=False).replace("</", "<\\/")
@@ -479,12 +496,12 @@ def findings(events, conf_rows, pairs, clean, man, clean_notes, state, doubt, pr
         fs = [f for f in final if f["type_id"] == t]
         cs = [f["confidence"] for f in fs if not math.isnan(f["confidence"])]
         oo = [norm_oop(f["onset_or_peak"]) for f in fs]
-        w(f"| {t} | {CATALOG.get(t, 'новый / неясно')} | {len(fs)} | {len(fs) / len(final):.0%} | "
+        w(f"| {t} | {TYPES.get(t, 'новый / неясно')} | {len(fs)} | {len(fs) / len(final):.0%} | "
           f"{statistics.mean(cs) if cs else float('nan'):.2f} | {oo.count('onset')} / {oo.count('peak')} |")
     w("")
     w("## 3. Признаки по типам (что видно в размеченную секунду)\n")
     for t in sorted(set(types)):
-        w(f"### {t} — {CATALOG.get(t, 'новый / неясно')}\n")
+        w(f"### {t} — {TYPES.get(t, 'новый / неясно')}\n")
         for f in [f for f in final if f["type_id"] == t]:
             extra = f" — новый тип: {f['new_type']}" if f.get("new_type") else ""
             w(f"- **{f['video_id']} @ {f['t_sec']:g} с** [{f['src']}, conf {f['confidence']:.2f}, "
@@ -551,9 +568,9 @@ def findings(events, conf_rows, pairs, clean, man, clean_notes, state, doubt, pr
           f"решение человека: {dec or 'нет'}. {s(r.get('event_t1'))} | {s(r.get('event_t2'))}")
     w("")
     w("## 7. Гипотезы V01–V08\n")
-    seen = sorted({t for t in types if t in CATALOG})
+    seen = sorted({t for t in types if t in TYPES})
     w(f"- Встретились: {', '.join(seen) or '—'}.")
-    w(f"- Не встретились: {', '.join(k for k in CATALOG if k not in seen) or '—'}.")
+    w(f"- Не встретились: {', '.join(k for k in TYPES if k not in seen) or '—'}.")
     news = "; ".join(f"{f['video_id']}: {f['new_type']}" for f in final if f["type_id"] == "NEW")
     w(f"- Новые типы: {news or '—'}.\n")
     w("## 8. Рекомендации для правил (сигналы контракта, стартовые пороги — подстроить на данных)\n")
@@ -578,8 +595,13 @@ def main():
     ap.add_argument("--clean-notes", type=Path, default=None)
     ap.add_argument("--state", type=Path, default=None, help="review_state.json из HTML (решения по дубликатам)")
     ap.add_argument("--doubt", type=float, default=0.6)
+    ap.add_argument("--catalog", type=Path, default=None,
+                    help="norms/catalog.yaml (по умолчанию <root>/norms/catalog.yaml, иначе встроенный снимок)")
     a = ap.parse_args()
     root = Path(a.root)
+    types, cat_src = _tc.load_types(a.catalog, root)
+    TYPES.clear()
+    TYPES.update(types)
     rdir = root / "cache/types_review"
     recs = load_jsonl(rdir / "vlm_raw.jsonl")
     man = {r["video_id"]: r for r in csv.DictReader(open(root / "data/manifest.csv", encoding="utf-8"))}
@@ -600,10 +622,10 @@ def main():
     conf_rows = read_confirmed(a.confirmed)
     state = json.loads(a.state.read_text(encoding="utf-8-sig")) if a.state and a.state.exists() else None
 
-    (rdir / "index.html").write_text(build_html(nan_to_none(events), pairs, clean, man, conflict, a.doubt),
+    (rdir / "index.html").write_text(build_html(nan_to_none(events), pairs, clean, man, conflict, a.doubt, cat_src),
                                      encoding="utf-8")
     out = root / "data/labels_types.csv"
-    rows_out = label_rows(events, conf_rows, conflict, state)
+    rows_out = label_rows(events, conf_rows, conflict, state, TYPES)
     with open(out, "w", newline="", encoding="utf-8") as f:
         wr = csv.DictWriter(f, fieldnames=COLS, lineterminator="\n", extrasaction="ignore")
         wr.writeheader()
@@ -614,6 +636,10 @@ def main():
         print(f"probe windows={len(probes)}; classification type ∈ probe candidates: {agree}/"
               f"{sum(1 for e in events if e['probe'])}; events with no probe candidate: "
               f"{sum(1 for e in events if e['probe'] and not e['probe_types'])}")
+    print(f"types: {', '.join(TYPES)} ← {cat_src}")
+    if _tc.missing_vs_snapshot(TYPES):
+        print(f"WARN: в каталоге нет {_tc.missing_vs_snapshot(TYPES)} из снимка integration-cloud@2055fc4 — "
+              "каталог устарел? (V09 добавлен в A13 phase2 01997cd)")
     print(f"html: {rdir / 'index.html'} | events={len(events)} pairs={len(pairs)} clean={len(clean)}")
     print(f"labels_types.csv: {len(rows_out)} rows | confirmed by human: {sum(r['confirmed'] == 1 for r in rows_out)} "
           f"| with type_id (eval GT): {sum(bool(r['type_id']) for r in rows_out)} "

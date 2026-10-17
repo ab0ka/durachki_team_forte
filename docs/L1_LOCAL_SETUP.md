@@ -40,8 +40,9 @@
 | `contact_sheets.py <video> <out.jpg> <t1,t2,…\|overview:N> [scale] [crop=…]` | контакт-лист для человека; держит в памяти только нужные кадры |
 | `vlm_types.py --root .` | предложения типов от VLM (GPU), см. §1.2 |
 | `vlm_probe.py --root .` | нейтральный опросник признаков (GPU, возобновляемый) |
-| `types_review.py --root . [--confirmed …]` | HTML для человека, `labels_types.csv`, черновик DATA_FINDINGS (CPU) |
-| `check_local.py --root . [--hash] [--eval-src …]` | проверка окружения, весов, данных, меток и совместимости с `eval` (CPU) |
+| `types_review.py --root . [--catalog …] [--confirmed …]` | HTML для человека, `labels_types.csv`, черновик DATA_FINDINGS (CPU) |
+| `check_local.py --root . [--hash] [--load] [--eval-src …] [--catalog …]` | окружение, наличие/хэши весов, (опц.) загрузка+forward на CPU, данные, метки, совместимость с `eval` |
+| `type_catalog.py` | список типов из `norms/catalog.yaml` (`--catalog` → `<root>/norms/catalog.yaml` → снимок integration-cloud@2055fc4 = V01–V09, V99) |
 | `siglip2_*_baseline.py`, `vlm_smoke.py` | baseline и smoke-тест VLM (GPU) |
 
 Тесты (только синтетика, CPU): `.venv/Scripts/python.exe -m pytest tools/dataprep/tests -q`.
@@ -63,6 +64,9 @@ onset_or_peak,event_time_sec,new_type,draft_type_id,vlm_type_id,alt_type_id,sour
 - `type_id` заполнен **только** при `confirmed=1, source=human`. `eval.read_types_csv` пропускает строки с пустым
   `type_id`, поэтому предложения VLM в эталон не попадают.
 - `vlm_type_id` — предложение VLM; `draft_type_id` — неподтверждённый выбор человека (в выгрузке из HTML).
+- Допустимые `type_id` — из каталога A13 (`norms/catalog.yaml`): сейчас V01–V09 и V99. Страница подтверждения и
+  валидатор берут список оттуда и печатают источник. Каталог без V09 (старый `751dc55`) даёт WARN. Промпты VLM
+  (`vlm_types.CATALOG`, гипотезы V01–V08) не менялись: уже полученные предложения остаются сопоставимыми.
 - NEW → `V99` (по контракту) + описание в `new_type`. «Нарушения не видно» и «неясно» → `type_id` пуст, `notes=HUMAN:NONE/UNSURE`.
 - md5-конфликт: `conflict=<id дубликата>`, `notes=UNRESOLVED…`, пока человек не примет решение в карточке пары
   (тогда `PAIR_DECISION:<решение>`). `labels.csv` скрипты не меняют.
@@ -77,7 +81,8 @@ onset_or_peak,event_time_sec,new_type,draft_type_id,vlm_type_id,alt_type_id,sour
 - `uv` 0.13.1 установлен через `pip --user` в Python 3.11: `%APPDATA%\Python\Python311\Scripts\uv.exe` (**не в PATH**).
 - `.venv`: Python 3.11.6 (системный 3.14 не используется). Ключевые версии: torch 2.11.0+cu128,
   torchvision 0.26.0+cu128, transformers 5.20.1, accelerate 1.15.0, bitsandbytes 0.50.2, huggingface-hub 2.2.0,
-  onnxruntime-gpu **1.23.2**, opencv-python-headless 4.14 (`<5`), numpy 2.4.6, pillow 13.0.0, scikit-learn 1.9.1.
+  onnxruntime-gpu **1.23.2** (проверенный пин, см. §3), opencv-python-headless 4.14 (`<5`), numpy 2.4.6,
+  pillow 13.0.0, scikit-learn 1.9.1. llama-cpp-python в `.venv` **нет**.
 - Полный lock (92 пина): `tools/dataprep/requirements-l1.lock.txt`; `check_local.py` сверяет установленное с lock.
 
 ## 3. Веса: HF hub-кэш `weights/hf/hub` (раскладка `deploy/weights.py`)
@@ -101,10 +106,32 @@ onset_or_peak,event_time_sec,new_type,draft_type_id,vlm_type_id,alt_type_id,sour
 | Qwen/Qwen2.5-7B-Instruct-GGUF Q4_K_M (2 шарда, 4.36 ГиБ, commit bb5d59e0) | `weights/copilot/qwen2.5-7b-instruct-q4_k_m-0000{1,2}-of-00002.gguf` | Apache-2.0 | copilot ждёт один файл, поэтому `COPILOT_MODEL_PATH=` на шард `-00001-of-00002` (llama.cpp подхватит второй) |
 | RTMPose-m body7 256×192 ONNX (openmmlab) | `weights/pose/20230831/rtmpose_onnx/rtmpose-m_simcc-body7_…/end2end.onnx` | Apache-2.0 | OK: `CUDAExecutionProvider`, 11.7 мс на батч из 8 кропов; `ml.pose` находит при cwd = корень репо |
 
-**onnxruntime-gpu закреплён на 1.23.2**: версии ≥ 1.24 на PyPI собраны под CUDA 13 и не грузят CUDA-провайдер
-рядом с torch cu128. rtmlib не ставился: у `ml/pose` свой ONNX-бэкенд, модель та же.
+**onnxruntime-gpu закреплён на 1.23.2** — эта версия проверена: CUDA-провайдер работает рядом с torch cu128.
+Проверена ещё только 1.31.0 (последняя на PyPI на 2026-10-17): она собрана под CUDA 13 и CUDA-провайдер не загрузила
+(нет `cublas64_13.dll`/`cudart64_13.dll`). Версии 1.24–1.30 **не проверялись**. rtmlib не ставился: у `ml/pose` свой
+ONNX-бэкенд, модель та же.
 Не скачано сознательно: Qwen2.5-VL-7B-AWQ (6.9 ГБ весов, на 8 ГБ с рабочим столом не помещается).
 `weights/Qwen__Qwen3-VL-4B-Instruct-GGUF/` — **недокачанный** GGUF, не использовать.
+
+### 3.1 Что проверено: наличие/хэши ≠ загрузка ≠ инференс
+
+`check_local.py` по умолчанию проверяет только **наличие** файлов и **офлайн-резолв** `config.json` из HF-кэша;
+с `--hash` добавляется **sha256** против `weights/L1_weights_manifest.json`. Веса при этом **не загружаются**.
+Реальную загрузку и forward проверяет `--load` (только CPU, синтетический вход) или GPU-скрипты.
+
+| модель | наличие + sha256 | загрузка | инференс (forward) |
+|---|---|---|---|
+| siglip2-base | ✓ (`check_local --hash`) | ✓ CPU (`--load`), ✓ GPU fp16 | ✓ CPU синтетика; ✓ GPU на 2911 реальных кадрах (baseline) |
+| owlv2-base | ✓ | ✓ CPU (`--load`) | ✓ CPU синтетика; GPU не проверялся |
+| rtdetr_v2_r18vd | ✓ | ✓ CPU (`--load`) | ✓ CPU синтетика (выход 1×300×80); GPU не проверялся |
+| dfine-medium | ✓ | ✓ CPU (`--load`) | ✓ CPU синтетика (1×300×80); GPU не проверялся |
+| multilingual-e5-small | ✓ | ✓ CPU (`--load`) | ✓ CPU синтетика (1×6×384); GPU не проверялся |
+| Qwen3-VL-4B-Instruct | ✓ | ✓ GPU nf4 (2.71 ГиБ); CPU не проверялась (~10 ГБ RAM) | ✓ GPU: smoke на синтетике + 31 + 11 запросов на реальных окнах |
+| RTMPose-m ONNX | ✓ | ✓ ORT CUDA EP и CPU EP | ✓ CUDA EP 11.7 мс/батч 8 (синтетика); ✓ CPU EP (`--load`) |
+| Qwen2.5-7B GGUF (2 шарда) | ✓ | **не проверялась** (нет llama.cpp / llama-cpp-python в `.venv`) | **не проверялся** |
+
+Все GPU-проверки сделаны 2026-10-17 до того, как GPU отдали L2. CPU-проверки (`--load`) повторяемы в любой момент:
+около 25 с, четверть потоков CPU.
 
 ## 4. Baseline (binary по open_labels): SigLIP2 linear probe — **не годится**
 
@@ -153,12 +180,16 @@ fallback: вызов «висит» минутами при 100% загрузк�
 ## 7. Для L2: проверки и импорт подтверждённой разметки
 
 ```powershell
-# окружение, веса (офлайн-резолв), данные, метки; CUDA не трогается
+# окружение, НАЛИЧИЕ весов (офлайн-резолв, без загрузки), данные, метки; CUDA не трогается
 .venv\Scripts\python.exe -I -X utf8 tools\dataprep\check_local.py --root . --no-cuda
 # + sha256 видео (vs data/manifest.csv) и весов (vs weights/L1_weights_manifest.json), ~15 с
 .venv\Scripts\python.exe -I -X utf8 tools\dataprep\check_local.py --root . --hash --no-cuda
-# + совместимость с eval.labels из ветки интеграции (корень worktree с пакетом eval/)
+# + РЕАЛЬНАЯ загрузка и forward на CPU (HF-модели + RTMPose; без Qwen3-VL и GGUF), ~25 с
+.venv\Scripts\python.exe -I -X utf8 tools\dataprep\check_local.py --root . --load --no-cuda
+# совместимость с eval.labels: --eval-src = КОРЕНЬ ИНТЕГРАЦИИ (worktree с пакетами eval/ и norms/)
 .venv\Scripts\python.exe -I -X utf8 tools\dataprep\check_local.py --root . --only labels --eval-src C:\Users\LEGION\Desktop\durachki_L2
+# каталог типов интеграции (WARN, если в нём нет V09 и т.п.)
+.venv\Scripts\python.exe -I -X utf8 tools\dataprep\check_local.py --root . --only labels --catalog C:\Users\LEGION\Desktop\durachki_L2\norms\catalog.yaml
 # тесты инструментов (синтетика)
 .venv\Scripts\python.exe -m pytest tools\dataprep\tests -q
 
@@ -169,15 +200,29 @@ fallback: вызов «висит» минутами при 100% загрузк�
 .venv\Scripts\python.exe -I -X utf8 tools\dataprep\check_local.py --root . --only labels
 ```
 
-Импорт берёт только строки `confirmed=1`; повторный запуск идемпотентен. Данные и веса лежат только в основной папке
-(`C:\Users\LEGION\Desktop\durachki_team_forte\data`, `…\weights`). Из другого worktree на них указывают через
-`SENTINEL_WEIGHTS` / `HF_HUB_CACHE` / `--root` или junction.
+Импорт берёт только строки `confirmed=1`; повторный запуск идемпотентен. Для страницы подтверждения нужен каталог
+с V09: из корня, где `norms/catalog.yaml` актуален, или `--catalog <путь>`. Если `norms/` в корне нет, берётся
+встроенный снимок integration-cloud@2055fc4.
+
+Данные и веса физически лежат в основной папке (`C:\Users\LEGION\Desktop\durachki_team_forte\{data,weights,cache,.venv}`).
+В worktree L2 (`C:\Users\LEGION\Desktop\durachki_L2`) `data`, `weights`, `cache` и `.venv` — **junction на основную папку**,
+копировать ничего не нужно; команды выше работают и с `--root C:\Users\LEGION\Desktop\durachki_L2`.
 
 ## 8. Совместимость с `claude/integration-cloud` @ 2055fc4 (проверено на CPU)
 
 - `eval.labels` читает `data/labels.csv` и `data/labels_types.csv`: 42 строки, 40 групп, conflict-группа одна
   (дубликат с двумя таймкодами), типов в эталоне 0 (подтверждений пока нет).
-- `tools/dataprep/tests` проходят и под корневым `conftest`/`pyproject` интеграции (30/30).
+- **Для A16 (`eval.labels.read_types_csv`).** Колонка `confirmed` сейчас игнорируется: синтетическая проба
+  `check_local --eval-src` (строки `confirmed=1 V01` и `confirmed=0 V02`) читает обе. Наши файлы безопасны, потому что
+  у неподтверждённых `type_id` пуст. Но чужой или ручной CSV с `confirmed=0` и заполненным `type_id` попадёт в эталон.
+  Нужно:
+  1. если колонка `confirmed` есть — брать только `1`/`true`;
+  2. для старого формата без `confirmed` — **явная политика** параметром (например, `legacy_types="reject"|"accept"`),
+     по умолчанию лучше `reject` с предупреждением в отчёте;
+  3. `type_id` проверять по `norms/catalog.yaml`.
+- Каталог: в `integration-cloud` — A13 phase2 `01997cd` (V01–V09, V99). В локальной ветке L2 `integration` (5597969)
+  остался `751dc55` без V09, ветки разошлись.
+- `tools/dataprep/tests` проходят и под корневым `conftest`/`pyproject` интеграции.
 - `deploy` (тесты без gpu/slow) на Windows: 56 passed, 5 failed, 1 skipped. Падения **одинаковые со старым и новым**
   lock L1:
   - 3 — cp1251 в subprocess и ассертах (`test_offline` ×2, `test_supervisor::test_foreign_process_on_port_is_not_touched`);
