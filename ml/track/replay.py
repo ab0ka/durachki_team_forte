@@ -2,9 +2,9 @@
 
 Синтетика (облако, без данных):
     python -m ml.track.replay --variant smooth [--out ml/track/_out/replay] [--seeds 3]
-Реальные кэши детекций (только L2, локально):
-    python -m ml.track.replay --real --dets-glob "cache/*/detections.json" --labels labels.csv \
-        --variant smooth --out ml/track/_out/replay_real
+Реальные кэши детекций (только L2, локально; кэш стадий A03 = cache/<sha256>/dets.jsonl + manifest.json):
+    python -m ml.track.replay --real --dets-glob "cache/*/dets.jsonl" --videos-dir <папка с роликами> \
+        --labels labels.csv --variant smooth --out ml/track/_out/replay_real
 
 Метрики:
   ID: fragmentation (лишние ID на GT-человека), switches (трек собран из 2+ людей), spurious (трек из шума);
@@ -39,6 +39,8 @@ VARIANTS: dict[str, dict] = {
     "vis_bridge": {"visibility": {"bridge_tracks": True}},              # H-VIS — следующий кандидат
     "appearance": {"appearance": {"enabled": True}},                    # H-APP
     "naive_entries": {"queries": {"entry_requires_boundary": False}},   # эталон «до исправления» входов
+    "no_lost_penalty": {"tracker": {"lost_cost_penalty": 0.0}},         # прежнее сопоставление (подмена ID при проходе)
+    "speed_gate": {"tracker": {"speed_gate": True}},                    # H-SPEED: запрет «прыжка» трека на соседа
 }
 ALARM_KINDS = ("cashier_left_workplace", "cashier_left_room", "outsider_at_cashier_side")
 REVIEW_KINDS = ("unknown_at_cashier_side",)   # честное «неизвестно»: на проверку, не тревога
@@ -54,6 +56,7 @@ SCENARIOS: dict[str, tuple[Callable[[], S.Scene], dict[str, list[float]]]] = {
     "two_staff": (S.scene_two_staff, {"unknown_at_cashier_side": [0.0]}),  # второй у кассы: unknown, не «посторонний»
     "fidget": (S.scene_fidget, {}),
     "cashier_enters": (S.scene_cashier_enters_client_seated, {"person_entered": [1.0]}),
+    "crossing_front": (S.scene_crossing_front, {"person_entered": [8.0]}),
 }
 PERTURBATIONS: dict[str, dict] = {
     "none": {},
@@ -194,42 +197,82 @@ def norm_name(name: str) -> str:
 
 
 def load_labels(path: Optional[str]) -> dict[str, dict]:
+    """Ключи — нормализованные имя файла и video_id, а также sha256 (если есть такая колонка).
+
+    Понимает схему eval.labels (tools/dataprep/build_labels.py -> data/labels.csv):
+    video_id, file, label, t_sec, md5, group, t_all, conflict, raw. t_all — все таймкоды группы
+    дубликатов; conflict=1 — разные таймкоды или метки у дубликатов (решает человек).
+    """
     if not path:
         return {}
-    out = {}
+    out: dict[str, dict] = {}
+    num = re.compile(r"\d+(?:[.,]\d+)?")
     with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             low = {k.strip().lower(): (v or "").strip() for k, v in row.items() if k}
-            name = low.get("video") or low.get("file") or low.get("filename") or low.get("name") or ""
+            name = low.get("video") or low.get("file") or low.get("filename") or low.get("name") or low.get("video_id") or ""
             lab = (low.get("label") or low.get("violation") or low.get("verdict") or "").lower()
             viol = lab in ("1", "true", "yes", "violation", "нарушение", "да")
-            sec = re.findall(r"\d+(?:[.,]\d+)?", low.get("second") or low.get("t") or low.get("timecode") or "")
-            out.setdefault(norm_name(name), {"violation": viol, "seconds": []})
-            if sec:
-                out[norm_name(name)]["seconds"].append(float(sec[0].replace(",", ".")))
+            raw_t = low.get("second") or low.get("t_sec") or low.get("t") or low.get("timecode") or ""
+            secs = [float(x.replace(",", ".")) for x in num.findall(raw_t)[:1]]
+            secs += [float(x.replace(",", ".")) for x in num.findall(low.get("t_all") or "")]
+            entry = out.setdefault(norm_name(name), {"violation": viol, "seconds": [], "conflict": False})
+            for s in secs:
+                if s not in entry["seconds"]:
+                    entry["seconds"].append(s)
+            entry["conflict"] = entry["conflict"] or low.get("conflict", "") in ("1", "true", "yes")
+            if low.get("video_id"):
+                out.setdefault(norm_name(low["video_id"]), entry)
+            if low.get("sha256"):
+                out[low["sha256"].lower()] = entry
+    return out
+
+
+VIDEO_EXT = (".mov", ".mp4", ".avi", ".mkv", ".m4v")
+
+
+def sha_names(videos_dir: Optional[str]) -> dict[str, str]:
+    """sha256 файла -> имя ролика: каталоги кэша A03 называются по sha256, а метки — по имени файла.
+    Считается ЛОКАЛЬНО у L2 по своим роликам; видео никуда не передаются."""
+    if not videos_dir:
+        return {}
+    import hashlib
+
+    out = {}
+    for p in sorted(Path(videos_dir).rglob("*")):
+        if p.is_file() and p.suffix.lower() in VIDEO_EXT:
+            h = hashlib.sha256()
+            with p.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            out[h.hexdigest()] = p.name
     return out
 
 
 class _CacheClip:
-    """Мета ролика из кэша (без кадров): width/height/times/duration из meta.json|clip.json, иначе из детекций."""
+    """Мета ролика из кэша (без кадров): width/height/duration из meta.json | manifest.json["video"] (A03);
+    times — из meta, иначе обработанные кадры = моменты детекций (статичные предметы видны почти всегда)."""
 
     def __init__(self, d: Path, dets: Sequence[Any], aspect: float) -> None:
-        meta = {}
-        for n in ("meta.json", "clip.json", "video.json"):
-            if (d / n).is_file():
-                meta = json.loads((d / n).read_text(encoding="utf-8"))
-                break
+        from .serialize import load_clip_meta
+
+        meta = load_clip_meta(str(d))
         self.width = meta.get("width") or int(round(aspect * 1000))
         self.height = meta.get("height") or 1000
         self.times = meta.get("times") or sorted({round(float(x.t), 4) for x in dets})
         self.duration = meta.get("duration") or (self.times[-1] if self.times else 0.0)
 
 
-def run_real(variants: Sequence[str], dets_glob: str, labels: dict, tol: float, aspect: float) -> dict:
+def run_real(variants: Sequence[str], dets_glob: str, labels: dict, tol: float, aspect: float,
+             names: Optional[dict[str, str]] = None) -> dict:
     from .serialize import load_detections
 
     rows = []
+    names = names or {}
     paths = sorted(glob.glob(dets_glob))
+    if not paths:  # раньше: молча 0 роликов
+        raise SystemExit(f"replay --real: по шаблону {dets_glob!r} не найдено ни одного файла детекций "
+                         "(кэш A03: cache/<sha256>/dets.jsonl; корень — $SENTINEL_CACHE_DIR или <repo>/cache)")
     for variant in variants:
         cfg = _cfg(variant)
         for p in paths:
@@ -241,10 +284,12 @@ def run_real(variants: Sequence[str], dets_glob: str, labels: dict, tol: float, 
             q = TrackQueries(res.tracks, res.zones, res.info, cfg)
             pred = _onsets(q)
             ms = (time.perf_counter() - t0) * 1000
-            lab = labels.get(norm_name(d.name)) or labels.get(norm_name(Path(p).stem)) or {}
+            vid = names.get(d.name, d.name)
+            lab = (labels.get(norm_name(vid)) or labels.get(d.name.lower()) or labels.get(norm_name(Path(p).stem)) or {})
             alarm = sorted(t for k in ALARM_KINDS for t in pred.get(k, []))
             near = [min(abs(a - s) for a in alarm) for s in lab.get("seconds", []) if alarm]
-            rows.append({"variant": variant, "video": d.name, "violation": lab.get("violation"),
+            rows.append({"variant": variant, "video": vid, "cache_dir": d.name, "violation": lab.get("violation"),
+                         "label_conflict": bool(lab.get("conflict")),
                          "label_seconds": lab.get("seconds", []), "latency_ms": round(ms, 1),
                          "person_tracks": sum(1 for t in res.tracks if t.label == "person"),
                          "n_events": {k: len(pred.get(k, [])) for k in KINDS},
@@ -265,6 +310,9 @@ def run_real(variants: Sequence[str], dets_glob: str, labels: dict, tol: float, 
             "mean_person_tracks": round(float(np.mean([r["person_tracks"] for r in rs])), 2) if rs else None,
             "latency_ms_p50": round(float(np.median([r["latency_ms"] for r in rs])), 1) if rs else None,
             "vram": "0 (stage is CPU-only)"}
+    for variant in variants:
+        summ[variant]["unlabeled_videos"] = sum(1 for r in rows if r["variant"] == variant and r["violation"] is None)
+        summ[variant]["label_conflicts"] = sum(1 for r in rows if r["variant"] == variant and r["label_conflict"])
     return {"mode": "real", "tol_s": tol, "rows": rows, "summary": summ,
             "note": "Все 42 строки уже использованы в разведке — это не независимый тест."}
 
@@ -304,12 +352,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--tol", type=float, default=2.0, help="допуск таймкода, с")
     ap.add_argument("--out", default="ml/track/_out/replay")
     ap.add_argument("--real", action="store_true", help="реальные кэши детекций (только L2)")
-    ap.add_argument("--dets-glob", default="cache/*/detections.json")
-    ap.add_argument("--labels", default=None, help="CSV: video|file, label|violation, second|t")
+    ap.add_argument("--dets-glob", default="cache/*/dets.jsonl", help="кэш A03: cache/<sha256>/dets.jsonl")
+    ap.add_argument("--labels", default=None, help="CSV: video|file, label|violation, second|t[, sha256]")
+    ap.add_argument("--videos-dir", default=None, help="локальная папка роликов: sha256 -> имя для меток (только L2)")
     ap.add_argument("--aspect", type=float, default=464 / 848, help="width/height, если в кэше нет meta.json")
     args = ap.parse_args(argv)
     variants = [args.baseline, args.variant] if args.variant != args.baseline else [args.baseline]
-    rep = (run_real(variants, args.dets_glob, load_labels(args.labels), args.tol, args.aspect) if args.real
+    rep = (run_real(variants, args.dets_glob, load_labels(args.labels), args.tol, args.aspect,
+                    sha_names(args.videos_dir)) if args.real
            else run_synthetic(variants, args.seeds, args.tol))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

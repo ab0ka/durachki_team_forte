@@ -280,3 +280,11 @@ def scene_v02_bounce(duration: float = 60.0) -> Scene:
                            (27, *DOOR_PT)], [(0.0, 27.0)], color=(200, 80, 40))
     objs = base_objects(duration) + [Obj("cash", (0.44, 0.56, 0.52, 0.60), [(0.0, duration)], 0.7)]
     return Scene(duration, [c], objs)
+
+
+def scene_crossing_front(duration: float = 30.0) -> Scene:
+    """Посетитель проходит прямо перед сидящим кассиром; кассир перекрыт и не детектируется 1.4 с."""
+    c = cashier(duration)
+    c.miss = [(11.4, 12.8)]
+    v = walker("visitor", [(8, 0.15, 0.70), (16, 0.85, 0.72)], (40, 40, 220))
+    return Scene(duration, [c, v], base_objects(duration))

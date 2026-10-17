@@ -4,6 +4,78 @@
 Моделей и весов нет: своя реализация ByteTrack на numpy и геометрические эвристики.
 `models.json` поэтому пустой (`[]`).
 
+## Граница с A03 / A08 / A09 (зафиксировано после аудита `2055fc4`)
+
+**Единицы и координаты**
+- `t` — секунды от начала ролика по PTS (`Detection.t`, `clip.times`). В окне refine (`WindowClip` A03) время тоже **абсолютное**, а не от начала окна.
+- `bbox` и полигоны зон нормированы 0..1 к кадру после поворота.
+- `Track.boxes` = `[(t, bbox), ...]` по возрастанию `t`. Это только **реальные наблюдения** в моменты детекций: интерполяции нет (`fill_gaps_s: 0`), за последним боксом трек не продлевается.
+- Нормировки (доли присутствия, «статичный предмет», `conf` зон) считаются по сэмплированному отрезку `clip.times`, а не по `clip.duration`. В окне refine `duration` — это весь ролик (исправлено, см. ниже).
+
+**observed / unknown**
+- Есть бокс в момент `t` → человек **наблюдается**. Нет бокса → **не наблюдается**, а не «отсутствует».
+- Каждый пропуск классифицируют `gaps()` и `presence_state()`:
+  - `lost_in_view` — окклюзия или пропуск модели, **не уход**;
+  - `left_view_edge` — вышел из поля зрения, но не обязательно из помещения;
+  - `left_via_door` — последний раз виден в зоне двери.
+- Конец трека или новый ID после потери в глубине кадра **не означают** ни ухода, ни входа, ни нарушения. Новый фрагмент получает роль по собственному поведению.
+- `TrackQueries`:
+  - `Answer.value = None` — «неизвестно»; `source` объясняет причину;
+  - роль с `conf < 0,5` и зона с `conf < 0,35` считаются неопределёнными;
+  - во время `coverage.visibility_loss` все ответы — `None`.
+- Роли — `cashier`, `visitor`, `collector`, `unknown` плюс `role_conf`. `unknown` ≠ «посторонний»; non-cashier ≠ «неуполномоченный».
+
+**Поля, которые отдаёт ml.track**
+
+| Объект | Поля | Замечания |
+|---|---|---|
+| `Track` | `track_id`, `label`, `role`, `role_conf`, `boxes` | `track_id` уникален в пределах вызова: сначала люди (1..N по времени появления), потом предметы. Группы меток: `safe_open` → `safe`, `door_open` → `door`, `bag` → `cash_bag`, если ≥30% голосов за `cash_bag`. У предметов `role="unknown"`, `role_conf=0`. |
+| `Zone` | `name`, `polygon`, `conf` | `name` ∈ `cashier_area`, `desk`, `safe`, `door`, `client_area`, `cash_tray`. Нет зоны — не оценена: «весь кадр» не создаётся. Fallback-зоны имеют `conf ≤ 0,3`. |
+| `Detection.track_id` | проставляется **на месте** внутри `track()` | Через границу процесса ProcessExecutor (spawn) A03 **не переходит**, см. «Для L2». |
+| `track_full().info` | `roles[tid]` = {`role`, `conf`, `reasons`, `features`, …}; `zones[name]` = {`method`, `independent`, …}; `coverage` = {`frames_total`, `frames_processed`, `frames_with_detections`, `t_first_detection`, `t_last_detection`, `t_window`, `declared_duration`, `span_frac`, `visibility_loss`, `visibility_check`}; `stitch`; `cashier_selection`; `warnings`; `timings` | Provenance вне контракта: в `Track` и `Zone` нет поля `extra` (предложение A01). |
+| `person_signals(extended=True)` | + `x_cashier_lost_in_view` | Префикс `x_` принят `contracts/COMPAT.md`. |
+| `model_info()` | `config_sha`, `config_path`, `config_from_env` | Для ключа кэша A03 (`backend/pipeline/stages.py: module_identity`). |
+
+Пример выходного объекта (**только синтетика**, `scene_v02`): `ml/track/examples/synthetic_output.json`.
+
+**Для L2: несовместимости на границе** (чужой код не менял)
+1. **A08 не учитывает `Zone.conf`.**
+   - Где: `ml/scene/core.py:153-161`. Рабочее место — первая `cashier_area` без проверки `conf`.
+   - Вход: `track()` на сцене без предметов стола → `cashier_area` с `conf ≤ 0,3`.
+   - Ожидается: при `conf < 0,35` A08 считает рабочее место неизвестным (сигналы `unknown`) или взвешивает по `conf`.
+2. **`Detection.track_id` не доходит до A08 при ProcessExecutor.**
+   - Где: `backend/pipeline/worker.py`, spawn. `track()` меняет копию детекций в воркере, а scene получает исходный список A03.
+   - Следствие: `ml/scene/timeline.py:133-137` — `det_score` пуст, score по умолчанию 0,8.
+   - Ожидается: A08 сопоставляет детекции с треком по паре (`t`, `bbox`) — `Track.boxes` содержит те же боксы детекций (5 знаков) в те же `t`. Либо A03 передаёт `track_id` сам.
+3. **A09 в запасном пути считает разрыв трека отсутствием.**
+   - Где: `ml/rules/signals.py: derive_from_tracks` (строки ~300–345). Путь работает, только если сигнала нет в состояниях A08 (`ml/rules/engine.py:812-824`).
+   - Что происходит: между боксами трека кассира и между его фрагментами `cashier_present = 0`.
+   - Вход: трек кассира с пропуском в глубине кадра (`gaps()` → `lost_in_view`).
+   - Ожидается: `NaN` или unknown на этом отрезке, а не 0. Классификация пропусков — `ml.track.events.gaps` / `presence_state`.
+4. **A09 ждёт треки с метками `safe_open` и `door_open`, а `ml.track` объединяет состояния одного предмета в трек `safe` / `door`.**
+   - Где: `ml/rules/signals.py: derive_from_tracks`, `label_to_signal`.
+   - Следствие: в запасном пути `safe_open` и `door_open` из треков не появляются никогда. Состояние открыт/закрыт есть только в `Detection.label`, и A08 берёт его оттуда.
+   - Ожидается: запасной путь A09 не выводит открытость из треков, а оставляет сигнал отсутствующим (unknown).
+5. **`coverage` трекера не попадает в `meta.coverage`.**
+   - Где: `backend/pipeline/orchestrator.py:314` вызывает `track()`, а не `track_full()`.
+   - Ожидается: при необходимости A03 вызывает `ml.track.track_full` и передаёт `info["coverage"]["visibility_loss"]` как `unknown_spans` в `contracts/extensions.py: compute_coverage`.
+
+**Исправлено после аудита** (каждое — с воспроизведением на синтетике до правки)
+| Ошибка | Было | Стало | Тест |
+|---|---|---|---|
+| Окно refine: нормировка на `clip.duration` (весь ролик) | `conf` зон занижен (`safe` 0,50 вместо 1,0; `door` 0,43 вместо 0,8), стационарный телефон выпадал из опор стола, `span_frac` 0,17 | нормировка по `clip.times`; `coverage.t_window` и `declared_duration` | `test_refine_window_normalizes_by_sampled_span_not_full_duration` |
+| Подмена ID при проходе посетителя перед сидящим кассиром | потерянный трек кассира забирал детекцию посетителя | `tracker.lost_cost_penalty: 0.1` — штраф потерянным трекам только при выборе пар (0 — как было) | `test_crossing_in_front_of_cashier_keeps_cashier_and_no_leave[0-4]` |
+| Конфиг не перечитывался в долгоживущем воркере; внешний `$SENTINEL_TRACK_CONFIG` не менял ключ кэша A03 | правка YAML не действовала, кэш стадии мог вернуть результат со старым конфигом | YAML кэшируется по (путь, `mtime`, размер); `ml.track.model_info()` отдаёт `config_sha` | `test_config_reload_and_model_info_follow_external_yaml` |
+| `replay --real`, `report` и `viz` не читали кэш стадий A03: `cache/<sha256>/dets.jsonl`, `tracks.json` + `zones.json`, `manifest.json` | команда замера L2 находила 0 роликов **молча**; метки не сопоставлялись, потому что папки названы по sha256 | читаются `dets.jsonl`, `tracks.json` + `zones.json`, `manifest.json["video"]`; `--videos-dir` сопоставляет sha256 с именем (считается локально); 0 файлов → явная ошибка | `test_replay_real_reads_a03_stage_cache_and_maps_sha_to_names`, `test_replay_real_without_files_fails_loudly`, `test_report_and_loaders_read_a03_tracks_zones` |
+| Метки в схеме `eval.labels` (`t_sec`, `t_all`, `conflict`) не читались | таймкод не попадал в метрику попадания | читаются `t_sec`, `t_all` (все таймкоды дубликатов), `video_id`, `conflict` | `test_replay_real_reads_eval_labels_schema` |
+
+Синтетический replay, 9 сценариев × 8 возмущений × 1 сид. Сравнение `baseline` с `no_lost_penalty` (прежнее поведение): подмены ID 1 против 6, фрагментация 31 против 39, ложные тревоги 8 против 10. Пропуски (3) и входы без изменений.
+
+H-SPEED (`tracker.speed_gate`, **ВЫКЛ**): трек не «прыгает» на детекцию соседа без перекрытия боксов дальше `0,2 + 1,5·dt` диагоналей.
+- На синтетике «двое сидят рядом + выпадение детекций» подмена в 0 из 8 сидов против 1 из 8.
+- В полном replay эффект мал: фрагментация 31 → 30, подмены 1 → 1.
+- Ждёт замера L2: `--variant speed_gate`.
+
 ## Фаза 2 — что изменилось (решения записаны здесь)
 
 ### Решения по спецификации команды (включены по умолчанию: это требования, а не гипотезы)
@@ -49,6 +121,8 @@ q.events()                    # все переходы: person_entered, cashier
 | `visibility.bridge_tracks: true` | `false` | **H-VIS**: склейка треков через потерю видимости по положению уменьшает фрагментацию ID | `replay --variant vis_bridge` |
 | `appearance.enabled: true` | `false` | **H-APP**: склейка по гистограмме одежды (противоречит спецификации «одежда — не признак», только для замера) | `replay --variant appearance` |
 | `queries.entry_requires_boundary: false` | `true` | наивные входы — эталон «до исправления» | `replay --variant naive_entries` |
+| `tracker.speed_gate: true` | `false` | **H-SPEED**: ограничение скорости без перекрытия боксов уменьшает подмены ID у сидящих рядом | `replay --variant speed_gate` |
+| `tracker.lost_cost_penalty: 0` | `0.1` (исправление ошибки) | откат к прежнему сопоставлению | `replay --variant no_lost_penalty` |
 
 ### Replay: текущий режим против одного изменения сглаживания
 Синтетика: 8 сценариев × 8 возмущений (none, dropout, jitter, occlusion, blackout, mirror, perspective, noise) × 2 сида = 128 прогонов на вариант. Замерено в облаке на CPU; это **поведение кода на синтетике, не точность на роликах**.
@@ -75,14 +149,14 @@ python -m ml.track.report --cache cache/<sha>                   # PNG-таймл
 
 ### Команда замера для L2 (одна; реальные детекции, локально)
 ```bash
-python -m ml.track.replay --real --dets-glob "cache/*/detections.json" --labels <labels.csv> \
-    --variant smooth --tol 2.0 --out ml/track/_out/replay_real
+python -m ml.track.replay --real --dets-glob "cache/*/dets.jsonl" --videos-dir data \
+    --labels data/labels.csv --variant smooth --tol 2.0 --out ml/track/_out/replay_real
 ```
 - **Сравниваем**: `baseline` (текущие значения) против `smooth` (H-SMOOTH). Другие флаги — `--variant vis_bridge`, `appearance` или `naive_entries`, по одному за раз.
 - **Вход**:
-  - детекции A05 в `cache/<id>/detections.json`: список `{t, label, bbox, score}`, где `t` из PTS;
-  - необязательный `meta.json` с `width`, `height`, `times`, `duration`;
-  - CSV меток с колонками `video|file`, `label|violation`, `second|t`. Имена нормализуются: латинская X = кириллическая Х.
+  - кэш стадий A03 (`backend/pipeline/cache.py`): `$SENTINEL_CACHE_DIR` или `<repo>/cache`, внутри `<sha256>/dets.jsonl` и `manifest.json["video"]` (`width`, `height`, `duration`). Он появляется после прогона пайплайна с кэшем `read_write`. Подходят и дампы `detections.json` + `meta.json` (тогда `--dets-glob` указывает на них);
+  - `--videos-dir` — локальная папка роликов: только для соответствия sha256 → имя; видео никуда не передаются;
+  - метки `data/labels.csv` в схеме `eval.labels` (`tools/dataprep/build_labels.py`): `video_id`, `file`, `label`, `t_sec`, `t_all`, `conflict`, … Поддерживаются и простые CSV `video|file`, `label`, `second|t` (и необязательно `sha256`). Имена нормализуются: латинская X = кириллическая Х. Конфликтные дубликаты (`conflict=1`) считаются в `label_conflicts` — решает человек.
 - **Выход**: `replay.json` и `replay.md`.
 - **Метрики для решения**:
   - «чистые ролики с тревогой» — прокси ложных срабатываний;
@@ -146,7 +220,7 @@ person_signals(tracks, zones, times, *, extended=False) -> list[SceneState]
 ## Запуск
 ```bash
 pip install -r ml/track/requirements.txt -c <lock L1>   # версии не менять вслепую (opencv < 5)
-python -m pytest ml/track/tests -q                     # 62 теста, без GPU/весов/данных (~15 с)
+python -m pytest ml/track/tests -q                     # 88 тестов, без GPU/весов/данных (~25 с)
 python -m pytest ml/track/tests -q -m perturbation     # только возмущения ракурса (perspective/mirror/rotation)
 python -m ml.track.viz video.mov --cache cache/<sha> [--out out.mp4] [--recompute] [--blur-heads]
 ```
