@@ -35,7 +35,7 @@ presets:
 transformers:
   device: cuda               # cuda | cpu
   allow_cpu: false           # на CPU 4B-модель — минуты на вызов; по умолчанию стадия пропускается
-  dtype: float16
+  dtype: bfloat16            # Qwen-VL обучены в bf16 (fp16 может переполняться); RTX 4060 (Ada) bf16 поддерживает
   attn_implementation: sdpa
   max_pixels: 200704         # 448*448 — процессор не будет апскейлить
   min_pixels: 3136

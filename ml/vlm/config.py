@@ -57,10 +57,10 @@ def load_config(path: Optional[str] = None, overrides: Optional[dict[str, Any]] 
 
 def apply_env(cfg: dict[str, Any]) -> dict[str, Any]:
     env = os.environ
-    if _truthy(env.get("SENTINEL_MOCK")):
-        cfg["backend"] = "mock"
     if env.get("SENTINEL_VLM_BACKEND"):
         cfg["backend"] = env["SENTINEL_VLM_BACKEND"].strip()
+    if _truthy(env.get("SENTINEL_MOCK")):  # глобальный mock сильнее: гарантирует прогон без весов (CI)
+        cfg["backend"] = "mock"
     if env.get("SENTINEL_VLM_PRESET"):
         cfg["preset"] = env["SENTINEL_VLM_PRESET"].strip()
     if env.get("SENTINEL_VLM_LANG"):

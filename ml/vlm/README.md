@@ -102,7 +102,7 @@ vlm.set_backend(be)     # подстановка бэкенда (тесты/ин
 
 | env | смысл |
 |---|---|
-| `SENTINEL_MOCK=1` | mock-бэкенд |
+| `SENTINEL_MOCK=1` | mock-бэкенд (сильнее `SENTINEL_VLM_BACKEND`: гарантирует прогон без весов) |
 | `SENTINEL_VLM_BACKEND` | `transformers` / `llamacpp_server` / `llamacpp_python` / `auto` / `off` / `mock` |
 | `SENTINEL_VLM_PRESET` | `qwen3vl4b` (по умолчанию) / `qwen3vl8b` / `qwen25vl7b_awq` / `qwen3vl2b` |
 | `SENTINEL_VLM_MODEL` | путь к локальной папке весов или HF id (для `.gguf` — имя файла) |

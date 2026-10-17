@@ -68,7 +68,7 @@ class TransformersBackend(VLMBackend):
     name = "transformers"
 
     def __init__(self, model: str, quant: str = "bnb4", device: str = "cuda", allow_cpu: bool = False,
-                 dtype: str = "float16", attn_implementation: str = "sdpa", max_pixels: int = 448 * 448,
+                 dtype: str = "bfloat16", attn_implementation: str = "sdpa", max_pixels: int = 448 * 448,
                  min_pixels: int = 3136, skip_quant_modules: Optional[list[str]] = None,
                  local_files_only: Optional[bool] = None, license_guard: str = "warn",
                  allowed_licenses: Optional[list[str]] = None, min_free_vram_mb: int = 0, **_: Any) -> None:

@@ -158,7 +158,7 @@ def test_env_overrides(monkeypatch):
     assert cfg["backend"] == "llamacpp_server" and cfg["llamacpp_server"]["url"] == "http://127.0.0.1:9999"
     assert cfg["presets"][cfg["preset"]]["transformers"]["model"] == "/models/qwen3vl"
     monkeypatch.setenv("SENTINEL_MOCK", "1")
-    assert load_config()["backend"] == "llamacpp_server"  # явный SENTINEL_VLM_BACKEND сильнее
+    assert load_config()["backend"] == "mock"  # глобальный SENTINEL_MOCK=1 сильнее: прогон без весов
 
 
 @pytest.mark.gpu
