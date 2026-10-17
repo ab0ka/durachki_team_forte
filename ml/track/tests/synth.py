@@ -218,3 +218,15 @@ def scene_two_staff(duration: float = 40.0) -> Scene:
 def scene_no_desk(duration: float = 30.0) -> Scene:
     v = walker("visitor", [(5, *DOOR_PT), (9, *CLIENT), (20, *CLIENT), (24, *DOOR_PT)], (40, 40, 220))
     return Scene(duration, [cashier(duration), v], [])
+
+
+def without(scene: Scene, label: str) -> Scene:
+    """Та же сцена без предметов данного класса (например, без сейфа)."""
+    return Scene(scene.duration, scene.persons, [o for o in scene.objects if o.label != label], scene.width, scene.height)
+
+
+def scene_cashier_enters_client_seated(duration: float = 40.0) -> Scene:
+    """Клиент уже сидит напротив; кассир входит через дверь в первые секунды и садится за кассу."""
+    client = Person("client", [(0, *CLIENT), (duration, *CLIENT)], [(0.0, duration)], color=(40, 40, 220))
+    cas = Person("cashier", [(1.0, *DOOR_PT), (4.0, *SEAT), (duration, *SEAT)], [(1.0, duration)], color=(200, 80, 40))
+    return Scene(duration, [client, cas], base_objects(duration))

@@ -172,6 +172,9 @@ def track_full(clip: Any, dets: Sequence[Any], cfg: Optional[dict] = None,
         info["warnings"].append(f"skipped_invalid_detections:{bad}")
     if not nd:
         info["warnings"].append("no_detections")
+        # пустые детекции != «людей нет»: покрытие сообщаем, решение — за потребителем
+        info["coverage"] = {"frames_total": int(len(times)) if times is not None else None, "frames_processed": 0,
+                            "frames_with_detections": 0, "span_frac": 0.0}
         info["timings"]["total_s"] = round(time.monotonic() - t_begin, 4)
         return TrackResult([], [], info)
 
@@ -185,6 +188,14 @@ def track_full(clip: Any, dets: Sequence[Any], cfg: Optional[dict] = None,
     t1 = max(t1, t0)
     info.update(aspect=round(aspect, 4), frame_dt=round(frame_dt, 4), n_frames_processed=len(ft),
                 n_detections=len(nd))
+    n_total = int(len(times)) if times is not None else None
+    info["coverage"] = {
+        "frames_total": n_total,                       # кадров сэмплировано (clip.times)
+        "frames_processed": len(ft),                   # кадров, прошедших через детектор (с учётом every_n)
+        "frames_with_detections": int(sum(1 for v in by_frame.values() if v)),
+        "t_first_detection": round(float(ft[0]), 4), "t_last_detection": round(float(ft[-1]), 4),
+        "span_frac": None if n_total is None or duration <= 0 else round(min(1.0, (ft[-1] - ft[0] + frame_dt) / duration), 4),
+    }
 
     # 1) ByteTrack по группам классов
     ids = itertools.count(1)
@@ -245,7 +256,9 @@ def track_full(clip: Any, dets: Sequence[Any], cfg: Optional[dict] = None,
     zinfo: dict[str, dict] = {}
     desk, zinfo["desk"] = zones_mod.desk_zone(oviews, pviews, cfg, duration)
     safe, zinfo["safe"] = zones_mod.safe_zone(oviews, cfg, duration)
-    cashier = roles_mod.pick_cashier(pviews, desk, safe, cfg, aspect, t0, t1, duration)
+    counters = [zones_mod.median_box(v.boxes) for v in oviews if v.label == "money_counter"
+                and v.presence >= cfg["zones"]["min_object_presence_s"]]
+    cashier = roles_mod.pick_cashier(pviews, desk, safe, cfg, aspect, t0, t1, duration, counters)
     cviews = [v for v in pviews if v.tid == cashier.get("primary")]
     others = [v for v in pviews if v.tid != cashier.get("primary")]
     if desk is None:
@@ -263,7 +276,7 @@ def track_full(clip: Any, dets: Sequence[Any], cfg: Optional[dict] = None,
     role_info = roles_mod.assign_roles(pviews, oviews, zd, cashier, app, cfg, aspect, t0, t1)
     info["timings"]["zones_roles_s"] = round(time.monotonic() - t_z, 4)
     info["zones"] = zinfo
-    info["cashier_selection"] = {k: v for k, v in cashier.items() if k != "features"}
+    info["cashier_selection"] = {k: v for k, v in cashier.items() if k not in ("features", "side")}
     info["roles"] = {}
     feats = cashier.get("features", {})
     for tid, r in role_info.items():

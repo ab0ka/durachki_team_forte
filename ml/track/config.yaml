@@ -20,12 +20,13 @@ stitch:
   app_thr_long: 0.32
   long_requires_appearance: true
 appearance:
-  enabled: true
+  enabled: false          # H-APP: гистограмма одежды для склейки; цвет одежды — не признак по спецификации
   samples_per_track: 6
   max_frames: 150
   budget_s: 4.0
 roles:
   early_s: 3.0
+  w_start: 0.0            # роль не зависит от «кто первый»
   min_presence_s: 1.0
   min_cashier_score: 0.35
   fallback_cashier_conf_cap: 0.45
