@@ -1,6 +1,6 @@
 # Kassa Sentinel CI (владелец A01).
 # Обязательные проверки (без continue-on-error, падение = красный CI): core, modules (матрица, fail-fast: false), e2e.
-# Необязательные (информационные): frontend-сборка, отчёт о владении файлами для PR без тега [Axx].
+# Необязательные (информационные): frontend-сборка, e2e через backend.pipeline.run, ownership для PR без [Axx].
 name: CI
 
 on:
@@ -23,7 +23,7 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONUTF8: "1"
   PYTHONDONTWRITEBYTECODE: "1"
-  CORE_DEPS: "numpy>=1.26 pyyaml>=6 jsonschema>=4.20 pytest>=8 ruff>=0.5 opencv-python-headless>=4.8,<5"
+  CORE_DEPS: "numpy>=1.26 pyyaml>=6 jsonschema>=4.20 pytest>=8 ruff>=0.5 opencv-python-headless>=4.8"
 
 jobs:
   core:
@@ -129,8 +129,36 @@ jobs:
           python scripts/ci_requirements.py --all > "$RUNNER_TEMP/req-ci.txt"
           cat "$RUNNER_TEMP/req-ci.txt"
           if [ -s "$RUNNER_TEMP/req-ci.txt" ]; then python -m pip install -r "$RUNNER_TEMP/req-ci.txt"; fi
-      - name: E2E stub (схема ответа жюри обязательна)
-        run: python -m testkit.e2e_stub --duration 8 --fps 10 --out "$RUNNER_TEMP/e2e"
+      - name: E2E по стадиям контракта (схема ответа жюри обязательна)
+        run: python -m testkit.e2e_stub --no-backend --scenarios clean,V01,V03,V07 --duration 8 --fps 10 --out "$RUNNER_TEMP/e2e"
+
+  e2e-backend:
+    name: e2e через backend.pipeline.run (необязательная)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Has backend/pipeline?
+        id: be
+        run: |
+          if [ -d backend/pipeline ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "present=false" >> "$GITHUB_OUTPUT"; echo "::notice::backend/pipeline нет — пропуск"; fi
+      - uses: actions/setup-python@v5
+        if: steps.be.outputs.present == 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install deps
+        if: steps.be.outputs.present == 'true'
+        run: |
+          python -m pip install $CORE_DEPS
+          python scripts/ci_requirements.py --all > "$RUNNER_TEMP/req-ci.txt"
+          if [ -s "$RUNNER_TEMP/req-ci.txt" ]; then python -m pip install -r "$RUNNER_TEMP/req-ci.txt"; fi
+      - name: E2E через оркестратор A03
+        if: steps.be.outputs.present == 'true'
+        run: timeout 600 python -m testkit.e2e_stub --scenarios clean,V01 --duration 8 --fps 10 --deadline 60
 
   frontend:
     name: frontend build (необязательная)

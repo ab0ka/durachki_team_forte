@@ -14,8 +14,9 @@
    t_start, t_end, rules[], rule{}`` у нарушения и ``progress, stage, error, verdict_state, analysis_complete,
    warnings, candidates, timeline, meta`` на верхнем уровне.
 
-``result_to_api(result)`` — прежнее имя из контракта; по умолчанию ``profile="jury"`` (строгая схема),
-``profile="ui"`` — расширенный отчёт.
+``result_to_api(result)`` — прежнее имя и прежнее поведение из контракта («ровно схема ТЗ + доп. поля»), т.е.
+UI-report; на него уже опираются A02/A03 (кэш)/A16 (eval). Ответ жюри — ``result_to_jury_api``
+(или ``result_to_api(result, profile="jury")``).
 
 Политика вердикта (одна для обоих сериализаторов, ``resolve_outcome``):
 
@@ -406,8 +407,8 @@ def result_to_ui_report(result: AnalysisResult | Mapping[str, Any], *, include_t
     return out
 
 
-def result_to_api(result: AnalysisResult | Mapping[str, Any], *, profile: str = "jury", **kwargs: Any) -> dict:
-    """Имя из контракта v1. ``profile="jury"`` (по умолчанию) — строгая схема ТЗ; ``"ui"`` — UI-report."""
+def result_to_api(result: AnalysisResult | Mapping[str, Any], *, profile: str = "ui", **kwargs: Any) -> dict:
+    """Имя из контракта v1 («схема ТЗ + доп. поля») = UI-report; ``profile="jury"`` — строгий ответ жюри."""
     if profile == "jury":
         return result_to_jury_api(result, **kwargs)
     if profile == "ui":

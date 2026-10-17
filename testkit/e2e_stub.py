@@ -192,7 +192,8 @@ def run_backend(video_path: str, job_id: str, deadline_s: float = 240.0) -> Opti
 
 
 def run_scenario(scenario: str, out_dir: Path, *, duration: float = 8.0, fps: float = 10.0, view: str = "default",
-                 use_backend: bool = True, prefer_real: bool = True, strict: bool = False) -> dict:
+                 use_backend: bool = True, prefer_real: bool = True, strict: bool = False,
+                 deadline_s: float = 120.0) -> dict:
     suffix = "" if view == "default" else f"_{view}"
     video = out_dir / f"{scenario}{suffix}.mov"
     gt = make_video(video, scenario, duration=duration, fps=fps, view=view)
@@ -201,7 +202,7 @@ def run_scenario(scenario: str, out_dir: Path, *, duration: float = 8.0, fps: fl
                            "gt_t": gt["t"], "stages": [], "errors": []}
     t0 = time.perf_counter()
     try:
-        result = run_backend(str(video), job_id) if use_backend else None
+        result = run_backend(str(video), job_id, deadline_s) if use_backend else None
         if result is not None:
             rec["runner"] = "backend.pipeline"
         else:
@@ -236,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fixtures-only", action="store_true", help="все стадии — фикстуры (самопроверка тест-кита)")
     ap.add_argument("--strict-stages", action="store_true", help="падение/невалидный выход модуля -> код 1")
     ap.add_argument("--require-accuracy", action="store_true", help="вердикт и тип должны совпасть с GT")
+    ap.add_argument("--deadline", type=float, default=120.0, help="deadline_s для backend.pipeline.run, с")
     args = ap.parse_args(argv)
     os.environ.setdefault("SENTINEL_MOCK", "1")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -253,7 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         for sc in [s.strip() for s in args.scenarios.split(",") if s.strip()]:
             rec = run_scenario(sc, out_dir, duration=args.duration, fps=args.fps, view=args.view,
                                use_backend=not args.no_backend and not args.fixtures_only,
-                               prefer_real=not args.fixtures_only, strict=args.strict_stages)
+                               prefer_real=not args.fixtures_only, strict=args.strict_stages,
+                               deadline_s=args.deadline)
             records.append(rec)
             stages = " ".join(f"{s['name']}:{s['source']}" for s in rec["stages"]) or "-"
             resp = rec.get("response", {})

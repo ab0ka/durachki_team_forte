@@ -33,6 +33,13 @@ SOFT_SDKS = {"openai": "допустимо только для локально�
 CLOUD_ENDPOINT_RE = re.compile(
     r"api\.openai\.com|api\.anthropic\.com|generativelanguage\.googleapis\.com|vision\.googleapis\.com|"
     r"aiplatform\.googleapis\.com|openai\.azure\.com|api\.cohere\.ai|api\.mistral\.ai|api\.groq\.com", re.I)
+def license_ok(lic: str) -> bool:
+    """«Apache-2.0», «MIT / BSD-3-Clause», «Apache-2.0 (собственные веса команды)» — ок; иное — нет."""
+    base = re.split(r"[(;,]", lic, maxsplit=1)[0].strip()
+    parts = [p.strip() for p in re.split(r"\s*(?:/|\+|\bor\b|\band\b)\s*", base, flags=re.I) if p.strip()]
+    return bool(parts) and all(ALLOWED_LICENSE_RE.match(p) for p in parts)
+
+
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "data", "weights", "cache", "__pycache__", "dist", "build"}
 MAX_TRACKED_MB = 10.0
 
@@ -61,7 +68,7 @@ def check_models(root: Path) -> list[str]:
             lic = str(e.get("license", "")).strip()
             if FORBIDDEN_MODEL_RE.search(name) or FORBIDDEN_MODEL_RE.search(lic):
                 errs.append(f"{rel}: запрещённая модель/лицензия: {name.strip()} [{lic}]")
-            elif not ALLOWED_LICENSE_RE.match(lic):
+            elif not license_ok(lic):
                 errs.append(f"{rel}: лицензия '{lic}' у {name.strip()} — разрешены только Apache-2.0/MIT/BSD")
     return errs
 

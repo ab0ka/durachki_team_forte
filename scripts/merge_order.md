@@ -61,3 +61,33 @@ make lint test-fast e2e
 python scripts/check_licenses.py
 python scripts/check_ownership.py --base origin/main --all-branches --report-only
 ```
+
+## 5. Пробная интеграция (A01, 17.10, ~08:05 UTC; локально, ничего не пушилось)
+
+Деревья всех 17 веток наложены во временную папку поверх ветки A01: агенты пишут в разные папки, так что это эквивалент мерджа. Окружение: CPU, Python 3.11, только `numpy`, `opencv-python-headless`, `PyYAML`, `jsonschema`, `pytest`; без GPU, весов и `requirements.txt` модулей.
+
+**Конфликты файлов:**
+
+* `.gitignore`, `contracts/__init__.py` и `contracts/sentinel_contracts.py` есть в 9 ветках, и везде они **побайтно совпадают** с A01.
+* 4 ветки (A14, A15, A16, A17) содержат коммит A01 `ccf2923` как предка; остальные — несвязанные истории.
+* Ни один из 525 файлов других веток не скрывается `.gitignore` A01.
+* Запрещённых файлов (видео, веса, кадры) нет.
+
+**Стыковка по контракту (`python -m testkit.e2e_stub --no-backend`):**
+
+* все 12 стадий реальных модулей (ingest → detect → track → pose → pose_signals → scene → norms → rules → temporal → vlm verify/discover → fusion) прошли проверки `testkit.contract_checks`;
+* ответ проходит строгую схему жюри — 8 сценариев по 20 с, ≈19 с на ролик (CPU, mock);
+* вердикты в mock-режиме — `no_violation`: моки без весов нарушений не находят, это ожидаемо.
+
+**Что требует внимания:**
+
+| Где | Что | Чьё |
+|---|---|---|
+| `backend.pipeline.run` | На синтетическом ролике 6 с (mock, CPU) не вернул результат за 110 с при `deadline_s=40`; три ролика по 8 с не уложились в 300 с. Повтор: `python <скрипт с run(...)>` в корне интеграции (из stdin не запускать — spawn). | A03 |
+| `backend/pipeline/tests/test_pipeline.py::test_partial_with_violation` | Ждёт вердикт `violation` при `status=processing`. Это противоречит правилу «у processing/failed нет бинарного вердикта» (`contracts/MIGRATION.md`). | A03 |
+| `backend/pipeline/tests/test_cache_budget.py` | Предупреждения первого и второго (кэшированного) прогона различаются: «ml.ingest недоступен» только в первом. | A03 |
+| `ml/fusion` (2 теста: `test_no_catalog_reports_with_warning`, `test_tune::test_cli_end_to_end`) | Отдельно A12 — 58/58, A12 + контракт A01 — 58/58, **A12 + `norms/` (A13) — 2 падения**: при `catalog={}` fusion, видимо, подхватывает реальный каталог или пороги. | A12 × A13 |
+| `backend/api/results.py`, `ml/fusion/serialize.py` | Переключить ответ жюри на `result_to_jury_api` (см. `contracts/MIGRATION.md`). | A02, A12 |
+| `backend/api`, `copilot` (нет `fastapi`), `ml/ingest` (нет `av`), `ml/vlm` (нет `PIL`), `eval` (нет `openpyxl`) | Падения из-за не установленных в пробном окружении зависимостей. В CI они ставятся через `scripts/ci_requirements.py`. | окружение |
+
+Без замечаний: `ml/track` 35, `ml/pose` 39, `ml/scene` 34, `ml/rules` 118, `ml/temporal` 29, `norms` 36, `deploy` 38, `contracts` 88, `testkit` 109.

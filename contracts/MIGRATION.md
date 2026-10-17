@@ -7,7 +7,7 @@
 1. **Два сериализатора вместо одного** (`contracts/serialize.py`):
    * `result_to_jury_api(result)` — ровно обязательная схема ТЗ, без дополнительных полей. Норма из `Violation.rules[0]` дописывается в `description`, если её URL там ещё нет.
    * `result_to_ui_report(result)` — прежний расширенный формат («ТЗ + доп. поля»), плюс `verdict_state`, `analysis_complete`, `candidates`, `warnings`.
-   * `result_to_api(result, *, profile="jury")` — имя из контракта сохранено. **По умолчанию теперь строгий профиль жюри**; прежний расширенный вывод — `profile="ui"`.
+   * `result_to_api(result, *, profile="ui")` — имя **и поведение** из контракта сохранены («схема ТЗ + доп. поля» = UI-report). Пробная интеграция показала, что на это опираются A03 (кэш) и A16 (eval); при строгом выводе по умолчанию кэш A03 падал с `KeyError: 'meta'`. Ответ жюри — `result_to_jury_api` (или `profile="jury"`).
 2. **Политика вердикта** (`resolve_outcome`, общая для обоих сериализаторов):
    * у `processing` и `failed` вердикт всегда `null`;
    * у `done` без вердикта и без нарушений ответ теперь `failed`, раньше выводился `no_violation`;
@@ -33,7 +33,8 @@
 
 | Кто | Действие |
 |---|---|
-| A02 API | Маршрут `GET /api/v1/jobs/{id}` отдаёт `result_to_jury_api(result)`. UI-данные — на отдельном маршруте (например `/report`) через `result_to_ui_report`. |
+| A02 API | Маршрут `GET /api/v1/jobs/{id}` отдаёт `result_to_jury_api(result)`: сейчас `backend/api/results.py` вызывает `result_to_api`, это расширенный формат — нужна замена одной строки. UI-данные — на отдельном маршруте (например `/report`) через `result_to_ui_report`. |
+| A12 fusion (`ml/fusion/serialize.py: result_to_jury`) | Вызывать `contracts.serialize.result_to_jury_api` вместо `result_to_api`: функция задумана как «строгий ответ жюри». |
 | A03 pipeline | Заполнять `meta.completeness` (с `required_stages`), `meta.duration_sec` и `meta.provenance`. При исключении/таймауте ядра — `status="failed"` или `completeness.complete=False`. |
 | A12 fusion | Ставить `verdict` явно; кадры — JPEG base64 без `data:`; `rules` только из `norms/catalog.yaml`. |
 | A15 UI | Читать расширенные поля из UI-report, а не из ответа жюри. |

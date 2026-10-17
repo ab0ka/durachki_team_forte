@@ -5,7 +5,7 @@
 | `sentinel_contracts.py` | **Замороженный контракт v1** (байт в байт с ТЗ). sha256 `3b870961e62dac86e9457029009a37a753c0fdc73543639690b0493d8e134cac` — проверяется тестом. |
 | `__init__.py` | Реэкспорт dataclass-ов, `LABELS`, `SIGNALS`, `CONTRACT_VERSION`. |
 | `extensions.py` | Совместимые дополнения v1.1 (только через `meta`/`extra`, со значениями по умолчанию): `completeness`, `provenance`, `verdict_state`/unknown. |
-| `serialize.py` | Два сериализатора: `result_to_jury_api` (строго ТЗ) и `result_to_ui_report` (расширенный); `result_to_api(profile="jury"\|"ui")`; `api_to_result`; `resolve_outcome`. |
+| `serialize.py` | Два сериализатора: `result_to_jury_api` (строго ТЗ) и `result_to_ui_report` (расширенный). `result_to_api` — прежнее имя = UI-report (`profile="jury"` — ответ жюри). Также `api_to_result`, `resolve_outcome`. |
 | `api_schema.json` | JSON Schema (draft 2020-12) ответа `GET /api/v1/jobs/{id}`; `$defs/AnalyzeResponse` — ответ `POST /analyze`. |
 | `validate.py` | Валидатор: обычный, строгий для жюри (`jury_response_errors`), смысловые проверки; CLI `python -m contracts.validate`. |
 | `examples/*.json` | Примеры ответов: `job_*`/`jury_*` — строгие ответы жюри, `job_done_full`/`ui_*` — UI-report. |
@@ -44,7 +44,7 @@ assert not jury_response_errors(body)          # можно держать в т
 report = result_to_ui_report(result)           # + type_id, confidence, rules, rule, timeline, meta, progress, stage, ...
 ```
 
-`result_to_api(result)` (имя из контракта) = `result_to_jury_api` по умолчанию; `profile="ui"` — UI-report.
+`result_to_api(result)` (имя из контракта) сохраняет прежнее поведение «схема ТЗ + доп. поля», т.е. это UI-report. На него уже опираются A03 (кэш читает `meta`/`timeline`) и A16 (`type_id`/`confidence`). Строгий ответ жюри — **только** `result_to_jury_api` (или `profile="jury"`).
 
 ### Пайплайн / fusion (A03, A12)
 

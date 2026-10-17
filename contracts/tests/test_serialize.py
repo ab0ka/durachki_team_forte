@@ -63,10 +63,13 @@ def test_jury_has_exactly_tz_fields():
     assert job_response_errors(out, strict=True) == []
 
 
-def test_result_to_api_defaults_to_jury_profile():
+def test_result_to_api_keeps_contract_behaviour():
+    # «ровно схема ТЗ + доп. поля» — на это опираются A02, A03 (кэш: meta/timeline) и A16 (type_id/confidence)
     r = _result()
-    assert result_to_api(r) == result_to_jury_api(r)
-    assert result_to_api(r, profile="ui") == result_to_ui_report(r)
+    out = result_to_api(r)
+    assert out == result_to_ui_report(r)
+    assert "meta" in out and "timeline" in out and out["violations"][0]["type_id"] == "V01"
+    assert result_to_api(r, profile="jury") == result_to_jury_api(r)
     with pytest.raises(ValueError):
         result_to_api(r, profile="xml")
 

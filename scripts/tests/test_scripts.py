@@ -93,6 +93,16 @@ def test_check_licenses_on_tree(tmp_path):
     assert check_licenses.main(["--root", str(tmp_path), "--no-git"]) == 1
 
 
+@pytest.mark.parametrize("lic,ok", [
+    ("Apache-2.0", True), ("apache-2.0 (наследует базовый чекпойнт; датасет — внутренний)", True),
+    ("Apache-2.0 (собственный код/веса команды)", True), ("MIT / BSD-3-Clause", True), ("BSD", True),
+    ("AGPL-3.0", False), ("CC-BY-NC-4.0", False), ("qwen-research", False), ("", False),
+    ("Apache-2.0 / CC-BY-NC-4.0", False), ("llama3", False),
+])
+def test_license_ok(lic, ok):
+    assert check_licenses.license_ok(lic) is ok
+
+
 def test_repo_itself_is_clean():
     root = SCRIPTS.parent
     rc = subprocess.run([sys.executable, str(SCRIPTS / "check_licenses.py"), "--root", str(root)],
