@@ -152,3 +152,16 @@ def test_validate_report_exposes_statuses():
     rep = v.validate_catalog(yaml.safe_load(norms.CATALOG_PATH.read_text(encoding="utf-8")))
     d = rep.to_dict()
     assert d["legal_status"]["V08"] == "candidate" and "not a legal verification" in d["check"]
+
+
+def test_phase2_types_and_examples():
+    cat = norms.load_catalog()
+    assert "клиент" in " ".join(cat["types"]["V01"]["exclusions"])  # клиент напротив — норма
+    assert cat["types"]["V01"]["name"].startswith("Посторонний на стороне кассира")
+    v09 = cat["types"]["V09"]
+    assert v09["legal_status"] == "candidate" and v09["rules"][0]["clause"] == "п. 12"
+    for tid, t in cat["types"].items():
+        kinds = {e["kind"] for e in t["examples"]}
+        assert "positive" in kinds and kinds & {"negative", "unknown"}, tid
+        for chk in t.get("rule_checks", []):
+            assert chk["quote_checked_by_human"] is False and chk["applicability_checked_by_human"] is False

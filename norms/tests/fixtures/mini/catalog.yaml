@@ -17,6 +17,15 @@ types:
     exclusions: ["X без Z — не нарушение"]
     description_template: "{t}: {facts}."
     severity: high
+    examples:
+      - kind: positive
+        facts: ["видно X"]
+        signals: {cash_visible: 1.0, n_persons: 2}
+        expected: candidate
+      - kind: unknown
+        facts: ["X не видно"]
+        signals: {cash_visible: null}
+        expected: unknown
     rules:
       - document: "Тестовый документ А"
         clause: "п. 1"
@@ -25,6 +34,8 @@ types:
         verified: false
     rule_checks:
       - quote_level: snippet
+        quote_checked_by_human: false
+        applicability_checked_by_human: false
         currency: "не сверено"
         applicability: "тест"
         conditions_visible: ["X"]

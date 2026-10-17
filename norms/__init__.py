@@ -53,7 +53,7 @@ SOURCES_DIR = NORMS_DIR / "sources"
 #: Ключи нормы — ровно поля contracts.RuleRef (можно делать RuleRef(**rule)).
 RULE_KEYS: tuple[str, ...] = ("document", "clause", "url", "quote", "verified")
 #: Обязательные типы нарушений (ключи каталога = Event.type_id).
-TYPE_IDS: tuple[str, ...] = ("V01", "V02", "V03", "V04", "V05", "V06", "V07", "V08", "V99")
+TYPE_IDS: tuple[str, ...] = ("V01", "V02", "V03", "V04", "V05", "V06", "V07", "V08", "V09", "V99")
 SEVERITIES: tuple[str, ...] = ("low", "medium", "high", "critical")
 #: Переменная окружения для подмены пути к каталогу (тесты, интегратор).
 ENV_CATALOG = "SENTINEL_NORMS_CATALOG"

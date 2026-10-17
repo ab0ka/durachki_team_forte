@@ -43,7 +43,15 @@ from . import CATALOG_PATH, NORMS_DIR, RULE_KEYS, SEVERITIES, TYPE_IDS
 RETRIEVAL_KINDS = ("fulltext", "partial", "search_snippets")
 LEGAL_STATUSES = ("confirmed", "candidate", "disabled")
 QUOTE_LEVELS = ("fulltext", "snippet", "none")
-RULE_CHECK_KEYS = ("quote_level", "currency", "applicability", "conditions_visible", "conditions_not_visible")
+RULE_CHECK_KEYS = ("quote_level", "quote_checked_by_human", "applicability_checked_by_human", "currency",
+                   "applicability", "conditions_visible", "conditions_not_visible")
+EXAMPLE_KINDS = {"positive": "candidate", "negative": "no_violation", "unknown": "unknown"}
+
+try:
+    from contracts.sentinel_contracts import SIGNALS as _SIGNALS
+except ImportError:  # пока ветка A01 не смерджена
+    from ._contract_fallback import SIGNALS as _SIGNALS
+SIGNAL_NAMES = frozenset(_SIGNALS)
 _RETRIEVAL_TO_LEVEL = {"fulltext": "fulltext", "partial": "snippet", "search_snippets": "snippet"}
 _NOT_QUOTABLE_RE = re.compile(r"<!--\s*not-quotable\s*-->.*?<!--\s*/not-quotable\s*-->", re.S)
 _TYPE_ID_RE = re.compile(r"^V\d{2}$")
@@ -263,6 +271,58 @@ def _check_rule_checks(type_id: str, t: dict[str, Any], rep: Report) -> None:
             v = chk.get(k)
             if v is not None and (not isinstance(v, list) or not all(_is_str(x) for x in v)):
                 rep.errors.append(f"{where}[{i}].{k}: список строк")
+        for k in ("quote_checked_by_human", "applicability_checked_by_human"):
+            if k in chk and not isinstance(chk[k], bool):
+                rep.errors.append(f"{where}[{i}].{k}: true/false")
+        if isinstance(rule, dict) and rule.get("verified") is True:
+            if chk.get("quote_checked_by_human") is not True or level != "fulltext":
+                rep.errors.append(f"{where}[{i}]: verified=true требует quote_level=fulltext и "
+                                  f"quote_checked_by_human=true (цитату сверил человек)")
+        if t.get("legal_status") == "confirmed" and chk.get("applicability_checked_by_human") is not True:
+            rep.errors.append(f"{where}[{i}]: legal_status=confirmed требует applicability_checked_by_human=true")
+
+
+def _check_examples(type_id: str, t: dict[str, Any], rep: Report) -> None:
+    """Синтетические примеры: positive → candidate, negative → no_violation, unknown → unknown (null-сигнал)."""
+    where = f"types.{type_id}.examples"
+    ex = t.get("examples")
+    if ex is None:
+        rep.warnings.append(f"{where}: нет синтетических примеров (positive + negative/unknown)")
+        return
+    if not isinstance(ex, list) or not ex:
+        rep.errors.append(f"{where}: непустой список")
+        return
+    kinds = set()
+    for i, e in enumerate(ex):
+        w = f"{where}[{i}]"
+        if not isinstance(e, dict):
+            rep.errors.append(f"{w}: должен быть словарём")
+            continue
+        kind, expected = e.get("kind"), e.get("expected")
+        if kind not in EXAMPLE_KINDS:
+            rep.errors.append(f"{w}.kind: одно из {sorted(EXAMPLE_KINDS)}")
+            continue
+        kinds.add(kind)
+        if expected != EXAMPLE_KINDS[kind]:
+            rep.errors.append(f"{w}.expected: для kind={kind} ожидается {EXAMPLE_KINDS[kind]!r}")
+        facts = e.get("facts")
+        if not isinstance(facts, list) or not facts or not all(_is_str(x) for x in facts):
+            rep.errors.append(f"{w}.facts: непустой список строк")
+        sig = e.get("signals")
+        if not isinstance(sig, dict) or not sig:
+            rep.errors.append(f"{w}.signals: непустой словарь сигналов")
+            continue
+        for name, val in sig.items():
+            if name not in SIGNAL_NAMES:
+                rep.errors.append(f"{w}.signals.{name}: нет в contracts.SIGNALS")
+            elif val is not None and (isinstance(val, bool) or not isinstance(val, (int, float))):
+                rep.errors.append(f"{w}.signals.{name}: число или null (null = неизвестно)")
+            elif isinstance(val, (int, float)) and name != "n_persons" and not 0.0 <= float(val) <= 1.0:
+                rep.errors.append(f"{w}.signals.{name}: значение 0..1")
+        if kind == "unknown" and not any(v is None for v in sig.values()):
+            rep.errors.append(f"{w}: unknown-пример должен содержать хотя бы один null-сигнал (unknown ≠ false)")
+    if "positive" not in kinds or not kinds & {"negative", "unknown"}:
+        rep.errors.append(f"{where}: нужен positive и хотя бы один negative или unknown")
 
 
 def _check_legal_status(type_id: str, t: dict[str, Any], rep: Report) -> None:
@@ -319,6 +379,7 @@ def _check_type(type_id: str, t: Any, sources: dict[str, dict[str, Any]], rep: R
         rep.errors.append(f"{where}.research_candidates: список строк")
     _check_legal_status(type_id, t, rep)
     _check_rule_checks(type_id, t, rep)
+    _check_examples(type_id, t, rep)
     rules = t.get("rules")
     if not isinstance(rules, list):
         rep.errors.append(f"{where}.rules: список (может быть пустым)")
