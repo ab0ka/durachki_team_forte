@@ -72,7 +72,7 @@ export default function ViolationCard({ v, index, job, active, onSeek }: Props) 
                   onClick={() => setLightbox(i)}
                   aria-label={`Открыть кадр ${formatTimecode(f.timestamp_sec)}`}
                 >
-                  <img src={imageSrc(f.image_base64)} alt={`Кадр ${formatTimecode(f.timestamp_sec)}`} loading="lazy" className="h-full w-full object-cover transition duration-300 group-hover:scale-105" />
+                  <img src={imageSrc(f.image_base64)} alt={`Кадр ${formatTimecode(f.timestamp_sec)}`} className="h-full w-full object-cover transition duration-300 group-hover:scale-105" />
                   <span className="absolute bottom-1.5 left-1.5 rounded bg-black/70 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-white tnum">
                     {formatTimecode(f.timestamp_sec)}
                   </span>

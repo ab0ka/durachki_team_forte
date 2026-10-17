@@ -220,7 +220,7 @@ export default function UploadScreen() {
         </div>
       </section>
 
-      <div className="mt-6 grid gap-6 lg:grid-cols-[1fr_1fr]">
+      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
         <section className="card p-5">
           <h2 className="mb-3 flex items-center gap-2 text-base font-bold">
             <History className="h-4 w-4 text-slate-400" /> Недавние проверки

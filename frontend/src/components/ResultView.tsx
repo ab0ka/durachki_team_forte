@@ -101,7 +101,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             <p className="mt-2 max-w-3xl text-sm opacity-90 sm:text-[15px]">{view.subtitle}</p>
             <div className="mt-4 flex flex-wrap gap-2 text-xs font-semibold">
               {name && <span className="rounded-full bg-white/15 px-3 py-1">{name}</span>}
-              <span className="rounded-full bg-white/15 px-3 py-1 tnum">длительность {formatTimecode(duration)}</span>
+              {duration > 0 && <span className="rounded-full bg-white/15 px-3 py-1 tnum">длительность {formatTimecode(duration)}</span>}
               <span className="rounded-full bg-white/15 px-3 py-1 tnum">эпизодов: {job.violations.length}</span>
               {total !== undefined && <span className="rounded-full bg-white/15 px-3 py-1 tnum">анализ {formatDuration(total)}</span>}
               {job.timeline.length > 0 && (
@@ -132,9 +132,9 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
         </div>
       )}
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         <div className="min-w-0 space-y-6">
-          <section ref={playerBox} className="card no-print scroll-mt-24 p-4 sm:p-5">
+          <section ref={playerBox} className="card no-print scroll-mt-32 p-4 sm:p-5">
             <VideoPlayer
               ref={player}
               source={source}

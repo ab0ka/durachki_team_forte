@@ -134,7 +134,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
             onClick={toggle}
           />
         ) : virtual ? (
-          <img src={demoSceneDataUri(t)} alt="Синтетическая сцена (демо)" className="max-h-[68vh] w-auto object-contain" onClick={toggle} />
+          <img src={demoSceneDataUri(t)} alt="Синтетическая сцена (демо)" className="max-h-[68vh] w-auto max-w-full object-contain" onClick={toggle} />
         ) : (
           <div className="flex flex-col items-center gap-2 p-8 text-center text-sm text-slate-400">
             <VideoOff className="h-8 w-8" />
@@ -192,9 +192,13 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
           ))}
         </div>
       </div>
-      <div className="mt-5">
-        <RiskTimeline duration={d} timeline={timeline} violations={violations} currentTime={t} onSeek={(x) => seek(x)} />
-      </div>
+      {d > 0 ? (
+        <div className="mt-5">
+          <RiskTimeline duration={d} timeline={timeline} violations={violations} currentTime={t} onSeek={(x) => seek(x)} />
+        </div>
+      ) : (
+        <p className="mt-4 text-xs text-slate-500">Длительность записи неизвестна — шкала риска недоступна.</p>
+      )}
     </div>
   );
 });
