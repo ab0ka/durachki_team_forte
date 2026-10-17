@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { Info, Monitor, Moon, ScanSearch, Settings, Sun } from "lucide-react";
+import { CircleAlert, Info, Monitor, Moon, ScanSearch, Settings, Sun } from "lucide-react";
 import { useApp } from "../context";
 import type { Route } from "../lib/router";
 import { applyTheme, getThemePref, type ThemePref } from "../lib/theme";
-import { cx, LocalBadge } from "./ui";
+import { LocalBadge } from "./ui";
 
+/** Знак продукта. Малиновый brand — только здесь (идентичность), не в кнопках и статусах. */
 export function Logo({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 64 64" className={className} aria-hidden>
@@ -23,6 +24,12 @@ export function Logo({ className }: { className?: string }) {
 
 const THEME_ORDER: ThemePref[] = ["system", "light", "dark"];
 
+/**
+ * Шапка рабочей области. Порядок: знак → разделы → (справа) статусы → служебные кнопки.
+ * Статусы по смыслу: нет связи — событие/ошибка (красный), демо — предупреждение (янтарный),
+ * локальная обработка — справка (нейтральный). Зелёного «всё хорошо» здесь нет: шапка не знает,
+ * что анализ подтверждён.
+ */
 export default function Header({ route }: { route: Route }) {
   const { demo, openSettings, serverOk } = useApp();
   const [theme, setTheme] = useState<ThemePref>(() => getThemePref());
@@ -41,53 +48,44 @@ export default function Header({ route }: { route: Route }) {
   const themeTitle = theme === "dark" ? "Тёмная тема" : theme === "light" ? "Светлая тема" : "Тема как в системе";
 
   const link = (href: string, active: boolean, label: string, Icon: typeof Info) => (
-    <a
-      href={href}
-      className={cx(
-        "inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium transition",
-        active
-          ? "bg-slate-900/5 text-slate-900 dark:bg-white/10 dark:text-white"
-          : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white",
-      )}
-    >
-      <Icon className="h-4 w-4" />
+    <a href={href} className="ks-nav-link" aria-current={active ? "page" : undefined} title={label}>
+      <Icon className="h-4 w-4" aria-hidden />
       <span className="hidden sm:inline">{label}</span>
     </a>
   );
 
   return (
-    <header className="no-print border-b border-slate-200/70 bg-white/80 backdrop-blur-xl dark:border-white/[.06] dark:bg-ink-950/75">
-      <div className="mx-auto flex h-16 max-w-[1320px] items-center gap-3 px-4 sm:px-6 lg:px-8">
-        <a href="#/" className="flex items-center gap-2.5" aria-label="Kassa Sentinel — на главную">
+    <header className="ks-header no-print">
+      <div className="ks-container flex h-16 items-center gap-2 sm:gap-3">
+        <a href="#/" className="flex shrink-0 items-center gap-2.5 rounded-xl" aria-label="Kassa Sentinel — на главную">
           <Logo className="h-9 w-9 shrink-0" />
-          <div className="leading-tight">
-            <div className="font-display text-[15px] font-extrabold tracking-tight">Kassa Sentinel</div>
-            <div className="hidden text-[11px] text-slate-500 dark:text-slate-400 sm:block">AI-контроль кассовых операций</div>
+          <div className="hidden leading-tight min-[420px]:block">
+            <div className="font-display text-[15px] font-extrabold tracking-tight text-ks-text">Kassa Sentinel</div>
+            <div className="hidden text-[11px] text-ks-text-3 sm:block">AI-контроль кассовых операций</div>
           </div>
         </a>
-        {demo && (
-          <span className="chip hidden border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-400/30 dark:bg-amber-400/10 dark:text-amber-300 sm:inline-flex">
-            СИНТЕТИЧЕСКОЕ ДЕМО
-          </span>
-        )}
-        <nav className="ml-2 flex items-center gap-1">
+        <nav className="ml-1 flex items-center gap-1 sm:ml-4" aria-label="Разделы">
           {link("#/", route.name !== "about", "Проверка", ScanSearch)}
           {link("#/about", route.name === "about", "О системе", Info)}
         </nav>
-        <div className="ml-auto flex items-center gap-2">
-          <span className="hidden md:inline-flex">
-            <LocalBadge />
-          </span>
+        <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
           {serverOk === false && !demo && (
-            <span className="chip hidden border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-400/20 dark:bg-rose-400/10 dark:text-rose-300 sm:inline-flex">
-              нет связи с сервером
+            <span className="chip chip-event" role="status">
+              <CircleAlert className="h-3.5 w-3.5" aria-hidden />
+              <span className="hidden sm:inline">нет связи с сервером</span>
+              <span className="sm:hidden">нет связи</span>
             </span>
           )}
-          <button className="rounded-xl p-2 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-white/10" onClick={nextTheme} title={themeTitle} aria-label={themeTitle}>
-            <ThemeIcon className="h-5 w-5" />
+          {demo && <span className="chip chip-warning hidden uppercase tracking-wide sm:inline-flex">Синтетическое демо</span>}
+          <span className="hidden lg:inline-flex">
+            <LocalBadge />
+          </span>
+          <span className="mx-1 hidden h-6 w-px bg-[var(--ks-border)] sm:block" aria-hidden />
+          <button className="ks-icon-btn" onClick={nextTheme} title={themeTitle} aria-label={themeTitle}>
+            <ThemeIcon className="h-[18px] w-[18px]" />
           </button>
-          <button className="rounded-xl p-2 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-white/10" onClick={openSettings} title="Настройки" aria-label="Настройки">
-            <Settings className="h-5 w-5" />
+          <button className="ks-icon-btn" onClick={openSettings} title="Настройки" aria-label="Настройки">
+            <Settings className="h-[18px] w-[18px]" />
           </button>
         </div>
       </div>
