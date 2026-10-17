@@ -151,3 +151,12 @@ def test_netguard_blocks_loopback_proxy(tmp_path, loopback_server):
                     "HTTPS_PROXY": f"http://127.0.0.1:{loopback_server}"}, [NETGUARD])
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "proxy-blocked"
+
+
+def test_scripts_portable():
+    for p in (ROOT / "deploy").rglob("*.ps1"):
+        data = p.read_bytes()
+        assert all(b < 128 for b in data), f"{p}: не-ASCII (PowerShell 5.1 прочтёт как ANSI)"
+    for p in (ROOT / "deploy").rglob("*.sh"):
+        data = p.read_bytes()
+        assert data.startswith(b"#!") and b"\r\n" not in data, p
