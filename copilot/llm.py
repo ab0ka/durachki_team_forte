@@ -1,7 +1,8 @@
 """LLM-бэкенды Sentinel Copilot. Всё локально: никаких облачных API (правило 1).
 
-* ``extractive`` (= ``mock``) — без модели: детерминированный ответ из фактов результата и норм.
-  Это и мок-бэкенд, и graceful fallback, когда GGUF/VRAM недоступны или вышел таймаут.
+* ``mock`` (SENTINEL_MOCK=1) / ``extractive`` (только явно в конфиге) — без модели: детерминированный
+  ответ из фактов результата и норм. НЕ подставляется автоматически вместо LLM: если модели нет,
+  ассистент честно сообщает «недоступен» (HTTP 501).
 * ``llama_cpp`` — llama-cpp-python (MIT) в процессе, GGUF Q4_K_M, загрузка по требованию,
   частичный offload на GPU по свободной VRAM, выгрузка по простою (VRAM нужна VLM).
 * ``llama_server`` — локальный llama.cpp server (OpenAI-совместимый /v1/chat/completions),
@@ -389,18 +390,27 @@ def find_model(cfg: dict[str, Any]) -> Optional[Path]:
     return None
 
 
-def make_llm(cfg: Optional[dict[str, Any]] = None, warnings: Optional[list[str]] = None) -> Any:
-    """auto: llama_server (если задан и жив) -> llama_cpp (если есть GGUF) -> extractive."""
+def make_llm(cfg: Optional[dict[str, Any]] = None, warnings: Optional[list[str]] = None) -> Optional[Any]:
+    """Выбор бэкенда. auto: llama_server (если задан и жив) -> llama_cpp (если есть GGUF и библиотека).
+
+    Если локальной модели нет — возвращает None (честное «недоступно», без подмены ответа и без
+    облачных API). ``mock`` — только при SENTINEL_MOCK=1 (auto) или явно; ``extractive`` — только явно.
+    Модель здесь НЕ загружается (загрузка — при первом вопросе или warmup()).
+    """
     cfg = cfg or default_config()
     lcfg = cfg.get("llm", {})
     backend = str(lcfg.get("backend", "auto")).lower()
     warn = warnings if warnings is not None else []
-    if backend in {"mock", "extractive"} or (is_mock() and backend == "auto"):
+    if backend == "extractive":
         return ExtractiveBackend()
+    if backend == "mock" or (is_mock() and backend == "auto"):
+        mock = ExtractiveBackend()
+        mock.name = "mock"
+        return mock
     if backend in {"auto", "llama_server"} and lcfg.get("server_url"):
         try:
             srv = LlamaServerBackend(str(lcfg["server_url"]), cfg)
-            if backend == "llama_server" or srv.healthy():
+            if srv.healthy():
                 return srv
             warn.append("llama.cpp server не отвечает")
         except ValueError as exc:
@@ -408,9 +418,11 @@ def make_llm(cfg: Optional[dict[str, Any]] = None, warnings: Optional[list[str]]
     if backend in {"auto", "llama_cpp"}:
         path = find_model(cfg)
         if path is None:
-            warn.append("GGUF-модель не найдена (llm.model_candidates) — экстрактивный режим")
+            warn.append("GGUF-модель не найдена (llm.model_candidates)")
         elif importlib.util.find_spec("llama_cpp") is None:
-            warn.append("llama-cpp-python не установлен — экстрактивный режим")
+            warn.append("llama-cpp-python не установлен")
         else:
             return LlamaCppBackend(path, cfg)
-    return ExtractiveBackend()
+    if backend not in {"auto", "llama_cpp", "llama_server"}:
+        warn.append(f"неизвестный llm.backend: {backend!r}")
+    return None

@@ -96,6 +96,19 @@ def resolve_path(path: str | os.PathLike[str] | None) -> Path | None:
     return p if p.is_absolute() else REPO_ROOT / p
 
 
+def copilot_enabled(cfg: dict[str, Any]) -> bool:
+    """COPILOT_ENABLED (env) > enabled (конфиг: true | false | mock)."""
+    env = os.environ.get("COPILOT_ENABLED")
+    if env is not None and env.strip() != "":
+        return env.strip().lower() in {"1", "true", "yes", "on"}
+    mode = str(cfg.get("enabled", "mock")).strip().lower()
+    if mode in {"true", "1", "yes", "on"}:
+        return True
+    if mode == "mock":
+        return is_mock()
+    return False
+
+
 def fixture_allowed(cfg: dict[str, Any]) -> bool:
     mode = str(cfg.get("corpus", {}).get("fixture_fallback", "auto")).lower()
     if mode in {"true", "1", "yes", "always"}:

@@ -1,6 +1,11 @@
 # Sentinel Copilot (A14) — все пороги и пути. Переопределение: env COPILOT_CONFIG=<path>
 # или точечно через env-переменные (см. README, раздел «Для интегратора»).
 
+# Copilot — ОПЦИОНАЛЬНЫЙ модуль. На 8 ГБ VRAM ресурсы делятся с VLM, поэтому по умолчанию выключен.
+# false — выключен (ask -> 501); true — включён; mock — включён только при SENTINEL_MOCK=1.
+# env COPILOT_ENABLED=1/0 имеет приоритет.
+enabled: mock
+
 corpus:
   # Каталог норм (владелец A13). Пути относительны корня репозитория.
   catalog_path: norms/catalog.yaml
@@ -47,7 +52,8 @@ llm:
   temperature: 0.2
   top_p: 0.9
   repeat_penalty: 1.05
-  timeout_s: 45            # бюджет генерации; по таймауту — экстрактивный ответ
+  timeout_s: 45            # бюджет генерации; по таймауту — честная ошибка timeout (HTTP 504)
+  max_norm_refs: 6         # сколько фрагментов норм максимум кладём в контекст
   server_url: null         # напр. http://127.0.0.1:8081 (llama.cpp server). Только локальные адреса!
   allow_private_hosts: true  # 10.x/172.16-31.x/192.168.x и docker-имена без точки
 

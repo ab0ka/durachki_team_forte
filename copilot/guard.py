@@ -155,10 +155,12 @@ def check_answer(raw: str, refs: Sequence[NormRef], corpus: Optional[Corpus], re
         if not bad and sent.strip():
             kept.append(sent.strip())
     answer = ""
+    prev_item = False
     for part in kept:
         is_item = bool(re.match(r"^(?:[-*•]|\d+[.)])\s+", part))
-        sep = "\n" if (is_item or answer.endswith(("\n", ":"))) and answer else " "
+        sep = "\n" if (is_item or prev_item or answer.endswith(":")) else " "
         answer = f"{answer}{sep}{part}" if answer else part
+        prev_item = is_item
     answer = answer.strip()
     answer = re.sub(r"[ \t]+([.,;:!?])", r"\1", answer)
     answer = re.sub(r"[ \t]{2,}", " ", answer)
