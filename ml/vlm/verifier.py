@@ -175,13 +175,15 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
                   "system": system, "prompt": user, "raw": outcome.raw, "status": outcome.status})
         if not outcome.ok:
             _mark(ev, outcome.status, attempts=outcome.attempts, latency_s=round(outcome.latency_s, 3),
-                  error=outcome.error[:120])
+                  error=outcome.error[:120], finish_reason=outcome.finish_reason, complete=not outcome.truncated)
             continue
         res = dict(outcome.data)
         res["_times"] = ftimes
         res["_attempts"] = outcome.attempts
         res["_latency_s"] = round(outcome.latency_s, 3)
         res["_repaired"] = outcome.repaired
+        res["_finish"] = outcome.finish_reason
+        res["_truncated"] = outcome.truncated
         res["_backend"] = backend.info().get("model", backend.name)
         snap = Event(orig_type, ev.t_start, ev.t_end, ev.t_peak, ev.confidence, ev.source)
         _apply(ev, res, types, cfg, ffcfg)
@@ -273,6 +275,8 @@ def _apply(ev: Event, res: dict[str, Any], types: dict[str, dict[str, Any]], cfg
         "attempts": res.get("_attempts"),
         "latency_s": res.get("_latency_s"),
         "repaired_json": bool(res.get("_repaired")),
+        "finish_reason": res.get("_finish", ""),
+        "complete": not bool(res.get("_truncated")),  # обрезанный ответ (length/time) — complete=false
         "model": res.get("_backend"),
         "shared": shared_from,
         **trace,

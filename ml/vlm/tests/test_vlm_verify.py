@@ -177,3 +177,18 @@ def test_emit_rejected_flag(clip, cfg, clock):
     rej = verify_events(clip, [_ev(conf=0.9)], 30.0, cfg=cfg,
                         backend=MockBackend(responses=[_ans(False, "V05", 0.8, [])], clock=clock), clock=clock)[0]
     assert rej.extra["vlm_verdict"] == "rejected"
+
+
+def test_truncated_answer_marked_incomplete(clip, cfg, clock):
+    from ml.vlm.backends.base import GenResult
+
+    class Trunc(MockBackend):
+        def generate(self, images, system, prompt, **kw):
+            self.calls.append({"prompt": prompt})
+            return GenResult(text='{"visible": true, "type_id": "V05", "confidence": 0.8, "observed_facts": ["Кас',
+                             latency_s=1.0, completion_tokens=180, finish_reason="length")
+
+    out = verify_events(clip, [_ev(conf=0.5)], 30.0, cfg=cfg, backend=Trunc(clock=clock), clock=clock)[0]
+    v = out.extra["vlm"]
+    assert v["status"] == "ok" and v["finish_reason"] == "length" and v["complete"] is False
+    assert v["repaired_json"] is True

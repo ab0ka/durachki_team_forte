@@ -169,6 +169,8 @@ class CallOutcome:
     latency_s: float = 0.0
     repaired: bool = False
     error: str = ""
+    finish_reason: str = ""        # последнего вызова: eos | length | time | stop | ""
+    truncated: bool = False        # ответ обрезан по длине/времени (complete=False)
     raw: list[str] = field(default_factory=list)  # только для локального дампа (CLI), не для логов
 
 
@@ -247,6 +249,7 @@ def call_json(be: VLMBackend, images: list[Any], system: str, prompt: str, budge
             break
         out.attempts += 1
         out.latency_s += res.latency_s
+        out.finish_reason, out.truncated = res.finish_reason, bool(res.truncated)
         budget.record(res.latency_s, vis, res.completion_tokens, mnt, retry)
         out.raw.append(res.text)
         if not res.text.strip():
