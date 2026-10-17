@@ -14,18 +14,24 @@ import re
 import time
 from typing import Any, Callable, Optional
 
-from .base import GenResult, VLMBackend
+from .base import GenResult, OptionScores, VLMBackend
 
 Responder = Callable[[list[Any], str, str], str]
 
 
 class MockBackend(VLMBackend):
+    """ТОЛЬКО для тестов и демо (SENTINEL_MOCK=1 или явный backend: mock). Ответы помечены как mock."""
+
     name = "mock"
     model_id = "mock-vlm"
+    supports_option_probs = True
 
     def __init__(self, mode: str = "neutral", latency_s: float = 0.0, responder: Optional[Responder] = None,
-                 responses: Optional[list[str]] = None, clock: Any = None) -> None:
+                 responses: Optional[list[str]] = None, clock: Any = None,
+                 option_responder: Optional[Callable[[list[Any], str, str, dict[str, list[str]]], dict[str, float]]] = None
+                 ) -> None:
         self.mode = mode
+        self.option_responder = option_responder
         self.latency_s = float(latency_s)
         self.responder = responder
         self.responses = list(responses or [])
@@ -80,3 +86,35 @@ class MockBackend(VLMBackend):
             text = self._default(prompt)
         lat = self.latency_s if self.clock is not None else time.perf_counter() - t0
         return GenResult(text=text, latency_s=lat, prompt_tokens=None, completion_tokens=len(text) // 4)
+
+    def option_probs(self, images: list[Any], system: str, prompt: str,
+                     options: dict[str, list[str]], timeout_s: float = 10.0) -> OptionScores:
+        """neutral — равномерно; confirm/phone — «да»; reject — «нет»; garbage — «не видно»."""
+        self.calls.append({"n_images": len(images), "system": system, "prompt": prompt, "options": list(options),
+                           "sizes": [getattr(i, "size", None) for i in images], "kind": "option_probs"})
+        self._wait(timeout_s)
+        keys = list(options)
+        if self.option_responder is not None:
+            raw = self.option_responder(images, system, prompt, options)
+        else:
+            raw = {k: 1.0 for k in keys}
+            pick = {"confirm": "yes", "phone": "yes", "reject": "no", "garbage": "unknown"}.get(self.mode)
+            if pick in raw:
+                raw = {k: (17.0 if k == pick else 1.0) for k in keys}
+        tot = sum(max(0.0, float(raw.get(k, 0.0))) for k in keys) or 1.0
+        probs = {k: max(0.0, float(raw.get(k, 0.0))) / tot for k in keys}
+        return OptionScores(probs=probs, mass=0.9, latency_s=self.latency_s, mode="words", meta={"mock": True})
+
+    def chat(self, messages: list[dict[str, Any]], images: Optional[list[Any]] = None, max_new_tokens: int = 256,
+             timeout_s: float = 20.0, temperature: float = 0.0) -> GenResult:
+        self.calls.append({"kind": "chat", "n_messages": len(messages), "n_images": len(images or [])})
+        timed_out = self._wait(timeout_s)
+        if timed_out:
+            return GenResult(text="", latency_s=min(self.latency_s, timeout_s), timed_out=True, error="timeout",
+                             finish_reason="time")
+        if self.responses:
+            text = self.responses.pop(0)
+        else:
+            last = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+            text = f"[mock] получено сообщение из {len(str(last))} символов"
+        return GenResult(text=text, latency_s=self.latency_s, completion_tokens=len(text) // 4, finish_reason="eos")
