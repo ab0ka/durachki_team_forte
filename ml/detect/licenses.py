@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-from .weights import hf_cache_dir
+from .weights import find_cache_dir
 
 MODELS_JSON = Path(__file__).with_name("models.json")
 PERMISSIVE = {"apache-2.0", "mit", "bsd-2-clause", "bsd-3-clause", "bsd"}
@@ -23,9 +23,10 @@ def load_models() -> list[dict[str, Any]]:
 
 
 def local_license_files(model_id: str) -> list[Path]:
-    snap = hf_cache_dir() / ("models--" + model_id.replace("/", "--")) / "snapshots"
-    if not snap.is_dir():
+    cache = find_cache_dir(model_id)
+    if cache is None:
         return []
+    snap = cache / ("models--" + model_id.replace("/", "--")) / "snapshots"
     return sorted(p for p in snap.rglob("*") if p.is_file() and p.name.upper().startswith(("LICENSE", "README")))
 
 

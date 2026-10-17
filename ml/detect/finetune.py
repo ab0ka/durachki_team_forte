@@ -138,7 +138,7 @@ def train(coco_path: str | Path, frames_root: str | Path, out_dir: str | Path, b
         from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
         src = str(local_model_dir(base) or base)
-        kw = {} if local_model_dir(base) else pretrained_kwargs()
+        kw = {} if local_model_dir(base) else pretrained_kwargs(base)
         processor = processor or AutoImageProcessor.from_pretrained(src, **kw)
         model = model or AutoModelForObjectDetection.from_pretrained(
             src, id2label=id2label, label2id=label2id, num_labels=len(classes), ignore_mismatched_sizes=True, **kw)

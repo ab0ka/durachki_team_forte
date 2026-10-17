@@ -102,7 +102,12 @@ def test_empty_and_broken_frames(mock_mode):
     clip.frames[2] = None  # битый кадр не должен ронять детекцию
     dets = detect(clip)
     assert clip.times[2] not in {d.t for d in dets}
-    assert any("frame 2" in w for w in last_stats()["warnings"])
+    st = last_stats()
+    assert any("frame 2" in w for w in st["warnings"])
+    # битый кадр = пробел в покрытии, а не «объектов нет»
+    assert st["status"] == "partial"
+    assert st["coverage"]["frames_processed"] == len(clip.times) - 1
+    assert st["coverage"]["gaps_s"] == [[clip.times[2], clip.times[2]]]
 
 
 def test_baseline_over_soft_budget_is_not_degraded(mock_mode):
@@ -116,8 +121,9 @@ def test_budget_forces_stride(mock_mode, monkeypatch):
     clip, _ = synth_clip(duration_s=8.0, sample_fps=5.0)
     dets = detect(clip, config={"runtime": {"budget_s": 0.0, "hard_budget_s": 1e-9, "batch_size": 4}})
     st = last_stats()
-    assert st["stride_final"] > 1 and st["status"] == "degraded"
+    assert st["stride_final"] > 1 and st["status"] == "partial"
     assert len({d.t for d in dets}) < len(clip.times)
+    assert st["coverage"]["fraction"] < 1.0 and st["coverage"]["gaps_s"]
 
 
 def test_last_stats_are_per_thread(mock_mode):
@@ -137,3 +143,40 @@ def test_last_stats_are_per_thread(mock_mode):
     for t in ts:
         t.join()
     assert seen == {"a": len(clip_a.times), "b": len(clip_b.times)}
+
+
+def test_full_coverage_and_every_n_not_counted_as_gap(mock_mode):
+    clip, _ = synth_clip(duration_s=2.0)
+    detect(clip, every_n=2)
+    cov = last_stats()["coverage"]
+    assert cov == {"frames_planned": 5, "frames_processed": 5, "fraction": 1.0, "gaps_s": []}
+    assert last_stats()["status"] == "ok"
+
+
+def test_backend_failure_is_partial_not_empty(mock_mode, monkeypatch):
+    from ml.detect.backends.mock import MockColorDetector
+
+    calls = {"n": 0}
+    orig = MockColorDetector.predict
+
+    def flaky(self, frames):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("device lost")
+        return orig(self, frames)
+
+    monkeypatch.setattr(MockColorDetector, "predict", flaky)
+    clip, _ = synth_clip(duration_s=4.0)
+    detect(clip, config={"runtime": {"batch_size": 5}})
+    st = last_stats()
+    assert st["status"] == "partial"
+    assert st["coverage"]["frames_processed"] == 5 and st["coverage"]["gaps_s"][0][0] == clip.times[5]
+    assert any("all closed-set backends failed" in w for w in st["warnings"])
+
+
+def test_landscape_video_other_angle(mock_mode):
+    """Тест «под другим углом» может быть горизонтальным: 848×464, нормированные боксы, без координат-констант."""
+    clip, gts = synth_clip(duration_s=1.0, width=848, height=464)
+    dets = detect(clip)
+    _check_format(dets)
+    assert {lab for lab, _ in gts[0]} <= {d.label for d in dets if d.t == 0.0}
