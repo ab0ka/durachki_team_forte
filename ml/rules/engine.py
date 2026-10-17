@@ -32,7 +32,7 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 
 from .catalog import legal_basis_of, norm_status, resolve_catalog, type_info
-from .config import RuleSpec, RulesConfig, load_rules_config
+from .config import Clause, RuleSpec, RulesConfig, load_rules_config
 from .expr import EvalContext
 from .signals import SignalSeries, build_series, derive_from_tracks, polygon_bbox, track_box_at
 
@@ -513,6 +513,14 @@ def _make_event(rule: RuleSpec, series: SignalSeries, strength: np.ndarray, i0: 
         "derived_signals": {n: series.derived[n] for n in rule.names if n in series.derived},
     }
     clauses = []
+    if ("legacy", "strength") in aux:
+        clauses.append(_clause_trace("predicate", Clause("strength", rule.comment[:80] or "условие правила",
+                                                         rule.strength), aux[("legacy", "strength")], i0, i1, ip))
+    if ("legacy", "gate") in aux and rule.gate is not None:
+        kind = "applicability" if rule.gate_mode == "strict" else "gate_lenient"
+        clauses.append(_clause_trace(kind, Clause("gate", "условие применимости" if kind == "applicability"
+                                                  else "исключение (блокирует, только если доказано ложным gate)",
+                                                  rule.gate), aux[("legacy", "gate")], i0, i1, ip))
     if rule.applicability is not None and "app" in aux:
         clauses.append(_clause_trace("applicability", rule.applicability, aux["app"], i0, i1, ip))
     for c in rule.predicates:
@@ -598,6 +606,10 @@ def _rule_events(rule: RuleSpec, series: SignalSeries, ctx: EvalContext, s_lo: n
     events: list[Any] = []
     base_assessment, base_reasons = _assess(rule, catalog, cfg)
     aux: dict[Any, Any] = {}
+    if not rule.predicates:  # старый формат: strength — единственный обязательный предикат, gate — условие
+        aux[("legacy", "strength")] = rule.strength.bounds(ctx)
+        if rule.gate is not None:
+            aux[("legacy", "gate")] = rule.gate.bounds(ctx)
     if rule.applicability is not None:
         aux["app"] = rule.applicability.expr.bounds(ctx)
     for c in rule.predicates:

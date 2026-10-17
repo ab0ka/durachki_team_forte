@@ -22,7 +22,11 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-__all__ = ["save_cache", "load_cache_dir", "load_labels", "normalize_video_id", "parse_timecode", "parse_label"]
+__all__ = ["save_cache", "load_cache_dir", "load_labels", "load_name_map", "hash_videos", "normalize_video_id",
+           "parse_timecode", "parse_label"]
+
+# Файлы кэша A03 (cache/<sha>/...), которые не являются состояниями сцены.
+_NOT_STATES = ("dets.", "poses.", "pose_states.", "events_", "risk.", "manifest.", "summary.", "tracks.", "zones.")
 
 _CYR2LAT = str.maketrans({
     "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T",
@@ -94,7 +98,7 @@ def load_cache_dir(cache_dir: str | Path) -> dict[str, dict[str, Any]]:
     files = sorted(p for p in root.rglob("*") if p.is_file() and re.search(r"\.jsonl?(\.gz)?$", p.name))
     for p in files:
         lname = p.name.lower()
-        if lname.startswith(("tracks.", "zones.")) or re.search(r"\.(tracks|zones)\.json", lname):
+        if lname.startswith(_NOT_STATES) or re.search(r"\.(tracks|zones)\.json", lname):
             continue
         if lname.startswith("states."):
             name = p.parent.name
@@ -121,11 +125,56 @@ def load_cache_dir(cache_dir: str | Path) -> dict[str, dict[str, Any]]:
                         holder.extend(_items(_read_json_any(sib), kind))
                     except (OSError, ValueError):
                         pass
+        manifest = p.parent / "manifest.json"
+        video_info: dict[str, Any] = {}
+        if lname.startswith("states.") and manifest.exists():
+            try:
+                video_info = dict((_read_json_any(manifest) or {}).get("video") or {})
+            except (OSError, ValueError, AttributeError):
+                video_info = {}
         key = normalize_video_id(name)
         if key in out:
             print(f"[replay] дубликат id {key}: {p} (оставлен {out[key]['path']})")
             continue
-        out[key] = {"name": name, "states": states, "tracks": tracks, "zones": zones, "path": str(p)}
+        out[key] = {"name": name, "states": states, "tracks": tracks, "zones": zones, "path": str(p),
+                    "video_info": video_info}
+    return out
+
+
+def load_name_map(path: str | Path) -> dict[str, str]:
+    """sha256 → имя файла: ``summary.json`` батча A03 (``file``/``name`` + ``sha256``) или CSV ``sha256,file``."""
+    p = Path(path)
+    out: dict[str, str] = {}
+    if p.suffix.lower() == ".json":
+        rows = _read_json_any(p)
+        rows = rows.get("rows", rows) if isinstance(rows, dict) else rows
+        for r in rows or []:
+            if isinstance(r, dict) and r.get("sha256") and (r.get("file") or r.get("name")):
+                out[str(r["sha256"]).lower()] = str(r.get("file") or r.get("name"))
+        return out
+    text = p.read_text(encoding="utf-8-sig")
+    rows = list(csv.DictReader(io.StringIO(text)))
+    for r in rows:
+        low = {k.strip().lower(): (v or "").strip() for k, v in r.items() if k}
+        sha = low.get("sha256") or low.get("sha")
+        name = low.get("file") or low.get("name") or low.get("video")
+        if sha and name:
+            out[sha.lower()] = name
+    return out
+
+
+def hash_videos(folder: str | Path) -> dict[str, str]:
+    """sha256 → имя файла для видео в папке (локально у L2; содержимое видео никуда не передаётся)."""
+    import hashlib
+
+    out: dict[str, str] = {}
+    for p in sorted(Path(folder).iterdir()):
+        if p.is_file() and _VIDEO_EXT.search(p.name):
+            h = hashlib.sha256()
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            out[h.hexdigest()] = p.name
     return out
 
 
@@ -197,7 +246,15 @@ def load_labels(path: str | Path) -> dict[str, list[dict[str, Any]]]:
     if not rows:
         return {}
     header = rows[0]
-    i_file, i_label, i_time = _pick(header, _COL_FILE), _pick(header, _COL_LABEL), _pick(header, _COL_TIME)
+    low_header = [h.strip().lower() for h in header]
+
+    def _exact(name: str) -> Optional[int]:
+        return low_header.index(name) if name in low_header else None
+
+    i_tall, i_conflict, i_group, i_md5 = _exact("t_all"), _exact("conflict"), _exact("group"), _exact("md5")
+    i_file = _exact("file") if _exact("file") is not None else _pick(header, _COL_FILE)
+    i_label = _exact("label") if _exact("label") is not None else _pick(header, _COL_LABEL)
+    i_time = _exact("t_sec") if _exact("t_sec") is not None else _pick(header, _COL_TIME)
     if i_file is None:
         i_file, i_label, i_time = 0, 1 if len(header) > 1 else None, 2 if len(header) > 2 else None
         body = rows
@@ -214,5 +271,16 @@ def load_labels(path: str | Path) -> dict[str, list[dict[str, Any]]]:
         t = parse_timecode(r[i_time]) if i_time is not None and i_time < len(r) else None
         if label is None and t is not None:
             label = True  # есть секунда события → нарушение
-        out.setdefault(normalize_video_id(name), []).append({"name": name, "violation": label, "t": t})
+        entry: dict[str, Any] = {"name": name, "violation": label, "t": t}
+        # схема L1 (eval.labels): md5, group, t_all, conflict — дубликаты и конфликт таймкодов
+        if i_tall is not None and i_tall < len(r):
+            alts = [parse_timecode(x) for x in re.split(r"[;|,/ ]+", r[i_tall]) if x.strip()]
+            entry["t_all"] = sorted({a for a in alts if a is not None})
+        if i_conflict is not None and i_conflict < len(r):
+            entry["conflict"] = str(r[i_conflict]).strip().lower() in ("1", "true", "yes", "да", "y")
+        if i_group is not None and i_group < len(r) and r[i_group].strip():
+            entry["group"] = r[i_group].strip()
+        if i_md5 is not None and i_md5 < len(r) and r[i_md5].strip():
+            entry["md5"] = r[i_md5].strip().lower()
+        out.setdefault(normalize_video_id(name), []).append(entry)
     return out

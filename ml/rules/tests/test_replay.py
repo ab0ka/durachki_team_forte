@@ -68,17 +68,20 @@ def test_replay_cli_end_to_end(tmp_path: Path, capsys: pytest.CaptureFixture[str
     assert out_csv.read_text(encoding="utf-8").startswith("name,gt")
 
 
-def test_replay_without_verified_norms_predicts_no_violation(tmp_path: Path, capsys: pytest.CaptureFixture[str],
-                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+def test_replay_verdict_policies_without_verified_norms(tmp_path: Path, capsys: pytest.CaptureFixture[str],
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
     import ml.rules.catalog as catalog_mod
 
     monkeypatch.setattr(catalog_mod, "_try_norms_catalog", lambda: None)
     cache = _write_cache(tmp_path)
     labels = tmp_path / "labels.csv"
     labels.write_text("file,label,second\nX-1.mov,нарушение,15\n", encoding="utf-8")
+    # по умолчанию — ось обнаружения (поведение по видео), норма отчитывается отдельно
     assert main(["--cache", str(cache), "--labels", str(labels)]) == 0
-    text = capsys.readouterr().out
-    assert "TP=0 FP=0 FN=1" in text  # без проверенной нормы — только review_observation
+    assert "TP=1 FP=0 FN=0" in capsys.readouterr().out
+    # юридическая политика: без подтверждённой нормы — только наблюдения
+    assert main(["--cache", str(cache), "--labels", str(labels), "--verdict", "legal"]) == 0
+    assert "TP=0 FP=0 FN=1" in capsys.readouterr().out
 
 
 def test_replay_sweep_and_overrides(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -102,3 +105,62 @@ def test_rules_table_cli(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_replay_empty_cache(tmp_path: Path) -> None:
     assert main(["--cache", str(tmp_path / "nothing")]) == 2
+
+
+def _a03_cache(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Раскладка A03: cache/<sha>/states.jsonl (+ dets.jsonl, manifest.json) и summary.json батча."""
+    cache = tmp_path / "cache"
+    pos = RULE_CASES["V03_safe_left_open"]["pos"]
+    shas = {"X-1.mov": "a" * 64, "Х-4.mov": "b" * 64, "X-47.mov": "c" * 64, "X-9.mov": "d" * 64}
+    for fname, sha in shas.items():
+        d = cache / sha
+        d.mkdir(parents=True)
+        segs = pos["segments"] if fname in ("X-1.mov", "Х-4.mov", "X-47.mov") else []
+        with open(d / "states.jsonl", "w", encoding="utf-8") as fh:
+            for st in make_states(60.0, segments=segs):
+                fh.write(json.dumps({"t": st.t, "signals": st.signals}) + "\n")
+        (d / "dets.jsonl").write_text(json.dumps({"t": 0.0, "label": "person", "bbox": [0, 0, 1, 1], "score": 1}) + "\n",
+                                      encoding="utf-8")
+        (d / "manifest.json").write_text(json.dumps({"sha256": sha, "video": {"duration": 60.0}}), encoding="utf-8")
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps([{"file": f, "name": f.split(".")[0], "sha256": s} for f, s in shas.items()]),
+                       encoding="utf-8")
+    labels = tmp_path / "labels.csv"
+    labels.write_text(
+        "video_id,file,label,t_sec,md5,group,t_all,conflict,raw\n"
+        "X-1,X-1.mov,violation,15,m1,,15,0,\n"
+        "Х-4,Х-4.mov,violation,15,m4,g4,15;27,1,\n"
+        "X-47,X-47.mov,violation,27,m4,g4,15;27,1,\n"
+        "X-9,X-9.mov,no_violation,,m9,,,0,\n", encoding="utf-8")
+    return cache, summary, labels
+
+
+def test_a03_layout_names_dedupe_and_conflict(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cache, summary, labels = _a03_cache(tmp_path)
+    found = load_cache_dir(cache)
+    assert len(found) == 4  # dets.jsonl/manifest.json не принимаются за ролики
+    out_json = tmp_path / "res.json"
+    assert main(["--cache", str(cache), "--labels", str(labels), "--names", str(summary), "--json", str(out_json),
+                 "--trace"]) == 0
+    text = capsys.readouterr().out
+    assert "TP=2 FP=0 FN=0 TN=1" in text          # Х-4 ≡ X-47 — один ролик
+    assert "конфликт таймкода: 1" in text and "predicate" in text
+    res = json.loads(out_json.read_text(encoding="utf-8"))
+    assert res["summary"]["n_labeled"] == 3 and res["summary"]["joint"] is not None
+    assert res["summary"]["time_hit_rate"]["1.0"] == 1.0   # конфликтная группа не входит в метрику времени
+    assert res["summary"]["vram_mb"] == 0
+
+
+def test_ablation_and_propose(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cache, summary, labels = _a03_cache(tmp_path)
+    out_json = tmp_path / "abl.json"
+    assert main(["--cache", str(cache), "--labels", str(labels), "--names", str(summary),
+                 "--hypotheses", "all", "--json", str(out_json)]) == 0
+    rows = json.loads(out_json.read_text(encoding="utf-8"))
+    names = [r["variant"] for r in rows]
+    assert names[0] == "baseline" and "profile:phase2" in names and "+H1_left_after_departure" in names
+    assert all("joint" in r and "d_fp" in r for r in rows)
+    capsys.readouterr()
+    assert main(["--cache", str(cache), "--labels", str(labels), "--names", str(summary), "--propose"]) == 0
+    out = capsys.readouterr().out
+    assert "joint" in out or "не найдено" in out
