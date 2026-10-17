@@ -7,7 +7,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from .geometry import BBox, bbox_gap, zone_membership
+from .geometry import BBox, bbox_gap
 
 
 @dataclass
@@ -106,6 +106,12 @@ def _explicit_roles(track: Any, min_conf: float) -> Optional[tuple[float, float]
     return pc, pcol
 
 
+def _member(b: BBox, poly: Any, anchor_y: float, ofull: float) -> float:
+    from .presence import member
+
+    return member(b, [poly], anchor_y, ofull)
+
+
 def build_persons(
     tl: Timeline,
     tracks: Sequence[Any],
@@ -145,7 +151,7 @@ def build_persons(
             explicit = _explicit_roles(tr, float(pcfg["role_min_conf"]))
             # эвристика по треку целиком (офлайн): доля времени в зоне кассира, длительность, сумка рядом
             if workplace:
-                frac_ws = float(np.mean([zone_membership(b, workplace, anchor_y, ofull) for _, b in vis]))
+                frac_ws = float(np.mean([_member(b, workplace, anchor_y, ofull) for _, b in vis]))
             else:
                 frac_ws = 0.5
             dur = len(vis) * dt
@@ -179,7 +185,7 @@ def build_persons(
             if d.label != "person" or float(d.score) < min_score:
                 continue
             b = tuple(map(float, d.bbox))
-            m = zone_membership(b, workplace, anchor_y, ofull) if workplace else 0.5
+            m = _member(b, workplace, anchor_y, ofull) if workplace else 0.5
             pc = float(np.clip(float(hcfg["cashier_base"]) + float(hcfg["cashier_gain"]) * m, 0.0, 0.9))
             near_bag = any(bbox_gap(b, bg) <= float(hcfg["collector_bag_dist"]) for bg in bag_boxes[i])
             pcol = 0.6 * (1.0 - pc) if near_bag else 0.0

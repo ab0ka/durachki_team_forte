@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -39,15 +39,62 @@ class AppearanceResult:
     info: dict[str, Any] = field(default_factory=dict)
 
 
+def roi_boxes(roi_box: BBox, cfg_roi: dict[str, Any]) -> tuple[BBox, BBox]:
+    """Внутренний ROI (объект + margin) и внешний (кольцо для «кромки вне контура»)."""
+    return expand_bbox(roi_box, float(cfg_roi["margin"])), expand_bbox(roi_box, float(cfg_roi["ring"]))
+
+
+def extract_u8(frame: np.ndarray, roi_box: BBox, shift: tuple[float, float], cfg_roi: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Сжатые серые кропы (uint8, size×size, размытие 3×3) — всё, что нужно анализу вида; кадр читается один раз."""
+    import cv2
+
+    size = int(cfg_roi["size"])
+    inner, outer = roi_boxes(roi_box, cfg_roi)
+    ci = cv2.GaussianBlur(R.to_gray(R.crop(frame, inner, shift, (size, size))), (3, 3), 0)
+    co = cv2.GaussianBlur(R.to_gray(R.crop(frame, outer, shift, (size, size))), (3, 3), 0)
+    return np.clip(ci, 0, 255).astype(np.uint8), np.clip(co, 0, 255).astype(np.uint8)
+
+
+class _Crops:
+    """Ленивый доступ к подготовленным кропам: z-норма и маски людей считаются по запросу (экономия памяти)."""
+
+    def __init__(self, store: dict[int, tuple[np.ndarray, np.ndarray]], inner: BBox, outer: BBox, person_boxes: list[list[BBox]], size: int, pad: float) -> None:
+        self.store, self.inner, self.outer, self.boxes, self.size, self.pad = store, inner, outer, person_boxes, size, pad
+        self.keys: set[int] = set()
+        self._ring = R.ring_mask(outer, inner, (size, size))
+
+    def get(self, i: int) -> Optional[tuple[np.ndarray, ...]]:
+        c = self.store.get(i)
+        if c is None:
+            return None
+        ci, co = c[0].astype(np.float32), c[1].astype(np.float32)
+        wh = (self.size, self.size)
+        mi = R.mask_from_boxes(self.inner, self.boxes[i], wh, self.pad)
+        mo = R.mask_from_boxes(self.outer, self.boxes[i], wh, self.pad) * self._ring
+        return R.znorm(ci, mi), mi, R.znorm(co, mo), mo, ci, co
+
+    def __contains__(self, i: int) -> bool:
+        return i in self.keys
+
+    def __getitem__(self, i: int) -> tuple[np.ndarray, ...]:
+        c = self.get(i)
+        if c is None:
+            raise KeyError(i)
+        return c
+
+    def items(self):  # noqa: ANN201
+        for i in sorted(self.keys):
+            yield i, self[i]
+
+
 def analyze_roi(
-    frames: Callable[[int], Optional[np.ndarray]],
+    store: dict[int, tuple[np.ndarray, np.ndarray]],
     idxs: list[int],
     n: int,
     times: np.ndarray,
     roi_box: BBox,
     person_boxes: list[list[BBox]],
     quality: np.ndarray,
-    shifts: list[tuple[float, float]],
     det_logodds: np.ndarray,
     det_conf: np.ndarray,
     cfg_roi: dict[str, Any],
@@ -55,13 +102,11 @@ def analyze_roi(
     extra_open_votes: Optional[np.ndarray] = None,
     use_shape_prior: bool = True,
 ) -> AppearanceResult:
-    """idxs — индексы сэмплов, для которых читаются кадры (stride); результат — на все n сэмплов."""
+    """store — uint8-кропы (extract_u8) по индексам idxs (stride); результат — на все n сэмплов."""
     size = int(cfg_roi["size"])
     pad = float(cfg_roi["person_pad"])
-    inner = expand_bbox(roi_box, float(cfg_roi["margin"]))
-    outer = expand_bbox(roi_box, float(cfg_roi["ring"]))
+    inner, outer = roi_boxes(roi_box, cfg_roi)
     occ_max = float(cfg_roi["occlusion_max"])
-    blur = 3
 
     vis = np.ones(n)
     for i in range(n):
@@ -70,46 +115,34 @@ def analyze_roi(
     # --- эталон A: первые N чистых кадров (сначала в первых ref_search_s секундах) ---
     ref_max_occ = float(cfg_roi["ref_max_occlusion"])
     n_ref = int(cfg_roi["ref_frames"])
-    clean = [i for i in idxs if 1.0 - vis[i] <= ref_max_occ and quality[i] >= 0.4]
+    clean = [i for i in idxs if i in store and 1.0 - vis[i] <= ref_max_occ and quality[i] >= 0.4]
     early = [i for i in clean if times[i] <= float(cfg_roi["ref_search_s"])]
     ref_idx = (early if len(early) >= max(3, n_ref // 2) else clean)[:n_ref]
 
-    import cv2
-
-    def crops(i: int) -> Optional[tuple[np.ndarray, ...]]:
-        fr = frames(i)
-        if fr is None:
-            return None
-        g = R.to_gray(fr)
-        ci = cv2.GaussianBlur(R.crop(g, inner, shifts[i], (size, size)), (blur, blur), 0)
-        co = cv2.GaussianBlur(R.crop(g, outer, shifts[i], (size, size)), (blur, blur), 0)
-        mi = R.mask_from_boxes(inner, person_boxes[i], (size, size), pad)
-        mo = R.mask_from_boxes(outer, person_boxes[i], (size, size), pad) * R.ring_mask(outer, inner, (size, size))
-        return R.znorm(ci, mi), mi, R.znorm(co, mo), mo, ci, co
-
+    crops = _Crops(store, inner, outer, person_boxes, size, pad)
     res = AppearanceResult(p_open=np.full(n, 0.5), conf=np.zeros(n), visibility=vis, change=np.full(n, np.nan), state_b=np.zeros(n), roi=roi_box)
     if len(ref_idx) < 3:
         res.info["reason"] = "no clean reference frames"
         res.provenance.append("no_reference")
         return _with_dets(res, det_logodds, det_conf, cfg_obj)
 
-    ref_c = [crops(i) for i in ref_idx]
+    ref_c = [crops.get(i) for i in ref_idx]
     ref_c = [c for c in ref_c if c is not None]
     if len(ref_c) < 3:
         res.info["reason"] = "frames unavailable"
         return _with_dets(res, det_logodds, det_conf, cfg_obj)
     ref_a = R.masked_median([c[0] for c in ref_c], [c[1] for c in ref_c])
 
-    cur: dict[int, tuple[np.ndarray, ...]] = {}
+    cur = crops
     d_a = np.full(n, np.nan)
     win = int(cfg_roi["ssim_win"])
     for i in idxs:
         if 1.0 - vis[i] > occ_max:
             continue
-        c = crops(i)
+        c = crops.get(i)
         if c is None:
             continue
-        cur[i] = c
+        cur.keys.add(i)
         d_a[i] = 1.0 - R.cs_ssim(c[0], ref_a, c[1], win)
     res.change = d_a
 
@@ -124,8 +157,10 @@ def analyze_roi(
     has_b = len(b_idx) >= 3
     ref_b = None
     if has_b:
-        ref_b = R.masked_median([cur[i][0] for i in b_idx], [cur[i][1] for i in b_idx])
-        d_bb = np.array([1.0 - R.cs_ssim(cur[i][0], ref_b, cur[i][1], win) for i in b_idx])
+        b_c = [cur[i] for i in b_idx]
+        ref_b = R.masked_median([c[0] for c in b_c], [c[1] for c in b_c])
+        d_bb = np.array([1.0 - R.cs_ssim(c[0], ref_b, c[1], win) for c in b_c])
+        del b_c
         if not np.isfinite(d_bb).any() or np.nanmedian(d_bb) > d_hi:
             has_b = False  # B несогласован (люди/шум/тени) — не считаем это состоянием
             res.provenance.append("inconsistent_change")
@@ -138,7 +173,8 @@ def analyze_roi(
             continue
         da = d_a[i]
         if has_b and ref_b is not None:
-            db = 1.0 - R.cs_ssim(cur[i][0], ref_b, cur[i][1], win)
+            ci_ = cur[i]
+            db = 1.0 - R.cs_ssim(ci_[0], ref_b, ci_[1], win)
             if not np.isfinite(db):
                 continue
             p_b[i] = float(sigmoid((da - db) / max(scale, 1e-3)))
@@ -217,7 +253,7 @@ def _state_det_logodds(det_lo: np.ndarray, det_c: np.ndarray, mask: np.ndarray) 
     return float(np.clip(mean * support * 2.0, -4.0, 4.0))
 
 
-def _shape_prior(cur: dict[int, Any], in_a: np.ndarray, in_b: np.ndarray, cfg: dict[str, Any]) -> float:
+def _shape_prior(cur: Any, in_a: np.ndarray, in_b: np.ndarray, cfg: dict[str, Any]) -> float:
     """Слабый априор: «открытый» вид темнее (проём), с большим числом кромок и с вертикальной кромкой вне контура."""
     ia = [i for i in np.flatnonzero(in_a) if i in cur]
     ib = [i for i in np.flatnonzero(in_b) if i in cur]
@@ -226,19 +262,22 @@ def _shape_prior(cur: dict[int, Any], in_a: np.ndarray, in_b: np.ndarray, cfg: d
 
     rel = float(cfg.get("dark_rel", 0.55))
 
-    def dark(i: int) -> float:
+    def dark(c: tuple[np.ndarray, ...]) -> float:
         # тёмный проём: пиксели ROI темнее dark_rel × медианы окружения (инвариантно к общему освещению)
-        ci, mi, co, mo = cur[i][4], cur[i][1], cur[i][5], cur[i][3]
+        ci, mi, co, mo = c[4], c[1], c[5], c[3]
         ring_vals = co[mo > 0] if (mo > 0).sum() > 16 else co.ravel()
         thr = rel * float(np.median(ring_vals))
         vals = ci[mi > 0] if (mi > 0).sum() > 16 else ci.ravel()
         return float(np.mean(vals < thr))
 
     def feats(ids: list[int]) -> tuple[float, float, float]:
-        dk = np.median([dark(i) for i in ids])
-        edge = np.median([R.edge_density(cur[i][0], cur[i][1]) for i in ids])
-        ring = np.median([R.vertical_edge_energy(cur[i][2], cur[i][3]) for i in ids])
-        return float(dk), float(edge), float(ring)
+        dk, edge, ring = [], [], []
+        for i in ids:
+            c = cur[i]
+            dk.append(dark(c))
+            edge.append(R.edge_density(c[0], c[1]))
+            ring.append(R.vertical_edge_energy(c[2], c[3]))
+        return float(np.median(dk)), float(np.median(edge)), float(np.median(ring))
 
     da, ea, ra = feats(ia)
     db, eb, rb = feats(ib)

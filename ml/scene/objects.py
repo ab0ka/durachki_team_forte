@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -127,60 +127,61 @@ def cash_det_cue(tl: Timeline, zones: dict[str, Polys], cfg: dict[str, Any], cfg
     return s, best
 
 
-def cash_color_cue(frames: Callable[[int], Optional[np.ndarray]], idxs: list[int], n: int, desk: BBox, tl: Timeline, quality: np.ndarray, shifts: list[tuple[float, float]], cfg: dict[str, Any], pad: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Запасной цвет/форма-классификатор купюр на ROI стола: пастельные прямоугольные пятна
-    (не белая бумага, не тёмная техника), люди и известные предметы маскируются."""
+MASK_LABELS = ("person", "laptop", "cell_phone", "money_counter", "cup", "bottle", "keys", "document", "cash_bag", "bag", "food")
+
+
+def cash_color_frame(fr: np.ndarray, desk: BBox, boxes: list[BBox], shift: tuple[float, float], cfg: dict[str, Any], pad: float) -> tuple[float, float]:
+    """Запасной цвет/форма-классификатор купюр на ROI стола (один кадр): пастельные прямоугольные пятна
+    (не белая бумага, не тёмная техника); люди и известные предметы маскируются. → (доля площади, видимость стола)."""
     import cv2
 
-    area = np.zeros(n)
-    vis = np.ones(n)
-    seen = np.zeros(n, dtype=bool)
+    if fr is None or fr.ndim != 3:
+        return 0.0, 0.0
     long_side = int(cfg.get("desk_size", 160))
-    mask_labels = ("person", "laptop", "cell_phone", "money_counter", "cup", "bottle", "keys", "document", "cash_bag", "bag", "food")
-    for i in idxs:
-        fr = frames(i)
-        if fr is None or fr.ndim != 3:
+    crop = R.crop(fr, desk, shift)
+    h, w = crop.shape[:2]
+    sc = long_side / float(max(h, w))
+    wh = (max(8, int(w * sc)), max(8, int(h * sc)))
+    crop = cv2.resize(crop, wh, interpolation=cv2.INTER_AREA)
+    valid = R.mask_from_boxes(desk, boxes, wh, pad)
+    vis = float(valid.mean())
+    if vis < 0.2:
+        return 0.0, vis
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hch, sch, vch = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
+    colored = (sch >= int(cfg["color_sat_lo"])) & (sch <= int(cfg["color_sat_hi"])) & (vch >= int(cfg["color_val_lo"]))
+    bg = valid > 0
+    if (bg & colored).sum() > 0.5 * bg.sum():  # стол сам цветной — доминирующий оттенок исключаем
+        hist = np.bincount(hch[bg & colored].ravel(), minlength=180)
+        dom = int(np.argmax(hist))
+        dist = np.minimum(np.abs(hch - dom), 180 - np.abs(hch - dom))
+        colored &= dist >= int(cfg["color_hue_bg_dist"])
+    m = (colored & bg).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    ncomp, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    tot = float(wh[0] * wh[1])
+    acc = 0.0
+    for k in range(1, ncomp):
+        a = float(stats[k, cv2.CC_STAT_AREA])
+        frac = a / tot
+        if not (float(cfg["blob_min_frac"]) <= frac <= float(cfg["blob_max_frac"])):
             continue
-        crop = R.crop(fr, desk, shifts[i])
-        h, w = crop.shape[:2]
-        sc = long_side / float(max(h, w))
-        wh = (max(8, int(w * sc)), max(8, int(h * sc)))
-        crop = cv2.resize(crop, wh, interpolation=cv2.INTER_AREA)
-        boxes = [o.bbox for o in tl.persons[i]] + [tuple(d.bbox) for d in tl.dets[i] if d.label in mask_labels]
-        valid = R.mask_from_boxes(desk, boxes, wh, pad)
-        vis[i] = float(valid.mean())
-        if vis[i] < 0.2:
+        ys, xs = np.nonzero(lab == k)
+        rect = cv2.minAreaRect(np.stack([xs, ys], axis=1).astype(np.float32))
+        rw, rh = rect[1]
+        if rw < 2 or rh < 2:
             continue
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        hch, sch, vch = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
-        colored = (sch >= int(cfg["color_sat_lo"])) & (sch <= int(cfg["color_sat_hi"])) & (vch >= int(cfg["color_val_lo"]))
-        bg = valid > 0
-        if (bg & colored).sum() > 0.5 * bg.sum():  # стол сам цветной — доминирующий оттенок исключаем
-            hist = np.bincount(hch[bg & colored].ravel(), minlength=180)
-            dom = int(np.argmax(hist))
-            dist = np.minimum(np.abs(hch - dom), 180 - np.abs(hch - dom))
-            colored &= dist >= int(cfg["color_hue_bg_dist"])
-        m = (colored & bg).astype(np.uint8)
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        ncomp, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-        tot = float(wh[0] * wh[1])
-        acc = 0.0
-        for k in range(1, ncomp):
-            a = float(stats[k, cv2.CC_STAT_AREA])
-            frac = a / tot
-            if not (float(cfg["blob_min_frac"]) <= frac <= float(cfg["blob_max_frac"])):
-                continue
-            ys, xs = np.nonzero(lab == k)
-            rect = cv2.minAreaRect(np.stack([xs, ys], axis=1).astype(np.float32))
-            rw, rh = rect[1]
-            if rw < 2 or rh < 2:
-                continue
-            if a / (rw * rh) < float(cfg["blob_min_rect"]) or max(rw, rh) / min(rw, rh) > float(cfg["blob_aspect_max"]):
-                continue
-            acc += frac
-        area[i] = acc
-        seen[i] = True
-    # заполнить пропущенные (stride) ближайшим обработанным
+        if a / (rw * rh) < float(cfg["blob_min_rect"]) or max(rw, rh) / min(rw, rh) > float(cfg["blob_aspect_max"]):
+            continue
+        acc += frac
+    return acc, vis
+
+
+def cash_color_finalize(per_frame: dict[int, tuple[float, float]], n: int, quality: np.ndarray, cfg: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Покадровые (площадь, видимость) → p, conf, видимость; пропуски (stride) — ближайшим обработанным."""
+    area, vis, seen = np.zeros(n), np.ones(n), np.zeros(n, dtype=bool)
+    for i, (a, v) in per_frame.items():
+        area[i], vis[i], seen[i] = a, v, True
     if seen.any() and not seen.all():
         si = np.flatnonzero(seen)
         for i in np.flatnonzero(~seen):
@@ -192,22 +193,26 @@ def cash_color_cue(frames: Callable[[int], Optional[np.ndarray]], idxs: list[int
     return p, c, vis
 
 
-def green_bag_cue(frames: Callable[[int], Optional[np.ndarray]], idxs: list[int], n: int, region: Optional[BBox], quality: np.ndarray, cfg: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    """Слабый запасной признак зелёной инкассаторской сумки (насыщенный зелёный блоб)."""
+def green_frac_frame(fr: np.ndarray, region: Optional[BBox], cfg: dict[str, Any]) -> float:
+    """Доля насыщенно-зелёных пикселей (инкассаторская сумка) в области (один кадр, грубая подвыборка)."""
     import cv2
 
+    if fr is None or fr.ndim != 3:
+        return 0.0
+    img = R.crop(fr, region) if region is not None else fr
+    step = max(1, img.shape[1] // 120)
+    img = np.ascontiguousarray(img[::step, ::step])
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lo_h, hi_h = cfg["green_hue"]
+    g = (hsv[..., 0] >= lo_h) & (hsv[..., 0] <= hi_h) & (hsv[..., 1] >= int(cfg["green_sat_lo"])) & (hsv[..., 2] >= int(cfg["green_val_lo"]))
+    return float(g.mean())
+
+
+def green_bag_finalize(per_frame: dict[int, float], n: int, quality: np.ndarray, cfg: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Слабый запасной признак зелёной сумки: есть блоб → p=0.7 с малой уверенностью; нет — молчим (не «нет сумки»)."""
     p = np.full(n, 0.5)
     c = np.zeros(n)
-    lo_h, hi_h = cfg["green_hue"]
-    for i in idxs:
-        fr = frames(i)
-        if fr is None or fr.ndim != 3:
-            continue
-        img = R.crop(fr, region) if region is not None else fr
-        img = R.resize_w(img, 120)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        g = (hsv[..., 0] >= lo_h) & (hsv[..., 0] <= hi_h) & (hsv[..., 1] >= int(cfg["green_sat_lo"])) & (hsv[..., 2] >= int(cfg["green_val_lo"]))
-        frac = float(g.mean())
+    for i, frac in per_frame.items():
         if frac >= float(cfg["green_min_frac"]):
             p[i] = 0.7
             c[i] = float(cfg["green_c"]) * float(quality[i])

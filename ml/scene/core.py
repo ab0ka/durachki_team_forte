@@ -14,11 +14,21 @@ import numpy as np
 
 from . import roi as R
 from ._contract import SIGNALS
-from .appearance import analyze_roi
+from .appearance import analyze_roi, extract_u8
 from .config import is_mock, load_config
 from .geometry import BBox, dilate_polygon, expand_bbox, polygon_bbox
 from .learned import feature_matrix, load_model, predict
-from .objects import cash_color_cue, cash_det_cue, det_evidence, door_traffic, green_bag_cue, object_roi
+from .objects import (
+    MASK_LABELS,
+    cash_color_finalize,
+    cash_color_frame,
+    cash_det_cue,
+    det_evidence,
+    door_traffic,
+    green_bag_finalize,
+    green_frac_frame,
+    object_roi,
+)
 from .presence import Sig, presence_signals
 from .smoothing import hold_conf, logit, median_filter, runs_above, sigmoid, smooth
 from .timeline import build_persons, build_timeline, sample_dt
@@ -153,7 +163,25 @@ def scene_states_with_trace(
     trace["warnings"].extend(tl.warnings)
     person_boxes: list[list[BBox]] = [[o.bbox for o in tl.persons[i]] for i in range(n)]
 
-    # --- кадры: качество, глобальный сдвиг, motion ---
+    # --- ROI объектов определяются ДО чтения кадров (из зон A06 или устойчивых детекций) ---
+    obj_specs = (
+        ("safe_open", "safe", "safe_open", "safe", cfg["safe"]),
+        ("door_open", "door", "door_open", "door", cfg["door"]),
+    )
+    roi_of: dict[str, Optional[BBox]] = {}
+    for name, zone_name, open_lbl, closed_lbl, _ in obj_specs:
+        roi_box, roi_src = object_roi(zb, tl, zone_name, (closed_lbl, open_lbl))
+        roi_of[name] = roi_box
+        trace["rois"][zone_name] = {"bbox": roi_box, "source": roi_src}
+    cc, bc = cfg["cash"], cfg["cash_bag"]
+    desk_box = None
+    for zn in ("desk", "cash_tray"):
+        if zb.get(zn):
+            desk_box = polygon_bbox(zb[zn][0])
+            break
+    green_region = expand_bbox(polygon_bbox(workplace[0]) or (0, 0, 1, 1), 0.2) if workplace else None
+
+    # --- один проход по кадрам: качество, сдвиг камеры, motion, кропы ROI, цветовые признаки ---
     stride = max(int(rc["stride"]), int(np.ceil(n / max(int(rc["max_frames"]), 1))))
     idxs = list(range(0, n, stride))
     frames = _frame_reader(clip)
@@ -162,12 +190,17 @@ def scene_states_with_trace(
     q_own = np.zeros(n)
     mot = np.zeros(n)
     shifts_have: dict[int, tuple[float, float]] = {}
+    stores: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {k: {} for k, v in roi_of.items() if v is not None}
+    cash_pf: dict[int, tuple[float, float]] = {}
+    green_pf: dict[int, float] = {}
     ref_small: Optional[np.ndarray] = None
     prev_small: Optional[np.ndarray] = None
     aw = int(rc["align_width"])
-    import_ok = True
+    pad = float(rc["person_pad"])
     try:
         import cv2  # noqa: F401
+
+        import_ok = True
     except ImportError:
         import_ok = False
         trace["warnings"].append("opencv unavailable: frame-based cues disabled")
@@ -192,16 +225,17 @@ def scene_states_with_trace(
                 dx, dy = R.phase_shift(ref_small, g, max_px, float(rc["align_min_response"]))
                 sx, sy = dx / g.shape[1], dy / g.shape[0]
             shifts_have[i] = (sx, sy)
+            for name, store in stores.items():
+                store[i] = extract_u8(fr, roi_of[name], (sx, sy), rc)  # type: ignore[arg-type]
+            if cc.get("color", True) and desk_box is not None:
+                boxes = [o.bbox for o in tl.persons[i]] + [tuple(d.bbox) for d in tl.dets[i] if d.label in MASK_LABELS]
+                cash_pf[i] = cash_color_frame(fr, desk_box, boxes, (sx, sy), cc, pad)
+            if bc.get("color", True):
+                green_pf[i] = green_frac_frame(fr, green_region, bc)
     if not have.any():
         trace["warnings"].append("frames unavailable: ROI/colour cues disabled, detections only")
     quality = q_clip if q_clip is not None else _fill_nearest(q_own, have, 1.0 if not have.any() else 0.5)
     trace["info"]["quality_source"] = "clip.quality" if q_clip is not None else ("frames" if have.any() else "default")
-    shifts = [shifts_have.get(i, (0.0, 0.0)) for i in range(n)]
-    if shifts_have:
-        sk = np.array(sorted(shifts_have))
-        for i in range(n):
-            if i not in shifts_have:
-                shifts[i] = shifts_have[int(sk[np.argmin(np.abs(sk - i))])]
     det_ran = np.full(n, bool(dets))
     if not dets:
         trace["warnings"].append("no detections at all: absence claims are unknown")
@@ -218,15 +252,11 @@ def scene_states_with_trace(
     raw.update(pres)
 
     # --- сейф и дверь: вид ROI (без допущения «эталон = закрыто») + детекции (+ проходы для двери) ---
-    for name, zone_name, open_lbl, closed_lbl, ocfg in (
-        ("safe_open", "safe", "safe_open", "safe", cfg["safe"]),
-        ("door_open", "door", "door_open", "door", cfg["door"]),
-    ):
-        roi_box, roi_src = object_roi(zb, tl, zone_name, (closed_lbl, open_lbl))
-        trace["rois"][zone_name] = {"bbox": roi_box, "source": roi_src}
+    for name, _zone, open_lbl, closed_lbl, ocfg in obj_specs:
+        roi_box = roi_of[name]
         det_lo, det_c = det_evidence(tl, roi_box, open_lbl, closed_lbl, ocfg, quality)
-        if roi_box is not None and have.any():
-            res = analyze_roi(frames, [i for i in idxs if have[i]], n, times, roi_box, person_boxes, quality, shifts, det_lo, det_c, rc, ocfg, use_shape_prior=(name == "safe_open"))
+        if roi_box is not None and stores.get(name):
+            res = analyze_roi(stores[name], [i for i in idxs if have[i]], n, times, roi_box, person_boxes, quality, det_lo, det_c, rc, ocfg, use_shape_prior=(name == "safe_open"))
             p, c, v = res.p_open, res.conf, res.visibility
             prov = list(dict.fromkeys(res.provenance))
             trace["info"][name] = {"p_a_open": res.p_a_open, "label_conf": res.label_conf, "two_states": res.has_two_states, **{k: v2 for k, v2 in res.info.items() if k not in ("ref_idx", "features")}}
@@ -239,10 +269,11 @@ def scene_states_with_trace(
             v = np.ones(n) if roi_box is None else np.array([1.0 - R.occlusion_fraction(expand_bbox(roi_box, 0.1), person_boxes[i]) for i in range(n)])
             prov = ["det"] if (det_c > 0).any() else ["none"]
             feats = {}
+        stores.pop(name, None)  # кропы больше не нужны — освобождаем память
         feats.update({"visibility": v, "quality": quality, "det_lo": det_lo, "det_c": det_c})
         if name == "door_open":
             tp, tc, crossings = door_traffic(tl, zb, cfg["door"], cfg["presence"])
-            z = c * logit(p) + float(cfg["door"]["w_traffic"]) * tc * logit(tp)
+            z = logit(p) + float(cfg["door"]["w_traffic"]) * tc * logit(tp)
             p, c = sigmoid(z), np.clip(c + float(cfg["door"]["w_traffic"]) * tc, 0.0, 1.0)
             trace["info"]["door_crossings"] = crossings
             feats.update({"traffic_lo": np.where(tc > 0, logit(tp), 0.0), "traffic_c": tc})
@@ -255,13 +286,7 @@ def scene_states_with_trace(
         weighted.add(name)
 
     # --- наличные: детекции в зоне стола + запасной цвет/форма-классификатор ---
-    cc = cfg["cash"]
     s_det, _ = cash_det_cue(tl, zb, cc, cfg["presence"])
-    desk_box = None
-    for zn in ("desk", "cash_tray"):
-        if zb.get(zn):
-            desk_box = polygon_bbox(zb[zn][0])
-            break
     desk_vis = np.ones(n) if desk_box is None else np.array([1.0 - R.occlusion_fraction(desk_box, person_boxes[i]) for i in range(n)])
     z = np.where(s_det > 0, float(cc["w_det"]) * logit(np.clip(0.5 + 0.5 * s_det, 0.05, 0.97)), 0.0)
     c_cash = np.where(s_det > 0, np.minimum(1.0, s_det * 1.25), 0.0)
@@ -270,8 +295,8 @@ def scene_states_with_trace(
     z = z + c_absent * logit(float(cc["det_absent_p"]))
     prov_cash = ["det"] if (s_det > 0).any() else []
     feats_cash: dict[str, np.ndarray] = {"det_score": s_det, "colour_lo": np.zeros(n), "colour_c": np.zeros(n)}
-    if cc.get("color", True) and desk_box is not None and have.any():
-        pc_, ccol, dv = cash_color_cue(frames, [i for i in idxs if have[i]], n, desk_box, tl, quality, shifts, cc, float(rc["person_pad"]))
+    if cash_pf:
+        pc_, ccol, dv = cash_color_finalize(cash_pf, n, quality, cc)
         z = z + float(cc["w_color"]) * ccol * logit(pc_)
         c_cash = c_cash + float(cc["w_color"]) * ccol
         desk_vis = np.minimum(desk_vis, dv)
@@ -286,17 +311,13 @@ def scene_states_with_trace(
     weighted.add("cash_visible")
 
     # --- инкассаторская сумка ---
-    bc = cfg["cash_bag"]
     s_bag = np.array([max((float(d.score) for d in tl.dets_of(i, ("cash_bag",), float(bc["min_det_score"]))), default=0.0) for i in range(n)])
     zb_ = np.where(s_bag > 0, logit(np.clip(0.5 + 0.5 * s_bag, 0.05, 0.97)), 0.0)
     cb = np.where(s_bag > 0, np.minimum(1.0, s_bag * 1.25), float(bc["det_absent_c"]) * quality * det_ran)
     zb_ = zb_ + np.where(s_bag > 0, 0.0, cb * logit(float(bc["det_absent_p"])))
     prov_bag = ["det"] if (s_bag > 0).any() else []
-    if bc.get("color", True) and have.any():
-        region = None
-        if workplace:
-            region = expand_bbox(polygon_bbox(workplace[0]) or (0, 0, 1, 1), 0.2)
-        gp, gc = green_bag_cue(frames, [i for i in idxs if have[i]], n, region, quality, bc)
+    if green_pf:
+        gp, gc = green_bag_finalize(green_pf, n, quality, bc)
         zb_ = zb_ + gc * logit(gp)
         cb = cb + gc
         if (gc > 0).any():

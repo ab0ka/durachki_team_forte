@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Optional
 
 import numpy as np
@@ -25,10 +26,16 @@ class Sig:
     prov: list[str] = field(default_factory=list)
 
 
+@lru_cache(maxsize=1 << 16)
+def _member_one(b: BBox, poly: tuple[tuple[float, float], ...], anchor_y: float, ofull: float) -> float:
+    return zone_membership(b, poly, anchor_y, ofull)
+
+
 def member(b: BBox, polys: Optional[Polys], anchor_y: float, ofull: float) -> float:
     if not polys:
         return 0.0
-    return max(zone_membership(b, p, anchor_y, ofull) for p in polys)
+    bb = tuple(float(v) for v in b)
+    return max(_member_one(bb, tuple((float(x), float(y)) for x, y in p), anchor_y, ofull) for p in polys)
 
 
 def _near_exit(b: BBox, door: Optional[Polys], border: float, anchor_y: float, ofull: float) -> bool:
