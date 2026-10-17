@@ -5,6 +5,7 @@
     python -m backend.pipeline batch data/raw --out preds/ [--workers 1] [--no-vlm] [--mock] [--from-cache]
     python -m backend.pipeline profile video.mov [--mock] [--no-vlm] [--json]
     python -m backend.pipeline warmup
+    python -m backend.pipeline compare data/videos --labels data/labels.csv --modes baseline,refine --out reports/h1
 
 Код выхода: 0 — status=done; 2 — status=failed (реальный статус ошибки, а не «пустой» успех).
 """
@@ -225,6 +226,22 @@ def _peak_rss_mb() -> Optional[float]:
             return None
 
 
+def cmd_compare(args: argparse.Namespace) -> int:
+    from .compare import compare
+
+    over = _overrides(args)
+    over.pop("cache", None)
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    tols = [float(x) for x in args.tol.split(",") if x.strip()]
+    if args.cache != "off":
+        print("ВНИМАНИЕ: кэш включён — время стадий между режимами несравнимо", file=sys.stderr)
+    rep = compare(args.videos, args.labels, modes, args.out, float(args.deadline), args.cache, args.limit, tols,
+                  extra=over or None, budgets_out=args.emit_budgets,
+                  log=lambda msg: print(msg, file=sys.stderr, flush=True))
+    print((Path(args.out) / "compare.md").read_text(encoding="utf-8"))
+    return 0 if rep["results"] else 1
+
+
 def cmd_warmup(args: argparse.Namespace) -> int:
     from .orchestrator import warmup
     from .registry import ModelRegistry
@@ -278,6 +295,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--with-cache", action="store_true", help="не отключать кэш (по умолчанию — честный холодный прогон)")
     common(p)
     p.set_defaults(func=cmd_profile)
+
+    p = sub.add_parser("compare", help="замер L2: режимы пайплайна на размеченных видео (ошибки, таймкоды, время, VRAM)")
+    p.add_argument("videos", help="папка с видео")
+    p.add_argument("--labels", required=True, help="data/labels.csv (схема eval.labels)")
+    p.add_argument("--modes", default="baseline,refine", help="профили из backend/pipeline/profiles/ или пути к YAML")
+    p.add_argument("--out", required=True, help="папка отчёта: compare.md, compare.json, <режим>/preds/*.json")
+    p.add_argument("--cache", choices=["off", "read_write"], default="off",
+                   help="off (по умолч.) — честное время; read_write — быстрее, но время несравнимо")
+    p.add_argument("--limit", type=int, help="первые N видео (смоук)")
+    p.add_argument("--tol", default="1,2,5", help="допуски таймкода, с")
+    p.add_argument("--emit-budgets", metavar="YAML", help="записать budgets_s из первого режима (p90 × запас)")
+    common(p)
+    p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("warmup", help="прогрев моделей (как при старте сервера)")
     p.set_defaults(func=cmd_warmup)
