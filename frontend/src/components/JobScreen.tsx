@@ -127,7 +127,7 @@ export default function JobScreen({ jobId }: { jobId: string }) {
         meaning="Пока результат не получен, вывода о нарушениях по этой записи нет."
         onRetry={retryNow}
         jobId={jobId}
-        settings={error.status === 403}
+        access={error.status === 403}
       />
     );
   }
@@ -245,7 +245,7 @@ function StateCard({
   meaning,
   onRetry,
   jobId,
-  settings,
+  access,
 }: {
   /** error — результат не получен (красный: ошибка); warning — анализ не завершён (янтарный, как во всём UI). */
   tone: "error" | "warning";
@@ -255,8 +255,8 @@ function StateCard({
   meaning: ReactNode;
   onRetry: () => void;
   jobId?: string;
-  /** 403: доступ — показать переход к настройкам ключа. */
-  settings?: boolean;
+  /** 403: дело в доступе — главное действие «Настройки доступа»; повторная отправка файла не поможет. */
+  access?: boolean;
 }) {
   const { demo, openSettings } = useApp();
   const titleId = useId();
@@ -289,16 +289,16 @@ function StateCard({
             <dt>Что можно сделать</dt>
             <dd>
               <div className={s.actionsStack}>
-                {jobId && <RetryUpload jobId={jobId} className="btn-primary" />}
+                {jobId && !access && <RetryUpload jobId={jobId} className="btn-primary" />}
                 <div className={s.actions}>
-                  <button className="btn-ghost" onClick={onRetry}>
-                    <RefreshCw className="h-4 w-4" aria-hidden /> Обновить статус
-                  </button>
-                  {settings && (
-                    <button className="btn-ghost" onClick={openSettings}>
+                  {access && (
+                    <button className="btn-primary" onClick={openSettings}>
                       <Settings className="h-4 w-4" aria-hidden /> Настройки доступа
                     </button>
                   )}
+                  <button className="btn-ghost" onClick={onRetry}>
+                    <RefreshCw className="h-4 w-4" aria-hidden /> Обновить статус
+                  </button>
                   <a className="btn-ghost" href={demo ? "?demo=1#/" : "#/"}>
                     <Upload className="h-4 w-4" aria-hidden /> Загрузить видео
                   </a>

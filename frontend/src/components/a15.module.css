@@ -344,7 +344,7 @@
 .stateTitle {
   margin-top: 4px;
   font-family: var(--a15-font-display);
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 800;
   line-height: 1.15;
   letter-spacing: -0.015em;
@@ -428,7 +428,6 @@
 .baTile {
   position: relative;
   display: flex;
-  min-height: 112px;
   width: 100%;
   align-items: center;
   justify-content: center;
@@ -448,7 +447,9 @@ button.baTile:focus-visible {
   outline: 2px solid rgb(var(--a15-focus));
   outline-offset: 2px;
 }
+/* Плашке нужна высота под значок, текст и кнопку; плитки с кадрами — по высоте кадра (без полос). */
 .baEmpty {
+  min-height: 112px;
   flex-direction: column;
   gap: 6px;
   border: 1px dashed var(--a15-border-strong);
