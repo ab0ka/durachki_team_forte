@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ChevronLeft, ChevronRight, Crosshair, Minus, Plus, X } from "lucide-react";
 import type { EvidenceFrame } from "../api/types";
 import { imageSrc, type HighlightBox } from "../api/normalize";
@@ -45,9 +46,11 @@ export default function Lightbox({ frames, index, caption, onClose, onIndex, onS
   }, [index, frames.length, onClose, onIndex]);
 
   if (!f) return null;
+  if (typeof document === "undefined") return null;
   const btn = "flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur hover:bg-white/20 disabled:opacity-30";
 
-  return (
+  // Портал в body: fixed-оверлей не зависит от transform/overflow предков.
+  return createPortal(
     <div className="no-print fixed inset-0 z-[70] flex flex-col bg-black/90" role="dialog" aria-modal="true" aria-label="Кадр-доказательство">
       <div className="flex items-center gap-3 px-4 py-3 text-sm text-white">
         <div className="min-w-0 flex-1">
@@ -115,6 +118,7 @@ export default function Lightbox({ frames, index, caption, onClose, onIndex, onS
           <Crosshair className="h-4 w-4" /> Перейти к {formatTimecode(f.timestamp_sec)} в видео
         </button>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

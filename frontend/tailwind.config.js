@@ -57,7 +57,9 @@ export default {
       },
       animation: {
         scan: "scan 2.4s ease-in-out infinite alternate",
-        "fade-in": "fade-in .35s ease-out both",
+        // backwards (не both): после анимации transform не остаётся — иначе предок становится опорным блоком
+        // для position: fixed (лайтбокс, модалки) и они «съезжают» внутрь карточки.
+        "fade-in": "fade-in .35s ease-out backwards",
         "pulse-ring": "pulse-ring 1.6s ease-out infinite",
       },
     },
