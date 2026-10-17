@@ -449,12 +449,18 @@ export class HttpBackend implements Backend {
 
 // ---------- локальные видео (только что загруженные файлы: играем без сервера) ----------
 const localVideos = new Map<string, string>();
+const localFiles = new Map<string, File>();
 export function rememberLocalVideo(jobId: string, file: File) {
+  localFiles.set(jobId, file);
   try {
     localVideos.set(jobId, URL.createObjectURL(file));
   } catch {
     /* SSR/тесты */
   }
+}
+/** Файл задачи, если он ещё в памяти вкладки (для повторной отправки после ошибки). */
+export function localFile(jobId: string): File | undefined {
+  return localFiles.get(jobId);
 }
 export function localVideo(jobId: string): string | undefined {
   return localVideos.get(jobId);

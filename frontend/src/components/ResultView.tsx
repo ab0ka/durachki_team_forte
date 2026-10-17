@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertOctagon,
   AlertTriangle,
@@ -20,6 +20,9 @@ import { formatDateTime, formatDuration, formatTimecode } from "../lib/format";
 import { analyzeCompleteness } from "../lib/completeness";
 import { verdictView } from "../lib/verdict";
 import CompletenessPanel from "./CompletenessPanel";
+import EpisodeNavigator from "./EpisodeNavigator";
+import RetryUpload from "./RetryUpload";
+import { uiConfig } from "../lib/uiConfig";
 import CopilotPanel from "./CopilotPanel";
 import VideoPlayer, { type PlayerHandle } from "./VideoPlayer";
 import ViolationCard from "./ViolationCard";
@@ -57,7 +60,17 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
   const completeness = useMemo(() => analyzeCompleteness(job), [job]);
   const view = verdictView(job, completeness.state, completeness.mock);
   const duration = inferDuration(job);
-  const hints = reviewHints(job);
+  const candidates = job.candidates ?? [];
+  // Эпизоды для просмотра: нарушения; у упавшего анализа без нарушений — кандидаты A01 (не вошли в вердикт).
+  const episodes = job.violations.length ? job.violations : job.status === "failed" ? candidates : [];
+  const episodesAreCandidates = job.violations.length === 0 && episodes.length > 0;
+  // У завершённого анализа кандидаты (ниже порога) — в «Стоит просмотреть», вместе с review_hints A12.
+  const hints = [
+    ...reviewHints(job),
+    ...(job.status === "done" && job.violations.length === 0
+      ? candidates.map((c) => ({ type: c.type, type_id: c.type_id, timecode_sec: c.timecode_sec, reasons: ["не вошло в вердикт"], facts: [] as string[] }))
+      : []),
+  ].sort((a, b) => a.timecode_sec - b.timecode_sec);
   const source = useMemo(() => {
     const server = backend.videoSource(job.job_id);
     const local = localVideo(job.job_id);
@@ -67,11 +80,38 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
     return server;
   }, [backend, job.job_id]);
   const onTime = useCallback((x: number) => setT(x), []);
+  const [current, setCurrent] = useState(0);
+  const [reviewed, setReviewed] = useState<Set<number>>(() => loadReviewed(job.job_id));
+  useEffect(() => saveReviewed(job.job_id, reviewed), [job.job_id, reviewed]);
+  // Сдвиг PTS — только по флагу (гипотеза до замера L2): meta.video.t0_pts_sec.
+  const timeOffset = uiConfig().ptsOffsetMode === "meta_t0" ? readT0(job.meta) : 0;
+  const capture = useCallback((x: number) => player.current?.captureAt(x) ?? Promise.resolve(null), []);
 
   const seek = (time: number) => {
     player.current?.seek(time);
     playerBox.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
+  const goEpisode = (i: number) => {
+    if (i < 0 || i >= episodes.length) return;
+    setCurrent(i);
+    seek(episodes[i].timecode_sec);
+  };
+  const playEpisode = (i: number) => {
+    const v = episodes[i];
+    if (!v) return;
+    setCurrent(i);
+    const from = Math.max(0, (v.t_start ?? v.timecode_sec) - uiConfig().episodePrerollS);
+    const to = (v.t_end ?? v.timecode_sec + 2) + uiConfig().episodePostrollS;
+    player.current?.playRange(from, to);
+    playerBox.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  const toggleReviewed = (i: number) =>
+    setReviewed((r) => {
+      const n = new Set(r);
+      if (n.has(i)) n.delete(i);
+      else n.add(i);
+      return n;
+    });
 
   const timings = (job.meta.timings ?? {}) as Record<string, number>;
   const total = typeof timings.total === "number" ? timings.total : undefined;
@@ -172,7 +212,13 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
 
       {job.status === "failed" && (
         <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-400/30 dark:bg-amber-400/10 dark:text-amber-200" role="alert">
-          <b>Анализ не завершён{job.error ? `: ${job.error}` : ""}.</b> Ниже — только то, что система успела найти до сбоя; остальная часть записи не проверена.
+          <b>Анализ не завершён{job.error ? `: ${job.error}` : ""}.</b>{" "}
+          {episodes.length
+            ? "Ниже — только то, что система успела найти; в вердикт это не вошло, остальная часть записи могла остаться непроверенной."
+            : "Вывод об отсутствии нарушений сделать нельзя — нужен ручной просмотр."}
+          <div className="mt-2">
+            <RetryUpload jobId={job.job_id} className="btn-ghost px-3 py-1.5 text-xs" />
+          </div>
         </div>
       )}
 
@@ -191,26 +237,44 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
               synthetic={demo}
               duration={duration}
               timeline={job.timeline}
-              violations={job.violations}
-              hints={hints}
+              violations={episodes}
+              hints={uiConfig().showReviewHints ? hints : []}
               onTime={onTime}
+              timeOffset={timeOffset}
+            />
+            <EpisodeNavigator
+              violations={episodes}
+              current={Math.min(current, Math.max(0, episodes.length - 1))}
+              reviewed={reviewed}
+              onGo={goEpisode}
+              onPlay={playEpisode}
+              onToggleReviewed={toggleReviewed}
             />
           </section>
 
-          {job.violations.length > 0 ? (
+          {episodes.length > 0 ? (
             <section className="space-y-4">
               <h2 className="flex items-center gap-2 text-lg font-bold">
                 <ListChecks className="h-5 w-5 text-brand-600 dark:text-brand-300" />
-                {job.status === "failed" ? "Найдено до сбоя анализа" : "Эпизоды с признаками возможных нарушений"}
+                {episodesAreCandidates
+                  ? "Кандидаты — не подтверждены, в вердикт не вошли"
+                  : job.status === "failed"
+                    ? "Найдено до сбоя анализа"
+                    : "Эпизоды с признаками возможных нарушений"}
               </h2>
-              {job.violations.map((v, i) => (
+              {episodes.map((v, i) => (
                 <ViolationCard
+                  candidate={episodesAreCandidates}
                   key={`${v.type_id}-${v.timecode_sec}-${i}`}
                   v={v}
                   index={i}
                   job={job}
                   active={t >= (v.t_start ?? v.timecode_sec - 1) && t <= (v.t_end ?? v.timecode_sec + 1)}
-                  onSeek={seek}
+                  onSeek={(x) => {
+                    setCurrent(i);
+                    seek(x);
+                  }}
+                  capture={capture}
                 />
               ))}
             </section>
@@ -232,11 +296,11 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
         </div>
 
         <aside className="space-y-6 lg:sticky lg:top-24 lg:self-start">
-          {job.violations.length > 0 && (
+          {episodes.length > 0 && (
             <section className="card no-print p-4">
               <div className="label mb-2">Навигация по эпизодам</div>
               <ul className="space-y-1">
-                {job.violations.map((v, i) => (
+                {episodes.map((v, i) => (
                   <li key={i}>
                     <button className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left hover:bg-slate-50 dark:hover:bg-white/5" onClick={() => seek(v.timecode_sec)}>
                       <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-brand-600 text-[11px] font-bold text-white">{i + 1}</span>
@@ -249,7 +313,7 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
             </section>
           )}
 
-          {hints.length > 0 && (
+          {uiConfig().showReviewHints && hints.length > 0 && (
             <section className="card p-4">
               <div className="label mb-1 flex items-center gap-1.5">
                 <Eye className="h-3.5 w-3.5" /> Стоит просмотреть
@@ -336,4 +400,30 @@ export default function ResultView({ job, raw, fileName }: { job: JobResult; raw
       </div>
     </div>
   );
+}
+
+function readT0(meta: Record<string, unknown>): number {
+  const pick = (o: unknown) => (o && typeof o === "object" ? (o as Record<string, unknown>).t0_pts_sec : undefined);
+  for (const v of [pick(meta.video), meta.t0_pts_sec, pick(meta.ingest)]) {
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0 && v < 60) return v;
+  }
+  return 0;
+}
+
+const REV_KEY = (id: string) => `ks.reviewed.${id}`;
+function loadReviewed(jobId: string): Set<number> {
+  try {
+    const v = JSON.parse(localStorage.getItem(REV_KEY(jobId)) ?? "[]") as unknown;
+    return new Set(Array.isArray(v) ? v.filter((x): x is number => typeof x === "number") : []);
+  } catch {
+    return new Set();
+  }
+}
+function saveReviewed(jobId: string, s: Set<number>) {
+  try {
+    if (s.size) localStorage.setItem(REV_KEY(jobId), JSON.stringify([...s]));
+    else localStorage.removeItem(REV_KEY(jobId));
+  } catch {
+    /* noop */
+  }
 }

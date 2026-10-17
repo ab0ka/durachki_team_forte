@@ -16,10 +16,16 @@ export default function NormCard({ rule }: { rule: RuleRef }) {
         <div className="min-w-0 flex-1">
           <div className="text-sm font-semibold leading-snug text-slate-900 dark:text-white">{rule.document}</div>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
-            {rule.clause && <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{rule.clause}</span>}
-            {rule.verified ? (
-              <span className="chip border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-400/10 dark:text-emerald-300" title="Цитата сверена с текстом на adilet.zan.kz">
-                <BadgeCheck className="h-3.5 w-3.5" /> цитата проверена
+            {rule.clause && rule.clause.trim() ? (
+              <span className="font-mono font-semibold text-slate-700 dark:text-slate-200">{rule.clause}</span>
+            ) : (
+              <span className="chip border-slate-200 text-slate-500 dark:border-white/10" title="Конкретный пункт в каталоге норм не установлен — ничего не придумываем">
+                без пункта
+              </span>
+            )}
+            {rule.verified === true ? (
+              <span className="chip border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-400/10 dark:text-emerald-300" title="Цитата сверена с текстом первоисточника">
+                <BadgeCheck className="h-3.5 w-3.5" /> цитата сверена
               </span>
             ) : (
               <span className="chip border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-400/20 dark:bg-amber-400/10 dark:text-amber-300" title="Цитату нужно сверить с первоисточником">
@@ -27,6 +33,7 @@ export default function NormCard({ rule }: { rule: RuleRef }) {
               </span>
             )}
           </div>
+          {!rule.verified && rule.status_ru && <div className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">{rule.status_ru}</div>}
         </div>
       </div>
       {hasQuote && (

@@ -3,11 +3,17 @@ import { AlertTriangle, Pause, Play, RotateCcw, RotateCw, VideoOff } from "lucid
 import type { TimelinePoint, Violation } from "../api/types";
 import { demoSceneDataUri } from "../api/demo";
 import { formatTimecode } from "../lib/format";
+import { uiConfig } from "../lib/uiConfig";
 import RiskTimeline from "./RiskTimeline";
 import { cx, Spinner } from "./ui";
 
 export interface PlayerHandle {
+  /** Переход к моменту (время анализа, сек от первого кадра). По умолчанию — пауза на кадре (uiConfig.seekPauses). */
   seek: (t: number, play?: boolean) => void;
+  /** Проиграть интервал [from, to] и остановиться (для «Смотреть эпизод»). */
+  playRange: (from: number, to: number) => void;
+  /** Кадр из видео в браузере в момент t (JPEG data-URI) или null, если видео недоступно. */
+  captureAt: (t: number) => Promise<string | null>;
 }
 
 export interface VideoSource {
@@ -25,12 +31,17 @@ interface Props {
   violations: Violation[];
   hints?: { timecode_sec: number; type: string }[];
   onTime?: (t: number) => void;
+  /**
+   * Сдвиг: время медиа = время анализа + timeOffset (напр. PTS первого кадра, если браузер его не вычитает).
+   * Задаётся флагом uiConfig.ptsOffsetMode; по умолчанию 0.
+   */
+  timeOffset?: number;
 }
 
 const SPEEDS = [0.5, 1, 2];
 
 const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
-  { source, synthetic, duration, timeline, violations, hints, onTime },
+  { source, synthetic, duration, timeline, violations, hints, onTime, timeOffset = 0 },
   ref,
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -60,6 +71,11 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
       const now = performance.now();
       setT((x) => {
         const nx = x + ((now - last) / 1000) * speed;
+        if (stopAt.current !== null && nx >= stopAt.current) {
+          stopAt.current = null;
+          setPlaying(false);
+          return nx;
+        }
         if (nx >= d) {
           setPlaying(false);
           return d;
@@ -73,21 +89,81 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
 
   useEffect(() => onTime?.(t), [t, onTime]);
 
-  const seek = useCallback(
-    (time: number, play = false) => {
+  const stopAt = useRef<number | null>(null);
+
+  /** time — время анализа; mode "jump" ставит паузу на кадре (если включено), "scrub" — нет. */
+  const seekTo = useCallback(
+    (time: number, mode: "jump" | "scrub" | "play" = "scrub") => {
       const tt = Math.min(Math.max(0, time), d || time);
       const v = videoRef.current;
+      if (mode !== "play") stopAt.current = null;
       if (v && src) {
-        v.currentTime = tt;
-        if (play) void v.play().catch(() => undefined);
+        v.currentTime = tt + timeOffset;
+        if (mode === "play") void v.play().catch(() => undefined);
+        else if (mode === "jump" && uiConfig().seekPauses) v.pause();
       }
       setT(tt);
-      if (play && virtual) setPlaying(true);
+      if (virtual) {
+        if (mode === "play") setPlaying(true);
+        else if (mode === "jump" && uiConfig().seekPauses) setPlaying(false);
+      }
     },
-    [d, src, virtual],
+    [d, src, virtual, timeOffset],
   );
 
-  useImperativeHandle(ref, () => ({ seek }), [seek]);
+  const seek = useCallback((time: number, play = false) => seekTo(time, play ? "play" : "jump"), [seekTo]);
+
+  const playRange = useCallback(
+    (from: number, to: number) => {
+      seekTo(from, "play");
+      stopAt.current = to;
+    },
+    [seekTo],
+  );
+
+  const captureAt = useCallback(
+    async (time: number): Promise<string | null> => {
+      if (virtual) return demoSceneDataUri(Math.max(0, time));
+      if (!src) return null;
+      return new Promise((resolve) => {
+        const v = document.createElement("video");
+        let settled = false;
+        const done = (r: string | null) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
+          v.removeAttribute("src");
+          v.load();
+          resolve(r);
+        };
+        const timer = window.setTimeout(() => done(null), 10000);
+        v.muted = true;
+        v.preload = "auto";
+        v.playsInline = true;
+        v.onerror = () => done(null);
+        v.onloadeddata = () => {
+          const target = Math.max(0, time + timeOffset);
+          v.currentTime = Number.isFinite(v.duration) ? Math.min(target, Math.max(0, v.duration - 0.05)) : target;
+        };
+        v.onseeked = () => {
+          try {
+            const scale = Math.min(1, 640 / Math.max(1, v.videoWidth, v.videoHeight));
+            const c = document.createElement("canvas");
+            c.width = Math.max(1, Math.round(v.videoWidth * scale));
+            c.height = Math.max(1, Math.round(v.videoHeight * scale));
+            c.getContext("2d")!.drawImage(v, 0, 0, c.width, c.height);
+            done(c.toDataURL("image/jpeg", 0.85));
+          } catch {
+            done(null);
+          }
+        };
+        v.src = src;
+      });
+    },
+    [src, virtual, timeOffset],
+  );
+
+  useImperativeHandle(ref, () => ({ seek, playRange, captureAt }), [seek, playRange, captureAt]);
 
   // Горячие клавиши (когда фокус не в поле ввода): Space — пауза, ←/→ — ±5 с, N/P — следующий/предыдущий эпизод.
   const keyState = useRef({ t, d });
@@ -105,10 +181,10 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
         toggleRef.current();
       } else if (code === "ArrowRight") {
         e.preventDefault();
-        seek(cur + 5);
+        seekTo(cur + 5, "scrub");
       } else if (code === "ArrowLeft") {
         e.preventDefault();
-        seek(cur - 5);
+        seekTo(cur - 5, "scrub");
       } else if (code === "KeyN" || code === "KeyP") {
         const peaks = violations.map((v) => v.timecode_sec).sort((a, b) => a - b);
         const target = code === "KeyN" ? peaks.find((x) => x > cur + 0.3) : [...peaks].reverse().find((x) => x < cur - 0.3);
@@ -117,7 +193,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [seek, violations]);
+  }, [seek, seekTo, violations]);
 
   const toggleRef = useRef<() => void>(() => undefined);
   const toggle = () => {
@@ -172,9 +248,16 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
             onLoadedMetadata={(e) => {
               setLoading(false);
               const dur = e.currentTarget.duration;
-              if (Number.isFinite(dur) && dur > 0) setRealDuration(dur);
+              if (Number.isFinite(dur) && dur > 0) setRealDuration(Math.max(0, dur - timeOffset));
             }}
-            onTimeUpdate={(e) => setT(e.currentTarget.currentTime)}
+            onTimeUpdate={(e) => {
+              const ct = e.currentTarget.currentTime - timeOffset;
+              setT(Math.max(0, ct));
+              if (stopAt.current !== null && ct >= stopAt.current) {
+                stopAt.current = null;
+                e.currentTarget.pause();
+              }
+            }}
             onPlay={() => setPlaying(true)}
             onPause={() => setPlaying(false)}
             onError={() => void onVideoError()}
@@ -214,10 +297,10 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
         <button className="btn-primary h-10 w-10 rounded-full p-0" onClick={toggle} aria-label={playing ? "Пауза" : "Воспроизвести"} disabled={!src && !virtual}>
           {playing ? <Pause className="h-4 w-4" /> : <Play className="ml-0.5 h-4 w-4" />}
         </button>
-        <button className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/10" onClick={() => seek(t - 5)} aria-label="Назад 5 с" title="Назад 5 с">
+        <button className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/10" onClick={() => seekTo(t - 5, "scrub")} aria-label="Назад 5 с" title="Назад 5 с">
           <RotateCcw className="h-4 w-4" />
         </button>
-        <button className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/10" onClick={() => seek(t + 5)} aria-label="Вперёд 5 с" title="Вперёд 5 с">
+        <button className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-white/10" onClick={() => seekTo(t + 5, "scrub")} aria-label="Вперёд 5 с" title="Вперёд 5 с">
           <RotateCw className="h-4 w-4" />
         </button>
         <div className="ml-1 font-mono text-sm tnum">
@@ -244,7 +327,7 @@ const VideoPlayer = forwardRef<PlayerHandle, Props>(function VideoPlayer(
       </div>
       {d > 0 ? (
         <div className="mt-5">
-          <RiskTimeline duration={d} timeline={timeline} violations={violations} hints={hints} currentTime={t} onSeek={(x) => seek(x)} />
+          <RiskTimeline duration={d} timeline={timeline} violations={violations} hints={hints} currentTime={t} onSeek={(x) => seekTo(x, "scrub")} />
         </div>
       ) : (
         <p className="mt-4 text-xs text-slate-500">Длительность записи неизвестна — шкала риска недоступна.</p>
