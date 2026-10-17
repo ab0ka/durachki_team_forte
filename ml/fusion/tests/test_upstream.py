@@ -105,16 +105,26 @@ def test_coverage_complete_and_partial():
 
 
 def test_partial_coverage_blocks_clean_verdict(no_frames):
+    from ml.fusion import result_to_jury
+
     class Partial(FakeClip):
         meta = {"coverage": 0.6, "complete": False}
 
     res = fuse(Partial(), [], [], A13_LIKE, "j")
-    assert res.status == "failed" and res.verdict is None and res.meta["failure"]["reason"] == "partial_coverage"
+    # fusion не утверждает «нарушений нет»: verdict=None; status=done — failed A03 счёл бы падением fusion
+    assert res.status == "done" and res.verdict is None and res.violations == []
+    assert res.meta["fusion"]["coverage"]["complete"] is False and res.meta["ui"]["incomplete"]["message_ru"]
+    assert "coverage" not in res.meta            # канонический meta.coverage — у A03/A01, fusion его не пишет
+    jury = result_to_jury(res)
+    assert jury["status"] == "failed" and jury["verdict"] is None and jury["violations"] == []
+
     res2 = fuse(Partial(), [a09(t=5.0)], [], A13_LIKE, "j")
     assert res2.status == "done" and res2.verdict == "violation" and res2.meta["analysis_complete"] is False
 
 
 def test_unknown_coverage_is_not_clean(no_frames):
+    from ml.fusion import result_to_jury
+
     class NoTimes:
         duration, fps, path = 20.0, 30.0, "x"
         times: list = []
@@ -123,7 +133,17 @@ def test_unknown_coverage_is_not_clean(no_frames):
             return np.zeros((8, 8, 3), np.uint8)
 
     res = fuse(NoTimes(), [], [], A13_LIKE, "j")
-    assert res.status == "failed" and res.verdict is None
+    assert res.status == "done" and res.verdict is None
+    assert result_to_jury(res)["status"] == "failed"
+
+
+def test_fusion_never_returns_failed_for_coverage(no_frames):
+    # A03 (orchestrator._fusion) считает status=="failed" падением fusion и подменяет результат fallback_fuse
+    class Partial(FakeClip):
+        meta = {"coverage": 0.3, "complete": False}
+
+    for events in ([], [a09(t=5.0)]):
+        assert fuse(Partial(), events, [], A13_LIKE, "j").status == "done"
 
 
 def test_a04_frame_at_ts_timestamp_used():

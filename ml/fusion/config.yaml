@@ -186,9 +186,11 @@ completeness:
   required: [ingest, detect, rules]       # без них «нарушений нет» не доказано
   optional: [track, pose, scene, temporal, vlm]  # падение → вердикт остаётся, но meta.degraded
   ok_values: [ok, done, success, "true", skipped_by_config]
-  # meta.coverage внутри fuse(): неполное покрытие видео + нет нарушений → status=failed, verdict=None.
+  # Покрытие видео глазами fusion (meta.fusion.coverage): неполное/неизвестное + нет нарушений →
+  # verdict=None («нет нарушения» не утверждаем), status остаётся done (failed A03 считает падением fusion).
+  # Канонический meta.coverage и итоговый failed/no_violation — A03 + сериализатор A01 (contracts.extensions).
   coverage_gate: true
   min_decoded: 0.98       # clip.meta["coverage"] от A04 (декодированная доля длительности) ниже → неполно
   min_sampled: 0.9        # доля длительности, покрытая сэмплами clip.times
   max_gap_s: 2.0          # разрыв между соседними сэмплами больше → «дыра» в анализе
-  unknown_coverage: failed  # нет ни clip.meta, ни clip.times: failed | done (с предупреждением)
+  unknown_coverage: no_verdict  # нет ни clip.meta, ни clip.times: no_verdict | ignore (с предупреждением)

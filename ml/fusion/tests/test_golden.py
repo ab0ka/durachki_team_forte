@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from ml.fusion import fuse
-from ml.fusion.serialize import result_to_api
+from ml.fusion.serialize import result_to_api, result_to_jury
 
 from .conftest import FakeClip
 from .test_upstream import A13_LIKE
@@ -59,6 +59,10 @@ def test_golden(case, catalog):
         assert any(exp["warning"] in w for w in res.meta["warnings"])
     if "failure" in exp:
         assert res.meta["failure"]["reason"] == exp["failure"] and res.violations == []
+    if exp.get("incomplete"):
+        assert res.meta["ui"]["incomplete"]["message_ru"] and res.meta["fusion"]["coverage"]["complete"] is False
+    if "jury_status" in exp:
+        assert result_to_jury(res)["status"] == exp["jury_status"]
     hints = {h["type_id"]: h["reasons"] for h in res.meta.get("ui", {}).get("review_hints", [])}
     for type_id, reasons in (exp.get("hint_reasons") or {}).items():
         assert hints.get(type_id) == reasons

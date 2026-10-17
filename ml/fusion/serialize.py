@@ -96,18 +96,31 @@ JURY_TOP_KEYS = ("job_id", "status", "verdict", "violations")
 
 
 def result_to_jury(result: AnalysisResult) -> dict[str, Any]:
-    """Строгий ответ жюри. Канон — ``contracts.serialize.result_to_api`` (A01); пока его нет —
-    локальный fallback РОВНО по схеме ТЗ (без meta/подсказок/оверлеев)."""
+    """Строгий ответ жюри. Канон — ``contracts.serialize.result_to_jury_api`` (A01: схема ТЗ, политика вердикта,
+    проверка meta.coverage перед no_violation). Старый A01 без него — ``result_to_api``. Без contracts —
+    локальный fallback ровно по схеме ТЗ с той же политикой: failed/processing → verdict null; done без
+    вердикта и без нарушений → failed («нет нарушения» не выдумываем)."""
     try:
-        from contracts.serialize import result_to_api as a01_result_to_api  # type: ignore[import-not-found]
+        import contracts.serialize as a01  # type: ignore[import-not-found]
     except ImportError:
-        a01_result_to_api = None
-    if a01_result_to_api is not None:
-        return a01_result_to_api(result)
+        a01 = None
+    fn = (getattr(a01, "result_to_jury_api", None) or getattr(a01, "result_to_api", None)) if a01 else None
+    if fn is not None:
+        return fn(result)
+    status = str(result.status)
+    violations = list(result.violations or []) if status == "done" else []
+    verdict = result.verdict if status == "done" else None
+    if status == "done" and verdict is None:
+        if violations:
+            verdict = "violation"
+        else:
+            status = "failed"
+    if verdict == "no_violation":
+        violations = []
     out = {
         "job_id": str(result.job_id),
-        "status": str(result.status),
-        "verdict": result.verdict if result.status == "done" else None,
+        "status": status,
+        "verdict": verdict,
         "violations": [
             {
                 "type": str(v.type),
@@ -118,8 +131,8 @@ def result_to_jury(result: AnalysisResult) -> dict[str, Any]:
                     for f in (v.evidence_frames or [])
                 ],
             }
-            for v in (result.violations or [])
-        ] if result.status == "done" else [],
+            for v in violations
+        ],
     }
     return out
 

@@ -1068,32 +1068,34 @@ def fuse(clip: Any, events: list[Any], risk: list[tuple[float, float]], catalog:
         "warnings": warnings,
         "disclaimer": "Результат — подсказка для проверяющего, а не юридическое заключение.",
     }
-    meta["coverage"] = coverage
+    # Наблюдение fusion о покрытии. Канонический meta["coverage"] (contracts.extensions.Coverage) считает A03 по
+    # статусам стадий, проверяет сериализатор A01 перед no_violation — этот ключ fusion НЕ пишет.
+    meta["fusion"]["coverage"] = coverage
     ccfg = cfg.get("completeness") or {}
-    unknown_fails = str(ccfg.get("unknown_coverage", "failed")).lower() == "failed"
-    incomplete = coverage["complete"] is False or (coverage["complete"] is None and unknown_fails)
+    unknown_is_gap = str(ccfg.get("unknown_coverage", "no_verdict")).lower() not in {"done", "ignore"}
+    incomplete = coverage["complete"] is False or (coverage["complete"] is None and unknown_is_gap)
     if coverage["complete"] is None:
         warnings.append("coverage: нет данных о покрытии видео (clip.meta / clip.times)")
+    verdict: Optional[str] = outcome.verdict
     if ccfg.get("coverage_gate", True) and incomplete:
         reason_list = coverage["reasons"] or ["покрытие видео анализом неизвестно"]
+        meta["analysis_complete"] = False
         if outcome.verdict == "violation":
             warnings.append("анализ видео неполный (" + "; ".join(reason_list) + "): найденные нарушения "
                             "показаны, но другие могли быть пропущены")
-            meta["analysis_complete"] = False
         else:
+            # «Нарушений нет» не утверждаем: вердикт не выносится (verdict=None). status остаётся "done":
+            # status="failed" от fusion оркестратор A03 трактует как падение модуля и подменяет результат
+            # встроенным слиянием; итоговый failed/no_violation решают A03 (покрытие) и сериализатор A01.
             msg = ("Анализ видео неполный: " + "; ".join(reason_list) +
                    ". Отсутствие нарушений не подтверждено — вердикт не выносится.")
-            meta["analysis_complete"] = False
-            meta["failure"] = {"reason": "partial_coverage" if coverage["complete"] is False else "unknown_coverage",
-                               "details": reason_list, "message_ru": msg}
             meta["ui"]["incomplete"] = {"failed_stages": [], "details": {"coverage": reason_list}, "message_ru": msg}
             warnings.append(msg)
-            return AnalysisResult(job_id=str(job_id), status="failed", verdict=None, violations=[],
-                                  timeline=outcome.timeline, meta=meta)
+            verdict = None
     return AnalysisResult(
         job_id=str(job_id),
         status="done",
-        verdict=outcome.verdict,  # type: ignore[arg-type]
+        verdict=verdict,  # type: ignore[arg-type]
         violations=violations,
         timeline=outcome.timeline,
         meta=meta,

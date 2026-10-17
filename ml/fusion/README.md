@@ -13,7 +13,7 @@
 
 | Функция | Что делает |
 |---|---|
-| `ml.fusion.fuse(clip, events, risk, catalog, job_id) -> AnalysisResult` | Сигнатура заморожена контрактом v1. Возвращает `done` или `failed`, если покрытие неполное и нарушений нет. |
+| `ml.fusion.fuse(clip, events, risk, catalog, job_id) -> AnalysisResult` | Сигнатура заморожена контрактом v1. Всегда `status="done"` (`failed` — только аварийный режим без найденных нарушений). При неполном или неизвестном покрытии без нарушений `verdict=None`. |
 | `ml.fusion.apply_completeness(result, stages) -> AnalysisResult` | Учитывает статусы стадий A03: упала обязательная стадия → `failed`, а не «чистый» вердикт. |
 | `ml.fusion.result_to_jury(result) -> dict` | Строгий ответ жюри: `contracts.serialize.result_to_api` от A01, иначе fallback ровно по ТЗ. |
 | `ml.fusion.result_to_ui_report(result) -> dict` | Полный отчёт для UI: подсказки, оверлеи, нормы со статусом сверки, полнота. |
@@ -31,7 +31,7 @@
 |---|---|---|---|
 | Норма обязательна только для V99. Остальные типы с фактами выдаются «без пункта» (`rules: []`). | `report_gate.require_norm_types` | `[V99]` | В каталоге A13 у V01–V07 `rules: []`. Гейт фазы 1 «нужна норма» обнулил бы детекцию. По FAQ 32 пункт ищем, но не выдумываем. |
 | Оценка A09 `extra.assessment`. Правило вида violation без проверенной нормы может стать нарушением, уверенность восстанавливается из `confidence_raw` / `trace.confidence_terms`. Правило-наблюдение и `insufficient_context` становятся подсказкой. | `report_gate.upstream_assessment`, `observation_policy`, `insufficient_policy`, `uncap_norm_review` | вкл, `hint`, `hint`, вкл | A09 срезает уверенность до 0.45 из-за отсутствия нормы, а это теряет ранжирование. Телефон, еда или дверь сами по себе — не нарушение (исключения A13). Неизвестно ≠ нет. |
-| `meta.coverage`: покрытие видео по `clip.meta["coverage"/"complete"]` (A04) и сетке `clip.times`. Неполное или неизвестное покрытие при отсутствии нарушений → `failed`, `verdict=None`. | `completeness.coverage_gate`, `min_decoded`, `min_sampled`, `max_gap_s`, `unknown_coverage` | вкл, 0.98, 0.9, 2 с, `failed` | Failed или partial upstream не должны давать clean done. |
+| Покрытие глазами fusion (`meta.fusion.coverage`): по `clip.meta["coverage"/"complete"]` (A04) и сетке `clip.times`. Неполное или неизвестное покрытие без нарушений → `verdict=None`, `status="done"`. Канонический `meta.coverage` fusion не пишет. | `completeness.coverage_gate`, `min_decoded`, `min_sampled`, `max_gap_s`, `unknown_coverage` | вкл, 0.98, 0.9, 2 с, `no_verdict` | Failed или partial upstream не должны давать clean done. Подробнее — раздел «Полнота и вердикт». |
 | Temporal (события и риск-кривая) не повышает скор кластера с фактическими источниками. | `temporal_mode` | `off` (`bonus`, `score` — для замера) | Разведка L1: SigLIP2 по кадру + max дал AUC 0.30–0.34, такой скор не отсеивает видео. Кластер только из temporal — подсказка. |
 | «Ушла и оставила»: решение по столу и сейфу в окне после ухода. | `policies.v02_after_window.enabled` | **выкл** | Гипотеза. Ценности убраны и сейф закрыт → норма. Не видно (свет выключен) → без изменений. |
 | Клиент напротив со своей стороны — норма, если нет второго постороннего и ценности закрыты. | `policies.v01_client_side.enabled` | **выкл** | Гипотеза. Неизвестная сторона → без изменений. |
@@ -69,10 +69,10 @@
    - скор ≥ τ[тип] из `thresholds.yaml`.
 
    Остальное попадает в `meta.ui.review_hints` с `reasons` / `reasons_ru`. Риск-кривая без фактов **никогда** не становится V99.
-6. **Вердикт.**
+6. **Вердикт fusion** (окончательный статус решают A03 и сериализатор A01 — см. «Полнота и вердикт»).
    - `violation`, если есть хотя бы одно нарушение (в ответе ≤ 10: самые сильные, по времени).
-   - `no_violation` — только при полном покрытии (`meta.coverage.complete is True`).
-   - Иначе `failed` с `meta.failure`.
+   - `no_violation` — нарушений нет и покрытие глазами fusion полное.
+   - `None` — нарушений нет, но покрытие неполное или неизвестно: «нет нарушения» fusion не утверждает.
 7. **Таймкод** — по `timecode.policy`, привязан к фактическому PTS кадра (сетка `clip.times`), 0.1 с, в границах видео.
    Первый кадр-доказательство — ровно этот момент.
 8. **Кадры.**
@@ -135,6 +135,104 @@ python -m ml.fusion.tune --preds preds_raw/ --labels data/labels.csv --cv 5 --ou
 
 Каждый случай дополнительно проверяется на детерминизм.
 
+## Полнота и вердикт (согласовано с актуальными A01/A03)
+
+- **Канонический `meta.coverage`** (`contracts.extensions.Coverage`: `ratio`, `analyzed_sec`, `duration_sec`, `unknown_spans`,
+  `stages`, `required`, `complete`, `source`) считает A03 по статусам стадий. Сериализатор A01 (`resolve_outcome`) проверяет его
+  перед `no_violation`; `done` без вердикта и без нарушений A01 превращает в `failed`. Fusion этот ключ **не пишет**:
+  стадий fusion не видит, и подтверждать полноту за оркестратор было бы выдумкой.
+- **Наблюдение fusion** — `meta.fusion.coverage`: `{checked, complete: true|false|null, reasons, decoded, sampled, max_gap_s,
+  n_samples}`. При неполноте добавляются предупреждение и `meta.ui.incomplete`.
+- **Почему не `status="failed"`.** `backend/pipeline/orchestrator.py::_fusion` (A03) принимает `status == "failed"` от fusion
+  за падение модуля и подменяет весь результат встроенным `fallback_fuse`. Поэтому fusion отдаёт `done` + `verdict=None`.
+  `failed` остаётся только для аварийного режима: исключение внутри fusion и ничего не найдено. Подмена fallback-ом там уместна.
+- **Проверено тестами:** `test_upstream.py::test_partial_coverage_blocks_clean_verdict`, `test_fusion_never_returns_failed_for_coverage`,
+  golden `partial_coverage_clean`. Ответ жюри для такого результата — `failed`, `verdict=null`.
+
+## Каталог норм: None / пустой / fallback
+
+| Что передали в `catalog` | Что делает fusion |
+|---|---|
+| Каталог с непустым `types` | Использует как есть, без перезагрузки и слияния с A13. |
+| `None`, `{}`, `{"version": 1, "types": {}}` (так A03 передаёт недоступный каталог), мусор | `ml.fusion.catalog.load_norms_catalog()` → `norms.load_catalog()` (A13). |
+| A13 недоступен или пуст | Встроенный fallback: только названия, шаблоны, серьёзность; `rules: []` (нормы не выдумываются). Предупреждение `norms catalog unavailable`. |
+
+`load_norms_catalog` — единственная точка загрузки, тесты подменяют её monkeypatch-ем. Так тесты не зависят от наличия `norms`
+в окружении. `tests/test_a13_catalog.py` проверяет fusion на **настоящем** каталоге A13 (в ветке A12 без `norms/` — skip):
+- имена и нормы нарушений ровно из каталога, `verified` строго как в каталоге;
+- в тексте цитируется только сверенная норма;
+- V99 без нормы — подсказка;
+- temporal-only сигнал не становится нарушением ни для одного типа.
+
+## API подбора порогов (`ml.fusion.tune`) — схема для адаптера A16
+
+Сигнатуры (не меняются):
+
+```python
+Cand = tuple            # (type_id: str, score: float, t_peak: float, t_start: float); старые 3-кортежи без t_start допустимы
+@dataclass
+class Sample:           # единица оценки — уникальное видео (группа дублей)
+    video: str
+    positive: bool                 # label == "violation"
+    seconds: list[float]           # размеченные секунды события (для |Δt|); [] — нет таймкода
+    cands: list[Cand]              # кандидаты, ПРОШЕДШИЕ гейт fusion (факт/норма/оценка A09/политики), без порогов
+    group: str                     # группа дублей
+    conflict: bool = False         # разные таймкоды у дублей → не штрафуется по Δt, «решает человек»
+    type_id: Optional[str] = None  # тип из разметки (если есть) → type_accuracy
+    members: list[str] = []
+
+fit(samples, start, default, target_recall=1.0, bias=0.35, passes=4, dt_tol=1.0, dt_weight=0.5) -> dict[str, float]
+    # start: {type_id: τ} — стартовые пороги (thresholds.yaml); default: τ для типов вне словаря
+predict(sample, thr, default) -> list[Cand]          # кандидаты с score ≥ τ[type]; bool(...) == «видео — violation»
+evaluate(samples, thr, default, dt_tol=1.0, policy="peak") -> dict  # fn/fp/recall/fp_rate/timecode_hit_rate/type_accuracy
+candidates_for(VideoPred(video, raw=scores_raw, fingerprint=group), cfg, types) -> (list[Cand], seconds_spent)
+```
+
+Корректный вызов на строках `eval.run --raw` (`scores_raw.jsonl`: `video_id, group, label, gt_times, scores_raw`).
+Этот рецепт проверяет тест `test_tune.py::test_documented_adapter_recipe_on_a16_rows`:
+
+```python
+from ml.fusion.catalog import resolve_catalog
+from ml.fusion.config import load_config, load_thresholds, threshold_for
+from ml.fusion.tune import Sample, VideoPred, candidates_for, fit, predict
+
+cfg, thr0 = load_config(), load_thresholds()
+default = float(thr0["default"])
+start = {t: threshold_for(thr0, t) for t in thr0["per_type"]}
+types, _ = resolve_catalog(None)            # каталог A13 (или fallback без норм)
+
+def to_sample(row):
+    pred = VideoPred(row["video_id"], row["scores_raw"], fingerprint=row.get("group") or row["video_id"])
+    cands, _ = candidates_for(pred, cfg, types)
+    return Sample(video=row["video_id"], positive=row["label"] == "violation",
+                  seconds=[float(t) for t in row.get("gt_times") or []], cands=cands,
+                  group=row.get("group") or row["video_id"])
+
+thr = fit([to_sample(r) for r in train_rows], start, default)     # → {type_id: τ}
+is_violation = bool(predict(to_sample(row), thr, default))
+```
+
+Для `eval/loo.py` с его `fit(rows) -> params` и `predict(params, row) -> bool` адаптер в зоне A16 — обёртки вида
+`lambda rows: fit([to_sample(r) for r in rows], start, default)` и `lambda thr, row: bool(predict(to_sample(row), thr, default))`.
+
+**Поля, нужные корректному адаптеру:**
+- `scores_raw.inputs.events`, `scores_raw.inputs.risk`, `scores_raw.duration` — для пересчёта слияния текущим конфигом
+  (пишутся fusion с фазы 1). Без `inputs` используется `scores_raw.candidates[]`: `type_id, confidence, t_peak, t_start,
+  gate, suppressed_by`. Это решения гейта на момент прогона, смена флагов на них не влияет.
+- `label` ∈ {violation, no_violation}; строки без метки — не обучающие.
+- `gt_times` — секунды события; `group` — группа дублей.
+- **Отсутствует, нужно для полной метрики:** тип из разметки (`gt_type` → `Sample.type_id`) и флаг конфликта таймкодов
+  у дублей (`conflict`; `tune.build_samples` выводит его сам из разных секунд в группе).
+
+**Ограничения преобразования сырых скоров:**
+1. `candidates_for` пересчитывает слияние **текущими** `config.yaml` и каталогом. Для воспроизводимости фиксируйте их версии.
+2. Скоры эвристические по коррелированным источникам. Пороги — точки отсечения, не «вероятность ≥ τ».
+3. Полнота не моделируется. `predict` отвечает «есть ли нарушение»; пустой ответ ≠ `no_violation`, если покрытие неполное
+   (API даст `failed`). Для метрик вердикта сверяйте со `status`/`verdict` ответа.
+4. `fuse_scores` не видит кадров: таймкод кандидата не привязан к PTS сэмпла. Отличие от `timecode_sec` ответа API — не больше
+   половины шага сэмплирования (0.1 с при 5 fps).
+5. В `cands` только кандидаты, прошедшие гейт: подсказки (`review_hints`) в подбор порогов не входят.
+
 ## Запуск и проверки
 
 ```bash
@@ -142,7 +240,10 @@ pip install -r ml/fusion/requirements.txt
 python -m pytest ml/fusion/tests -q     # без GPU, видео и весов: синтетические клипы
 ```
 
-130 тестов проходят на Python 3.13 и на Python 3.11.17 (venv с `requirements.txt`, облачный контейнер, CPU).
+136 тестов (+1 skip без `norms`) проходят на Python 3.13 и на Python 3.11.17 с версиями из lock L1
+(`pillow 13.0.0`, `numpy 2.4.6`, `opencv-python-headless 4.14.0.94`, `PyYAML 6.0.3`, `pytest 9.1.1`; облачный контейнер, CPU).
+На копии `claude/integration-cloud` (2055fc4) с изменениями A12 — 158 passed (Python 3.13 и 3.11.17 с lock L1),
+включая настоящий каталог A13.
 Измерений на реальных данных в этой сессии **нет**. Пороги, веса и окна — стартовые, их меряет L2.
 
 ## Конфиги и env
@@ -177,22 +278,31 @@ python -m pytest ml/fusion/tests -q     # без GPU, видео и весов: 
 
 ## Для интегратора
 
-1. **A03 (критично, `backend/pipeline/orchestrator.py::_finalize`).** Сейчас при `complete=True` A03 перезаписывает
-   `status="failed"` от fusion на `done`, а `verdict=None` — на `no_violation`. Это ровно скрытый «чистый» вердикт
-   при неполном покрытии.
-   - Предлагаемая правка: если `result.meta.get("failure", {}).get("reason") in ("partial_coverage", "unknown_coverage")`,
-     добавить её в `ctx.incomplete` (или не трогать `status`/`verdict`).
-   - Также добавлять в `ctx.incomplete` неполный ingest (`clip.meta["complete"] is False`).
-   - После `fuse()` можно вызывать `apply_completeness(result, stages)`.
+1. **A03 (`backend/pipeline/orchestrator.py`).** Канонический `meta.coverage` и `coverage_gate` теперь у A03, и fusion
+   с этим согласован: `failed` из-за покрытия больше не отдаёт, так как `_fusion` принял бы его за падение и включил `fallback_fuse`.
+   - Остаётся: при `complete=True` `_finalize` превращает `verdict=None` от fusion в `no_violation`. Если fusion увидел
+     неполное покрытие, которого не видит `canonical_coverage` (`meta.fusion.coverage.complete is False`, например разрыв
+     в `clip.times` > 2 с), это стоит добавить в `ctx.incomplete`.
 2. **A09:** класть в `extra.confidence_raw` уверенность до потолка review/insufficient. Сейчас она восстанавливается из `trace`.
    `state_after` / `person_side` / `negative` — по таблице выше, по мере готовности сигналов A08.
 3. **A04:** используются `frame_at_ts`, `read_exact` и `clip.meta["coverage"/"complete"]`. Предложение A01 из README A04 поддерживаю.
-4. **A02:** ответ жюри — `result_to_jury`, UI — `result_to_ui_report`. Статус `failed` с `meta.failure.message_ru` показывать как технический отказ, не как «нарушений нет».
+4. **A02:** ответ жюри — `contracts.serialize.result_to_jury_api` (A01; `ml.fusion.result_to_jury` делегирует ему).
+   `failed` показывать как технический отказ, не как «нарушений нет».
+   **A01, граница:** `contracts/serialize.py::_jury_description` дописывает в описание жюри «Норма: … — URL» из `rules[0]`,
+   не проверяя `verified`. В каталоге A13 у V08/V09 нормы с `verified: false`, и они уйдут жюри без пометки «требует сверки».
+   - Вход: нарушение V08 с `rules=[{verified: false, url: …}]`.
+   - Ожидаемо: ссылка только при `verified: true`, либо с пометкой «(не подтверждено, требует сверки)».
 5. **A15:** `meta.ui.evidence_overlays[i].frames[*].role` (`key|before|after`), `shapes[*].frame_role`; новые причины подсказок:
-   `observation_only`, `insufficient_context`, `valuables_removed`, `client_side`; `meta.ui.incomplete`, `meta.coverage`.
+   `observation_only`, `insufficient_context`, `valuables_removed`, `client_side`; `meta.ui.incomplete`, `meta.fusion.coverage`.
    Ключи фазы 1 сохранены.
-6. **A16:** `scores_raw` совместим с фазой 1 (добавлены `candidates[].assessment`). Для сравнения вариантов fusion есть `ml.fusion.ab`.
+6. **A16:** `eval/loo.py` вызывает `tune.fit(rows)` / `tune.predict(params, row)` — сигнатуры другие, отсюда `TypeError`
+   в `eval/tests/test_eval_loo.py::test_logo_exploratory_and_nested`. Падение воспроизводится и на чистом 2055fc4.
+   Адаптер пишет A16 по схеме из раздела «API подбора порогов». `scores_raw` совместим с фазой 1 (добавлены
+   `candidates[].assessment`). Для сравнения вариантов fusion есть `ml.fusion.ab`.
 7. **A13:** fusion читает `types.<id>.{name, description_template, severity, rules[]}`. Норма в тексте описания — только при `verified: true`.
 8. **A17:** в Docker нужен `fonts-dejavu-core`, иначе подписи UI-оверлея будут транслитом.
 9. **История веток.** Ветка начинается от коммита контракта A01, `main` — пустой отдельный корень, PR в `main` GitHub не создаёт.
-   Ветка уже влита в `claude/integration-cloud`. Fallback-копия контракта сохранена до появления canonical `contracts` в ветке.
+   Ветка влита в `claude/integration-cloud` (там интегратор удалил `_contract_fallback.py` и поправил `_types.py`). В ветке A12
+   эти два файла не менялись после `9ca9a0e`, поэтому слияние не конфликтует.
+10. **Зависимости:** `Pillow>=10.0,<14` совместим с lock L1 (`pillow==13.0.0`).
+    `python deploy/merge_requirements.py --check`: на 2055fc4 exit 1 (конфликт pillow), с изменением A12 — exit 0, конфликтов нет.
