@@ -37,9 +37,16 @@ def discover(clip: Any, budget_s: float, *, limits: Optional[dict[str, Any]] = N
              motion: Optional[list[tuple[float, float]]] = None) -> list[Any]:
     """Поиск нарушений вне правил (включая V99). По умолчанию выключен (config: discover.enabled=false).
     motion — необязательная кривая [(t, 0..1)] (сигнал motion_energy из A08), чтобы не считать её заново."""
+    from .config import load_config
     from .discoverer import discover_events
 
     try:
+        cfg = load_config()
+        dcfg = cfg.get("discover") or {}
+        if dcfg.get("enabled", False) and str(dcfg.get("mode", "windows")) == "states":
+            from .states import states_events
+
+            return states_events(clip, float(budget_s), cfg=cfg, limits=limits)
         return discover_events(clip, float(budget_s), limits=limits, motion=motion)
     except Exception as e:  # noqa: BLE001
         log.warning("ml.vlm.discover failed: %s", type(e).__name__)
