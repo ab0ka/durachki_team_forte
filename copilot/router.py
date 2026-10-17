@@ -34,6 +34,7 @@ ERROR_STATUS = {
     "busy": 503,
     "timeout": 504,
     "llm_error": 500,
+    "internal_error": 500,
 }
 
 _job_provider: Optional[JobProvider] = None
@@ -75,9 +76,15 @@ def make_router(get_job: Optional[JobProvider] = None, service: Any = None, pref
         if provider is None:
             raise HTTPException(status_code=503, detail={"code": "no_job_provider",
                                                          "message": "Провайдер результатов задач не настроен"})
-        job = provider(job_id)
-        if inspect.isawaitable(job):
-            job = await job
+        try:
+            job = provider(job_id)
+            if inspect.isawaitable(job):
+                job = await job
+        except HTTPException:
+            raise
+        except Exception as exc:  # сбой хранилища задач не превращаем в 500 без тела
+            raise HTTPException(status_code=503, detail={"code": "job_provider_error",
+                                                         "message": f"Не удалось получить результат задачи: {type(exc).__name__}"})
         if job is None:
             raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "Задача не найдена"})
         return job

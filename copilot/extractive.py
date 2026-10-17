@@ -11,7 +11,8 @@ import re
 from typing import Any, Optional, Sequence
 
 from .corpus import Corpus
-from .prompts import NormRef, REFUSAL_SCOPE, REFUSAL_SOURCES, REFUSAL_VIDEO, fmt_tc, unobservable_items, verdict_text
+from .prompts import (NormRef, REFUSAL_NO_DATA, REFUSAL_SCOPE, REFUSAL_SOURCES, REFUSAL_VIDEO, fmt_tc,
+                      to_float, unobservable_items, verdict_text)
 
 # порядок важен: первое совпадение побеждает
 _INTENT_PATTERNS: list[tuple[str, str]] = [
@@ -48,6 +49,21 @@ _TYPE_HINTS: dict[str, str] = {
 _ORDINALS = {"перв": 1, "втор": 2, "трет": 3, "четв": 4, "пят": 5, "шест": 6}
 
 
+def _asked_times(question: str) -> list[float]:
+    from .guard import _times_in
+
+    return _times_in(question or "")
+
+
+def _near(v: dict[str, Any], times: Sequence[float], pad: float = 2.0) -> bool:
+    t0 = to_float(v.get("t_start"))
+    t1 = to_float(v.get("t_end"))
+    tc = to_float(v.get("timecode_sec"), 0.0) or 0.0
+    lo = (t0 if t0 is not None else tc) - pad
+    hi = (t1 if t1 is not None else tc) + pad
+    return any(lo <= t <= hi for t in times)
+
+
 def classify(question: str) -> str:
     q = (question or "").lower().replace("ё", "е")
     for intent, pattern in _INTENT_PATTERNS:
@@ -74,11 +90,11 @@ def target_violations(question: str, result: dict[str, Any]) -> list[dict[str, A
 
 def refusal_for(intent: str, result: dict[str, Any], corpus: Optional[Corpus]) -> Optional[str]:
     if intent == "identity":
-        return (f"{REFUSAL_VIDEO}: система не распознаёт и не идентифицирует людей по лицу. "
+        return (f"{REFUSAL_VIDEO}. Система не распознаёт и не идентифицирует людей по лицу. "
                 "Роли (кассир, посетитель, инкассатор) определяются только по зоне, поведению и предметам.")
     if intent == "unobservable":
         items = "; ".join(unobservable_items(result, corpus))
-        return (f"{REFUSAL_VIDEO}. По видео фиксируются только видимые действия; не устанавливаются: {items}. "
+        return (f"{REFUSAL_VIDEO}. Фиксируются только видимые действия; не устанавливаются: {items}. "
                 "Это проверяется по документам и учётной системе.")
     if intent == "offtopic":
         return f"{REFUSAL_SCOPE}."
@@ -110,12 +126,20 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
     targets = target_violations(question, result)
     status = result.get("status")
     if status in {"processing", "failed"}:
-        return f"Результат недоступен: {verdict_text(result)}. Нет данных для ответа."
+        return f"{REFUSAL_NO_DATA}: {verdict_text(result)}. Нет данных для ответа."
+    asked = _asked_times(question)
+    if asked and intent not in {"norm", "fine"}:
+        near = [v for v in viols if _near(v, asked)]
+        if not near:
+            when = ", ".join(fmt_tc(t) for t in asked)
+            return (f"{REFUSAL_NO_DATA}: в результате анализа нет событий около {when}. "
+                    "Анализ сообщает только о перечисленных в результате эпизодах; этот момент стоит просмотреть вручную.")
+        targets = near
 
     if intent == "fine":
         hits = [r for r in refs if re.search(r"штраф|ответствен|санкц|наказан", r.chunk.text.lower())]
         if not hits:
-            return f"{REFUSAL_SOURCES}: в найденных нормах не указаны штрафы или ответственность."
+            return f"{REFUSAL_SOURCES}. В найденных нормах не указаны штрафы или ответственность."
         return "В источниках: " + " ".join(f"«{r.chunk.text}» {r.marker}" for r in hits[:2])
 
     if intent == "norm":
@@ -169,6 +193,6 @@ def compose(intent: str, question: str, result: dict[str, Any], refs: Sequence[N
             if intent in {"summary", "general"} else "Основания (только наблюдаемые факты):")
     lines = [head] + [_viol_line(v, refs, corpus) for v in targets]
     if not any(r for r in refs if any(t.get("type_id") in r.chunk.type_ids for t in targets)):
-        lines.append(f"{REFUSAL_SOURCES} о конкретной норме для этого случая.")
+        lines.append("Норма для этого случая в источниках не найдена.")
     lines.append("Это признаки возможного нарушения, решение принимает проверяющий.")
     return "\n".join(lines)

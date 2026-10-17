@@ -7,7 +7,9 @@
 
 Если copilot выключен или локальной модели нет — ответ с ``error`` = "disabled" | "unavailable"
 и пустым ``answer`` (роутер отдаёт 501). Ответ никогда не подменяется выдуманным текстом и не
-уходит во внешние AI API. Импорт модуля не загружает ни моделей, ни корпуса.
+уходит во внешние AI API. Импорт модуля не загружает ни моделей, ни корпуса. Публичные функции
+не бросают исключений: любая ошибка copilot возвращается кодом в ``error`` и не затрагивает
+анализ видео.
 """
 from __future__ import annotations
 
@@ -21,8 +23,8 @@ from typing import Any, Iterator, Optional, Sequence
 from .config import copilot_enabled, default_config, is_mock
 from .corpus import Corpus, load_corpus
 from .extractive import classify, compose, refusal_for, target_violations
-from .guard import check_answer
-from .llm import LLMTimeout, ThinkFilter, make_llm
+from .guard import UNVERIFIED_ANSWER, check_answer, complete_prefix
+from .llm import LLMBusy, LLMTimeout, make_llm
 from .prompts import NormRef, build_messages, normalize_result
 
 log = logging.getLogger(__name__)
@@ -33,10 +35,11 @@ ERROR_MESSAGES = {
     "disabled": "Ассистент отключён в этой установке (COPILOT_ENABLED=0).",
     "unavailable": "Ассистент недоступен: локальная языковая модель не загружена.",
     "timeout": "Ассистент не успел ответить за отведённое время. Повторите вопрос позже.",
-    "busy": "GPU занят анализом видео. Повторите вопрос позже.",
+    "busy": "Ассистент занят (GPU или другой вопрос). Повторите вопрос позже.",
     "empty_question": "Пустой вопрос.",
     "not_ready": "Анализ ещё не завершён — вопросы доступны после результата.",
     "llm_error": "Ошибка локальной модели. Ответ не сформирован.",
+    "internal_error": "Внутренняя ошибка ассистента. Ответ не сформирован.",
 }
 
 
@@ -94,8 +97,13 @@ class CopilotService:
     # ------------------------------------------------------------------ status / VRAM
     def status(self) -> dict[str, Any]:
         enabled = copilot_enabled(self.cfg) or (self._llm_resolved and self._llm is not None)
-        llm = self.llm if enabled else None
-        info = llm.info() if llm is not None and hasattr(llm, "info") else {}
+        try:
+            llm = self.llm if enabled else None
+            info = llm.info() if llm is not None and hasattr(llm, "info") else {}
+        except Exception as exc:  # статус не должен падать ни при каких настройках
+            log.warning("copilot status error: %r", exc)
+            self.warnings.append(f"ошибка инициализации: {type(exc).__name__}")
+            llm, info = None, {}
         reason = None if llm is not None else ("disabled" if not enabled else "unavailable")
         return {
             "enabled": bool(enabled),
@@ -109,17 +117,29 @@ class CopilotService:
             "disclaimer": DISCLAIMER,
         }
 
-    def warmup(self) -> None:
-        llm = self.llm
-        if llm is not None and hasattr(llm, "warmup"):
-            llm.warmup()
-        if llm is not None:
+    def warmup(self) -> bool:
+        """Прогрев (модель + индекс норм). Никогда не бросает: False — copilot недоступен/ошибка."""
+        try:
+            llm = self.llm
+            if llm is None:
+                return False
+            if hasattr(llm, "warmup"):
+                llm.warmup()
             _ = self.retriever
+            return True
+        except Exception as exc:
+            log.warning("copilot warmup failed: %r", exc)
+            self.warnings.append(f"прогрев не удался: {type(exc).__name__}")
+            return False
 
     def release(self) -> None:
+        """Выгрузить модель (освободить VRAM). Никогда не бросает."""
         llm = self._llm
-        if llm is not None and hasattr(llm, "release"):
-            llm.release()
+        try:
+            if llm is not None and hasattr(llm, "release"):
+                llm.release()
+        except Exception as exc:
+            log.warning("copilot release failed: %r", exc)
 
     # ------------------------------------------------------------------ helpers
     def _clean_history(self, history: Any) -> list[dict[str, str]]:
@@ -212,15 +232,17 @@ class CopilotService:
         return {"result": result, "job_id": job_id, "q": q, "hist": hist, "llm": llm, "intent": intent,
                 "refs": refs, "warnings": warnings}
 
+    def _check(self, p: dict[str, Any], raw: str) -> Any:
+        gcfg = self.cfg.get("guard", {})
+        return check_answer(raw, p["refs"], self.corpus, p["result"], p["q"], p["hist"],
+                            float(gcfg.get("timecode_tolerance_s", 1.5)), float(gcfg.get("min_support_ratio", 0.3)))
+
     def _finish(self, p: dict[str, Any], raw: str, backend: str, t0: float) -> dict[str, Any]:
-        g = check_answer(raw, p["refs"], self.corpus, p["result"], p["q"], p["hist"],
-                         float(self.cfg.get("guard", {}).get("timecode_tolerance_s", 1.5)))
+        g = self._check(p, raw)
         warnings = p["warnings"] + g.warnings
         if self.corpus.is_fixture:
             warnings.append("нормы взяты из ТЕСТОВОЙ фикстуры — не использовать как ссылки на нормы РК")
-        answer = g.answer
-        if not answer:
-            answer = "Ответ не прошёл проверку источников и был удалён. Нет данных для подтверждённого ответа."
+        answer = g.answer or UNVERIFIED_ANSWER
         return {
             "answer": answer,
             "citations": g.citations,
@@ -248,7 +270,7 @@ class CopilotService:
         messages = build_messages(p["result"], p["refs"], self.corpus, p["q"], p["hist"])
         gpu_lock = self.gpu_lock if getattr(llm, "name", "") == "llama_cpp" else None
         if gpu_lock is not None and not gpu_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-            raise _Busy()
+            raise LLMBusy("shared GPU lock not acquired before deadline")
         try:
             yield from llm.stream_chat(messages, max_tokens=int(lcfg.get("max_tokens", 512)),
                                        temperature=float(lcfg.get("temperature", 0.2)), deadline=deadline)
@@ -257,6 +279,13 @@ class CopilotService:
                 gpu_lock.release()
 
     def answer(self, job_result: Any, question: str, history: Any = None) -> dict[str, Any]:
+        try:
+            return self._answer(job_result, question, history)
+        except Exception as exc:  # copilot не должен ронять вызывающий код (API/анализ)
+            log.exception("copilot internal error")
+            return self._error("internal_error", detail=type(exc).__name__)
+
+    def _answer(self, job_result: Any, question: str, history: Any = None) -> dict[str, Any]:
         t0 = time.monotonic()
         p = self._prepare(job_result, question, history)
         if "error" in p:
@@ -267,7 +296,7 @@ class CopilotService:
             raw = "".join(self._generate(p, deadline))
         except (LLMTimeout, TimeoutError):
             return self._error("timeout", p["job_id"], backend=backend)
-        except _Busy:
+        except LLMBusy:
             return self._error("busy", p["job_id"], backend=backend)
         except Exception as exc:
             log.exception("copilot LLM error")
@@ -279,10 +308,18 @@ class CopilotService:
     def stream(self, job_result: Any, question: str, history: Any = None) -> Iterator[dict[str, Any]]:
         """События: {"event":"token","text"} … {"event":"done", <ответ как answer()>} | {"event":"error", …}.
 
-        Токены идут ДО пост-проверки: UI обязан заменить текст на ``done.answer``.
-        Генерация идёт в отдельном потоке-производителе: замки модели/GPU берутся и отпускаются
-        в одном потоке, даже если потребитель (Starlette) дёргает next() из разных потоков.
+        В ``token`` уходят только ПРОВЕРЕННЫЕ предложения (тот же guard, что и для answer()),
+        поэтому неподтверждённые цитаты пользователю не показываются даже временно. ``done.answer`` —
+        окончательный текст (UI заменяет им накопленные токены). Генерация идёт в потоке-
+        производителе: замки модели/GPU берутся и отпускаются в одном потоке.
         """
+        try:
+            yield from self._stream(job_result, question, history)
+        except Exception as exc:
+            log.exception("copilot internal error (stream)")
+            yield {"event": "error", **self._error("internal_error", detail=type(exc).__name__)}
+
+    def _stream(self, job_result: Any, question: str, history: Any = None) -> Iterator[dict[str, Any]]:
         t0 = time.monotonic()
         p = self._prepare(job_result, question, history)
         if "error" in p:
@@ -306,7 +343,8 @@ class CopilotService:
         worker = threading.Thread(target=produce, name="copilot-stream", daemon=True)
         worker.start()
         parts: list[str] = []
-        flt = ThinkFilter()
+        checked = ""   # сырой префикс, уже прошедший проверку
+        emitted = ""   # проверенный текст, уже отданный клиенту
         try:
             while True:
                 try:
@@ -316,14 +354,18 @@ class CopilotService:
                     return
                 if kind == "piece":
                     parts.append(val)
-                    visible = flt.feed(val)
-                    if visible:
-                        yield {"event": "token", "text": visible}
+                    prefix = complete_prefix("".join(parts))
+                    if len(prefix) > len(checked):
+                        checked = prefix
+                        clean = self._check(p, prefix).answer
+                        if clean != UNVERIFIED_ANSWER and clean.startswith(emitted) and len(clean) > len(emitted):
+                            yield {"event": "token", "text": clean[len(emitted):]}
+                            emitted = clean
                     continue
                 if kind == "exc":
                     if isinstance(val, (LLMTimeout, TimeoutError)):
                         code = "timeout"
-                    elif isinstance(val, _Busy):
+                    elif isinstance(val, LLMBusy):
                         code = "busy"
                     else:
                         log.error("copilot LLM error: %r", val)
@@ -335,11 +377,10 @@ class CopilotService:
                 break
         finally:
             cancel.set()
-        yield {"event": "done", **self._finish(p, "".join(parts), backend, t0)}
-
-
-class _Busy(Exception):
-    pass
+        done = self._finish(p, "".join(parts), backend, t0)
+        if done["answer"].startswith(emitted) and len(done["answer"]) > len(emitted):
+            yield {"event": "token", "text": done["answer"][len(emitted):]}
+        yield {"event": "done", **done}
 
 
 # ---------------------------------------------------------------------- module-level API
@@ -367,15 +408,28 @@ def answer(job_result: Any, question: str, history: Optional[list[dict[str, str]
 
 
 def status() -> dict[str, Any]:
-    return get_service().status()
+    try:
+        return get_service().status()
+    except Exception as exc:  # даже битый конфиг не должен ронять API
+        log.warning("copilot status failed: %r", exc)
+        return {"enabled": False, "available": False, "backend": None, "mock": False, "reason": "unavailable",
+                "message": ERROR_MESSAGES["unavailable"], "llm": {}, "warnings": [type(exc).__name__],
+                "disclaimer": DISCLAIMER}
 
 
-def warmup() -> None:
-    get_service().warmup()
+def warmup() -> bool:
+    try:
+        return get_service().warmup()
+    except Exception as exc:
+        log.warning("copilot warmup failed: %r", exc)
+        return False
 
 
 def release() -> None:
-    get_service().release()
+    try:
+        get_service().release()
+    except Exception as exc:
+        log.warning("copilot release failed: %r", exc)
 
 
 def set_gpu_lock(lock: Any) -> None:

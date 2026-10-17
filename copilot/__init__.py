@@ -31,10 +31,10 @@ def status() -> dict[str, Any]:
     return _status()
 
 
-def warmup() -> None:
+def warmup() -> bool:
     from .service import warmup as _warmup
 
-    _warmup()
+    return _warmup()
 
 
 def release() -> None:

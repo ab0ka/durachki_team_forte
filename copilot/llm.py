@@ -37,6 +37,10 @@ class LLMTimeout(RuntimeError):
     """Генерация не уложилась в бюджет."""
 
 
+class LLMBusy(RuntimeError):
+    """Модель/GPU заняты и не освободились до дедлайна."""
+
+
 # ----------------------------------------------------------------------------- think-фильтр
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.S)
@@ -282,7 +286,11 @@ class LlamaCppBackend:
 
     def stream_chat(self, messages: Sequence[Message], max_tokens: int = 512, temperature: float = 0.2,
                     deadline: Optional[float] = None, **kw: Any) -> Iterator[str]:
-        with self._lock:
+        # ждём модель не дольше дедлайна: зависшие запросы не должны занимать потоки API
+        wait = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+        if not self._lock.acquire(timeout=wait):
+            raise LLMBusy("copilot model is busy with another request")
+        try:
             llm = self._ensure_loaded()
             try:
                 stream = llm.create_chat_completion(
@@ -302,6 +310,8 @@ class LlamaCppBackend:
             finally:
                 self._last_used = time.monotonic()
                 self._schedule_unload()
+        finally:
+            self._lock.release()
 
     def info(self) -> dict[str, Any]:
         return {"backend": self.name, "model": Path(self.model_path).name, "gpu_layers": self.n_gpu_layers,

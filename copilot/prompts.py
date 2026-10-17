@@ -1,31 +1,44 @@
 """Системный промпт, нормализация результата анализа и сборка контекста для LLM.
 
-Один и тот же билдер используется в рантайме (service) и при генерации датасета для LoRA
-(train/make_dataset) — формат промпта на обучении и в проде совпадает.
+Билдер ``build_messages`` — единственный формат промпта; если позже появится датасет для
+дообучения, он должен строиться им же, чтобы формат на обучении и в проде совпадал.
 """
 from __future__ import annotations
 
 import dataclasses
+import json
+import math
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 from .corpus import Chunk, Corpus
 
-SYSTEM_PROMPT = """Ты — Sentinel Copilot, локальный ассистент проверяющего банковской кассы (ForteBank).
+REFUSAL_NO_DATA = "По имеющимся данным это установить нельзя"
+REFUSAL_VIDEO = f"{REFUSAL_NO_DATA}: по видео это не определяется"
+REFUSAL_SOURCES = f"{REFUSAL_NO_DATA}: в источниках нет информации об этом"
+REFUSAL_SCOPE = "Я отвечаю только на вопросы по результату анализа видео и нормам"
+
+SYSTEM_PROMPT = f"""Ты — Sentinel Copilot, локальный ассистент проверяющего банковской кассы (ForteBank).
 Правила ответа:
 1. Отвечай по-русски, кратко и по делу (не более 6 предложений или короткий список).
 2. Используй ТОЛЬКО два источника: «РЕЗУЛЬТАТ АНАЛИЗА ВИДЕО» и «НОРМЫ» из контекста. Ничего не добавляй от себя.
 3. Ссылайся на нормы только маркерами вида [N1], [N2] из раздела «НОРМЫ». Не придумывай документы, пункты, статьи и ссылки.
 4. На нарушения из результата ссылайся маркерами [V1], [V2]; таймкоды бери только из результата.
 5. Описывай только наблюдаемое на видео. Сумму, подлинность денег, умысел, личность людей, наличие допуска,
-   содержание разговоров по видео установить нельзя — так и скажи: «По видео это установить нельзя».
-6. Если нужной нормы нет в разделе «НОРМЫ», ответь: «В источниках нет информации об этом».
+   содержание разговоров по видео установить нельзя — так и скажи: «{REFUSAL_VIDEO}».
+6. Если ответа нет в результате или нужной нормы нет в разделе «НОРМЫ», ответь: «{REFUSAL_NO_DATA}»
+   и коротко укажи, каких данных не хватает.
 7. Говори «признаки возможного нарушения», а не «нарушение доказано». Ответ — подсказка, не юридическое заключение.
 8. Людей не идентифицируй; роли (кассир, посетитель, инкассатор) — только как в результате анализа."""
 
-REFUSAL_VIDEO = "По видео это установить нельзя"
-REFUSAL_SOURCES = "В источниках нет информации об этом"
-REFUSAL_SCOPE = "Я отвечаю только на вопросы по результату анализа видео и нормам"
+
+def to_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+    """Безопасное число из результата (битые/пустые значения -> default)."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
 
 
 def fmt_tc(sec: Any) -> str:
@@ -51,25 +64,46 @@ def _to_dict(obj: Any) -> Any:
 
 
 def normalize_result(job_result: Any) -> dict[str, Any]:
-    """dict (схема API) или AnalysisResult -> dict без base64-кадров (они не нужны LLM)."""
+    """dict (схема API), JSON-строка или AnalysisResult -> dict без base64-кадров (они не нужны LLM).
+
+    Числовые поля приводятся к float/None, чтобы битый результат не ронял ассистента.
+    """
+    if isinstance(job_result, (str, bytes)):
+        try:
+            job_result = json.loads(job_result)
+        except ValueError:
+            job_result = {}
     data = _to_dict(job_result) if job_result is not None else {}
     if not isinstance(data, dict):
         data = {}
     out = dict(data)
     viols: list[dict[str, Any]] = []
-    for i, v in enumerate(data.get("violations") or []):
+    raw_viols = data.get("violations")
+    for v in raw_viols if isinstance(raw_viols, list) else []:
         if not isinstance(v, dict):
             continue
         vv = dict(v)
+        for key in ("timecode_sec", "t_start", "t_end", "confidence"):
+            if key in vv:
+                vv[key] = to_float(vv[key])
         frames = []
         for f in vv.get("evidence_frames") or []:
             if isinstance(f, dict):
-                frames.append({"timestamp_sec": f.get("timestamp_sec")})
+                frames.append({"timestamp_sec": to_float(f.get("timestamp_sec"))})
         vv["evidence_frames"] = frames
-        vv.setdefault("type_id", "")
-        vv["_n"] = i + 1
+        vv["type_id"] = str(vv.get("type_id") or "")
+        vv["_n"] = len(viols) + 1
         viols.append(vv)
     out["violations"] = viols
+    meta = data.get("meta")
+    if isinstance(meta, dict):
+        meta = dict(meta)
+        for key in ("duration", "duration_s", "video_duration"):
+            if key in meta:
+                meta[key] = to_float(meta[key])
+        out["meta"] = meta
+    else:
+        out["meta"] = {}
     return out
 
 

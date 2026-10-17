@@ -40,7 +40,8 @@ def test_unobservable_questions_refused(cfg, corpus, job_violation) -> None:
 
 def test_not_in_sources(cfg, corpus, job_violation) -> None:
     r = _svc(cfg, corpus).answer(job_violation, "Какой штраф положен кассиру?", [])
-    assert r["refusal"] is True and "В источниках нет" in r["answer"]
+    assert r["refusal"] is True and r["answer"].startswith("По имеющимся данным это установить нельзя")
+    assert "в источниках нет" in r["answer"]
 
 
 def test_clean_result_says_no_data(cfg, corpus, job_clean) -> None:

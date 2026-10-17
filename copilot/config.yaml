@@ -59,6 +59,7 @@ llm:
 
 guard:
   timecode_tolerance_s: 1.5
+  min_support_ratio: 0.3   # доля слов предложения, опирающихся на результат/нормы; ниже — вырезается
   max_question_chars: 2000
   max_history_turns: 8
   max_history_chars: 4000

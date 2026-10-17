@@ -81,24 +81,36 @@ class E5Embedder:
         self._model: Any = None
         self._load()
 
+    def _local_path(self) -> str:
+        """Только локальные веса: папка на диске или уже скачанный снапшот из кэша HF.
+
+        Никогда не скачивает: snapshot_download(local_files_only=True) бросает исключение,
+        если модели нет в кэше (тогда make_embedder в режиме auto переходит на hashing).
+        """
+        from pathlib import Path
+
+        from .config import resolve_path
+
+        for cand in (Path(self.model_name), resolve_path(self.model_name)):
+            if cand is not None and cand.is_dir():
+                return str(cand)
+        from huggingface_hub import snapshot_download  # type: ignore
+
+        return str(snapshot_download(repo_id=self.model_name, local_files_only=True))
+
     def _load(self) -> None:
+        path = self._local_path()
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
-
-            self._st = SentenceTransformer(self.model_name, device=self.device, local_files_only=True)
-            return
-        except TypeError:
-            # старые версии sentence-transformers не знают local_files_only — полагаемся на HF_HUB_OFFLINE
-            from sentence_transformers import SentenceTransformer  # type: ignore
-
-            self._st = SentenceTransformer(self.model_name, device=self.device)
-            return
         except ImportError:
-            pass
+            SentenceTransformer = None  # noqa: N806
+        if SentenceTransformer is not None:
+            self._st = SentenceTransformer(path, device=self.device)
+            return
         from transformers import AutoModel, AutoTokenizer  # type: ignore
 
-        self._tok = AutoTokenizer.from_pretrained(self.model_name, local_files_only=True)
-        self._model = AutoModel.from_pretrained(self.model_name, local_files_only=True).to(self.device).eval()
+        self._tok = AutoTokenizer.from_pretrained(path, local_files_only=True)
+        self._model = AutoModel.from_pretrained(path, local_files_only=True).to(self.device).eval()
 
     def _encode(self, texts: Sequence[str]) -> np.ndarray:
         if self._st is not None:
