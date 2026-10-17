@@ -573,9 +573,13 @@ def score_group(group: Sequence[NormEvent], risk: RiskCurve, cfg: dict[str, Any]
     extra: dict[str, Any] = {}
     for e in [peak_ev] + ordered:
         for k in ("keypoints", "poses", "head_boxes", "person_bboxes", "persons", "roles", "type_probs",
-                  "type_scores"):
+                  "type_scores", "state_after"):
             if k in e.extra and k not in extra:
                 extra[k] = e.extra[k]
+    ev_t = sorted({round(_f(t), 3) for e in span for t in (e.extra.get("evidence_t") or [])
+                   if not math.isnan(_f(t, float("nan")))})
+    if ev_t:
+        extra["evidence_t"] = ev_t[:6]
     orig_types = sorted({e.orig_type_id for e in group if e.orig_type_id})
     if orig_types:
         extra["orig_type_ids"] = orig_types
