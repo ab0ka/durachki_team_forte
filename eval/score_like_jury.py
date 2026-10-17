@@ -1,7 +1,10 @@
-"""Один главный номер для итераций: аппроксимация 100-балльной шкалы жюри.
+"""НАШ PROXY-балл (0..100) для сравнения итераций. Формула жюри НЕИЗВЕСТНА — это не прогноз оценки жюри.
 
-Критерии ТЗ: Детекция 25 · Таймкод+кадр 15 · Тип 15 · Нормы 15 · Устойчивость 10 · Продукт/UI 10 ·
-Архитектура/локальность 10. Формулы каждого компонента (доля 0..1 × вес) — в README и в ``explain``.
+Главное — scorecard из eval.metrics (реальные precision/recall/FP/FN/timeouts/latency с n и версиями);
+proxy лишь сворачивает его в одно число по весам критериев ТЗ (Детекция 25 · Таймкод+кадр 15 · Тип 15 ·
+Нормы 15 · Устойчивость 10 · Продукт/UI 10 · Архитектура 10). Компоненты без настоящих данных — n/a
+(тип — только при реальной разметке типов; нормы — полнота ссылок, не корректность трактовки;
+устойчивость — синтетические возмущения, не реальный новый ракурс). Формулы — в README.
 
 CLI::
 
@@ -11,15 +14,11 @@ CLI::
 from __future__ import annotations
 
 import argparse
-import re
 import statistics
 from pathlib import Path
 from typing import Any, Optional
 
 from .common import load_config, read_json, write_json
-
-_TYPE_RE = re.compile(r"^V(0[1-9]|[1-9]\d)$")
-
 
 def _step(dt_abs: Optional[float], steps: list[list[float]]) -> float:
     if dt_abs is None:
@@ -47,9 +46,9 @@ def component_detection(summary: dict, cfg: dict) -> tuple[Optional[float], str]
     P, N = v["n_pos"], v["n_neg"]
     if not P + N:
         return None, "нет видео"
-    failed_neg = sum(1 for _ in [])  # failed на негативе — тоже ошибка (жюри не получит ответ)
+    # failed на негативе — тоже ошибка (ответа нет); failed на позитиве уже входит в FN
     fp_eff = v["fp"] + len([x for x in v.get("failed_ids", []) if x not in set(v.get("fn_ids", []))])
-    cost = cfn * v["fn"] + cfp * fp_eff + failed_neg
+    cost = cfn * v["fn"] + cfp * fp_eff
     val = max(0.0, 1.0 - cost / (cfn * P + cfp * N))
     return val, f"1 − ({cfn:g}·FN + {cfp:g}·(FP+failed⁻)) / ({cfn:g}·P + {cfp:g}·N): FN={v['fn']} FP={v['fp']} " \
                 f"failed⁻={fp_eff - v['fp']} P={P} N={N}"
@@ -71,28 +70,12 @@ def component_timecode(per_video: list[dict], cfg: dict) -> tuple[Optional[float
                        f"{1 - tp_part:g}·[кадр в ±tol]; FN → 0"
 
 
-def component_type(summary: dict, per_video: list[dict], cfg: dict, catalog_types: Optional[set] = None
-                   ) -> tuple[Optional[float], str, str]:
+def component_type(summary: dict) -> tuple[Optional[float], str, str]:
+    """Только по настоящей разметке типов (data/labels_types.csv). Без неё — n/a, никаких proxy."""
     ty = summary.get("types") or {}
     if ty.get("available"):
         return ty.get("accuracy"), f"точность типа по {ty.get('n_events')} GT-событиям (пропуск → 0)", "measured"
-    credit99 = float((cfg.get("jury") or {}).get("v99_type_credit", 0.5))
-    vals = []
-    for e in per_video:
-        if e["gt_label"] != "violation":
-            continue
-        if e["status"] != "done" or e["verdict"] != "violation":
-            vals.append(0.0)
-            continue
-        t = (e.get("pred_type") or "").upper()
-        if t == "V99":
-            vals.append(credit99)
-        elif _TYPE_RE.match(t) and (catalog_types is None or t in catalog_types):
-            vals.append(1.0)
-        else:
-            vals.append(0.0)
-    return _avg(vals), f"PROXY (нет labels_types): валидный type_id из каталога = 1, V99 = {credit99:g}, " \
-                       f"нет/неизвестный = 0; среднее по {len(vals)} позитивам", "proxy"
+    return None, "нет настоящей разметки типов (labels_types.csv) — не оцениваем", "n/a"
 
 
 def component_norms(per_video: list[dict]) -> tuple[Optional[float], str]:
@@ -104,8 +87,8 @@ def component_norms(per_video: list[dict]) -> tuple[Optional[float], str]:
             vals.append(0.0)
             continue
         vals.append(statistics.fmean(_norm_score(n) for n in e["norms"]))
-    return _avg(vals), "среднее по позитивам: 0.4·[≥1 rule] + 0.3·[все rules из каталога (или adilet URL)] + " \
-                       "0.3·доля verified; FN → 0"
+    return _avg(vals), "PROXY полноты ссылок (не корректности трактовки): среднее по позитивам 0.4·[≥1 rule] + " \
+                       "0.3·[все rules из каталога (или adilet URL)] + 0.3·доля verified; FN → 0"
 
 
 def component_robustness(rob: Optional[dict]) -> tuple[Optional[float], str]:
@@ -117,7 +100,8 @@ def component_robustness(rob: Optional[dict]) -> tuple[Optional[float], str]:
     if flip is None:
         return None, "в robustness.json нет flip_rate"
     val = 0.7 * (1 - float(flip)) + 0.3 * (float(stab) if stab is not None else 1 - float(flip))
-    return val, f"0.7·(1 − доля смены вердикта={flip}) + 0.3·доля стабильного таймкода={stab}"
+    return val, f"PROXY на СИНТЕТИЧЕСКИХ возмущениях (не реальный новый ракурс): 0.7·(1 − смена вердикта={flip}) + " \
+                f"0.3·стабильный таймкод={stab}"
 
 
 def component_product(summary: dict) -> tuple[Optional[float], str]:
@@ -156,7 +140,7 @@ def component_architecture(summary: dict, jury_sim: Optional[dict]) -> tuple[Opt
 
 
 def score(metrics: dict, robustness: Optional[dict] = None, jury_sim: Optional[dict] = None,
-          cfg: Optional[dict] = None, catalog_types: Optional[set] = None) -> dict:
+          cfg: Optional[dict] = None) -> dict:
     cfg = cfg or load_config()
     j = cfg.get("jury") or {}
     w = j.get("weights") or {}
@@ -176,10 +160,12 @@ def score(metrics: dict, robustness: Optional[dict] = None, jury_sim: Optional[d
 
     put("detection", *component_detection(summary, cfg))
     put("timecode", *component_timecode(per_video, cfg))
-    tv, tn, ts = component_type(summary, per_video, cfg, catalog_types)
+    tv, tn, ts = component_type(summary)
     put("type", tv, tn, ts)
-    put("norms", *component_norms(per_video))
-    put("robustness", *component_robustness(robustness))
+    nv, nn = component_norms(per_video)
+    put("norms", nv, nn, "proxy")
+    rv, rn = component_robustness(robustness)
+    put("robustness", rv, rn, "proxy")
     pv, pn = component_product(summary)
     put("product", pv, pn, "proxy")
     av, an = component_architecture(summary, jury_sim)
@@ -187,26 +173,27 @@ def score(metrics: dict, robustness: Optional[dict] = None, jury_sim: Optional[d
     avail = [c for c in comps.values() if c["points"] is not None]
     raw = sum(c["points"] for c in avail)
     wmax = sum(c["weight"] for c in avail)
-    return {"jury_score": round(100.0 * raw / wmax, 2) if wmax else 0.0,
+    val = round(100.0 * raw / wmax, 2) if wmax else 0.0
+    return {"proxy_score": val, "jury_score": val,  # jury_score — алиас для совместимости, это НЕ оценка жюри
+            "disclaimer": "Наш proxy; формула жюри неизвестна. Решения принимать по scorecard.",
             "points": round(raw, 2), "max_points_available": wmax,
             "missing": [k for k, c in comps.items() if c["points"] is None],
-            "components": comps}
+            "components": comps, "scorecard": metrics.get("scorecard")}
 
 
 def format_score(res: dict) -> str:
-    lines = [f"JURY_SCORE = {res['jury_score']:.1f} / 100   ({res['points']:.1f} из {res['max_points_available']:g} "
-             f"доступных баллов" + (f"; нет данных: {', '.join(res['missing'])}" if res["missing"] else "") + ")"]
+    lines = []
+    if res.get("scorecard"):
+        from .metrics import format_scorecard
+
+        lines.append(format_scorecard(res["scorecard"]))
+    lines.append(f"PROXY_SCORE = {res['proxy_score']:.1f} / 100  (НАШ proxy, формула жюри неизвестна; "
+                 f"{res['points']:.1f} из {res['max_points_available']:g} доступных баллов"
+                 + (f"; n/a: {', '.join(res['missing'])}" if res["missing"] else "") + ")")
     for k, c in res["components"].items():
         pts = "  n/a" if c["points"] is None else f"{c['points']:5.1f}"
         lines.append(f"  {k:<13} {pts} / {c['weight']:>4g}  [{c['source']}]  {c['note']}")
     return "\n".join(lines)
-
-
-def _catalog_types(cfg: dict) -> Optional[set]:
-    from .metrics import load_catalog
-
-    cat = load_catalog(cfg)
-    return set((cat or {}).get("types") or {}) or None
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -231,7 +218,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         ap.error("нужен --metrics или --preds")
     rob = read_json(args.robustness) if args.robustness else None
     js = read_json(args.jury_sim) if args.jury_sim else None
-    res = score(metrics, rob, js, cfg, _catalog_types(cfg))
+    res = score(metrics, rob, js, cfg)
     print(format_score(res))
     if args.out:
         write_json(args.out, res)

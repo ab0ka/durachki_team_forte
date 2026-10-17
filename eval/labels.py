@@ -28,7 +28,8 @@ log = logging.getLogger("eval.labels")
 
 LABEL_VIOLATION = "violation"
 LABEL_CLEAN = "no_violation"
-CSV_COLUMNS = ["video_id", "file", "label", "t_sec", "md5", "group", "t_all", "conflict", "raw"]
+CSV_COLUMNS = ["video_id", "file", "label", "t_sec", "md5", "group", "t_all", "conflict", "raw", "sha256"]
+LABEL_CONFLICT = "conflict"   # в md5/sha256-группе разные метки — исключаем из бинарных метрик, не выбираем сами
 
 _NO_VIOLATION_RE = re.compile(
     r"(без\s*нарушени|нет\s*нарушени|нарушени[йяе]\s*нет|не\s*выявлен|не\s*обнаружен|отсутству|"
@@ -60,7 +61,8 @@ class LabelRow:
     md5: str = ""
     group: str = ""
     conflict: bool = False
-    raw: str = ""
+    raw: str = ""                   # исходный текст ячеек — сохраняется как есть
+    sha256: str = ""
 
     @property
     def t_sec(self) -> Optional[float]:
@@ -69,10 +71,15 @@ class LabelRow:
 
 @dataclass
 class GroundTruth:
-    """GT по видео (или по md5-группе при dedupe)."""
+    """GT по видео (или по md5-группе при dedupe).
+
+    ``events`` — список GT-событий, каждое = список альтернативных таймкодов. Конфликт таймкодов в группе
+    дубликатов (Х-4: 57 с / Х-47: 68 с) не решаем выбором: это одно событие с альтернативами [57, 68]
+    (политика ``conflict_policy`` в config.yaml), исходные строки — в ``raw``.
+    """
 
     video_id: str
-    label: str
+    label: str                       # violation | no_violation | conflict
     times: list[float] = field(default_factory=list)
     group: str = ""
     members: list[str] = field(default_factory=list)
@@ -80,6 +87,8 @@ class GroundTruth:
     types: list[tuple[float, str]] = field(default_factory=list)  # (t_sec, type_id) из labels_types.csv
     file: str = ""
     md5: str = ""
+    events: list[list[float]] = field(default_factory=list)
+    raw: dict[str, str] = field(default_factory=dict)   # video_id члена → исходная строка разметки
 
     @property
     def positive(self) -> bool:
@@ -291,11 +300,17 @@ def read_labels_xlsx(path: str | Path) -> tuple[list[LabelRow], list[str]]:
 
 # ----------------------------------------------------------------------------- md5 / группы
 def md5_file(path: str | Path, chunk: int = 1 << 20) -> str:
-    h = hashlib.md5()
+    return hash_file(path, chunk)[0]
+
+
+def hash_file(path: str | Path, chunk: int = 1 << 20) -> tuple[str, str]:
+    """(md5, sha256) за один проход."""
+    h5, h256 = hashlib.md5(), hashlib.sha256()
     with open(path, "rb") as f:
         for b in iter(lambda: f.read(chunk), b""):
-            h.update(b)
-    return h.hexdigest()
+            h5.update(b)
+            h256.update(b)
+    return h5.hexdigest(), h256.hexdigest()
 
 
 def map_video_files(videos_dir: str | Path, exts: Iterable[str] = (".mov", ".mp4", ".m4v", ".avi", ".mkv")
@@ -316,12 +331,14 @@ def map_video_files(videos_dir: str | Path, exts: Iterable[str] = (".mov", ".mp4
 
 
 def assign_groups(rows: list[LabelRow]) -> list[str]:
-    """group = минимальный ID среди файлов с одинаковым md5; conflict — если метки/таймкоды различаются."""
+    """group = минимальный ID среди файлов с одинаковым содержимым (sha256, иначе md5);
+    conflict — если метки/таймкоды различаются (исходные строки не меняем)."""
     warnings: list[str] = []
     by_md5: dict[str, list[LabelRow]] = {}
     for r in rows:
-        if r.md5:
-            by_md5.setdefault(r.md5, []).append(r)
+        key = r.sha256 or r.md5
+        if key:
+            by_md5.setdefault(key, []).append(r)
         r.group = r.video_id
     for md5, members in by_md5.items():
         if len(members) < 2:
@@ -357,7 +374,7 @@ def build_labels(xlsx: str | Path, videos_dir: Optional[str | Path] = None,
             except ValueError:
                 r.file = str(p)
             if with_md5:
-                r.md5 = md5_file(p)
+                r.md5, r.sha256 = hash_file(p)
         for vid, p in files.items():
             if vid not in labeled:
                 warnings.append(f"{vid}: файл {p.name} без разметки")
@@ -383,7 +400,7 @@ def write_labels_csv(rows: list[LabelRow], path: str | Path) -> None:
         w.writerow(CSV_COLUMNS)
         for r in rows:
             w.writerow([r.video_id, r.file, r.label, _fmt_t(r.t_sec), r.md5, r.group or r.video_id,
-                        ";".join(_fmt_t(t) for t in r.times), int(r.conflict), r.raw])
+                        ";".join(_fmt_t(t) for t in r.times), int(r.conflict), r.raw, r.sha256])
 
 
 def _read_csv_dicts(path: str | Path) -> list[dict[str, str]]:
@@ -416,7 +433,8 @@ def read_labels_csv(path: str | Path) -> list[LabelRow]:
                     times.append(t)
         out.append(LabelRow(video_id=vid, label=label, times=times, file=d.get("file", ""),
                             md5=d.get("md5", ""), group=normalize_video_id(d.get("group")) or d.get("group") or vid,
-                            conflict=(d.get("conflict") or "0") in ("1", "true", "True"), raw=d.get("raw", "")))
+                            conflict=(d.get("conflict") or "0") in ("1", "true", "True"), raw=d.get("raw", ""),
+                            sha256=d.get("sha256", "")))
     return out
 
 
@@ -440,30 +458,40 @@ def read_types_csv(path: str | Path) -> dict[str, list[tuple[float, str]]]:
 
 def load_ground_truth(labels_csv: str | Path, types_csv: Optional[str | Path] = None,
                       dedupe: bool = True) -> dict[str, GroundTruth]:
-    """GT для метрик. dedupe=True: одна запись на md5-группу (ключ — ID группы), таймкоды — объединение,
-    метка — «нарушение», если хоть у одного члена группы нарушение (пропуск недопустим)."""
+    """GT для метрик. dedupe=True: одна запись на группу дубликатов (ключ — ID группы).
+
+    * метки в группе совпадают → эта метка; различаются → ``conflict`` (исключается из бинарных метрик);
+    * таймкоды: если в группе конфликт и у каждого члена ≤1 таймкода → ОДНО событие с альтернативами
+      (Х-4/Х-47: [57, 68]); иначе каждое время — отдельное событие. Исходные строки — в ``raw``.
+    """
     rows = read_labels_csv(labels_csv)
     types: dict[str, list[tuple[float, str]]] = {}
     if types_csv and Path(types_csv).exists():
         types = read_types_csv(types_csv)
-    out: dict[str, GroundTruth] = {}
+    grouped: dict[str, list[LabelRow]] = {}
     for r in rows:
         key = (r.group or r.video_id) if dedupe else r.video_id
-        gt = out.get(key)
-        if gt is None:
-            gt = out[key] = GroundTruth(video_id=key, label=r.label, group=r.group or r.video_id,
-                                        file=r.file, md5=r.md5)
-        elif r.label == LABEL_VIOLATION:
-            gt.label = LABEL_VIOLATION
-        if r.video_id == key and r.file:
-            gt.file = r.file
-        gt.members.append(r.video_id)
-        gt.times += [t for t in r.times if t not in gt.times]
-        gt.conflict = gt.conflict or r.conflict
-        gt.types += [x for x in types.get(r.video_id, []) if x not in gt.types]
-    for gt in out.values():
+        grouped.setdefault(key, []).append(r)
+    out: dict[str, GroundTruth] = {}
+    for key, members in grouped.items():
+        members.sort(key=lambda r: video_sort_key(r.video_id))
+        labels = {m.label for m in members}
+        label = labels.pop() if len(labels) == 1 else LABEL_CONFLICT
+        rep = next((m for m in members if m.video_id == key), members[0])
+        gt = GroundTruth(video_id=key, label=label, group=members[0].group or key, file=rep.file, md5=rep.md5,
+                         members=[m.video_id for m in members],
+                         conflict=any(m.conflict for m in members) or len({tuple(sorted(m.times)) for m in members}) > 1,
+                         raw={m.video_id: m.raw for m in members})
+        for m in members:
+            gt.times += [t for t in m.times if t not in gt.times]
+            gt.types += [x for x in types.get(m.video_id, []) if x not in gt.types]
         gt.times.sort()
         gt.types.sort(key=lambda x: (x[0] if x[0] == x[0] else 1e9))
+        if gt.conflict and len(members) > 1 and all(len(m.times) <= 1 for m in members) and gt.times:
+            gt.events = [list(gt.times)]
+        else:
+            gt.events = [[t] for t in gt.times]
+        out[key] = gt
     return dict(sorted(out.items(), key=lambda kv: video_sort_key(kv[0])))
 
 

@@ -24,7 +24,15 @@ from .common import load_config, normalize_video_id, read_json, video_sort_key, 
 from .labels import LABEL_VIOLATION, GroundTruth, load_ground_truth
 from .schema import check_api_response, decode_jpeg_b64
 
-CATEGORIES = ("TP", "TN", "FP", "FN", "early", "late", "wrong_type", "failed")
+CATEGORIES = ("TP", "TN", "FP", "FN", "early", "late", "wrong_type", "failed", "label_conflict")
+EVAL_VERSION = "a16-eval-1.1"
+LOCALIZATION_CAVEAT = ("GT размечена одной секундой на видео (неполная event-разметка): лишние кандидаты "
+                       "(extra_candidates) не обязательно ложные — показываются отдельно и не входят в FP по видео.")
+TYPES_NOTE = "Точность типа считается только по настоящей разметке типов (data/labels_types.csv); без неё — n/a."
+NORMS_NOTE = ("Проверяется полнота и формат ссылок (rule есть, из каталога, флаг verified). Наличие quote/URL "
+              "≠ правильная трактовка нормы — корректность только по ручной экспертизе (data/norms_review.csv).")
+_TIMEOUT_RE = ("timeout", "time out", "timed out", "deadline", "таймаут", "тайм-аут", "превышен")
+_DEGRADED_RE = ("deadline", "timeout", "budget", "skipped", "skip ", "таймаут", "бюджет", "пропущ", "fallback")
 
 
 # ----------------------------------------------------------------------------- загрузка
@@ -118,6 +126,16 @@ class VideoEval:
     duration: Optional[float] = None
     error: Optional[str] = None
     violations_brief: list[dict] = field(default_factory=list)
+    # one-to-one сопоставление предсказанных нарушений с GT-событиями
+    events_total: int = 0
+    events_matched: int = 0
+    event_hits: dict[str, int] = field(default_factory=dict)
+    extra_candidates: int = 0
+    nearest_dt_signed: Optional[float] = None   # без окна — справочно (насколько далеко промах)
+    match_pairs: list[dict] = field(default_factory=list)
+    timeout: bool = False
+    degraded: bool = False
+    pipeline_version: Optional[str] = None
 
     @property
     def gt_positive(self) -> bool:
@@ -160,6 +178,42 @@ def _duration(api: dict, info: dict) -> Optional[float]:
     return None
 
 
+def _texts(api: dict, info: dict) -> list[str]:
+    meta = api.get("meta") or {}
+    out = [str(info.get("error") or ""), str(api.get("error") or ""), str(meta.get("error") or "")]
+    w = meta.get("warnings")
+    if isinstance(w, list):
+        out += [str(x) for x in w]
+    elif w:
+        out.append(str(w))
+    return [x.lower() for x in out if x]
+
+
+def match_one_to_one(events: list[list[float]], timed: list[tuple[int, float]], window_s: float) -> list[dict]:
+    """Жадное one-to-one сопоставление по |Δt| (каждое GT-событие ↔ не более одного нарушения и наоборот).
+    Событие = список альтернативных таймкодов (конфликт дубликатов) — берётся ближайшая альтернатива."""
+    cands = []
+    for ei, alts in enumerate(events):
+        if not alts:
+            continue
+        for i, t in timed:
+            a = min(alts, key=lambda x: abs(t - x))
+            d = abs(t - a)
+            if d <= window_s + 1e-9:
+                cands.append((d, ei, i, t - a, a))
+    cands.sort()
+    used_e: set[int] = set()
+    used_p: set[int] = set()
+    pairs = []
+    for d, ei, i, sd, a in cands:
+        if ei in used_e or i in used_p:
+            continue
+        used_e.add(ei)
+        used_p.add(i)
+        pairs.append({"event": ei, "pred": i, "gt_t": a, "dt_signed": round(sd, 3), "dt_abs": round(d, 3)})
+    return pairs
+
+
 def _rule_key(r: dict) -> tuple:
     return (str(r.get("url") or "").strip().rstrip("/"), str(r.get("clause") or "").strip())
 
@@ -177,10 +231,18 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
                    members=list(gt.members or [gt.video_id]), conflict=gt.conflict, pred_id=pred_id)
     ve.latency_s = _latency(api or {}, info or {})
     ve.error = (info or {}).get("error")
+    ve.events_total = len(gt.events or [[t] for t in gt.times]) if gt.positive else 0
+    texts = _texts(api or {}, info or {})
     if not api:
         ve.status, ve.category = "missing", "failed"
+        ve.timeout = bool(info.get("timeout")) or any(k in t for t in texts for k in _TIMEOUT_RE)
         return ve
     ve.status = api.get("status") or "missing"
+    ve.pipeline_version = str((api.get("meta") or {}).get("version") or "") or None
+    if ve.status != "done":
+        ve.timeout = bool(info.get("timeout")) or any(k in t for t in texts for k in _TIMEOUT_RE)
+    else:
+        ve.degraded = any(k in t for t in texts for k in _DEGRADED_RE)
     ve.duration = _duration(api, info or {})
     rep = check_api_response(api, duration=ve.duration, max_frames=int(cfg.get("max_evidence_frames", 3)))
     ve.schema_errors, ve.schema_warnings = rep.errors, rep.warnings
@@ -219,51 +281,61 @@ def evaluate_video(gt: GroundTruth, api: Optional[dict], info: dict, cfg: dict,
 
     # --- вердикт
     pred_pos = ve.verdict == "violation"
-    if not gt.positive:
+    if gt.label == "conflict":
+        ve.category = "label_conflict"
+    elif not gt.positive:
         ve.category = "FP" if pred_pos else "TN"
     elif not pred_pos:
         ve.category = "FN"
     else:
         ve.category = "TP"
 
-    # --- локализация: ближайшее (по времени) нарушение к любому GT-таймкоду
-    timed = [(i, _num(v.get("timecode_sec"))) for i, v in enumerate(vios)]
-    timed = [(i, t) for i, t in timed if t is not None]
-    best: Optional[tuple[float, int, float]] = None
-    if timed and gt.times:
-        for i, t in timed:
-            for g in gt.times:
-                cand = (abs(t - g), i, g)
-                if best is None or cand < best:
-                    best = cand
-    if best is not None:
-        _, bi, g = best
-        v = vios[bi]
-        ve.pred_t, ve.matched_gt_t = _num(v.get("timecode_sec")), g
-        ve.dt_signed = round(ve.pred_t - g, 3)
-        ve.dt_abs = abs(ve.dt_signed)
-    elif timed:  # GT без таймкода или GT-негатив: показываем самое уверенное нарушение
-        bi = max(range(len(timed)), key=lambda k: _num(vios[timed[k][0]].get("confidence")) or 0.0)
-        bi = timed[bi][0]
-        v = vios[bi]
+    # --- локализация: one-to-one сопоставление нарушений с GT-событиями (альтернативы — для конфликтов)
+    timed = [(i, t) for i, t in ((i, _num(v.get("timecode_sec"))) for i, v in enumerate(vios)) if t is not None]
+    events = (gt.events or [[t] for t in gt.times]) if gt.positive else []
+    windows = [float(k) for k in cfg.get("hit_windows_s", [0.5, 1, 2, 3])]
+    win = max([float(cfg.get("match_window_s", 5.0))] + windows)
+    pairs = match_one_to_one(events, timed, win) if pred_pos else []
+    ve.match_pairs = pairs
+    ve.events_matched = len(pairs)
+    ve.extra_candidates = (len(timed) - len(pairs)) if (pred_pos and gt.positive) else 0
+    for k in windows:
+        ve.event_hits[f"{k:g}"] = sum(p["dt_abs"] <= k + 1e-9 for p in pairs)
+    nearest = min(((abs(t - a), i, t - a, a) for i, t in timed for alts in events for a in alts), default=None)
+    if nearest is not None:
+        ve.nearest_dt_signed = round(nearest[2], 3)
+    v: Optional[dict] = None
+    if pairs:
+        best = min(pairs, key=lambda p: p["dt_abs"])
+        v = vios[best["pred"]]
+        ve.pred_t, ve.matched_gt_t = _num(v.get("timecode_sec")), best["gt_t"]
+        ve.dt_signed, ve.dt_abs = best["dt_signed"], best["dt_abs"]
+    elif nearest is not None:
+        v = vios[nearest[1]]
         ve.pred_t = _num(v.get("timecode_sec"))
-    else:
-        v = None
+    elif timed:  # GT без таймкода или GT-негатив: показываем самое уверенное нарушение
+        i_best = max((i for i, _ in timed), key=lambda i: _num(vios[i].get("confidence")) or 0.0)
+        v = vios[i_best]
+        ve.pred_t = _num(v.get("timecode_sec"))
     if v is not None:
         ve.pred_type = v.get("type_id") or None
         ve.pred_conf = _num(v.get("confidence"))
-    if gt.positive and pred_pos and gt.times and ve.dt_abs is not None:
-        for k in cfg.get("hit_windows_s", [0.5, 1, 2, 3]):
-            ve.hits[f"{float(k):g}"] = ve.dt_abs <= float(k) + 1e-9
-        tol = float(cfg.get("evidence_tol_s", 1.0))
-        frames = [f for f in (v.get("evidence_frames") or []) if isinstance(f, dict)]
-        dts = [abs(_num(f.get("timestamp_sec")) - ve.matched_gt_t) for f in frames
-               if _num(f.get("timestamp_sec")) is not None and decode_jpeg_b64(f.get("image_base64")) is not None]
-        ve.evidence_dt = round(min(dts), 3) if dts else None
-        ve.evidence_ok = bool(dts) and min(dts) <= tol + 1e-9
+    if gt.positive and pred_pos and events:
+        for k in windows:
+            ve.hits[f"{k:g}"] = ve.dt_abs is not None and ve.dt_abs <= k + 1e-9
+        if v is not None and ve.matched_gt_t is not None:
+            tol = float(cfg.get("evidence_tol_s", 1.0))
+            frames = [f for f in (v.get("evidence_frames") or []) if isinstance(f, dict)]
+            dts = [abs(_num(f.get("timestamp_sec")) - ve.matched_gt_t) for f in frames
+                   if _num(f.get("timestamp_sec")) is not None and decode_jpeg_b64(f.get("image_base64")) is not None]
+            ve.evidence_dt = round(min(dts), 3) if dts else None
+            ve.evidence_ok = bool(dts) and min(dts) <= tol + 1e-9
+        else:
+            ve.evidence_ok = False
         el = float(cfg.get("early_late_tol_s", 2.0))
-        if ve.dt_abs > el:
-            ve.category = "early" if ve.dt_signed < 0 else "late"
+        sd = ve.dt_signed if ve.dt_signed is not None else ve.nearest_dt_signed
+        if sd is not None and abs(sd) > el:
+            ve.category = "early" if sd < 0 else "late"
 
     # --- типы
     if gt.types:
@@ -289,6 +361,17 @@ def _rate(a: float, b: float) -> Optional[float]:
     return round(a / b, 4) if b else None
 
 
+def wilson(k: int, n: int, z: float = 1.96) -> Optional[list[float]]:
+    """95% доверительный интервал Вильсона — при n≈20–40 он широкий, это честно."""
+    if not n:
+        return None
+    p = k / n
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return [round(max(0.0, c - h), 3), round(min(1.0, c + h), 3)]
+
+
 def _stats(xs: list[float]) -> dict:
     if not xs:
         return {"n": 0, "mean": None, "median": None, "p90": None, "max": None}
@@ -298,7 +381,52 @@ def _stats(xs: list[float]) -> dict:
             "p90": round(p90, 3), "max": round(s[-1], 3)}
 
 
-def summarize(evals: list[VideoEval], cfg: dict, dup_check: Optional[list[dict]] = None) -> dict:
+def _localization(evals: list[VideoEval], cfg: dict) -> dict:
+    windows = [f"{float(k):g}" for k in cfg.get("hit_windows_s", [0.5, 1, 2, 3])]
+    pos = [e for e in evals if e.gt_positive and e.events_total]
+    tp = [e for e in pos if e.pred_positive]
+    ev_all = sum(e.events_total for e in pos)
+    ev_tp = sum(e.events_total for e in tp)
+    matched = [p for e in tp for p in e.match_pairs]
+    return {
+        "n_videos_pos_with_time": len(pos), "events_total": ev_all, "events_in_tp_videos": ev_tp,
+        "events_matched": len(matched),
+        "abs_dt_matched": _stats([p["dt_abs"] for p in matched]),
+        "mean_signed_dt_matched": round(statistics.fmean([p["dt_signed"] for p in matched]), 3) if matched else None,
+        "nearest_abs_dt_unconstrained": _stats([abs(e.nearest_dt_signed) for e in tp if e.nearest_dt_signed is not None]),
+        "hit_events_all": {k: _rate(sum(e.event_hits.get(k, 0) for e in pos), ev_all) for k in windows},
+        "hit_events_tp": {k: _rate(sum(e.event_hits.get(k, 0) for e in tp), ev_tp) for k in windows},
+        "extra_candidates_total": sum(e.extra_candidates for e in tp),
+        "extra_candidates_mean_per_tp_video": round(statistics.fmean([e.extra_candidates for e in tp]), 3) if tp else None,
+        "early_ids": [e.video_id for e in evals if e.category == "early"],
+        "late_ids": [e.video_id for e in evals if e.category == "late"],
+        "match_window_s": max([float(cfg.get("match_window_s", 5.0))] + [float(k) for k in windows]),
+        "caveat": LOCALIZATION_CAVEAT,
+    }
+
+
+def _norms_review(cfg: dict) -> dict[tuple, bool]:
+    """data/norms_review.csv: type_id,url,clause,correct(1/0) — ручная экспертиза трактовки норм."""
+    from .common import REPO_ROOT
+
+    p = Path(((cfg.get("norms") or {}).get("review_path")) or "data/norms_review.csv")
+    if not p.is_absolute():
+        p = REPO_ROOT / p if not p.exists() else p
+    if not p.exists():
+        return {}
+    from .labels import _read_csv_dicts
+
+    out = {}
+    for d in _read_csv_dicts(p):
+        key = (str(d.get("type_id") or "").upper(), str(d.get("url") or "").strip().rstrip("/"),
+               str(d.get("clause") or "").strip())
+        out[key] = str(d.get("correct") or "").strip().lower() in ("1", "true", "yes", "да", "верно")
+    return out
+
+
+def summarize(evals_all: list[VideoEval], cfg: dict, dup_check: Optional[list[dict]] = None) -> dict:
+    conflicts = [e for e in evals_all if e.gt_label == "conflict"]
+    evals = [e for e in evals_all if e.gt_label != "conflict"]
     pos = [e for e in evals if e.gt_positive]
     neg = [e for e in evals if not e.gt_positive]
     tp = [e for e in pos if e.pred_positive]
@@ -314,40 +442,39 @@ def summarize(evals: list[VideoEval], cfg: dict, dup_check: Optional[list[dict]]
         pred = e.verdict if e.status == "done" else "failed"
         confusion.setdefault(e.gt_label, {}).setdefault(str(pred), 0)
         confusion[e.gt_label][str(pred)] += 1
+    n_correct = len(tp) + sum(1 for e in tn if e.status == "done")
     video = {
         "n": len(evals), "n_pos": len(pos), "n_neg": len(neg),
         "tp": len(tp), "tn": len(tn), "fp": len(fp), "fn": len(fn), "failed": len(failed),
+        "timeouts": sum(e.timeout for e in evals), "degraded": sum(e.degraded for e in evals),
         "precision": prec, "recall": rec, "f1": f1,
-        "accuracy": _rate(len(tp) + len(tn) - sum(1 for e in tn if e.status != "done"), len(evals)),
-        "specificity": _rate(len(tn), len(neg)),
+        "precision_ci95": wilson(len(tp), len(tp) + len(fp)), "recall_ci95": wilson(len(tp), len(pos)),
+        "accuracy": _rate(n_correct, len(evals)),
+        "specificity": _rate(len(tn), len(neg)), "specificity_ci95": wilson(len(tn), len(neg)),
         "fp_ids": [e.video_id for e in fp], "fn_ids": [e.video_id for e in fn],
-        "failed_ids": [e.video_id for e in failed], "confusion": confusion,
+        "failed_ids": [e.video_id for e in failed], "timeout_ids": [e.video_id for e in evals if e.timeout],
+        "label_conflict_ids": [e.video_id for e in conflicts], "confusion": confusion,
+        "note": "failed/missing считаются как «нет нарушения» в P/R (пропуск) и как ошибка в accuracy; "
+                "группы с конфликтом меток исключены (label_conflict_ids).",
     }
-    # локализация
-    timed_pos = [e for e in pos if e.gt_times]
-    loc_tp = [e for e in timed_pos if e.dt_abs is not None]
-    windows = [f"{float(k):g}" for k in cfg.get("hit_windows_s", [0.5, 1, 2, 3])]
-    localization = {
-        "n_pos_with_time": len(timed_pos), "n_tp_localized": len(loc_tp),
-        "abs_dt": _stats([e.dt_abs for e in loc_tp]),
-        "mean_signed_dt": round(statistics.fmean([e.dt_signed for e in loc_tp]), 3) if loc_tp else None,
-        "hit_tp": {k: _rate(sum(e.hits.get(k, False) for e in loc_tp), len(loc_tp)) for k in windows},
-        "hit_all": {k: _rate(sum(e.hits.get(k, False) for e in loc_tp), len(timed_pos)) for k in windows},
-        "early_ids": [e.video_id for e in evals if e.category == "early"],
-        "late_ids": [e.video_id for e in evals if e.category == "late"],
-    }
+    localization = _localization(evals, cfg)
+    no_conf = [e for e in evals if not e.conflict]
+    localization_no_conflict = _localization(no_conf, cfg) if len(no_conf) != len(evals) else None
+    loc_tp = [e for e in tp if e.events_total and e.dt_abs is not None]
+    timed_pos = [e for e in pos if e.events_total]
     frames_total = sum(e.frames_total for e in evals)
     n_vios = sum(e.n_violations for e in evals)
     frames_per_vio_ok = sum(1 for e in evals for v in e.violations_brief
                             if 1 <= v["n_frames"] <= int(cfg.get("max_evidence_frames", 3)))
     evidence = {
         "ok_tp": _rate(sum(bool(e.evidence_ok) for e in loc_tp), len(loc_tp)),
-        "ok_all": _rate(sum(bool(e.evidence_ok) for e in loc_tp), len(timed_pos)),
+        "ok_all": _rate(sum(bool(e.evidence_ok) for e in timed_pos), len(timed_pos)),
         "valid_jpeg_rate": _rate(sum(e.frames_valid for e in evals), frames_total),
         "frames_per_violation_ok": _rate(frames_per_vio_ok, n_vios),
         "evidence_dt": _stats([e.evidence_dt for e in loc_tp if e.evidence_dt is not None]),
+        "tol_s": float(cfg.get("evidence_tol_s", 1.0)),
     }
-    # типы
+    # типы — только по настоящей разметке
     trs = [r for e in evals for r in e.type_results]
     tconf: dict[str, dict[str, int]] = {}
     per_type: dict[str, dict[str, int]] = {}
@@ -363,13 +490,17 @@ def summarize(evals: list[VideoEval], cfg: dict, dup_check: Optional[list[dict]]
             for v in e.violations_brief:
                 pred_dist[v["type_id"] or "?"] = pred_dist.get(v["type_id"] or "?", 0) + 1
     types = {"available": bool(trs), "n_events": len(trs),
-             "accuracy": _rate(sum(r["ok"] for r in trs), len(trs)),
+             "accuracy": _rate(sum(r["ok"] for r in trs), len(trs)) if trs else None,
+             "accuracy_ci95": wilson(sum(r["ok"] for r in trs), len(trs)) if trs else None,
              "accuracy_localized": _rate(sum(r["ok"] for r in trs), sum(r["reason"] in ("ok", "wrong_type") for r in trs)),
-             "confusion": tconf, "per_type": per_type, "pred_distribution": dict(sorted(pred_dist.items()))}
-    # нормы
+             "confusion": tconf, "per_type": per_type, "pred_distribution": dict(sorted(pred_dist.items())),
+             "note": TYPES_NOTE}
+    # нормы — полнота ссылок, не корректность трактовки
     nrm = [n for e in evals for n in e.norms]
     nrm_tp = [n for e in tp for n in e.norms]
     cat_known = [n for n in nrm if n["in_catalog"] is not None]
+    review = _norms_review(cfg)
+    reviewed = [ok for e in evals for n in e.norms for ok in n.get("_review", [])] if review else []
     norms = {"n_violations": len(nrm),
              "with_rule_rate": _rate(sum(n["n_rules"] > 0 for n in nrm), len(nrm)),
              "with_rule_rate_tp": _rate(sum(n["n_rules"] > 0 for n in nrm_tp), len(nrm_tp)),
@@ -377,12 +508,15 @@ def summarize(evals: list[VideoEval], cfg: dict, dup_check: Optional[list[dict]]
              "url_ok_rate": _rate(sum(bool(n["url_ok"]) for n in nrm), len(nrm)),
              "in_catalog_rate": _rate(sum(bool(n["in_catalog"]) for n in cat_known), len(cat_known)) if cat_known else None,
              "type_in_catalog_rate": _rate(sum(bool(n["type_in_catalog"]) for n in nrm if n["type_in_catalog"] is not None),
-                                           sum(n["type_in_catalog"] is not None for n in nrm))}
-    schema = {"n": len([e for e in evals if e.status != "missing"]),
-              "valid_rate": _rate(sum(not e.schema_errors for e in evals if e.status != "missing"),
-                                  len([e for e in evals if e.status != "missing"])),
-              "errors": {e.video_id: e.schema_errors for e in evals if e.schema_errors},
-              "warnings": {e.video_id: e.schema_warnings for e in evals if e.schema_warnings}}
+                                           sum(n["type_in_catalog"] is not None for n in nrm)),
+             "review_available": bool(review),
+             "reviewed_correct_rate": _rate(sum(reviewed), len(reviewed)) if reviewed else None,
+             "note": NORMS_NOTE}
+    present = [e for e in evals_all if e.status != "missing"]
+    schema = {"n": len(present),
+              "valid_rate": _rate(sum(not e.schema_errors for e in present), len(present)),
+              "errors": {e.video_id: e.schema_errors for e in evals_all if e.schema_errors},
+              "warnings": {e.video_id: e.schema_warnings for e in evals_all if e.schema_warnings}}
     lng = [x for e in evals for x in e.language]
     language = {"n": len(lng), "hedged_rate": _rate(sum(x["hedged"] for x in lng), len(lng)),
                 "forbidden_rate": _rate(sum(bool(x["forbidden"]) for x in lng), len(lng)),
@@ -396,80 +530,160 @@ def summarize(evals: list[VideoEval], cfg: dict, dup_check: Optional[list[dict]]
             return sla * max(1.0, e.duration / ref)
         return sla
 
-    lats = [e for e in evals if e.latency_s is not None]
+    lats = [e for e in evals_all if e.latency_s is not None]
     latency = {**_stats([e.latency_s for e in lats]), "sla_s": sla,
                "over_sla_ids": [e.video_id for e in lats if e.latency_s > _sla(e)],
                "within_sla_rate": _rate(sum(e.latency_s <= _sla(e) for e in lats), len(lats)),
                "rt_factor": _stats([e.latency_s / e.duration for e in lats if e.duration])}
-    cats = {c: [e.video_id for e in evals if e.category == c] for c in CATEGORIES}
-    out = {"video": video, "localization": localization, "evidence": evidence, "types": types, "norms": norms,
-           "schema": schema, "language": language, "latency": latency, "categories": cats}
+    cats = {c: [e.video_id for e in evals_all if e.category == c] for c in CATEGORIES}
+    out = {"video": video, "localization": localization, "localization_no_conflict": localization_no_conflict,
+           "evidence": evidence, "types": types, "norms": norms, "schema": schema, "language": language,
+           "latency": latency, "categories": cats}
     if dup_check is not None:
         out["duplicates"] = {"groups": dup_check,
                              "consistent_rate": _rate(sum(d["consistent"] for d in dup_check), len(dup_check))}
     return out
 
 
+def git_sha(short: bool = True) -> Optional[str]:
+    import subprocess
+
+    from .common import REPO_ROOT
+
+    try:
+        cmd = ["git", "-C", str(REPO_ROOT), "rev-parse"] + (["--short"] if short else []) + ["HEAD"]
+        sha = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=10, check=False).stdout.strip()
+        return (sha + ("-dirty" if dirty else "")) if sha else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def collect_versions(preds: dict[str, dict], labels_csv: Optional[str | Path] = None,
+                     extra: Optional[dict] = None) -> dict:
+    import hashlib
+
+    pv = sorted({str((p.get("meta") or {}).get("version")) for p in preds.values()
+                 if isinstance(p, dict) and (p.get("meta") or {}).get("version")})
+    out = {"eval_version": EVAL_VERSION, "git_sha": git_sha(), "pipeline_versions": pv}
+    if labels_csv and Path(labels_csv).exists():
+        out["labels_sha256"] = hashlib.sha256(Path(labels_csv).read_bytes()).hexdigest()[:16]
+    out.update(extra or {})
+    return out
+
+
+def scorecard(summary: dict, versions: Optional[dict] = None) -> dict:
+    """Главная сводка: реальные P/R/FP/FN/timeouts/latency с числом примеров и версиями."""
+    v, lat, loc = summary["video"], summary["latency"], summary["localization"]
+    return {
+        "n_videos": v["n"], "n_pos": v["n_pos"], "n_neg": v["n_neg"],
+        "precision": v["precision"], "precision_ci95": v["precision_ci95"],
+        "recall": v["recall"], "recall_ci95": v["recall_ci95"],
+        "specificity": v["specificity"], "specificity_ci95": v["specificity_ci95"],
+        "fp": v["fp"], "fn": v["fn"], "failed": v["failed"], "timeouts": v["timeouts"], "degraded": v["degraded"],
+        "hit_events_all": loc["hit_events_all"], "events_total": loc["events_total"],
+        "extra_candidates_total": loc["extra_candidates_total"],
+        "latency_s": {k: lat.get(k) for k in ("n", "median", "p90", "max")}, "over_sla": len(lat["over_sla_ids"]),
+        "label_conflicts": len(v["label_conflict_ids"]),
+        "versions": versions or {},
+    }
+
+
 def evaluate(gt: dict[str, GroundTruth], preds: dict[str, dict], runinfo: Optional[dict[str, dict]] = None,
-             cfg: Optional[dict] = None, catalog: Optional[dict] = None) -> dict:
-    """Главная функция: → {"summary": ..., "per_video": [...]}."""
+             cfg: Optional[dict] = None, catalog: Optional[dict] = None, versions: Optional[dict] = None,
+             subset: Optional[set[str]] = None) -> dict:
+    """Главная функция: → {"scorecard", "summary", "per_video"}. subset — ID групп (например, holdout)."""
     cfg = cfg or load_config()
     runinfo = runinfo or {}
+    review = _norms_review(cfg)
     evals: list[VideoEval] = []
     dup_check: list[dict] = []
     for key, g in gt.items():
         members = g.members or [key]
+        if subset is not None and key not in subset and not (set(members) & subset):
+            continue
         order = [key] + [m for m in members if m != key]
         pid = next((m for m in order if m in preds), None)
-        evals.append(evaluate_video(g, preds.get(pid) if pid else None, runinfo.get(pid or key, {}), cfg, catalog, pid))
+        ve = evaluate_video(g, preds.get(pid) if pid else None, runinfo.get(pid or key, {}), cfg, catalog, pid)
+        if review and pid:
+            vios = [x for x in (preds[pid].get("violations") or []) if isinstance(x, dict)]
+            for n, x in zip(ve.norms, vios):
+                n["_review"] = [review[k] for k in ((str(x.get("type_id") or "").upper(),) + _rule_key(r)
+                                                    for r in (x.get("rules") or []) if isinstance(r, dict))
+                                if k in review]
+        evals.append(ve)
         have = [m for m in members if m in preds]
         if len(have) > 1:
             verdicts = {m: (preds[m] or {}).get("verdict") for m in have}
-            tcs = {m: sorted(_num(v.get("timecode_sec")) or 0.0 for v in (preds[m] or {}).get("violations") or []
-                             if isinstance(v, dict)) for m in have}
+            tcs = {m: sorted(_num(x.get("timecode_sec")) or 0.0 for x in (preds[m] or {}).get("violations") or []
+                             if isinstance(x, dict)) for m in have}
             dup_check.append({"group": key, "members": have, "verdicts": verdicts, "timecodes": tcs,
                               "consistent": len(set(verdicts.values())) == 1})
     extra = sorted(set(preds) - {m for g in gt.values() for m in (g.members or [g.video_id])}, key=video_sort_key)
     summary = summarize(evals, cfg, dup_check)
     summary["unlabeled_predictions"] = extra
-    return {"summary": summary, "per_video": [asdict(e) for e in evals]}
+    versions = versions if versions is not None else collect_versions(preds)
+    return {"scorecard": scorecard(summary, versions), "summary": summary, "per_video": [asdict(e) for e in evals]}
 
 
 def evaluate_dirs(labels_csv: str | Path, preds_dir: str | Path, types_csv: Optional[str | Path] = None,
-                  cfg: Optional[dict] = None) -> dict:
+                  cfg: Optional[dict] = None, subset: Optional[set[str]] = None,
+                  version_extra: Optional[dict] = None) -> dict:
     cfg = cfg or load_config()
     gt = load_ground_truth(labels_csv, types_csv, dedupe=bool(cfg.get("dedupe_groups", True)))
     preds, info = load_predictions(preds_dir)
-    return evaluate(gt, preds, info, cfg, load_catalog(cfg))
+    versions = collect_versions(preds, labels_csv, version_extra)
+    return evaluate(gt, preds, info, cfg, load_catalog(cfg), versions=versions, subset=subset)
+
+
+def _f(x: Any) -> str:
+    return "—" if x is None else (f"{x:.3f}" if isinstance(x, float) else str(x))
+
+
+def format_scorecard(sc: dict) -> str:
+    ci = lambda c: f" [{c[0]:.2f}–{c[1]:.2f}]" if c else ""  # noqa: E731
+    lat = sc["latency_s"]
+    ver = sc.get("versions") or {}
+    return "\n".join([
+        f"SCORECARD  n={sc['n_videos']} (+{sc['n_pos']} / -{sc['n_neg']})  eval={ver.get('eval_version')} "
+        f"git={ver.get('git_sha')} pipeline={','.join(ver.get('pipeline_versions') or []) or '—'} "
+        f"labels={ver.get('labels_sha256', '—')} subset={ver.get('subset', 'all')}",
+        f"  recall={_f(sc['recall'])}{ci(sc['recall_ci95'])}  precision={_f(sc['precision'])}{ci(sc['precision_ci95'])}  "
+        f"specificity={_f(sc['specificity'])}{ci(sc['specificity_ci95'])}",
+        f"  FN={sc['fn']}  FP={sc['fp']}  failed={sc['failed']}  timeouts={sc['timeouts']}  degraded={sc['degraded']}  "
+        f"конфликт меток={sc['label_conflicts']}",
+        f"  hit событий (из {sc['events_total']}): " + " ".join(f"@{k}={_f(x)}" for k, x in sc["hit_events_all"].items())
+        + f"  лишних кандидатов={sc['extra_candidates_total']}",
+        f"  latency: n={lat['n']} median={_f(lat['median'])} p90={_f(lat['p90'])} max={_f(lat['max'])} с; "
+        f"> SLA: {sc['over_sla']}",
+    ])
 
 
 def format_summary(s: dict) -> str:
     v, loc, ev, ty, nr, lat = s["video"], s["localization"], s["evidence"], s["types"], s["norms"], s["latency"]
-
-    def f(x: Any) -> str:
-        return "—" if x is None else (f"{x:.3f}" if isinstance(x, float) else str(x))
-
+    f = _f
     lines = [
-        f"Видео: n={v['n']} (+{v['n_pos']} / -{v['n_neg']})  TP={v['tp']} TN={v['tn']} FP={v['fp']} FN={v['fn']} "
-        f"failed={v['failed']}",
-        f"  precision={f(v['precision'])} recall={f(v['recall'])} F1={f(v['f1'])} accuracy={f(v['accuracy'])}",
-        f"  FN: {', '.join(v['fn_ids']) or '—'}   FP: {', '.join(v['fp_ids']) or '—'}   failed: {', '.join(v['failed_ids']) or '—'}",
-        f"Локализация: |Δt| median={f(loc['abs_dt']['median'])} mean={f(loc['abs_dt']['mean'])} "
-        f"signed={f(loc['mean_signed_dt'])}  hit(TP): " + " ".join(f"@{k}={f(x)}" for k, x in loc["hit_tp"].items()),
-        f"  hit(все позитивы): " + " ".join(f"@{k}={f(x)}" for k, x in loc["hit_all"].items()),
-        f"Кадр ±tol: TP={f(ev['ok_tp'])} все={f(ev['ok_all'])}  валидный JPEG={f(ev['valid_jpeg_rate'])} "
+        f"Видео: TP={v['tp']} TN={v['tn']} FP={v['fp']} FN={v['fn']} failed={v['failed']} F1={f(v['f1'])} "
+        f"accuracy={f(v['accuracy'])}",
+        f"  FN: {', '.join(v['fn_ids']) or '—'}   FP: {', '.join(v['fp_ids']) or '—'}   "
+        f"failed: {', '.join(v['failed_ids']) or '—'}",
+        f"Локализация (one-to-one, окно {loc['match_window_s']:g} с): |Δt| median={f(loc['abs_dt_matched']['median'])} "
+        f"mean={f(loc['abs_dt_matched']['mean'])} signed={f(loc['mean_signed_dt_matched'])}; "
+        f"без окна median={f(loc['nearest_abs_dt_unconstrained']['median'])}",
+        "  hit(события в TP): " + " ".join(f"@{k}={f(x)}" for k, x in loc["hit_events_tp"].items())
+        + f"; лишних кандидатов {loc['extra_candidates_total']} — {loc['caveat']}",
+        f"Кадр ±{ev['tol_s']:g} с: TP={f(ev['ok_tp'])} все={f(ev['ok_all'])}  валидный JPEG={f(ev['valid_jpeg_rate'])} "
         f"1–3 кадра={f(ev['frames_per_violation_ok'])}",
-        (f"Типы: acc={f(ty['accuracy'])} (локализованные {f(ty['accuracy_localized'])}), событий={ty['n_events']}"
-         if ty["available"] else f"Типы: нет labels_types; распределение: {ty['pred_distribution']}"),
-        f"Нормы: ≥1 rule={f(nr['with_rule_rate'])} verified={f(nr['verified_share'])} adilet={f(nr['url_ok_rate'])} "
-        f"в каталоге={f(nr['in_catalog_rate'])}",
+        (f"Типы: acc={f(ty['accuracy'])} по {ty['n_events']} GT-событиям" if ty["available"]
+         else f"Типы: n/a (нет labels_types); предсказанные: {ty['pred_distribution']}"),
+        f"Нормы (полнота ссылок, не корректность): ≥1 rule={f(nr['with_rule_rate'])} verified={f(nr['verified_share'])} "
+        f"adilet={f(nr['url_ok_rate'])} в каталоге={f(nr['in_catalog_rate'])} экспертиза={f(nr['reviewed_correct_rate'])}",
         f"Схема ТЗ: valid={f(s['schema']['valid_rate'])}  ошибок у {len(s['schema']['errors'])} видео; "
         f"язык: hedged={f(s['language']['hedged_rate'])} forbidden={f(s['language']['forbidden_rate'])}",
-        f"Латентность: mean={f(lat['mean'])} p90={f(lat['p90'])} max={f(lat['max'])} с; > SLA {lat['sla_s']} с: "
-        f"{', '.join(lat['over_sla_ids']) or '—'}",
     ]
     if s.get("duplicates") and s["duplicates"]["groups"]:
-        lines.append(f"Дубликаты md5: согласованность вердиктов={f(s['duplicates']['consistent_rate'])}")
+        lines.append(f"Дубликаты: согласованность вердиктов={f(s['duplicates']['consistent_rate'])}")
     return "\n".join(lines)
 
 
@@ -486,6 +700,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     res = evaluate_dirs(args.labels, args.preds, args.types, cfg)
     out = Path(args.out) if args.out else Path(args.preds).resolve().parent / "metrics.json"
     write_json(out, res)
+    print(format_scorecard(res["scorecard"]))
     print(format_summary(res["summary"]))
     print(f"→ {out}")
     return 0
