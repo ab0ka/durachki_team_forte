@@ -24,7 +24,12 @@ def weights_dir() -> Path:
 
 
 def hf_cache_dir() -> Path:
-    return weights_dir() / "hf"
+    # HF_HUB_CACHE (как у deploy/weights.py) → стандартная раскладка weights/hf/hub → старая weights/hf.
+    env = os.environ.get("HF_HUB_CACHE")
+    if env and Path(env).expanduser().is_dir():
+        return Path(env).expanduser()
+    hub = weights_dir() / "hf" / "hub"
+    return hub if hub.is_dir() else weights_dir() / "hf"
 
 
 def is_offline() -> bool:
