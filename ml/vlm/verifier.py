@@ -18,7 +18,7 @@ from .budget import Budget, VLMLimits
 from .catalog import catalog_types, load_catalog
 from .config import load_config, preset_cfg
 from .facts_filter import filter_facts
-from .frames import clip_duration, get_frame, prepare_images, verify_times
+from .frames import clip_duration, frames_at, prepare_images, verify_times
 from .parsing import normalize_verify, regex_fallback_verify, verify_schema
 from .prompting import render_verify, retry_suffix
 from .runtime import call_json, ensure_loaded, fit_images, get_backend
@@ -153,12 +153,7 @@ def verify_events(clip: Any, events: list[Event], budget_s: float, *, cfg: Optio
                 continue
         times = verify_times(ev.t_start, ev.t_end, ev.t_peak, duration, n_frames,
                              float(fcfg.get("verify_pad_s", 1.0)), float(fcfg.get("verify_max_span_s", 12.0)))
-        frames, ftimes = [], []
-        for t in times:
-            f = get_frame(clip, t)
-            if f is not None:
-                frames.append(f)
-                ftimes.append(t)
+        frames, ftimes = frames_at(clip, times)  # фактические PTS кадров, без дублей
         if not frames:
             _mark(ev, "no_frames")
             continue

@@ -17,7 +17,7 @@ from .budget import Budget, VLMLimits
 from .catalog import catalog_types, load_catalog
 from .config import load_config, preset_cfg
 from .facts_filter import filter_facts
-from .frames import clip_duration, get_frame, motion_energy, prepare_images
+from .frames import clip_duration, frames_at, motion_energy, prepare_images
 from .parsing import discover_schema, normalize_discover
 from .prompting import render_discover, retry_suffix
 from .runtime import call_json, ensure_loaded, fit_images, get_backend, record_stage
@@ -144,12 +144,7 @@ def discover_events(clip: Any, budget_s: float, *, cfg: Optional[dict[str, Any]]
         if not budget.can_call(n_fr):
             break
         times = [round(t0 + (t1 - t0) * (k + 0.5) / n_fr, 3) for k in range(n_fr)]
-        frames, ftimes = [], []
-        for t in times:
-            f = get_frame(clip, t)
-            if f is not None:
-                frames.append(f)
-                ftimes.append(t)
+        frames, ftimes = frames_at(clip, times)  # фактические PTS кадров, без дублей
         if not frames:
             continue
         images = prepare_images(frames, ftimes, None, None, fcfg)
