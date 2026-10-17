@@ -162,13 +162,24 @@ def _vram_peak_mb() -> Optional[float]:
     return None
 
 
+_DEFINITE = ("violation", "no_violation")
+
+
 def summarize(rows: list[dict[str, Any]], modes: list[str]) -> dict[str, Any]:
-    """Агрегаты по режимам + исправленные/созданные ошибки относительно режима none."""
-    summary: dict[str, Any] = {}
+    """Агрегаты по режимам + исправленные/созданные ошибки относительно режима none.
+
+    Режимы сравниваются на ОДНОМ наборе роликов: тех, где вердикт определён во всех запрошенных режимах
+    (common). Ролики с неопределённым вердиктом хотя бы в одном режиме считаются отдельно (unknown_verdicts)
+    и не превращаются в «нарушений нет». Самопроверка: tp_m - tp_none == fn_fixed - fn_created и
+    fp_m - fp_none == fp_created - fp_fixed (на common) -> vs_none.consistent.
+    """
+    rows_m = [r for r in rows if all(m in r["modes"] for m in modes)]
+    common = [r for r in rows_m if all(r["modes"][m]["verdict"] in _DEFINITE for m in modes)]
+    summary: dict[str, Any] = {"_common": {"videos_total": len(rows), "videos_compared": len(common),
+                                           "excluded_unknown": len(rows_m) - len(common)}}
     for m in modes:
-        all_rs = [r for r in rows if m in r["modes"]]
-        rs = [r for r in all_rs if r["modes"][m]["verdict"] in ("violation", "no_violation")]
-        unknown = len(all_rs) - len(rs)  # неполный анализ не засчитывается как «нарушений нет»
+        unknown = sum(r["modes"][m]["verdict"] not in _DEFINITE for r in rows_m)
+        rs = common
         tp = sum(r["gt"] and r["modes"][m]["verdict"] == "violation" for r in rs)
         fn = sum(r["gt"] and r["modes"][m]["verdict"] != "violation" for r in rs)
         fp = sum((not r["gt"]) and r["modes"][m]["verdict"] == "violation" for r in rs)
@@ -176,7 +187,7 @@ def summarize(rows: list[dict[str, Any]], modes: list[str]) -> dict[str, Any]:
         dts = [abs(r["modes"][m]["t"] - r["t_gt"]) for r in rs
                if r["gt"] and r["t_gt"] is not None and not r.get("t_conflict")
                and r["modes"][m]["verdict"] == "violation" and r["modes"][m]["t"] is not None]
-        lat = [r["modes"][m]["vlm_s"] for r in rs]
+        lat = [r["modes"][m]["vlm_s"] for r in rows_m]  # стоимость — по всем роликам режима
         types: dict[str, int] = {}
         for r in rs:
             if r["modes"][m]["verdict"] == "violation":
@@ -193,19 +204,26 @@ def summarize(rows: list[dict[str, Any]], modes: list[str]) -> dict[str, Any]:
              "vlm_s_mean": round(statistics.mean(lat), 3) if lat else None,
              "vlm_s_p95": round(sorted(lat)[max(0, int(round(0.95 * (len(lat) - 1))))], 3) if lat else None,
              "vlm_s_max": round(max(lat), 3) if lat else None,
-             "vlm_calls_total": sum(r["modes"][m].get("vlm_calls", 0) for r in rs),
-             "coverage_incomplete_videos": sum(not r["modes"][m].get("coverage_complete", True) for r in rs),
-             "verdict_by": sorted({r["modes"][m].get("by") for r in rs})}
-        if m != "none" and "none" in modes:
-            pairs = [(r["gt"], r["modes"]["none"]["verdict"] == "violation", r["modes"][m]["verdict"] == "violation")
-                     for r in rs if "none" in r["modes"] and r["modes"]["none"]["verdict"] in ("violation", "no_violation")]
-            s["vs_none"] = {
-                "fp_fixed": sum((not g) and b and not v for g, b, v in pairs),
-                "fn_fixed": sum(g and (not b) and v for g, b, v in pairs),
-                "fp_created": sum((not g) and (not b) and v for g, b, v in pairs),
-                "fn_created": sum(g and b and not v for g, b, v in pairs),
-            }
+             "vlm_calls_total": sum(r["modes"][m].get("vlm_calls", 0) for r in rows_m),
+             "coverage_incomplete_videos": sum(not r["modes"][m].get("coverage_complete", True) for r in rows_m),
+             "verdict_by": sorted({str(r["modes"][m].get("by")) for r in rows_m})}
         summary[m] = s
+    if "none" in modes:
+        base = summary["none"]
+        for m in modes:
+            if m == "none":
+                continue
+            pairs = [(r["gt"], r["modes"]["none"]["verdict"] == "violation", r["modes"][m]["verdict"] == "violation")
+                     for r in common]
+            vs = {"fp_fixed": sum((not g) and b and not v for g, b, v in pairs),
+                  "fn_fixed": sum(g and (not b) and v for g, b, v in pairs),
+                  "fp_created": sum((not g) and (not b) and v for g, b, v in pairs),
+                  "fn_created": sum(g and b and not v for g, b, v in pairs)}
+            s = summary[m]
+            vs["consistent"] = (s["tp"] - base["tp"] == vs["fn_fixed"] - vs["fn_created"]
+                                and s["fp"] - base["fp"] == vs["fp_created"] - vs["fp_fixed"]
+                                and s["n"] == base["n"])
+            s["vs_none"] = vs
     return summary
 
 

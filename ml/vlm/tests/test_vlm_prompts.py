@@ -20,7 +20,10 @@ def test_library_has_all_prompts_in_both_languages():
 def test_render_verify_substitutes_everything(lang):
     system, user = render_verify("V05", ["Телефон у уха"], [21.0, 21.5, 22.0, 22.5, 23.0], None, lang)
     assert not PH.search(system) and not PH.search(user)
-    assert "V05" in user and catalog_types()["V05"]["name"] in user  # активный каталог (A13 или запасной)
+    # имя — из АКТИВНОГО каталога (norms A13 в общей сборке, иначе запасной), строка кандидата проверяется целиком
+    name = catalog_types()["V05"]["name"]
+    line = f"- тип: V05 «{name}»" if lang == "ru" else f'- type: V05 "{name}"'
+    assert line in user.splitlines(), f"нет строки кандидата {line!r}"
     assert "Телефон у уха" in user
     for tid in catalog_types():
         assert tid in user  # описания всех типов каталога подставлены
@@ -69,3 +72,11 @@ def test_retry_suffix_and_no_dataset_fewshot():
         pid, ver, lang = key.split(".")
         body = get_prompt(pid, ver, lang).body
         assert "base64" not in body and ".mov" not in body.lower()
+
+
+def test_candidate_line_uses_explicit_catalog():
+    """Явный синтетический каталог побеждает и norms A13, и запасной (изоляция от окружения)."""
+    synth = {"version": 1, "types": {"V05": {"name": "Синтетическое имя V05", "observable": ["x"]},
+                                     "V99": {"name": "Иное (синт.)", "observable": ["y"]}}}
+    _, user = render_verify("V05", [], [1.0], synth, "ru")
+    assert "- тип: V05 «Синтетическое имя V05»" in user.splitlines()
