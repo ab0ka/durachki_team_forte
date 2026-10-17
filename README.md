@@ -25,8 +25,9 @@
 
 ```bash
 make setup-dev          # контракт, тест-кит, pytest, ruff
-make test-fast          # тесты без GPU и без весов (SENTINEL_MOCK=1)
+make test-fast          # тесты без GPU и без весов (без глобального SENTINEL_MOCK)
 make e2e                # сквозной mock-пайплайн на синтетическом видео
+make e2e-full           # полная сборка: backend.pipeline.run + сериализатор жюри (нужны все модули)
 make setup && make weights && make run   # полный запуск (веса качаются один раз, дальше офлайн)
 ```
 
@@ -64,10 +65,13 @@ Windows / Docker / Cloudflare Tunnel — см. [`deploy/`](deploy/) (A17).
 * **Тесты:**
   * `pytest <папка>` из корня, `pythonpath=["."]`;
   * тяжёлые тесты помечать `@pytest.mark.gpu` / `@pytest.mark.slow`;
-  * моки включаются через `SENTINEL_MOCK=1`.
+  * mock включается только явно: `SENTINEL_MOCK=1` в команде прогона или `monkeypatch.setenv` в тесте. На всю сессию pytest его не ставят ни CI, ни `make test`: иначе результат зависит от порядка тестов.
 * **CI (`.github/workflows/ci.yml`):**
-  * обязательные проверки: `core`, `modules` (матрица по модулям, `fail-fast: false`), `e2e`;
-  * необязательная: `frontend`.
+  * `core` — контракт, тест-кит, скрипты: тесты без `SENTINEL_MOCK` и повторно с ним (политика mock не зависит от окружения), примеры ТЗ, лицензии, fallback-копии и висячие импорты, медиа;
+  * `modules` — матрица только по модулям, которые есть в ветке; модуль без тестов — ошибка;
+  * `e2e-stages` — контракт каждой стадии (`--strict-stages`), частичная сборка допускается и так и подписана;
+  * `e2e-full` — полная сборка: `backend.pipeline.run` + `result_to_jury_api`, явный тестовый mock → `done`, без mock → `failed` (весов в CI нет). Запускается, только если в ветке есть оркестратор и модули критического пути, иначе job пропущен (серый), а не зелёный;
+  * необязательные: `frontend`; `ownership` для PR без тега `[Axx]` только информирует.
 * **Интеграция:** порядок мерджа и чек-лист — [`scripts/merge_order.md`](scripts/merge_order.md). Проверка чужих файлов — `scripts/check_ownership.py`. Лицензии, облачные API и файлы в git — `scripts/check_licenses.py`. Сверка fallback-копий контракта с каноном — `scripts/check_fallbacks.py`.
 * **В git не коммитим:** видео, кадры из датасета, веса (`*.mov`, `*.mp4`, `*.onnx`, `*.pt`, `*.safetensors`, `*.gguf`…), ключи и `.env`. См. `.gitignore`.
 
@@ -82,7 +86,7 @@ Windows / Docker / Cloudflare Tunnel — см. [`deploy/`](deploy/) (A17).
 - **`.gitignore` — только якорные шаблоны каталогов данных** (`/data/` и т.п.). Медиа, веса и файлы > 5 МБ блокирует `scripts/guard_media.py`: в pre-commit и в CI.
 - **Зависимости — от lock L1:** `scripts/resolve_deps.py` показывает конфликты и не подставляет максимальные версии (`scripts/DEPS_REPORT.md`).
 - **Совместимость веток** — `contracts/COMPAT.md`: матрица генерируется `scripts/compat_matrix.py`, к ней приложены записки владельцам.
-- **CI строгий:** e2e с `--strict-stages` — модуль, нарушивший контракт, роняет обязательную проверку.
+- **CI строгий:** e2e с `--strict-stages` — модуль, нарушивший контракт, роняет обязательную проверку. Полная сборка проверяется отдельно (`e2e-full`, `--require-full`): без `backend.pipeline.run` это «NOT RUN» (код 3), а не зелёный пропуск.
 
 ### Команда замера для L2 (без GPU, по готовым результатам пайплайна)
 

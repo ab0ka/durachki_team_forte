@@ -132,6 +132,25 @@ def test_check_fallbacks(tmp_path):
     assert [p.parent.name for p in tmp_path.rglob("_contract_fallback.py")] == ["b"]  # с прямым импортом — оставлен
 
 
+def test_check_fallbacks_dangling_import(tmp_path, capsys):
+    import check_fallbacks
+
+    (tmp_path / "contracts").mkdir()
+    (tmp_path / "contracts" / "sentinel_contracts.py").write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "ml/a/tests").mkdir(parents=True)
+    (tmp_path / "ml/a/core.py").write_text(  # охраняемый импорт: при наличии contracts ветка except не выполняется
+        "try:\n    from contracts.sentinel_contracts import X\nexcept ImportError:\n"
+        "    from ._contract_fallback import X\n", encoding="utf-8")
+    assert check_fallbacks.main(["--root", str(tmp_path)]) == 0
+    (tmp_path / "ml/a/tests/test_a.py").write_text("from .. import _contract_fallback\n", encoding="utf-8")
+    (tmp_path / "ml/a/tests/test_b.py").write_text("from ml.a._contract_fallback import X\n", encoding="utf-8")
+    assert check_fallbacks.unguarded_imports(tmp_path) == {"ml/a": ["ml/a/tests/test_a.py:1", "ml/a/tests/test_b.py:1"]}
+    assert check_fallbacks.main(["--root", str(tmp_path)]) == 1  # копии нет — модуль не загрузится
+    assert "DANGLING" in capsys.readouterr().out
+    (tmp_path / "ml/a/_contract_fallback.py").write_text("X = 1\n", encoding="utf-8")
+    assert check_fallbacks.main(["--root", str(tmp_path)]) == 0
+
+
 def test_guard_media(tmp_path):
     import guard_media
 

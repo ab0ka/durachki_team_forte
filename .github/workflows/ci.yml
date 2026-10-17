@@ -1,6 +1,18 @@
 # Kassa Sentinel CI (владелец A01).
-# Обязательные проверки (без continue-on-error, падение = красный CI): core, modules (матрица, fail-fast: false), e2e.
-# Необязательные (информационные): frontend-сборка, e2e через backend.pipeline.run, ownership для PR без [Axx].
+#
+# Обязательные проверки (без continue-on-error; падение = красный CI):
+#   core           — contracts/testkit/scripts, замороженный контракт, примеры ТЗ, лицензии, fallback-копии, медиа;
+#                    тесты идут БЕЗ SENTINEL_MOCK (семантика production) и повторно С ним — политика mock не должна
+#                    зависеть от окружения и порядка тестов;
+#   modules        — тесты только РЕАЛЬНО присутствующих модулей (отсутствующий модуль не даёт зелёного «пропуска»);
+#                    mock-окружение не выставляется глобально: модуль, которому нужен mock, задаёт его сам (monkeypatch);
+#   e2e-stages     — контракт каждой стадии (строго); частичная сборка допускается и так и подписана;
+#   e2e-full       — ПОЛНАЯ сборка: backend.pipeline.run + канонический сериализатор жюри (явный тестовый mock) и
+#                    проверка, что без mock-режима production не отдаёт mock. Запускается, только если в ветке есть
+#                    оркестратор и критические модули; иначе job пропущен (серый), а не зелёный.
+# Необязательные: frontend-сборка; ownership для PR без тега [Axx] — информационный.
+# Шаги проверок внутри job независимы (if: !cancelled() и зависимости установлены): упавший ruff не скрывает
+# тесты, check_fallbacks и guard_media — job всё равно красный, но видны все сигналы сразу.
 name: CI
 
 on:
@@ -16,8 +28,8 @@ concurrency:
 permissions:
   contents: read
 
+# ВНИМАНИЕ: SENTINEL_MOCK здесь не задаётся — только в шагах, где тестовый mock разрешён явно.
 env:
-  SENTINEL_MOCK: "1"
   HF_HUB_OFFLINE: "1"
   TRANSFORMERS_OFFLINE: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -26,6 +38,31 @@ env:
   CORE_DEPS: "numpy>=1.26 pyyaml>=6 jsonschema>=4.20 pytest>=8 ruff>=0.5 opencv-python-headless>=4.8"
 
 jobs:
+  detect:
+    name: состав ветки
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      modules: ${{ steps.d.outputs.modules }}
+      full: ${{ steps.d.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: d
+        run: |
+          mods=(); missing=()
+          for m in backend/api backend/pipeline ml/ingest ml/detect ml/track ml/pose ml/scene ml/rules ml/temporal \
+                   ml/vlm ml/fusion norms copilot eval deploy; do
+            if [ -d "$m" ]; then mods+=("\"$m\""); else missing+=("$m"); fi
+          done
+          echo "modules=[$(IFS=,; echo "${mods[*]}")]" >> "$GITHUB_OUTPUT"
+          full=true
+          for m in backend/pipeline ml/ingest ml/detect ml/track ml/scene ml/rules ml/fusion norms; do
+            [ -d "$m" ] || full=false
+          done
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          if [ ${#missing[@]} -gt 0 ]; then echo "::notice::нет в ветке: ${missing[*]}"; fi
+          if [ "$full" != true ]; then echo "::notice::полная сборка в этой ветке НЕ проверяется (нет оркестратора или критических модулей) — e2e-full пропущен"; fi
+
   core:
     name: core (contracts, testkit, scripts, лицензии)
     runs-on: ubuntu-latest
@@ -38,59 +75,55 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install core deps
+        id: deps
         run: python -m pip install $CORE_DEPS
       - name: Ruff (A01)
         run: ruff check contracts testkit scripts
       - name: Frozen contract v1 unchanged
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: python -m pytest contracts/tests/test_contract_frozen.py -q
-      - name: Tests (contracts, testkit, scripts)
-        run: python -m pytest contracts testkit scripts -m "not gpu and not slow" -q
+      - name: Tests без SENTINEL_MOCK (семантика production)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          test -z "${SENTINEL_MOCK:-}" || { echo "SENTINEL_MOCK не должен быть задан"; exit 1; }
+          python -m pytest contracts testkit scripts -m "not gpu and not slow" -q
+      - name: Те же тесты контракта С SENTINEL_MOCK=1 (политика mock не зависит от окружения)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        env:
+          SENTINEL_MOCK: "1"
+        run: python -m pytest contracts testkit/tests/test_contract_checks_and_e2e.py -m "not gpu and not slow" -q -p no:cacheprovider
       - name: Example responses match TZ schema
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           python -m contracts.validate --jury contracts/examples/job_done_tz.json contracts/examples/jury_done_full.json \
-            contracts/examples/job_processing.json contracts/examples/job_no_violation.json contracts/examples/job_failed.json
+            contracts/examples/job_processing.json contracts/examples/job_no_violation.json contracts/examples/job_failed.json \
+            contracts/examples/jury_unverified_no_violation.json
           python -m contracts.validate contracts/examples/job_done_full.json contracts/examples/ui_processing.json
       - name: Licenses / no cloud APIs / no weights or videos in git
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: python scripts/check_licenses.py
-      - name: Fallback-копии контракта совпадают с каноном
+      - name: Fallback-копии контракта совпадают с каноном, висячих импортов нет
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: python scripts/check_fallbacks.py
       - name: Медиа, веса и файлы > 5 МБ не попали в git
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: python scripts/guard_media.py --all
 
   modules:
     name: module ${{ matrix.module }}
+    needs: detect
+    if: needs.detect.outputs.modules != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        module:
-          - backend/api
-          - backend/pipeline
-          - ml/ingest
-          - ml/detect
-          - ml/track
-          - ml/pose
-          - ml/scene
-          - ml/rules
-          - ml/temporal
-          - ml/vlm
-          - ml/fusion
-          - norms
-          - copilot
-          - eval
-          - deploy
+        module: ${{ fromJSON(needs.detect.outputs.modules) }}
     env:
       MODULE: ${{ matrix.module }}
     steps:
       - uses: actions/checkout@v4
-      - name: Module present in this branch?
-        id: present
-        run: |
-          if [ -d "$MODULE" ]; then echo "present=true" >> "$GITHUB_OUTPUT"
-          else echo "present=false" >> "$GITHUB_OUTPUT"; echo "::notice::$MODULE отсутствует в этой ветке — пропуск"; fi
       - uses: actions/setup-python@v5
-        if: steps.present.outputs.present == 'true'
         with:
           python-version: "3.11"
           cache: pip
@@ -98,26 +131,25 @@ jobs:
             pyproject.toml
             ${{ matrix.module }}/requirements*.txt
       - name: Install deps (CI-light, без torch/CUDA)
-        if: steps.present.outputs.present == 'true'
+        id: deps
         run: |
           python -m pip install $CORE_DEPS
           python scripts/ci_requirements.py "$MODULE" > "$RUNNER_TEMP/req-ci.txt"
           echo "--- CI requirements for $MODULE:"; cat "$RUNNER_TEMP/req-ci.txt"
           if [ -s "$RUNNER_TEMP/req-ci.txt" ]; then python -m pip install -r "$RUNNER_TEMP/req-ci.txt"; fi
       - name: Ruff
-        if: steps.present.outputs.present == 'true'
         run: ruff check "$MODULE"
-      - name: Pytest (not gpu and not slow)
-        if: steps.present.outputs.present == 'true'
+      - name: Pytest (not gpu and not slow; без глобального SENTINEL_MOCK)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           set +e
           python -m pytest "$MODULE" -m "not gpu and not slow" -q
           rc=$?
-          if [ "$rc" -eq 5 ]; then echo "::warning::$MODULE: тесты не найдены"; exit 0; fi
+          if [ "$rc" -eq 5 ]; then echo "::error::$MODULE: в модуле нет тестов"; fi
           exit "$rc"
 
-  e2e:
-    name: e2e (mock-пайплайн на синтетическом видео)
+  e2e-stages:
+    name: e2e — контракт стадий (частичная сборка допускается)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -128,44 +160,66 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install deps (core + CI-light deps всех модулей)
+        id: deps
         run: |
           python -m pip install $CORE_DEPS
           python scripts/ci_requirements.py --all > "$RUNNER_TEMP/req-ci.txt"
           cat "$RUNNER_TEMP/req-ci.txt"
           if [ -s "$RUNNER_TEMP/req-ci.txt" ]; then python -m pip install -r "$RUNNER_TEMP/req-ci.txt"; fi
       # --strict-stages: модуль, который упал или вернул выход не по контракту, роняет CI (а не тихо заменяется фикстурой)
-      - name: E2E по стадиям контракта (строго; схема ответа жюри обязательна)
+      - name: Стадии контракта, сценарии v1 (тестовый mock явно)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        env:
+          SENTINEL_MOCK: "1"
         run: python -m testkit.e2e_stub --no-backend --strict-stages --scenarios clean,V01,V03,V07 --duration 8 --fps 10 --out "$RUNNER_TEMP/e2e"
-      - name: E2E на кейсах спецификации (две планировки, строго)
+      - name: Стадии контракта, кейсы спецификации, две планировки (тестовый mock явно)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        env:
+          SENTINEL_MOCK: "1"
         run: python -m testkit.e2e_stub --suite spec --no-backend --strict-stages --cases leave_clean,leave_cash,client_opposite,mobile,desk_phone,lights_off_cash --layouts A,B --fps 5 --out "$RUNNER_TEMP/e2e_spec"
 
-  e2e-backend:
-    name: e2e через backend.pipeline.run (необязательная)
+  e2e-full:
+    name: e2e — полная сборка (backend.pipeline.run + сериализатор жюри)
+    needs: detect
+    if: needs.detect.outputs.full == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-    continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Has backend/pipeline?
-        id: be
-        run: |
-          if [ -d backend/pipeline ]; then echo "present=true" >> "$GITHUB_OUTPUT"
-          else echo "present=false" >> "$GITHUB_OUTPUT"; echo "::notice::backend/pipeline нет — пропуск"; fi
       - uses: actions/setup-python@v5
-        if: steps.be.outputs.present == 'true'
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: pyproject.toml
-      - name: Install deps
-        if: steps.be.outputs.present == 'true'
+      - name: Install deps (core + CI-light deps всех модулей)
+        id: deps
         run: |
           python -m pip install $CORE_DEPS
           python scripts/ci_requirements.py --all > "$RUNNER_TEMP/req-ci.txt"
           if [ -s "$RUNNER_TEMP/req-ci.txt" ]; then python -m pip install -r "$RUNNER_TEMP/req-ci.txt"; fi
-      - name: E2E через оркестратор A03
-        if: steps.be.outputs.present == 'true'
-        run: timeout 600 python -m testkit.e2e_stub --scenarios clean,V01 --duration 8 --fps 10 --deadline 60
+      # Штатный дедлайн 240 с и 30 fps: меньший дедлайн меняет адаптивный sample_fps оркестратора.
+      # Свои пустые каталоги кэша/данных A03 на шаг: ответ не берётся из кэша другого шага.
+      - name: Оркестратор + канонический сериализатор, явный тестовый mock, ожидается done
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        env:
+          SENTINEL_MOCK: "1"
+          SENTINEL_CACHE_DIR: ${{ runner.temp }}/sentinel-mock/cache
+          SENTINEL_DATA_DIR: ${{ runner.temp }}/sentinel-mock/data
+        run: |
+          timeout 900 python -m testkit.e2e_stub --require-full --expect-status done \
+            --scenarios clean,V01,V03,V07 --duration 8 --fps 30 --out "$RUNNER_TEMP/e2e_full"
+          timeout 900 python -m testkit.e2e_stub --require-full --expect-status done --suite spec \
+            --cases leave_clean,leave_cash,client_opposite,mobile --layouts A,B --duration-range 8,10 --fps 30 \
+            --out "$RUNNER_TEMP/e2e_full_spec"
+      - name: Production без mock-режима не отдаёт mock (весов в CI нет -> честный failed)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        env:
+          SENTINEL_CACHE_DIR: ${{ runner.temp }}/sentinel-prod/cache
+          SENTINEL_DATA_DIR: ${{ runner.temp }}/sentinel-prod/data
+        run: |
+          test -z "${SENTINEL_MOCK:-}" || { echo "SENTINEL_MOCK не должен быть задан"; exit 1; }
+          timeout 600 python -m testkit.e2e_stub --require-full --expect-status failed \
+            --scenarios clean --duration 8 --fps 30 --out "$RUNNER_TEMP/e2e_prod"
 
   frontend:
     name: frontend build (необязательная)

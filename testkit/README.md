@@ -86,11 +86,22 @@ python -m testkit.e2e_stub --suite spec --strict-stages --layouts A,B --orientat
 ## Сквозной прогон
 
 ```bash
-python -m testkit.e2e_stub                                   # все сценарии, mock-режим
+SENTINEL_MOCK=1 python -m testkit.e2e_stub                   # все сценарии, mock модулей включён явно
 python -m testkit.e2e_stub --scenarios clean,V01 --view perspective --strict-stages
 python -m testkit.e2e_stub --fixtures-only --require-accuracy   # самопроверка тест-кита (10/10)
 python -m testkit.synth_video --out data/synth --all          # ролики в data/synth (в .gitignore)
+
+# полная сборка (как job e2e-full в CI): оркестратор + канонический сериализатор жюри
+SENTINEL_MOCK=1 python -m testkit.e2e_stub --require-full --expect-status done --scenarios clean,V01,V03,V07 --duration 8 --fps 30
+python -m testkit.e2e_stub --require-full --expect-status failed --scenarios clean --duration 8 --fps 30   # без mock
 ```
+
+`e2e_stub` не меняет `os.environ`: mock модулей включает вызывающий (`SENTINEL_MOCK=1` в команде или в шаге CI). Mock-результат оркестратора без явного режима — ошибка: production сам на mock не переключается.
+
+* `--require-full` — обязателен `backend.pipeline.run`, фикстуры запрещены, ответ — только через `contracts.serialize.result_to_jury_api`. Нет оркестратора → «NOT RUN», код 3 («ПОЛНАЯ СБОРКА НЕ ПРОВЕРЕНА»), а не зелёный результат.
+* `--expect-status done|failed|processing` — статус каждого ответа. `done` ловит регрессию «нет `meta.coverage` → `failed`».
+* `--deadline` (по умолчанию 240 с, как в ТЗ): прогон дольше дедлайна +10% — ошибка. Меньший дедлайн меняет адаптивный `sample_fps` оркестратора, поэтому для проверки сборки его не уменьшают.
+* Коды возврата: 0 — ок; 1 — ошибка (схема жюри, падение, дедлайн, статус, точность); 3 — NOT RUN.
 
 Как выбирается реализация:
 
