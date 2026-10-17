@@ -161,7 +161,7 @@ def _bench_qa(be: Any, frames: list[Any], cfg: dict[str, Any], n: int, qa_type: 
     max_side = int((cfg.get("frames") or {}).get("max_side", 448))
     lat, mass, modes = [], [], {}
     for i in range(max(1, n)):
-        for j, (q, at) in enumerate(plan):
+        for j, (q, _at) in enumerate(plan):
             f = frames[(i + j) % len(frames)]
             imgs = [resize_max_side(to_pil_rgb(f), max_side)]
             if (spec["questions"][q].get("crop")):

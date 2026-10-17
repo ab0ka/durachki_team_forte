@@ -229,7 +229,7 @@ def transition_time(answers: Answers, times: dict[str, float]) -> Optional[float
         if not opts or at not in times:
             continue
         by_q.setdefault(q, []).append((times[at], max(opts, key=opts.get)))
-    for q, seq in by_q.items():
+    for seq in by_q.values():
         seq.sort()
         for (t1, a1), (t2, a2) in zip(seq, seq[1:]):
             if a1 != a2:

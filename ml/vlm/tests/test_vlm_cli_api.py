@@ -8,7 +8,7 @@ import pytest
 
 import ml.vlm as vlm
 from ml.vlm._contract import Event
-from ml.vlm.backends.base import GenResult, VLMBackend
+from ml.vlm.backends.base import VLMBackend
 from ml.vlm.backends.mock import MockBackend
 
 REPO = Path(__file__).resolve().parents[3]

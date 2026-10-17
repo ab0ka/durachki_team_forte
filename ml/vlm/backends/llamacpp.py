@@ -166,7 +166,7 @@ class LlamaCppPythonBackend(VLMBackend):
             from llama_cpp import Llama
             import llama_cpp.llama_chat_format as fmt
 
-            cls = getattr(fmt, self.handler_name, None) or getattr(fmt, "Llava15ChatHandler")
+            cls = getattr(fmt, self.handler_name, None) or fmt.Llava15ChatHandler
             handler = cls(clip_model_path=self.mmproj_path, verbose=False)
             self._llm = Llama(model_path=self.model_path, chat_handler=handler, n_ctx=self.n_ctx,
                               n_gpu_layers=self.n_gpu_layers, verbose=False)

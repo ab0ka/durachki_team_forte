@@ -2,7 +2,7 @@ import re
 
 import pytest
 
-from ml.vlm.catalog import FALLBACK_CATALOG, catalog_types, describe_types
+from ml.vlm.catalog import catalog_types, describe_types
 from ml.vlm.prompting import CHECKLIST_TEXT, get_prompt, list_prompts, render_discover, render_verify, retry_suffix
 from ml.vlm.config import load_config
 

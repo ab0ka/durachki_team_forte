@@ -23,7 +23,7 @@ from .parsing import normalize_verify, regex_fallback_verify, verify_schema
 from .prompting import render_verify, retry_suffix
 from .runtime import call_json, ensure_loaded, fit_images, get_backend
 from .qa import qa_verify_event
-from .scoring import agreement as agreement_of, blend, clamp, fusion_opinion, logit, update_confidence
+from .scoring import agreement as agreement_of, blend, clamp, fusion_opinion, update_confidence
 
 log = logging.getLogger(__name__)
 
