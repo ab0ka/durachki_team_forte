@@ -1,0 +1,21 @@
+# ml/vlm (A11). Лицензии: все Apache-2.0 / MIT / BSD.
+# --- базовые (нужны всегда; импорт пакета их не тянет до первого вызова)
+numpy>=1.26            # BSD-3
+Pillow>=10.1           # MIT-CMU (HPND)
+PyYAML>=6.0            # MIT
+
+# --- основной backend: transformers in-process (GPU). torch ставить CUDA-сборкой:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.4             # BSD-3
+transformers>=4.57.1,<5   # Apache-2.0; Qwen3-VL появился в 4.57
+accelerate>=1.0        # Apache-2.0 (device_map)
+bitsandbytes>=0.45     # MIT; 4-bit nf4, есть колёса под Windows
+huggingface_hub>=0.25  # Apache-2.0; офлайн-кэш, проверка лицензии снапшота
+
+# --- опционально
+# autoawq>=0.2.8            # MIT — только пресет qwen25vl7b_awq
+# llama-cpp-python>=0.3.16  # MIT — только backend llamacpp_python
+# opencv-python-headless>=4.9  # Apache-2.0 — CLI `python -m ml.vlm.try` без ml.ingest
+
+# --- тесты (без GPU/весов/сети)
+pytest>=8
