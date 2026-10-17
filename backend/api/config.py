@@ -49,6 +49,7 @@ class Settings:
     video_validation: str = "required"
     copilot_timeout_s: float = 60.0
     min_coverage: float = 0.98
+    coverage_adapt_stages: bool = False
     partial_accept: bool = False
     jury_profile: str = "extended"
     jury_embed_rule: bool = False

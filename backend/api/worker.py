@@ -25,8 +25,9 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .config import Settings
-from .results import (analysis_complete, coverage_problem, coverage_ratio, enforce_size,
-                      fill_missing_evidence, iter_frames, json_size, normalize, to_api_dict)
+from .results import (adapt_stage_coverage, analysis_complete, coverage_problem, coverage_ratio,
+                      enforce_size, fill_missing_evidence, iter_frames, json_size, normalize,
+                      to_api_dict)
 from .store import JobStore
 
 log = logging.getLogger("sentinel.api.worker")
@@ -501,6 +502,11 @@ class JobManager:
             self._fail(job_id, f"pipeline returned unusable result: {type(result).__name__}",
                        "bad_result")
             return
+        if self.s.coverage_adapt_stages:
+            rmeta = result.get("meta") if isinstance(result, dict) else getattr(result, "meta", None)
+            note = adapt_stage_coverage(rmeta)
+            if note:
+                warns.append(note)
         try:
             api, w = to_api_dict(result)
             warns += w
@@ -598,6 +604,8 @@ class JobManager:
     def _try_partial(self, job_id: str, partial: dict[str, Any]) -> tuple[bool, str]:
         """partial.json -> done, только если включено и полнота достаточна. (принят?, причина)."""
         meta = partial.get("meta") if isinstance(partial.get("meta"), dict) else {}
+        if self.s.coverage_adapt_stages:
+            adapt_stage_coverage(meta)
         cov = coverage_ratio(meta)
         problem = coverage_problem(meta, self.s.min_coverage, allow_mock=self.s.allow_mock,
                                    pipeline_flags=False)

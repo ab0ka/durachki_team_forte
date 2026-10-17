@@ -43,6 +43,8 @@ copilot_timeout_s: 60
 # --- честность и полнота результата ---
 min_coverage: 0.98              # meta.coverage.ratio ниже (или нет meta.coverage) -> no_violation не выдаётся
                                 # (как contracts: coverage.min_ratio_for_no_violation у A01)
+coverage_adapt_stages: false    # НОВЫЙ РЕЖИМ (выкл. до замера L2): покрытие A03 «по стадиям» -> ratio A01
+                                # = min по required_stages. Без него (и без исправления A03/A01) чистые видео = failed
 partial_accept: false           # НОВЫЙ РЕЖИМ (выкл. до замера L2): по таймауту отдать partial.json как done,
                                 # только если полнота >= min_coverage; иначе всегда failed с причиной
 jury_profile: extended          # extended: поля ТЗ + доп. (type_id, rules, meta…); strict: ровно поля ТЗ

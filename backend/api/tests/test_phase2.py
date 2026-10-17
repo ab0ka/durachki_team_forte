@@ -387,3 +387,37 @@ def test_strict_profile_without_embedding_keeps_description(client_factory):
     with client_factory(spec(ok_run), jury_profile="strict") as c:
         d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
         assert d["violations"][0]["description"] == "Признаки возможного нарушения: тест."
+
+
+_A03_STAGES = {k: {"status": "ok"} for k in ("ingest", "detect", "track", "rules")}
+A03_STAGE_COVERAGE = {"coverage": {"ingest": 1.0, "detect": 1.0, "track": 1.0, "temporal": 0.0,
+                                   "vlm_verify": None, "rules": 1.0},
+                      "required_stages": ["ingest", "detect", "track", "rules"], "complete": True,
+                      "stages": _A03_STAGES}  # как в реальном meta A03
+
+
+def test_a03_stage_coverage_adapter_off_by_default(client_factory):
+    def run(video_path, job_id, progress, deadline_s=240):
+        return result_with(job_id, verdict="no_violation", violations=[],
+                           meta=json.loads(json.dumps(A03_STAGE_COVERAGE)))
+    with client_factory(spec(run)) as c:
+        d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
+        assert d["status"] == "failed" and "ratio" in d["error"]   # формат A03 != формат A01
+    with client_factory(spec(run), coverage_adapt_stages=True) as c:
+        d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
+        assert d["status"] == "done" and d["verdict"] == "no_violation"
+        assert d["meta"]["coverage"]["ratio"] == 1.0
+        assert d["meta"]["coverage"]["source"] == "api-adapter:A03-per-stage"
+
+
+def test_a03_stage_coverage_adapter_unknown_or_low(client_factory):
+    for cov, need in (({"ingest": 1.0, "detect": None, "track": 1.0, "rules": 1.0}, "ratio"),
+                      ({"ingest": 1.0, "detect": 0.6, "track": 1.0, "rules": 1.0}, "60%")):
+        meta = {"coverage": cov, "required_stages": ["ingest", "detect", "track", "rules"],
+                "stages": _A03_STAGES}
+
+        def run(video_path, job_id, progress, deadline_s=240, meta=meta):
+            return result_with(job_id, verdict="no_violation", violations=[], meta=json.loads(json.dumps(meta)))
+        with client_factory(spec(run), coverage_adapt_stages=True) as c:
+            d = wait_job(c, upload(c, FTYP_ONLY).json()["job_id"])
+            assert d["status"] == "failed" and need in d["error"], d["error"]

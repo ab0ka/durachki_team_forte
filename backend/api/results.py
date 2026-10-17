@@ -120,6 +120,28 @@ def coverage_ratio(meta: Any) -> Optional[float]:
     return None if r is None else min(1.0, max(0.0, r))
 
 
+def adapt_stage_coverage(meta: Any) -> Optional[str]:
+    """Перевод покрытия A03 «по стадиям» ({"ingest": 1.0, "detect": 1.0, ...} + required_stages) в
+    формат A01 ({"ratio": ...}): ratio = min по ОБЯЗАТЕЛЬНЫМ стадиям; хоть одна неизвестна (None/нет) —
+    ratio не ставим (unknown != false). Меняет meta на месте; возвращает описание или None.
+    Временный мост до согласования A01/A03 (флаг coverage_adapt_stages, по умолчанию выкл.)."""
+    if not isinstance(meta, dict):
+        return None
+    cov = meta.get("coverage")
+    if not isinstance(cov, dict) or "ratio" in cov:
+        return None
+    required = [r for r in (meta.get("required_stages") or []) if isinstance(r, str)]
+    if not required or not any(isinstance(v, (int, float)) for v in cov.values()):
+        return None
+    vals = [cov.get(r) for r in required]
+    if any(not isinstance(v, (int, float)) or isinstance(v, bool) for v in vals):
+        return "stage coverage adapter: unknown coverage of a required stage — ratio not set"
+    ratio = min(float(v) for v in vals)
+    meta["coverage"] = {"ratio": round(ratio, 4), "required": required, "stages_coverage": dict(cov),
+                        "source": "api-adapter:A03-per-stage"}
+    return f"stage coverage adapter: ratio=min(required)={ratio:.2f}"
+
+
 def coverage_problem(meta: Any, min_ratio: float = 0.98, *, allow_mock: bool = False,
                      pipeline_flags: bool = True) -> Optional[str]:
     """None — полнота ПОДТВЕРЖДЕНА и «нарушений нет» допустимо; иначе причина для failed.

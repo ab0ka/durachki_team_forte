@@ -201,12 +201,17 @@ class Acceptance:
             self.add("анализ синтетического видео выполнен (done)", False,
                      f"failed: {str(last.get('error'))[:200]}", warn=True)
         self.add(f"ответ ≤ {self.max_resp // (1024 * 1024)} МБ", size <= self.max_resp, f"{size} байт")
+        self.first_status = st
         return jid
 
-    def idempotency(self, mov: bytes, jid: str) -> None:
+    def idempotency(self, mov: bytes, jid: str, first_status: Optional[str]) -> None:
         r = self.c.post_file("/api/v1/analyze", mov, "same-again.MOV", self.H)
         d = r.json() or {}
         same = d.get("job_id") == jid
+        if first_status == "failed":  # упавшие задачи не переиспользуются — нужен новый прогон
+            self.add("повтор после failed -> новый job (failed не кэшируется)", not same,
+                     "новый job" if not same else "вернул упавший job")
+            return
         self.add("повторная загрузка того же файла -> тот же job", same,
                  "deduplicated" if same else "новый job (SENTINEL_DEDUP=0?)", warn=True)
 
@@ -263,7 +268,8 @@ class Acceptance:
                 name = src.name if src else "synthetic.mov"
                 jid = self.lifecycle(mov, name)
                 if jid:
-                    self._try("idempotency", lambda: self.idempotency(mov, jid))
+                    self._try("idempotency", lambda: self.idempotency(mov, jid,
+                                                                      getattr(self, "first_status", None)))
                     self._try("ranges", lambda: self.ranges(jid))
             else:
                 self.add("жизненный цикл", None, "нет cv2 и не задан --video")
