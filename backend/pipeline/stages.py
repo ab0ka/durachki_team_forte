@@ -139,21 +139,19 @@ def module_identity(module: Any, origin: str = "module") -> dict:
     for env in ("SENTINEL_FOLD", "SENTINEL_SPLIT"):
         if os.environ.get(env):
             ident[env.lower()] = os.environ[env]
-    # Настройки модулей через env (например SENTINEL_DETECT_EXTRAS=open_vocab) меняют выход стадии,
-    # поэтому входят в ключ кэша. Секреты не включаем.
-    behaviour_env = {
-        k: v for k, v in sorted(os.environ.items())
-        if k.startswith(_BEHAVIOUR_ENV_PREFIXES) and not any(s in k for s in _SECRET_ENV_MARKERS)
-    }
-    if behaviour_env:
-        ident["env"] = behaviour_env
+    # Настройки модуля через env (например SENTINEL_DETECT_EXTRAS=open_vocab для ml.detect) меняют
+    # выход его стадии, поэтому входят в её ключ кэша. Только переменные своего модуля, без секретов.
+    if origin == "module":
+        prefix = "SENTINEL_" + str(getattr(module, "__name__", "")).rsplit(".", 1)[-1].upper() + "_"
+        behaviour_env = {
+            k: v for k, v in sorted(os.environ.items())
+            if k.startswith(prefix) and not any(s in k for s in _SECRET_ENV_MARKERS)
+        }
+        if behaviour_env:
+            ident["env"] = behaviour_env
     return ident
 
 
-_BEHAVIOUR_ENV_PREFIXES = (
-    "SENTINEL_INGEST_", "SENTINEL_DETECT_", "SENTINEL_TRACK_", "SENTINEL_POSE_", "SENTINEL_SCENE_",
-    "SENTINEL_RULES_", "SENTINEL_TEMPORAL_", "SENTINEL_VLM_", "SENTINEL_FUSION_",
-)
 _SECRET_ENV_MARKERS = ("KEY", "PASSWORD", "SECRET", "TOKEN")
 
 
