@@ -99,3 +99,22 @@ def test_cli_profile(synth_video):
     p = _cli("profile", synth_video, "--mock", "--inline", "--json")
     rep = json.loads(p.stdout)
     assert rep["status"] == "done" and any(r["stage"] == "detect" for r in rep["stages"])
+
+
+def test_deadline_respected_when_worker_keeps_dying(synth_video, monkeypatch, fake_ml_files):
+    """Регрессия пробной интеграции A01: 6-с ролик, deadline 40 с, ответ через 110 с.
+    Служебные RPC (identity/device/prepare_vram) и перезапуски воркера тоже обязаны укладываться в дедлайн."""
+    base = fake_ml_files()
+    for name in ("track", "scene", "rules", "temporal", "vlm"):   # медленный импорт каждого модуля в воркере
+        p = base / "ml" / name / "__init__.py"
+        p.write_text("import time\ntime.sleep(2.0)\n" + p.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("SENTINEL_EXECUTOR", "process")
+    monkeypatch.setenv("SENTINEL_FAKE_SLEEP", "60")               # detect зависает → воркер убивается
+    deadline = 8.0
+    t0 = time.perf_counter()
+    res = run(synth_video, "job-deadline", None, deadline,
+              overrides={"executor": {"extra_sys_path": [str(base)]}, "timeouts": {"min_s": 2.0}})
+    elapsed = time.perf_counter() - t0
+    assert elapsed < deadline + 4.0, f"run() занял {elapsed:.1f} с при дедлайне {deadline} с"
+    assert res.status == "failed" and res.verdict is None
+    assert res.meta["stages"]["detect"]["status"] == "timeout"

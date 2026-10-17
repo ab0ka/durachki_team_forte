@@ -115,6 +115,14 @@ class RunContext:
             done += STAGES[name].weight
         return done / total
 
+    def rpc_timeout(self, base: float) -> float:
+        """Таймаут служебного вызова воркера: не дольше base и не дальше дедлайна (минус минимум на отчёт)."""
+        left = self.budget.remaining() - float(cfg_get(self.cfg, "reserve_s.fusion_min", 3))
+        return max(0.5, min(float(base), left))
+
+    def out_of_time(self) -> bool:
+        return self.budget.remaining() <= float(cfg_get(self.cfg, "reserve_s.essential_min", 1.5))
+
     def warn(self, msg: str) -> None:
         if msg and msg not in self.warnings:
             self.warnings.append(msg)
@@ -273,7 +281,7 @@ def _run_leased(ctx: RunContext) -> AnalysisResult:
         ctx.device = "cpu"
     else:
         try:
-            ctx.device = ex.request("device", {}, timeout=60)
+            ctx.device = ex.request("device", {}, timeout=ctx.rpc_timeout(60))
         except Exception as exc:  # noqa: BLE001
             ctx.warn(f"не удалось определить устройство: {exc}")
             ctx.device = "cpu"
@@ -347,9 +355,10 @@ def _ingest(ctx: RunContext) -> bool:
     ctx.records["ingest"] = rec
     ctx.report(STAGES["ingest"].label, ctx.stage_progress_base("ingest"))
     t0 = time.perf_counter()
-    timeout = min(float(cfg_get(ctx.cfg, "executor.load_clip_timeout_s", 60)), max(1.0, ctx.budget.remaining() - 2))
+    timeout = ctx.rpc_timeout(float(cfg_get(ctx.cfg, "executor.load_clip_timeout_s", 60)))
     try:
-        ctx.ingest_identity = ctx.executor.request("identity", {"module": "ml.ingest", "func": "load_video"}, timeout)
+        ctx.ingest_identity = ctx.executor.request("identity", {"module": "ml.ingest", "func": "load_video"},
+                                                   ctx.rpc_timeout(30))
         info = ctx.executor.load_clip(ctx.work_path, ctx.sample_fps, timeout)
     except (WorkerTimeout, WorkerCrashed, WorkerCancelled) as exc:
         rec.status = {WorkerTimeout: "timeout", WorkerCrashed: "crashed"}.get(type(exc), "cancelled")
@@ -406,8 +415,12 @@ def _stage(ctx: RunContext, stage: str, calls: list[tuple[str, str, tuple, dict]
             ctx.warn(f"дополнительная стадия {stage} выключена флагом")
         return None
 
+    if ctx.out_of_time():
+        rec.status, rec.error = "skipped", f"до дедлайна осталось {ctx.budget.remaining():.1f} с"
+        _record(ctx, stage, rec)
+        return None
     try:
-        ident = ctx.executor.request("identity", {"module": spec.module, "func": spec.func}, 30)
+        ident = ctx.executor.request("identity", {"module": spec.module, "func": spec.func}, ctx.rpc_timeout(30))
     except Exception as exc:  # noqa: BLE001
         ident = {"origin": "unknown", "error": str(exc)}
     rec.version = str(ident.get("version", ident.get("origin", "")))
@@ -522,7 +535,8 @@ def _prepare_vram(ctx: RunContext, stage: str) -> None:
         unload = []
     need = float(cfg_get(ctx.cfg, f"gpu.vram_gb.{stage}", 1.0))
     try:
-        info = ctx.executor.request("prepare_vram", {"need_gb": need, "unload_modules": unload}, 60)
+        info = ctx.executor.request("prepare_vram", {"need_gb": need, "unload_modules": unload},
+                                    ctx.rpc_timeout(60))
     except Exception as exc:  # noqa: BLE001
         ctx.warn(f"{stage}: проверка VRAM не удалась: {exc}")
         return
@@ -543,8 +557,14 @@ def _fusion(ctx: RunContext, events: list[Event], risk: list[tuple[float, float]
         return None
     ctx.report(STAGES["fusion"].label, ctx.stage_progress_base("fusion"))
     t0 = time.perf_counter()
-    res = ctx.executor.call("ml.fusion", "fuse", (CLIP, events, risk, ctx.catalog, ctx.job_id), {},
-                            ctx.budget.timeout("fusion"))
+    respawn_s = float(cfg_get(ctx.cfg, "reserve_s.respawn_s", 8))
+    worker_dead = getattr(ctx.executor, "mode", "") == "process" and not ctx.executor.alive()
+    if worker_dead and ctx.budget.remaining() < respawn_s:
+        res = CallResult("skipped", error=f"воркер остановлен, до дедлайна {ctx.budget.remaining():.1f} с — "
+                                          f"без перезапуска")
+    else:
+        res = ctx.executor.call("ml.fusion", "fuse", (CLIP, events, risk, ctx.catalog, ctx.job_id), {},
+                                ctx.budget.timeout("fusion"))
     result: Optional[AnalysisResult] = None
     if res.ok and hasattr(res.value, "violations") and getattr(res.value, "status", "") != "failed":
         result, rec.status, rec.origin = res.value, "ok", res.origin
